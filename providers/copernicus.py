@@ -1,16 +1,16 @@
-import os
 import requests
 from datetime import datetime, timedelta
 from typing import Dict, List
 from loguru import logger
-from config.config_loader import ConfigLoader
+from utilities import ConfigLoader, DownloadManager
 from providers.provider_base import ProviderBase
-from download_manager import DownloadManager
+from shapely.geometry import Polygon
+
 
 class Copernicus(ProviderBase):
     """Main class for downloading images from Copernicus Data Space Ecosystem"""
 
-    def __init__(self, config_loader: ConfigLoader ):
+    def __init__(self, config_loader: ConfigLoader):
         self.base_url = config_loader.get_var("providers.copernicus.base_urls.base_url")
         self.token_url = config_loader.get_var("providers.copernicus.base_urls.token_url")
         self.download_url = config_loader.get_var("providers.copernicus.base_urls.download_url")
@@ -58,11 +58,10 @@ class Copernicus(ProviderBase):
 
     def search_products(self,
                         collection: str = "SENTINEL-2",
+                        product_type: str = "S2MSI2A",
                         start_date: str = None,
                         end_date: str = None,
-                        bbox: List[float] = None,
-                        cloud_cover_max: int = 20,
-                        limit: int = 10) -> List[Dict]:
+                        aoi: Polygon = None) -> List[Dict]:
         """
         Search for products in the Copernicus catalogue
         """
@@ -73,24 +72,39 @@ class Copernicus(ProviderBase):
             end_date = datetime.now().strftime('%Y-%m-%d')
 
         query_params = {
-            '$filter': f"Collection/Name eq '{collection}' "
-                      f"and ContentDate/Start gt {start_date}T00:00:00.000Z "
-                      f"and ContentDate/Start lt {end_date}T23:59:59.999Z"
+            "$filter": (
+                f"Collection/Name eq '{collection}' "
+                f"and ContentDate/Start gt '{start_date}T00:00:00Z' "
+                f"and ContentDate/Start lt '{end_date}T23:59:59Z'"
+            )
         }
 
-        if collection in ["SENTINEL-2"] and cloud_cover_max is not None:
-            query_params['$filter'] += f" and Attributes/OData.CSC.DoubleAttribute/any(att:att/Name eq 'cloudCover' and att/OData.CSC.DoubleAttribute/Value le {cloud_cover_max})"
+        if product_type:
+            query_params["$filter"] += (
+                f" and Attributes/OData.CSC.StringAttribute/any("
+                f"att:att/Name eq 'productType' and "
+                f"att/OData.CSC.StringAttribute/Value eq '{product_type}')"
+            )
 
-        if bbox:
-            west, south, east, north = bbox
-            query_params['$filter'] += f" and OData.CSC.Intersects(area=geography'SRID=4326;POLYGON(({west} {south},{east} {south},{east} {north},{west} {north},{west} {south}))')"
+        if aoi:
+            # Get coordinates as a WKT-like string without 'POLYGON' prefix
+            coords_str = ", ".join([f"{x} {y}" for x, y in aoi.exterior.coords])
 
-        query_params['$top'] = limit
-        query_params['$orderby'] = "ContentDate/Start desc"
+            # Append to your query filter
+            query_params["$filter"] += (
+                f" and OData.CSC.Intersects(area=geography'SRID=4326;"
+                f"POLYGON(({coords_str}))')"
+            )
+
+        query_params["$orderby"] = "ContentDate/Start desc"
+
 
         headers = {
             'Authorization': f'Bearer {self.access_token}'
         }
+        
+        logger.info(f"Searching for products in collection '{collection}' from {start_date} to {end_date}")
+        logger.info(f"Query parameters: {query_params}")
 
         try:
             url = f"{self.base_url}/odata/v1/Products"
@@ -100,9 +114,10 @@ class Copernicus(ProviderBase):
             data = response.json()
             products = data.get('value', [])
             # get only the product IDs
-            products = [product['Id'] for product in products]
+            
             logger.info(f"Found {len(products)} products")
-            return products
+            logger.debug(f"Products: {products}")
+            return [product['Id'] for product in products]
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Search failed: {e}")

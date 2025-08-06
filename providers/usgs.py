@@ -6,7 +6,7 @@ from typing import Dict, List
 from loguru import logger
 from dotenv import load_dotenv
 from providers.provider_base import ProviderBase
-from download_manager.download_manager import DownloadManager
+from utilities.download_manager import DownloadManager
 
 class USGS(ProviderBase):
     """Main class for downloading images from USGS Landsat"""
