@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict
 
+from shapely import Polygon
+
 class ProviderBase(ABC):
     """
     Abstract base class for satellite imagery providers.
@@ -15,11 +17,10 @@ class ProviderBase(ABC):
     @abstractmethod
     def search_products(self,
                         collection: str,
+                        product_type: str,
                         start_date: str,
                         end_date: str,
-                        bbox: List[float],
-                        cloud_cover_max: int,
-                        limit: int) -> List[Dict]:
+                        aoi: Polygon) -> List[Dict]:
         """Search for products in the provider's catalogue."""
         pass
 

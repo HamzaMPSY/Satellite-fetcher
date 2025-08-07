@@ -97,7 +97,7 @@ class Copernicus(ProviderBase):
             )
 
         query_params["$orderby"] = "ContentDate/Start desc"
-
+        query_params["$top"] = "1000"
 
         headers = {
             'Authorization': f'Bearer {self.access_token}'
@@ -116,7 +116,6 @@ class Copernicus(ProviderBase):
             # get only the product IDs
             
             logger.info(f"Found {len(products)} products")
-            logger.debug(f"Products: {products}")
             return [product['Id'] for product in products]
 
         except requests.exceptions.RequestException as e:

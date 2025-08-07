@@ -1,113 +1,86 @@
-import os
 import requests
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List
-from loguru import logger
-from dotenv import load_dotenv
-from providers.provider_base import ProviderBase
-from utilities.download_manager import DownloadManager
+import threading
+import json
+import os
+from datetime import datetime
+from typing import List, Dict
 
-class USGS(ProviderBase):
-    """Main class for downloading images from USGS Landsat"""
+from shapely import Polygon
+from .provider_base import ProviderBase
+from utilities import ConfigLoader
 
-    def __init__(self):
-        self.base_url = "https://m2m.cr.usgs.gov"
-        self.token_url = "https://m2m.cr.usgs.gov/api/login"
-        self.download_url = "https://m2m.cr.usgs.gov"
+class UsgsProvider(ProviderBase):
+    """
+    USGS Provider for satellite image search and download,
+    with configuration via ConfigLoader.
+    """
 
-        self.username = os.getenv('USGS_USERNAME')
-        self.password = os.getenv('USGS_PASSWORD')
-
-        if not self.username or not self.password:
-            raise ValueError("Please set USGS_USERNAME and USGS_PASSWORD in your .env file")
-
-        self.access_token = None
+    def __init__(self, config_loader: ConfigLoader):
+        self.service_url = config_loader.get_var("providers.usgs.base_urls.service_url")
+        self.username = config_loader.get_var("providers.usgs.credentials.username")
+        self.token = config_loader.get_var("providers.usgs.credentials.token")
+        self.maxthreads = int(config_loader.get_var("providers.usgs.maxthreads") or 5)
+        self.api_key = None
+        self.download_sema = threading.Semaphore(value=self.maxthreads)
         self.session = requests.Session()
-        self.download_manager = DownloadManager(self.base_url, self.download_url, self.access_token)
-
-        logger.add("usgs_landsat_downloader.log", rotation="10 MB")
 
     def get_access_token(self) -> str:
-        """Get OAuth2 access token from USGS Identity Service"""
-
-        data = {
-            'username': self.username,
-            'password': self.password,
-        }
-
-        headers = {
-            'Content-Type': 'application/json'
-        }
-
-        try:
-            response = requests.post(self.token_url, json=data, headers=headers)
-            response.raise_for_status()
-
-            token_data = response.json()
-            self.access_token = token_data['access_token']
-
-            logger.info("Successfully obtained access token")
-            return self.access_token
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get access token: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(f"Response: {e.response.text}")
-            raise
+        payload = {'username': self.username, 'token': self.token}
+        resp = self._send_request(self.service_url + "login-token", payload)
+        self.api_key = resp  # The API key becomes the token for subsequent requests
+        return self.api_key
 
     def search_products(self,
-                        collection: str = "LANDSAT_8_C1",
-                        start_date: str = None,
-                        end_date: str = None,
-                        bbox: List[float] = None,
-                        cloud_cover_max: int = 20,
-                        limit: int = 10) -> List[Dict]:
-        """
-        Search for products in the USGS Landsat catalogue
-        """
-        if not self.access_token:
-            self.get_access_token()
-
-        if not start_date:
-            start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-        if not end_date:
-            end_date = datetime.now().strftime('%Y-%m-%d')
-
-        query_params = {
+                        collection: str,
+                        product_type: str,
+                        start_date: str,
+                        end_date: str,
+                        aoi: Polygon) -> List[Dict]:
+        spatial_filter = {
+            'filterType': "mbr",
+            'lowerLeft': {'latitude': aoi.bounds[1], 'longitude': aoi.bounds[0]},
+            'upperRight': {'latitude': aoi.bounds[3], 'longitude': aoi.bounds[2]},
+        }
+        temporal_filter = {'start': start_date, 'end': end_date}
+        payload = {
             'datasetName': collection,
-            'temporal': f"{start_date},{end_date}",
-            'bbox': f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
+            'spatialFilter': spatial_filter,
+            'temporalFilter': temporal_filter
         }
+        datasets = self._send_request(self.service_url + "dataset-search", payload, self.api_key)
+        products = []
+        for ds in datasets:
+            if ds['datasetAlias'] != collection:
+                continue
+            acquisition_filter = {"end": end_date, "start": start_date}
+            scene_payload = {
+                'datasetName': ds['datasetAlias'],
+                'startingNumber': 1,
+                'sceneFilter': {
+                    'spatialFilter': spatial_filter,
+                    'acquisitionFilter': acquisition_filter,
+                }
+            }
+            scenes = self._send_request(self.service_url + "scene-search", scene_payload, self.api_key)
+            if scenes.get('recordsReturned', 0) > 0:
+                for result in scenes['results']:
+                    products.append(result)
+        return products
 
-        if cloud_cover_max is not None:
-            query_params['maxCloudCover'] = cloud_cover_max
+    def download_products_concurrent(self, product_ids: List[str], output_dir: str) -> List[str]:
+        pass
 
-        query_params['maxResults'] = limit
-
-        headers = {
-            'Authorization': f'Bearer {self.access_token}'
-        }
-
+    def _send_request(self, url, data, api_key=None):
+        headers = {'Content-Type': 'application/json'}
+        if api_key:
+            headers['X-Auth-Token'] = api_key
+        resp = self.session.post(url, json.dumps(data), headers=headers)
+        if resp.status_code != 200:
+            raise Exception(f"HTTP {resp.status_code} error from {url}: {resp.text}")
         try:
-            url = f"{self.base_url}/api/scene-search"
-            response = self.session.get(url, params=query_params, headers=headers)
-            response.raise_for_status()
-
-            data = response.json()
-            products = data.get('results', [])
-
-            logger.info(f"Found {len(products)} products")
-            return products
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Search failed: {e}")
-            raise
-
-    def download_products_concurrent(self, product_ids: List[str], output_dir: str = "downloads") -> List[str]:
-        """
-        Download multiple products sequentially.
-        """
-        if not self.access_token:
-            self.get_access_token()
-        return self.download_manager.download_products_concurrent(product_ids, output_dir)
+            output = resp.json()
+        except Exception as e:
+            raise Exception(f"Error parsing JSON response from {url}: {e}")
+        if output.get('errorCode') is not None:
+            raise Exception(f"API Error {output['errorCode']}: {output.get('errorMessage')}")
+        return output['data']

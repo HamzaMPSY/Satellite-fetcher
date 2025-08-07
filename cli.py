@@ -16,19 +16,19 @@ def main():
     # Initialize Copernicus provider
     copernicus_provider = Copernicus(config_loader=configuration)
     # Example 1: Search for Sentinel-2 products over Rome, Italy
-    logger.info("Searching for Sentinel-2 products globally...")
+    logger.info("Searching for SMOS products globally...")
     products = copernicus_provider.search_products(
-        collection="SENTINEL-2",
-        product_type='S2MSI2A',
-        start_date="2025-07-01",
-        end_date="2025-07-31",
+        collection="SENTINEL-1",
+        product_type="GRD",
+        start_date="2024-06-01",
+        end_date="2024-06-30",
         aoi=geometry_handler.geometry  # Area of interest geometry
     )
 
     # Download all products individually
-    # if products:
-    #     logger.info("Downloading all products individually...")
-    #     copernicus_provider.download_products_concurrent(product_ids=products)
+    if products:
+        logger.info("Downloading all products individually...")
+        copernicus_provider.download_products_concurrent(product_ids=products)
 
     logger.info("Search and download completed successfully!")
 

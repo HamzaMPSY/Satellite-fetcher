@@ -64,11 +64,11 @@ Attributes/OData.CSC.StringAttribute/any(
 
 ---
 
-## ✅ README‑Friendly Table
+## Collections Table
 
 | **Collection Name** | **Satellite / Data Type** | **ProductType (processing level)** |
 |---------------------|---------------------------|-------------------------------------|
-| SENTINEL-1          | SAR imagery               | `SLC`, `GRD`, `GRDCOG`, `OCN`       |
+| SENTINEL-1          | SAR imagery               | `RAW`, `GRD`, `SLC`, `IW_SLC__1S`.  |
 | SENTINEL-2          | Optical & infrared        | `S2MSI1C`, `S2MSI2A`                 |
 | SENTINEL-3          | OLCI / SLSTR land & ocean | `S3OL1EFR`, `S3OL1ERR`, `S3SL1RBT`, `S3OL2WFR`, `S3OL2WRR`, `S3OL2LFR`, `S3OL2LRR`, `S3SL2LST`, `S3SL2FRP`, `S3SR2LAN`, `S3SY2SYN`, `S3SY2VGP`, `S3SY2VG1`, `S3SY2V10`, `S3SY2AOD` |
 | SENTINEL-5P         | Atmospheric gases         | `L2__NO2___`, `L2__CH4___`, `L2__CO____`, `L2__O3____`, `L2__SO2___`, `L2__HCHO__` |
@@ -92,9 +92,5 @@ That filters for **Sentinel‑2 Level‑1C** raw scenes in January 2024, without
 
 ---
 
-## 💡 Notes
-- For **raw imagery without mosaicking or cloud removal**, use:
-  - `SENTINEL-2` **S2MSI1C**
-  - `SENTINEL-1` **GRD** or **SLC**
-- Avoid `GLOBAL-MOSAICS` or other derived datasets if you want original scenes.
-- Not all processing levels are available for all collections in the public API.
+# AFKAR
+* use multi-sessions to download + semaphore
