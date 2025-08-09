@@ -1,14 +1,14 @@
-import requests
+import aiohttp
+import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import List, Dict
 from loguru import logger
-from utilities import ConfigLoader, DownloadManager
-from providers.provider_base import ProviderBase
 from shapely.geometry import Polygon
+from utilities import ConfigLoader, DownloadManager
 
 
-class Copernicus(ProviderBase):
-    """Main class for downloading images from Copernicus Data Space Ecosystem"""
+class Copernicus:
+    """Main class for downloading images from Copernicus Data Space Ecosystem (async version)"""
 
     def __init__(self, config_loader: ConfigLoader):
         self.base_url = config_loader.get_var("providers.copernicus.base_urls.base_url")
@@ -21,109 +21,86 @@ class Copernicus(ProviderBase):
         if not self.username or not self.password:
             raise ValueError("Please set cdse_username and cdse_password in your config.yaml file")
 
-        self.access_token = self.get_access_token()
-        self.download_manager = DownloadManager(self.base_url, self.download_url, self.access_token)
-        self.session = requests.Session()
+        self.access_token = None
+        self.download_manager = None
+        self.session = None
 
-
-    def get_access_token(self) -> str:
-        """Get OAuth2 access token from Copernicus Identity Service"""
-
+    async def get_access_token(self) -> str:
         data = {
             'client_id': 'cdse-public',
             'username': self.username,
             'password': self.password,
             'grant_type': 'password'
         }
-
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded'
         }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.token_url, data=data, headers=headers) as response:
+                response.raise_for_status()
+                token_data = await response.json()
+                self.access_token = token_data['access_token']
+                logger.info("Successfully obtained access token")
+                return self.access_token
 
-        try:
-            response = requests.post(self.token_url, data=data, headers=headers)
-            response.raise_for_status()
-
-            token_data = response.json()
-            self.access_token = token_data['access_token']
-
-            logger.info("Successfully obtained access token")
-            return self.access_token
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get access token: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(f"Response: {e.response.text}")
-            raise
-
-    def search_products(self,
-                        collection: str = "SENTINEL-2",
-                        product_type: str = "S2MSI2A",
-                        start_date: str = None,
-                        end_date: str = None,
-                        aoi: Polygon = None) -> List[Dict]:
-        """
-        Search for products in the Copernicus catalogue
-        """
+    async def search_products(
+        self,
+        collection: str = "SENTINEL-2",
+        product_type: str = "S2MSI2A",
+        start_date: str = None,
+        end_date: str = None,
+        aoi: Polygon = None,
+        cloud_cover_max: float = 20.0
+    ) -> List[Dict]:
 
         if not start_date:
             start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         if not end_date:
             end_date = datetime.now().strftime('%Y-%m-%d')
 
-        query_params = {
-            "$filter": (
-                f"Collection/Name eq '{collection}' "
-                f"and ContentDate/Start gt '{start_date}T00:00:00Z' "
-                f"and ContentDate/Start lt '{end_date}T23:59:59Z'"
-            )
-        }
+        filter_str = (
+            f"Collection/Name eq '{collection}' "
+            f"and ContentDate/Start gt '{start_date}T00:00:00Z' "
+            f"and ContentDate/Start lt '{end_date}T23:59:59Z'"
+        )
 
         if product_type:
-            query_params["$filter"] += (
+            filter_str += (
                 f" and Attributes/OData.CSC.StringAttribute/any("
                 f"att:att/Name eq 'productType' and "
                 f"att/OData.CSC.StringAttribute/Value eq '{product_type}')"
             )
 
         if aoi:
-            # Get coordinates as a WKT-like string without 'POLYGON' prefix
             coords_str = ", ".join([f"{x} {y}" for x, y in aoi.exterior.coords])
-
-            # Append to your query filter
-            query_params["$filter"] += (
+            filter_str += (
                 f" and OData.CSC.Intersects(area=geography'SRID=4326;"
                 f"POLYGON(({coords_str}))')"
             )
+        if cloud_cover_max is not None:
+            filter_str += f" and Attributes/OData.CSC.DoubleAttribute/any(att:att/Name eq 'cloudCover' and att/OData.CSC.DoubleAttribute/Value le {cloud_cover_max})"
 
-        query_params["$orderby"] = "ContentDate/Start desc"
-        query_params["$top"] = "1000"
-
-        headers = {
-            'Authorization': f'Bearer {self.access_token}'
+        query_params = {
+            "$filter": filter_str,
+            "$orderby": "ContentDate/Start desc",
+            "$top": "1000"
         }
-        
-        logger.info(f"Searching for products in collection '{collection}' from {start_date} to {end_date}")
-        logger.info(f"Query parameters: {query_params}")
 
-        try:
+        headers = {'Authorization': f'Bearer {self.access_token}'}
+
+        async with aiohttp.ClientSession() as session:
             url = f"{self.base_url}/odata/v1/Products"
-            response = self.session.get(url, params=query_params, headers=headers)
-            response.raise_for_status()
+            async with session.get(url, params=query_params, headers=headers) as response:
+                response.raise_for_status()
+                data = await response.json()
+                products = data.get('value', [])
+                logger.info(f"Found {len(products)} products")
+                return [product['Id'] for product in products]
 
-            data = response.json()
-            products = data.get('value', [])
-            # get only the product IDs
-            
-            logger.info(f"Found {len(products)} products")
-            return [product['Id'] for product in products]
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Search failed: {e}")
-            raise
-
-    def download_products_concurrent(self, product_ids: List[str], output_dir: str = "downloads") -> List[str]:
-        """
-        Download multiple products concurrently.
-        """
-        return self.download_manager.download_products_concurrent(product_ids, output_dir)
+    async def download_products_concurrent(self, product_ids: List[str], aoi_geometry=None, output_dir: str = "downloads", crop: bool = False):
+        if not self.access_token:
+            await self.get_access_token()
+        if not self.download_manager:
+            self.download_manager = DownloadManager(self.base_url, self.download_url, self.access_token)
+        results = await self.download_manager.download_products_concurrent(product_ids, aoi_geometry, output_dir, crop)
+        return results
