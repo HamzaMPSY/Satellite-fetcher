@@ -1,30 +1,38 @@
 import os
-import requests
+import asyncio
+import aiohttp
 from pathlib import Path
 from typing import Dict, List
 from loguru import logger
 from tqdm import tqdm
 
+from utilities.config_loader import ConfigLoader
+
 class DownloadManager:
     """
-    Manages downloading satellite products from a provider.
+    Manages downloading satellite products from a provider (now with concurrent asyncio/aiohttp support).
 
-    This class supports both single and batch downloads, provides progress visualization,
+    This class supports both single and concurrent batch downloads, provides progress visualization,
     and logs all major actions and errors.
 
     Attributes:
-        session (requests.Session): HTTP session for download requests.
+        None (session managed per-task in asyncio with aiohttp).
     """
 
-    def __init__(self):
+    def __init__(self, config_loader:ConfigLoader = None):
         """
-        Initialize the DownloadManager and create a persistent session for HTTP requests.
+        Initialize the DownloadManager.
+        Loads download concurrency/retry settings from config_loader if provided; else uses safe defaults.
         """
-        self.session = requests.Session()
+        
+        self.max_concurrent = config_loader.get_var('download_manager.max_concurrent')
+        self.max_retries = config_loader.get_var('download_manager.max_retries')
+        self.initial_delay = config_loader.get_var('download_manager.initial_delay')
+        self.backoff_factor = config_loader.get_var('download_manager.backoff_factor')
 
     def download_products(self, product_ids: Dict, output_dir: str = "downloads") -> List[str]:
         """
-        Download multiple products sequentially.
+        Download multiple products concurrently using asyncio and aiohttp.
 
         Args:
             product_ids (Dict): Dictionary with keys 'urls', 'file_names', and 'headers'.
@@ -36,63 +44,149 @@ class DownloadManager:
         Logs:
             Info when starting each download, and error messages on failures.
         """
-        # Ensure the output directory exists
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         logger.info(f"Ensured output directory exists: {output_dir}")
-        results = []
-
-        # Download files one by one
-        for download_url, file_name in zip(product_ids['urls'], product_ids['file_names']):
-            try:
-                logger.info(f"Downloading product: {file_name} from {download_url}")
-                file_path = os.path.join(output_dir, file_name)
-                results.append(self.download_product(download_url, product_ids['headers'], file_path))
-            except Exception as e:
-                logger.error(f"Download failed for {file_name} from {download_url}: {e}")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        results = loop.run_until_complete(
+            self._download_all_concurrent(product_ids, output_dir)
+        )
         return results
 
-    def download_product(self, download_url: str, headers: Dict[str, str], filepath: str) -> str:
+    async def _download_all_concurrent(self, product_ids: Dict, output_dir: str) -> List[str]:
         """
-        Download a single product to a specific file path.
+        Internal async method to download all files with limited concurrency and smart retry/backoff logic.
+        Returns a list of successfully downloaded file paths.
+        If downloads fail after all retries, failed (url, file_name) will be returned in a 'deferred' list for the user.
+        """
+        results = []
+        deferred = []
+
+        headers = product_ids['headers']
+        urls = product_ids['urls']
+        file_names = product_ids['file_names']
+
+        semaphore = asyncio.BoundedSemaphore(self.max_concurrent)
+
+        async def download_with_retry(session, url, headers, filepath, file_name):
+            delay = self.initial_delay
+            for attempt in range(1, self.max_retries + 1):
+                async with semaphore:
+                    try:
+                        logger.info(f"Attempt {attempt}: Downloading {url} -> {filepath}")
+                        async with session.get(url, headers=headers) as resp:
+                            if resp.status == 429:
+                                retry_after = resp.headers.get('Retry-After')
+                                if retry_after:
+                                    wait_time = int(retry_after)
+                                    logger.warning(f"429 Too Many Requests [{url}], retry-after {wait_time}s (attempt {attempt}/{self.max_retries})")
+                                    await asyncio.sleep(wait_time)
+                                else:
+                                    logger.warning(f"429 Too Many Requests [{url}], exponential backoff {delay}s (attempt {attempt}/{self.max_retries})")
+                                    await asyncio.sleep(delay)
+                                continue
+                            elif 500 <= resp.status < 600:
+                                logger.warning(f"{resp.status} Server error [{url}], retrying in {delay}s (attempt {attempt}/{self.max_retries})")
+                                await asyncio.sleep(delay)
+                                continue
+                            resp.raise_for_status()
+                            total_size_in_bytes = int(resp.headers.get('Content-Length', 0) or 0)
+                            chunk_size = 1024 * 1024
+                            Path(os.path.dirname(filepath)).mkdir(parents=True, exist_ok=True)
+                            if not os.path.isdir(filepath):
+                                with open(filepath, 'wb') as f:
+                                    with tqdm(
+                                        total=total_size_in_bytes,
+                                        unit='B',
+                                        unit_scale=True,
+                                        desc=f"Downloading {file_name}",
+                                        ncols=100
+                                    ) as progress_bar:
+                                        async for chunk in resp.content.iter_chunked(chunk_size):
+                                            f.write(chunk)
+                                            progress_bar.update(len(chunk))
+                            else:
+                                logger.warning(f"Expected file path, found directory: {filepath}. Skipping file write.")
+                            logger.info(f"Download complete: {filepath}")
+                            return str(filepath)
+                    except aiohttp.ClientError as e:
+                        logger.warning(f"Client error [{url}] (attempt {attempt}/{self.max_retries}): {e}")
+                        await asyncio.sleep(delay)
+                    except Exception as e:
+                        logger.error(f"Fatal error [{url}] (attempt {attempt}/{self.max_retries}): {e}")
+                        break
+                    delay *= self.backoff_factor
+            logger.error(f"Download failed for {file_name} [{url}] after {self.max_retries} attempts, will defer for later.")
+            deferred.append((url, file_name))
+            return None
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                download_with_retry(session, url, headers, os.path.join(output_dir, file_name), file_name)
+                for url, file_name in zip(urls, file_names)
+            ]
+            for f in tqdm(
+                asyncio.as_completed(tasks),
+                total=len(tasks),
+                desc=f"Concurrent Download Batch (max {self.max_concurrent})",
+                ncols=100
+            ):
+                try:
+                    result = await f
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"Download failed during concurrent batch with unexpected exception: {e}")
+        if deferred:
+            logger.warning(f"{len(deferred)} downloads were deferred due to repeated errors. See logs for details.")
+            # Optionally save to file for full trace:
+            with open(os.path.join(output_dir, "deferred_downloads.txt"), "w") as f:
+                for url, fname in deferred:
+                    f.write(f"{url} {fname}\n")
+            logger.info(f"Deferred URLs/filenames written to: {os.path.join(output_dir, 'deferred_downloads.txt')}")
+        return results
+
+    async def download_product(self, session: aiohttp.ClientSession, download_url: str, headers: Dict[str, str], filepath: str) -> str:
+        """
+        Download a single product to a specific file path using aiohttp.
 
         Args:
+            session (aiohttp.ClientSession): Active HTTP session for concurrent requests.
             download_url (str): The full URL to download from.
-            headers (Dict[str, str]): HTTP headers (may include auth token).
-            filepath (str): Destination file path for download.
+            headers (Dict[str, str]): HTTP headers, including auth token if necessary.
+            filepath (str): Output file path.
 
         Returns:
-            str: Path to the downloaded local file.
+            str: Path to the downloaded file.
 
         Raises:
-            requests.exceptions.RequestException: If the HTTP request fails.
+            aiohttp.ClientError: For network errors/data transfer issues.
 
         Logs:
-            Download progress, file size, and download success or failure.
+            Progress, file size & download success or failure.
         """
-        logger.info(f"Starting download: {download_url} -> {filepath}")
-        with self.session.get(download_url, headers=headers, stream=True) as r:
-            r.raise_for_status()
-
-            # Get total file size from headers (in bytes)
-            total_size_in_bytes = int(r.headers.get('Content-Length', 0))
-            total_size_in_mb = total_size_in_bytes / (1024 * 1024)
+        logger.info(f"Starting (async) download: {download_url} -> {filepath}")
+        async with session.get(download_url, headers=headers) as resp:
+            resp.raise_for_status()
+            total_size_in_bytes = int(resp.headers.get('Content-Length', 0) or 0)
+            total_size_in_mb = total_size_in_bytes / (1024 * 1024) if total_size_in_bytes else 0
             logger.info(f"File size: {total_size_in_mb:.2f} MB ({total_size_in_bytes} bytes)")
 
-            # Define chunk size in bytes (1 MB here)
             chunk_size = 1024 * 1024
-                    
-            # Write the download stream to disk
             if not os.path.isdir(filepath):
                 with open(filepath, 'wb') as f:
-                    # Create progress bar with tqdm
-                    with tqdm(total=total_size_in_bytes, unit='B', unit_scale=True, desc=f"Downloading ({total_size_in_mb:.2f} MB)", ncols=100) as progress_bar:
-                        # Stream download the file in chunks
-                        for chunk in r.iter_content(chunk_size=chunk_size):
+                    # tqdm for async not built-in, so progress is per file
+                    with tqdm(
+                        total=total_size_in_bytes,
+                        unit='B',
+                        unit_scale=True,
+                        desc=f"Downloading ({total_size_in_mb:.2f} MB)",
+                        dynamic_ncols=True
+                    ) as progress_bar:
+                        async for chunk in resp.content.iter_chunked(chunk_size):
                             f.write(chunk)
                             progress_bar.update(len(chunk))
             else:
                 logger.warning(f"Expected file path, found directory: {filepath}. Skipping file write.")
-            # Close the response data stream
-            r.close()
             logger.info(f"Download complete: {filepath}")
             return str(filepath)

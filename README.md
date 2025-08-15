@@ -1,96 +1,67 @@
-# Satellite-fetcher
-# Copernicus Data Collections & Product Types
+# Satellite Fetcher
 
-## 📡 Overview
+**Satellite Fetcher** is a Python toolkit for working with satellite and geospatial data. It provides a CLI and utilities to download, convert, and process geospatial datasets using popular open data providers.
 
-This guide provides **collection names**, **processing levels**, and **productType** values you can use in your Copernicus Data Space OData queries.
+## Features
 
----
+- Fetch geospatial data from a variety of open providers (Copernicus, USGS, Open Topography, and more)
+- Modular provider architecture (easily extendible)
+- Command-line interface for data fetching and conversion workflows
 
-## Collections & `productType` Values
+## Installation
 
-Use these strings in your filter queries, e.g.:
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/satellite-fetcher.git
+   cd satellite-fetcher
+   ```
 
-```text
-Attributes/OData.CSC.StringAttribute/any(
-  att:att/Name eq 'productType' and
-  att/OData.CSC.StringAttribute/Value eq '<PRODUCTTYPE>'
-)
+2. Install the dependencies (preferably in a virtual environment):
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Usage
+
+### 1. CLI Usage
+
+The CLI tool lets you run data fetching and processing workflows:
+
+```bash
+python satellite-fetcher.py --help
 ```
 
----
+Refer to documentation or use `--help` options with other scripts to discover available commands and arguments.
 
-### **Sentinel‑1 (SAR Imagery)**
-**Collection Name:** `SENTINEL-1`  
-**Supported `productType`:**
-- `SLC` — Level‑1 Single-Look Complex (complex SAR data, includes phase)
-- `GRD` — Level‑1 Ground Range Detected (ortho‑corrected amplitude)
-- `GRDCOG` — Level‑1 GRD in Cloud-Optimized GeoTIFF format
-- `OCN` — Level‑2 Ocean products (wind, wave, current data)
+### 2. Streamlit Usage
 
----
+## Providers
 
-### **Sentinel‑2 (Optical Multispectral)**
-**Collection Name:** `SENTINEL-2`  
-**Supported `productType`:**
-- `S2MSI1C` — Level‑1C Top‑Of‑Atmosphere reflectance (no atmospheric correction)
-- `S2MSI2A` — Level‑2A Bottom‑Of‑Atmosphere reflectance (with scene classification and cloud mask)
+- **Copernicus**: European satellite data
+- **USGS**: US Geological Survey data
+- **Open Topography**: Global elevation/topography data
 
----
+Provider modules are located in the `providers/` directory and can be extended for additional data sources.
 
-### **Sentinel‑3 (OLCI & SLSTR Instruments)**
-**Collection Name:** `SENTINEL-3`  
-**Supported `productType`:**  
-- `S3OL1EFR`, `S3OL1ERR` — Level‑1 OLCI (full/reduced resolution TOA radiances)  
-- `S3SL1RBT` — Level‑1 SLSTR brightness temperature & radiance  
-- `S3OL2WFR`, `S3OL2WRR` — Level‑2 OLCI ocean parameters (full/reduced resolution)  
-- `S3OL2LFR`, `S3OL2LRR` — Level‑2 OLCI land parameters  
-- `S3SL2LST` — Level‑2 land surface temperature  
-- `S3SL2FRP` — Level‑2 fire radiative power  
-- `S3SR2LAN` — Level‑2 land surface height  
-- `S3SY2SYN`, `S3SY2VGP`, `S3SY2VG1`, `S3SY2V10`, `S3SY2AOD` — Various vegetation and aerosol syntheses & surface reflectance products
+## Configuration
 
----
+Edit `config.yaml` to set up API keys, regions, product types, and provider-specific parameters as needed.
 
-### **Sentinel‑5P (Atmospheric Composition)**
-**Collection Name:** `SENTINEL-5P`  
-**Supported `productType`:**
-- `L2__NO2___` — Nitrogen Dioxide  
-- `L2__CH4___` — Methane  
-- `L2__CO____` — Carbon Monoxide  
-- `L2__O3____` — Ozone  
-- `L2__SO2___` — Sulfur Dioxide  
-- `L2__HCHO__` — Formaldehyde  
+## Development
 
----
+- Extend or add providers in `providers/`
+- Utility scripts are in `utilities/`
+- Core CLI logic is in `satellite-fetcher.py` and `cli.py`
+- Logging is managed via [loguru](https://github.com/Delgan/loguru)
+- Data manipulation relies on [geopandas](https://github.com/geopandas/geopandas) and [shapely](https://github.com/shapely/shapely)
 
-## Collections Table
+## License
 
-| **Collection Name** | **Satellite / Data Type** | **ProductType (processing level)** |
-|---------------------|---------------------------|-------------------------------------|
-| SENTINEL-1          | SAR imagery               | `RAW`, `GRD`, `SLC`, `IW_SLC__1S`.  |
-| SENTINEL-2          | Optical & infrared        | `S2MSI1C`, `S2MSI2A`                 |
-| SENTINEL-3          | OLCI / SLSTR land & ocean | `S3OL1EFR`, `S3OL1ERR`, `S3SL1RBT`, `S3OL2WFR`, `S3OL2WRR`, `S3OL2LFR`, `S3OL2LRR`, `S3SL2LST`, `S3SL2FRP`, `S3SR2LAN`, `S3SY2SYN`, `S3SY2VGP`, `S3SY2VG1`, `S3SY2V10`, `S3SY2AOD` |
-| SENTINEL-5P         | Atmospheric gases         | `L2__NO2___`, `L2__CH4___`, `L2__CO____`, `L2__O3____`, `L2__SO2___`, `L2__HCHO__` |
+This project is licensed under the terms of the [Apache 2.0](LICENSE)
 
----
+## Acknowledgments
 
-## 📝 Example OData filter snippet
-
-```text
-$filter=
-  Collection/Name eq 'SENTINEL-2'
-  and Attributes/OData.CSC.StringAttribute/any(
-    att:att/Name eq 'productType' and
-    att/OData.CSC.StringAttribute/Value eq 'S2MSI1C'
-  )
-  and ContentDate/Start gt 2024-01-01T00:00:00.000Z
-  and ContentDate/Start lt 2024-01-31T23:59:59.999Z
-```
-
-That filters for **Sentinel‑2 Level‑1C** raw scenes in January 2024, without atmospheric correction or cloud masks.
-
----
-
-# AFKAR
-* use multi-sessions to download + semaphore
+- European Space Agency [Copernicus](https://copernicus.eu/)
+- US Geological Survey [USGS](https://usgs.gov/)
+- [OpenTopography](https://opentopography.org/)
+- The open-source community: [geopandas](https://github.com/geopandas/geopandas), [shapely](https://github.com/shapely/shapely), and others.

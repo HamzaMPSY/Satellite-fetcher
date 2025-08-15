@@ -5,6 +5,8 @@ from loguru import logger
 from utilities import ConfigLoader, DownloadManager
 from providers.provider_base import ProviderBase
 from shapely.geometry import Polygon
+import asyncio
+import aiohttp
 
 
 class Copernicus(ProviderBase):
@@ -47,11 +49,15 @@ class Copernicus(ProviderBase):
         if not self.username or not self.password:
             logger.error("Username or password is not set in the configuration file.")
             raise ValueError("Please set cdse_username and cdse_password in your config.yaml file")
+        
+        self.max_retries = config_loader.get_var('download_manager.max_retries')
+        self.initial_delay = config_loader.get_var('download_manager.initial_delay')
+        self.backoff_factor = config_loader.get_var('download_manager.backoff_factor')
 
         # Obtain access token on init
         logger.info("Obtaining access token for Copernicus provider.")
         self.access_token = self.get_access_token()
-        self.download_manager = DownloadManager()
+        self.download_manager = DownloadManager(config_loader=config_loader)
         self.session = requests.Session()
 
     def get_access_token(self) -> str:
@@ -139,12 +145,9 @@ class Copernicus(ProviderBase):
 
         # Add AOI filter in WKT format (if provided)
         if aoi:
-            # Get coordinates as a WKT-like string without 'POLYGON' prefix
-            coords_str = ", ".join([f"{x} {y}" for x, y in aoi.exterior.coords])
-            # Append to the filter for spatial intersection
             query_params["$filter"] += (
                 f" and OData.CSC.Intersects(area=geography'SRID=4326;"
-                f"POLYGON(({coords_str}))')"
+                f"{aoi.wkt}')"
             )
 
         # Order results by acquisition date, most recent first, limit to 1000 results
@@ -196,23 +199,77 @@ class Copernicus(ProviderBase):
             'Authorization': f'Bearer {self.access_token}'
         }
         
-        # Note: Only the last product_id is actually processed due to indentation,
-        # but this is preserved as per do-not-change-logic instruction.
-        for product_id in product_ids:
-            product_url = f"{self.base_url}/odata/v1/Products({product_id})"
+        # Iterate through product IDs and prepare download URLs
+        logger.debug("Preparing download URLs for products.")
+        
+        # Run the concurrent fetch
+        logger.debug("Preparing download URLs for products concurrently.")
+        product_infos = asyncio.run(
+            self.fetch_product_infos(product_ids, self.base_url, self.download_url, product_dict['headers'])
+        )
 
-        try:
-            # Only processes the last product_id by original logic
-            logger.debug(f"Requesting product info for product_id {product_id}")
-            response = self.session.get(product_url, headers=product_dict['headers'])
-            response.raise_for_status()
-            product_info = response.json()
-            download_url = f"{self.download_url}/odata/v1/Products({product_id})/$value"
-            # Add determined download URL and file name for this product
-            product_dict['urls'].append(download_url)
-            product_dict['file_names'].append(f"{product_info['Name']}.zip")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Download failed for product ID {product_id}: {e}")
+        for info in product_infos:
+            if info:
+                product_dict['urls'].append(info["download_url"])
+                product_dict['file_names'].append(info["file_name"])
 
         logger.info(f"Triggering DownloadManager for {len(product_dict['urls'])} product(s).")
         self.download_manager.download_products(product_dict, output_dir)
+        
+    async def fetch_product_infos(self, product_ids, base_url, download_url, headers):
+        """
+        Fetch product information concurrently for multiple product IDs, with smart retries and 429 handling.
+
+        Args:
+            product_ids (List[str]): List of product IDs to fetch.
+            base_url (str): Base URL for the Copernicus API.
+            download_url (str): Download URL for the products.
+            headers (Dict[str, str]): Headers including authorization token.
+
+        Returns:
+            List[Dict]: List of dictionaries containing download URLs and file names for each product.
+        """
+
+
+        async def fetch_with_retry(session, url, product_id):
+            delay = self.initial_delay
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status == 429:
+                            # Too many requests, use Retry-After if present, else exponential backoff
+                            retry_after = resp.headers.get('Retry-After')
+                            if retry_after:
+                                wait_time = int(retry_after)
+                                logger.warning(f"429 Too Many Requests for {product_id}, retry-after {wait_time}s (attempt {attempt}/{self.max_retries})")
+                                await asyncio.sleep(wait_time)
+                            else:
+                                logger.warning(f"429 Too Many Requests for {product_id}, exponential backoff {delay}s (attempt {attempt}/{self.max_retries})")
+                                await asyncio.sleep(delay)
+                            continue
+                        elif 500 <= resp.status < 600:
+                            # Transient server error, retry
+                            logger.warning(f"HTTP {resp.status} for {product_id}, retrying in {delay}s (attempt {attempt}/{self.max_retries})")
+                            await asyncio.sleep(delay)
+                            continue
+                        resp.raise_for_status()
+                        product_info = await resp.json()
+                        download_url_full = f"{download_url}/odata/v1/Products({product_id})/$value"
+                        return {"download_url": download_url_full, "file_name": f"{product_info['Name']}.zip"}
+                except aiohttp.ClientError as e:
+                    logger.warning(f"Client error for {product_id}: {e} (attempt {attempt}/{self.max_retries}), retrying in {delay}s")
+                    await asyncio.sleep(delay)
+                except Exception as e:
+                    logger.error(f"Unexpected error for {product_id}: {e} (attempt {attempt}/{self.max_retries}), not retrying further")
+                    break
+                delay *= self.backoff_factor
+            logger.error(f"Download failed for product ID {product_id} after {self.max_retries} attempts")
+            return None
+
+        async with aiohttp.ClientSession(headers=headers) as session:
+            tasks = [
+                fetch_with_retry(session, f"{base_url}/odata/v1/Products({product_id})", product_id)
+                for product_id in product_ids
+            ]
+            infos = await asyncio.gather(*tasks, return_exceptions=False)
+            return infos

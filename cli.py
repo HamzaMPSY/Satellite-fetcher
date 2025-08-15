@@ -9,7 +9,7 @@ All operations and errors are logged to both terminal and file.
 
 import argparse
 from loguru import logger
-from providers import Copernicus, USGS
+from providers import Copernicus, Usgs, OpenTopography, Cds
 from utilities import ConfigLoader, GeometryHandler
 
 def main():
@@ -21,18 +21,15 @@ def main():
     """
     # Set up argument parser for all required input parameters
     parser = argparse.ArgumentParser(description="Satellite Product Search and Download CLI")
-    parser.add_argument("--provider", type=str, required=True, choices=["copernicus", "usgs"], help="Data provider (copernicus or usgs)")
-    parser.add_argument("--satellite", type=str, required=True, help="Satellite mission or collection name")
+    parser.add_argument("--provider", type=str, required=True, choices=["copernicus", "usgs", "open_topography", "cds"], help="Data provider (copernicus , usgs or open_topography)")
+    parser.add_argument("--collection", type=str, required=True, help="collection name")
     parser.add_argument("--product-type", type=str, required=False, help="Type of product to search for")
-    parser.add_argument("--start-date", type=str, required=True, help="Start date for search (YYYY-MM-DD)")
-    parser.add_argument("--end-date", type=str, required=True, help="End date for search (YYYY-MM-DD)")
+    parser.add_argument("--start-date", type=str, required=False, help="Start date for search (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, required=False, help="End date for search (YYYY-MM-DD)")
     parser.add_argument("--aoi_file", type=str, default="example_aoi.wkt", help="Path to AOI file (in WKT format)")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to configuration YAML file")
 
     args = parser.parse_args()
-
-    # Initialize persistent file logger for the CLI session
-    logger.add("satellite_fetcher.log", rotation="10 MB", level="INFO")
 
     # Load configuration file for provider credentials and endpoints
     configuration = ConfigLoader(config_file_path=args.config)
@@ -40,12 +37,14 @@ def main():
 
     # Load area of interest from WKT file and log geometry info
     geometry_handler = GeometryHandler(file_path=args.aoi_file)
-    logger.info(f"Geometry loaded: {geometry_handler.geometry}")
+    logger.info(f"Geometry loaded: {geometry_handler.geometry.wkt}")
 
     # Map string provider names to their implementations
     provider_map = {
         "copernicus": Copernicus,
-        "usgs": USGS,
+        "usgs": Usgs,
+        "open_topography": OpenTopography,
+        "cds": Cds
     }
     # Select provider based on input argument
     provider_cls = provider_map.get(args.provider.lower())
@@ -57,11 +56,11 @@ def main():
     provider_instance = provider_cls(config_loader=configuration)
     logger.info(f"Initialized provider: {args.provider}")
 
-    logger.info(f"Searching for products with provider: {args.provider}, collection: {args.satellite}, product_type: {args.product_type}, dates: {args.start_date} to {args.end_date}")
+    logger.info(f"Searching for products with provider: {args.provider}, collection: {args.collection}, product_type: {args.product_type}, dates: {args.start_date} to {args.end_date}")
 
     # Execute the search for available products matching the filters
     products = provider_instance.search_products(
-        collection=args.satellite,
+        collection=args.collection,
         product_type=args.product_type,
         start_date=args.start_date,
         end_date=args.end_date,

@@ -74,5 +74,4 @@ class ConfigLoader:
             else:
                 logger.warning(f"Variable '{var_name}' not found in configuration (missing key: '{key}').")
                 return None
-        logger.debug(f"Retrieved config value for '{var_name}': {value}")
         return value

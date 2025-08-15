@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs
 # Using loguru for enhanced logging throughout this provider.
 from loguru import logger
 
-class UsgsProvider(ProviderBase):
+class Usgs(ProviderBase):
     """
     Provider for interacting with the USGS M2M API for satellite image search and download.
 
@@ -23,7 +23,6 @@ class UsgsProvider(ProviderBase):
         service_url (str): The base URL for the USGS M2M API endpoints.
         username (str): USGS account username.
         token (str): USGS account token.
-        maxthreads (int): Maximum number of threads for downloading.
         api_key (str): API key obtained from USGS on login.
         session (requests.Session): HTTP session for all requests.
         download_manager (DownloadManager): Download manager instance for product downloads.
@@ -39,12 +38,11 @@ class UsgsProvider(ProviderBase):
         self.service_url = config_loader.get_var("providers.usgs.base_urls.service_url")
         self.username = config_loader.get_var("providers.usgs.credentials.username")
         self.token = config_loader.get_var("providers.usgs.credentials.token")
-        self.maxthreads = int(config_loader.get_var("providers.usgs.maxthreads") or 5)
         self.api_key = None
         self.session = requests.Session()
         logger.info("Initializing USGS Provider and obtaining API token.")
         self.get_access_token()
-        self.download_manager = DownloadManager()
+        self.download_manager = DownloadManager(config_loader=config_loader)
 
     def get_access_token(self) -> str:
         """

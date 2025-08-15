@@ -1,0 +1,9 @@
+aiohttp==3.12.15
+geopandas==1.1.1
+loguru==0.7.3
+PyYAML==6.0.2
+requests==2.32.4
+shapely==2.1.1
+streamlit==1.48.0
+streamlit-card==1.0.2
+tqdm==4.67.1
