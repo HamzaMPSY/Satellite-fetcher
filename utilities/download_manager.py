@@ -121,11 +121,14 @@ class DownloadManager:
                                 logger.warning(f"Expected file path, found directory: {filepath}. Skipping file write.")
                             logger.info(f"Download complete: {filepath}")
                             return str(filepath)
-                    except aiohttp.ClientError as e:
-                        logger.warning(f"Client error [{url}] (attempt {attempt}/{self.max_retries}): {e}")
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        logger.warning(f"Transient network error [{url}] (attempt {attempt}/{self.max_retries}): {e}")
                         await asyncio.sleep(delay)
+                        delay *= self.backoff_factor
+                        continue
                     except Exception as e:
                         logger.error(f"Fatal error [{url}] (attempt {attempt}/{self.max_retries}): {e}")
+                        # Only break if error is truly catastrophic e.g. filesystem errors, keyboard interrupt etc.
                         break
                     delay *= self.backoff_factor
             logger.error(f"Download failed for {file_name} [{url}] after {self.max_retries} attempts, will defer for later.")
