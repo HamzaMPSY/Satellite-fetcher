@@ -80,11 +80,11 @@ class Cds(ProviderBase):
             Exception: If the HTTP request fails, or API returns an error.
         """
 
-        self.session.auth = (self.user_id, self.api_key)
         headers = {
+            'Authorization': f'Bearer {self.access_token}',
             'Content-Type': 'application/json',
-            'User-Agent': 'cdsapi/0.7.6',
-            'Accept': 'application/json'
+            'User-Agent': 'ecmwf-datastores-client/0.4.0',
+            'PRIVATE-TOKEN': f'{self.api_key}'
         }
         
 

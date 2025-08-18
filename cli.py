@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--provider", type=str, required=True, choices=["copernicus", "usgs", "open_topography", "cds"], help="Data provider (copernicus , usgs or open_topography)")
     parser.add_argument("--collection", type=str, required=True, help="collection name")
     parser.add_argument("--product-type", type=str, required=False, help="Type of product to search for")
+    parser.add_argument("--tile-id", type=str, required=False, help="ID of the tile to search for")
     parser.add_argument("--start-date", type=str, required=False, help="Start date for search (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, required=False, help="End date for search (YYYY-MM-DD)")
     parser.add_argument("--aoi_file", type=str, default="example_aoi.wkt", help="Path to AOI file (in WKT format)")
@@ -64,13 +65,14 @@ def main():
         product_type=args.product_type,
         start_date=args.start_date,
         end_date=args.end_date,
-        aoi=geometry_handler.geometry
+        aoi=geometry_handler.geometry,
+        tile_id=args.tile_id
     )
 
     # Download each product one by one if any were found
     if products:
         logger.info(f"Found {len(products)} products. Downloading all products individually...")
-        provider_instance.download_products(product_ids=products)
+        # provider_instance.download_products(product_ids=products)
     else:
         logger.info("No products found for the given options.")
 

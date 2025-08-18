@@ -76,9 +76,10 @@ class Usgs(ProviderBase):
     def search_products(self,
                         collection: str,
                         product_type: str,
-                        start_date: str,
-                        end_date: str,
-                        aoi: Polygon) -> List[Dict]:
+                        start_date: str = None,
+                        end_date: str = None,
+                        aoi: Polygon = None,
+                        tile_id: str = None) -> List[Dict]:
         """
         Search for satellite scenes in a specific collection, product type, and date range within the provided AOI.
 

@@ -103,7 +103,8 @@ class Copernicus(ProviderBase):
                         product_type: str = "S2MSI2A",
                         start_date: str = None,
                         end_date: str = None,
-                        aoi: Polygon = None) -> List[Dict]:
+                        aoi: Polygon = None,
+                        tile_id: str = None) -> List[Dict]:
         """
         Search for products in the Copernicus catalogue by collection, date, type, and AOI.
 
@@ -149,6 +150,8 @@ class Copernicus(ProviderBase):
                 f" and OData.CSC.Intersects(area=geography'SRID=4326;"
                 f"{aoi.wkt}')"
             )
+        if tile_id:
+            query_params["$filter"] += f" and contains(Name,'{tile_id}') "
 
         # Order results by acquisition date, most recent first, limit to 1000 results
         query_params["$orderby"] = "ContentDate/Start desc"
@@ -198,6 +201,8 @@ class Copernicus(ProviderBase):
         product_dict['headers'] = {
             'Authorization': f'Bearer {self.access_token}'
         }
+        # Add token refresh callback for 401 handling
+        product_dict['refresh_token_callback'] = self.get_access_token
         
         # Iterate through product IDs and prepare download URLs
         logger.debug("Preparing download URLs for products.")
