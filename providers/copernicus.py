@@ -271,7 +271,7 @@ class Copernicus(ProviderBase):
             logger.error(f"Download failed for product ID {product_id} after {self.max_retries} attempts")
             return None
 
-        async with aiohttp.ClientSession(headers=headers) as session:
+        async with aiohttp.ClientSession(headers=headers, trust_env=True) as session:
             tasks = [
                 fetch_with_retry(session, f"{base_url}/odata/v1/Products({product_id})", product_id)
                 for product_id in product_ids

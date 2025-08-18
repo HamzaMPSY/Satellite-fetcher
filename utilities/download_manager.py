@@ -166,7 +166,7 @@ class DownloadManager:
             deferred.append((url, file_name))
             return None
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=True) as session:
             tasks = [
                 download_with_retry(session, url, headers, os.path.join(output_dir, file_name), file_name)
                 for url, file_name in zip(urls, file_names)
