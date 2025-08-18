@@ -72,7 +72,7 @@ def main():
     # Download each product one by one if any were found
     if products:
         logger.info(f"Found {len(products)} products. Downloading all products individually...")
-        # provider_instance.download_products(product_ids=products)
+        provider_instance.download_products(product_ids=products)
     else:
         logger.info("No products found for the given options.")
 

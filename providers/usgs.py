@@ -1,4 +1,5 @@
 from datetime import datetime
+import os
 import requests
 import json
 from typing import List, Dict
@@ -95,7 +96,6 @@ class Usgs(ProviderBase):
         """
         logger.info(f"Searching products in collection {collection} with product_type={product_type} for {start_date} to {end_date}.")
         self.dataset = collection
-        self.product_type = product_type
 
         # Build spatial filter using AOI
         spatial_filter = {
@@ -117,7 +117,7 @@ class Usgs(ProviderBase):
         }
 
         # Send the search request to the USGS API.
-        scenes = self._send_request(self.service_url + "scene-search", scene_payload, self.api_key)
+        scenes = self._send_request(os.path.join(self.service_url, "scene-search"), scene_payload, self.api_key)
         logger.info(f"Found {scenes.get('totalHits', 0)} scenes matching the dataset '{collection}'.")
 
         products = []
@@ -125,8 +125,11 @@ class Usgs(ProviderBase):
         if scenes.get('recordsReturned', 0) > 0 and "results" in scenes:
             for result in scenes['results']:
                 # Only add scene if a bulk download option exists
-                if result['options']['bulk'] == True:
-                    products.append(result['entityId'])
+                if result['options']['bulk'] == True and product_type[1:] in result['displayId']:
+                    for option in result['metadata']:
+                        if option.get('fieldName') == 'Satellite' and option.get('value') == int(product_type[0]):
+                            products.append(result['entityId'])
+                            break
 
         logger.info(f"Returning {len(products)} downloadable product entity IDs.")
         return products
@@ -155,7 +158,7 @@ class Usgs(ProviderBase):
         else:
             option_list = options
         for opt in option_list:
-            if opt.get("available") and opt.get("entityId") and opt.get("id"):
+            if opt.get("available") and opt.get("entityId") and opt.get("id") and "Bundle" in opt.get("productName"):
                 downloads.append({
                     "entityId": opt["entityId"],
                     "productId": opt["id"]
@@ -171,7 +174,6 @@ class Usgs(ProviderBase):
         logger.info(f"Submitting download request for {len(downloads)} products.")
         req_results = self._send_request(self.service_url + "download-request", req_payload, self.api_key)
         final_downloads = req_results.get("availableDownloads", []) if isinstance(req_results, dict) else []
-        final_downloads = [d for d in final_downloads if self.product_type in d.get("url", "")]
         logger.info(f"Found {len(final_downloads)} available downloads after polling.")
 
         product_dict = {
@@ -180,13 +182,15 @@ class Usgs(ProviderBase):
         }
         # Add headers for authentication (if needed by DownloadManager)
         product_dict['headers'] = {}
+        # Add token refresh callback for 401 handling
+        product_dict['refresh_token_callback'] = self.get_access_token
 
         for download in final_downloads:
             # Extract Landsat product ID from query string in download URL
             parsed_url = urlparse(download['url'])
             query_params = parse_qs(parsed_url.query)
-            # Determine file name based on landsat_product_id in URL; fallback to "unknown.zip"
-            file_name = query_params.get("landsat_product_id", [None])[0] + ".zip" if query_params.get("landsat_product_id") else "unknown.zip"
+            # Determine file name based on landsat_product_id in URL;
+            file_name = query_params.get("landsat_product_id", [None])[0] + ".zip"
             product_dict['urls'].append(download['url'])
             product_dict['file_names'].append(file_name)
 

@@ -69,46 +69,12 @@ class DownloadManager:
 
         semaphore = asyncio.BoundedSemaphore(self.max_concurrent)
 
-        import hashlib
-
-        async def get_remote_checksum(session, url, headers):
-            # Try for Content-MD5, ETag, X-Checksum-Md5. Returns (header_name, value) or None.
-            async with session.head(url, headers=headers) as resp:
-                if resp.status == 200:
-                    for chk_field in ['Content-MD5', 'ETag', 'X-Checksum-Md5', 'X-Checksum-Sha1']:
-                        val = resp.headers.get(chk_field)
-                        if val:
-                            return chk_field, val.strip('"')
-                return None, None
-
-        def get_local_checksum(filepath, hash_type='md5'):
-            hash_func = hashlib.md5() if hash_type.lower() == 'md5' else hashlib.sha1()
-            with open(filepath, 'rb') as f:
-                for chunk in iter(lambda: f.read(4096), b''):
-                    hash_func.update(chunk)
-            return hash_func.hexdigest()
-
         async def download_with_retry(session, url, headers, filepath, file_name):
             delay = self.initial_delay
-            # --- BEGIN: Pre-check: skip download if checksum matches ---
-            if os.path.exists(filepath):
-                logger.info(f"File already exists for {file_name}; checking checksum before download.")
-                header_name, remote_checksum = await get_remote_checksum(session, url, headers)
-                if remote_checksum and header_name:
-                    hash_type = 'md5' if 'md5' in header_name.lower() else 'sha1'
-                    local_checksum = get_local_checksum(filepath, hash_type)
-                    if local_checksum == remote_checksum:
-                        logger.info(f"Local file {filepath} checksum matches remote; skipping download.")
-                        return str(filepath)
-                    else:
-                        logger.info(f"Checksum mismatch for {filepath}: local={local_checksum} remote={remote_checksum}. Will re-download.")
-                else:
-                    logger.info(f"No supported checksum header found for {file_name}, or HEAD not allowed; will re-download.")
-            # --- END: Pre-check ---
             for attempt in range(1, self.max_retries + 1):
                 async with semaphore:
                     try:
-                        logger.info(f"Attempt {attempt}: Downloading {url} -> {filepath}")
+                        logger.info(f"Attempt {attempt}: Downloading {filepath}")
                         async with session.get(url, headers=headers) as resp:
                             if resp.status == 401 and refresh_token_callback:
                                 # Token expired, try refresh
