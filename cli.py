@@ -8,9 +8,11 @@ All operations and errors are logged to both terminal and file.
 """
 
 import argparse
+import os
 from loguru import logger
 from providers import Copernicus, Usgs, OpenTopography, Cds
 from utilities import ConfigLoader, GeometryHandler
+from hashlib import md5
 
 def main():
     """
@@ -73,7 +75,7 @@ def main():
         # Download each product one by one if any were found
         if products:
             logger.info(f"Found {len(products)} products. Downloading all products individually...")
-            provider_instance.download_products(product_ids=products)
+            provider_instance.download_products(product_ids=products, output_dir=os.path.join("downloads", md5(geom.wkt.encode()).hexdigest(), args.start_date.replace('/', '') + '_' + args.end_date.replace('/', '') ,args.provider , args.collection, args.product_type))
         else:
             logger.info("No products found for the given options.")
 
