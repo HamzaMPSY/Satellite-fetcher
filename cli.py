@@ -38,7 +38,7 @@ def main():
 
     # Load area of interest from WKT file and log geometry info
     geometry_handler = GeometryHandler(file_path=args.aoi_file)
-    logger.info(f"Geometry loaded: {geometry_handler.geometry.wkt}")
+    logger.info(f"Geometry loaded: {len(geometry_handler.geometries)} geometries")
 
     # Map string provider names to their implementations
     provider_map = {
@@ -60,21 +60,22 @@ def main():
     logger.info(f"Searching for products with provider: {args.provider}, collection: {args.collection}, product_type: {args.product_type}, dates: {args.start_date} to {args.end_date}")
 
     # Execute the search for available products matching the filters
-    products = provider_instance.search_products(
-        collection=args.collection,
-        product_type=args.product_type,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        aoi=geometry_handler.geometry,
-        tile_id=args.tile_id
-    )
+    for geom in geometry_handler.geometries:
+        products = provider_instance.search_products(
+            collection=args.collection,
+            product_type=args.product_type,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            aoi=geom,
+            tile_id=args.tile_id
+        )
 
-    # Download each product one by one if any were found
-    if products:
-        logger.info(f"Found {len(products)} products. Downloading all products individually...")
-        provider_instance.download_products(product_ids=products)
-    else:
-        logger.info("No products found for the given options.")
+        # Download each product one by one if any were found
+        if products:
+            logger.info(f"Found {len(products)} products. Downloading all products individually...")
+            provider_instance.download_products(product_ids=products)
+        else:
+            logger.info("No products found for the given options.")
 
     logger.info("Search and download completed successfully!")
 

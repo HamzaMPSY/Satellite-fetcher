@@ -25,7 +25,8 @@ class GeometryHandler:
             ValueError: If the file type is unsupported.
         """
         self.file_path = file_path
-        self.geometry = self._load_geometry()
+        self.geometries = []
+        self._load_geometry()
 
     def _load_geometry(self) -> Polygon:
         """
@@ -45,7 +46,10 @@ class GeometryHandler:
         elif self.file_path.endswith('.wkt'):
             logger.info(f"Loading geometry from WKT file: {self.file_path}")
             with open(self.file_path, 'r') as file:
-                return wkt.loads(file.read())
+                for line in file.readlines():
+                    # Assuming the WKT file contains a single geometry
+                    if line.strip():
+                        self.geometries.append(wkt.loads(line.strip()))
         else:
             logger.error(f"Unsupported geometry file format: {self.file_path}. Must be '.geojson' or '.wkt'.")
             raise ValueError("Unsupported geometry file format. Use .geojson or .wkt")
