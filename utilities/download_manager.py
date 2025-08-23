@@ -111,12 +111,21 @@ class DownloadManager:
                                         total=total_size_in_bytes,
                                         unit='B',
                                         unit_scale=True,
+                                        unit_divisor=1024,
                                         desc=f"Downloading {file_name}",
-                                        ncols=100
+                                        ncols=100,
+                                        ascii=True,
+                                        miniters=1,
+                                        bar_format=(
+                                            "{l_bar}{bar} | {n_fmt}/{total_fmt} [{percentage:3.0f}%] "
+                                            "• {rate_fmt} • Elapsed: {elapsed} • ETA: {remaining}"
+                                        ),
+                                        dynamic_ncols=True
                                     ) as progress_bar:
                                         async for chunk in resp.content.iter_chunked(chunk_size):
                                             f.write(chunk)
                                             progress_bar.update(len(chunk))
+
                             else:
                                 logger.warning(f"Expected file path, found directory: {filepath}. Skipping file write.")
                             logger.info(f"Download complete: {filepath}")

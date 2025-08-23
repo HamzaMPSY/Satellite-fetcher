@@ -186,13 +186,19 @@ class Usgs(ProviderBase):
         product_dict['refresh_token_callback'] = self.get_access_token
 
         for download in final_downloads:
-            # Extract Landsat product ID from query string in download URL
-            parsed_url = urlparse(download['url'])
-            query_params = parse_qs(parsed_url.query)
-            # Determine file name based on landsat_product_id in URL;
-            file_name = query_params.get("landsat_product_id", [None])[0] + ".zip"
+            # get the filename with a get http request
+            with requests.get(download['url'], stream=True) as r:
+                # First try content-disposition header
+                if "Content-Disposition" in r.headers:
+                    cd = r.headers["Content-Disposition"]
+                    # e.g. 'attachment; filename="file.zip"'
+                    filename = cd.split("filename=")[-1].strip('"')
+                else:
+                    # fallback: get from URL path
+                    filename = urlparse(download['url']).path.split("/")[-1]
+
             product_dict['urls'].append(download['url'])
-            product_dict['file_names'].append(file_name)
+            product_dict['file_names'].append(filename)
 
         logger.info(f"Initiating download for {len(product_dict['urls'])} files using DownloadManager.")
         self.download_manager.download_products(product_dict, output_dir)

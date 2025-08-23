@@ -36,7 +36,8 @@ class ProviderBase(ABC):
                         product_type: str,
                         start_date: str,
                         end_date: str,
-                        aoi: Polygon) -> List[Dict]:
+                        aoi: Polygon,
+                        tile_id: str=None) -> List[Dict]:
         """
         Search for products in the provider's catalogue.
 

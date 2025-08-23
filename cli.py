@@ -23,7 +23,7 @@ def main():
     """
     # Set up argument parser for all required input parameters
     parser = argparse.ArgumentParser(description="Satellite Product Search and Download CLI")
-    parser.add_argument("--provider", type=str, required=True, choices=["copernicus", "usgs", "open_topography", "cds"], help="Data provider (copernicus , usgs or open_topography)")
+    parser.add_argument("--provider", type=str, required=True, choices=["copernicus", "usgs", "opentopography", "cds"], help="Data provider (copernicus , usgs or open_topography)")
     parser.add_argument("--collection", type=str, required=True, help="collection name")
     parser.add_argument("--product-type", type=str, required=False, help="Type of product to search for")
     parser.add_argument("--tile-id", type=str, required=False, help="ID of the tile to search for")
@@ -46,7 +46,7 @@ def main():
     provider_map = {
         "copernicus": Copernicus,
         "usgs": Usgs,
-        "open_topography": OpenTopography,
+        "opentopography": OpenTopography,
         "cds": Cds
     }
     # Select provider based on input argument

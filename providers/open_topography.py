@@ -53,7 +53,8 @@ class OpenTopography(ProviderBase):
                         aoi: Polygon,
                         product_type: str=None,
                         start_date: str=None,
-                        end_date: str=None
+                        end_date: str=None,
+                        tile_id: str=None
                         ) -> List[Dict]:
         """
         Search for DEM products from OpenTopography within a specified AOI and collection.

@@ -43,7 +43,3 @@ To simplify, you can use these codes for the `productType` OData query:
 
 **Legend**:  
 - Replace `X` in `productType` with the Landsat number: `8` (Landsat 8) or `9` (Landsat 9).
-
----
-
-For more on OData queries and advanced usage, see [OData Query Examples](./odata_examples.md).
