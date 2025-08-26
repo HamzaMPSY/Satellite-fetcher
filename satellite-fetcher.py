@@ -12,21 +12,27 @@ from pathlib import Path
 
 
 # --- Live log function (tail -f alike for Streamlit) ---
-
 @st.fragment(run_every='2000ms')  # refresh every 2s
 def show_live_logs(log_path="nohup.out"):
     log_path = Path(log_path)
     batch_re = re.compile(
-        r"^(?P<desc>Concurrent Download Batch.*?):\s+"
-        r"(?P<percent>\d+)%\|.*\|\s*(?P<done>\d+)/(?P<total>\d+)"
+        r"^(?P<desc>.+?):\s*"                  # Description before colon
+        r"(?P<percent>\s*\d+)%\|\s*.*\|\s*"    # Percent and bar
+        r"(?P<done>\d+)/(?P<total>\d+)\s*"     # Done/Total tasks
+        r"\[\s*(?P<elapsed>[0-9:]+)<(?P<eta>[0-9:]+)\]"  # Elapsed and ETA
     )
     file_re = re.compile(
-        r"^(?P<desc>.+?):\s+(?P<percent>\d+)%\|.*\|\s*"
-        r"(?P<done>[\d\.]+[kMGTP]?B?)/(?P<total>[\d\.]+[kMGTP]?B?)\s*\[\s*(?P<percent2>\d+)%\]\s*•\s*"
-        r"(?P<rate>[^\s•]+)\s*•\s*Elapsed:\s*(?P<elapsed>[^•]+)\s*•\s*ETA:\s*(?P<eta>[^\x1b]+)"
+        r"^(?P<desc>.+?):\s*"                        # Description before colon
+        r"(?P<percent>\s*\d+)%\|\s*.*\|\s*"          # First % (with optional leading spaces) before bar
+        r"(?P<done>[\d\.]+[kMGTP]?B?)/"              # Done amount (e.g. 40.0M)
+        r"(?P<total>[\d\.]+[kMGTP]?B?)\s*"           # Total amount (e.g. 100.0M)
+        r"\[\s*(?P<percent2>\d+)%\]\s*"              # Second % inside [ ]
+        r"•\s*(?P<rate>[^\s•]+)\s*"                  # Rate (e.g. 1.23MB/s)
+        r"•\s*Elapsed:\s*(?P<elapsed>[^•]+?)\s*"     # Elapsed time
+        r"•\s*ETA:\s*(?P<eta>[^\x1b]+)"              # ETA (until color codes or EOL)
     )
     with st.container():
-        progress_bars_info = []
+        progress_bars_info = {}
         non_progress_lines = []
         if log_path.exists():
             with log_path.open("r") as f:
@@ -38,10 +44,10 @@ def show_live_logs(log_path="nohup.out"):
                     desc = m.group("desc").strip()
                     percent = int(m.group("percent"))
                     done, total = int(m.group("done")), int(m.group("total"))
-                    progress_bars_info.append({
+                    progress_bars_info[desc] = {
                         "label": f"🌐 {desc} ({done}/{total})",
                         "percent": percent
-                    })
+                    }
                     continue
                 m = file_re.search(line)
                 if m:
@@ -51,16 +57,16 @@ def show_live_logs(log_path="nohup.out"):
                     rate = m.group("rate").strip()
                     elapsed = m.group("elapsed").strip()
                     eta = m.group("eta").strip()
-                    progress_bars_info.append({
+                    progress_bars_info[desc] = {
                         "label": f"📥 {desc} ({done}/{total}) — {rate} | Elapsed: {elapsed} | ETA: {eta}",
                         "percent": percent
-                    })
+                    }
                     continue
                 # Collect non-matching lines to display as plain logs if wanted
                 if line:
                     non_progress_lines.append(line)
         # Render all detected progress bars
-        for pb in progress_bars_info:
+        for desc, pb in progress_bars_info.items():
             st.write(pb["label"])
             st.progress(pb["percent"])
         # Optionally, display last 4 non-progress lines for context

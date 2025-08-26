@@ -9,6 +9,7 @@ from shapely import Polygon
 from .provider_base import ProviderBase
 from utilities import ConfigLoader, DownloadManager
 from urllib.parse import urlparse, parse_qs
+import concurrent.futures
 
 # Using loguru for enhanced logging throughout this provider.
 from loguru import logger
@@ -44,6 +45,7 @@ class Usgs(ProviderBase):
         logger.info("Initializing USGS Provider and obtaining API token.")
         self.get_access_token()
         self.download_manager = DownloadManager(config_loader=config_loader)
+        self.config_loader = config_loader
 
     def get_access_token(self) -> str:
         """
@@ -185,8 +187,9 @@ class Usgs(ProviderBase):
         # Add token refresh callback for 401 handling
         product_dict['refresh_token_callback'] = self.get_access_token
 
-        for download in final_downloads:
-            # get the filename with a get http request
+        product_dict['urls'] = [download['url'] for download in final_downloads]
+
+        def get_filename(download):
             with requests.get(download['url'], stream=True) as r:
                 # First try content-disposition header
                 if "Content-Disposition" in r.headers:
@@ -196,9 +199,11 @@ class Usgs(ProviderBase):
                 else:
                     # fallback: get from URL path
                     filename = urlparse(download['url']).path.split("/")[-1]
+            return filename
 
-            product_dict['urls'].append(download['url'])
-            product_dict['file_names'].append(filename)
+        max_concurrent = self.config_loader.get_var("download_manager.max_concurrent")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            product_dict['file_names'] = list(executor.map(get_filename, final_downloads))
 
         logger.info(f"Initiating download for {len(product_dict['urls'])} files using DownloadManager.")
         self.download_manager.download_products(product_dict, output_dir)
