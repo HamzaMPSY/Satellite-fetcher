@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Dict, List
 from loguru import logger
 from tqdm import tqdm
-
 from utilities.config_loader import ConfigLoader
+from utilities.ocifs_manager import OCIFSManager
 
 class DownloadManager:
     """
@@ -16,11 +16,12 @@ class DownloadManager:
     implements resumable downloads, and logs all major actions and errors.
     """
 
-    def __init__(self, config_loader: ConfigLoader = None):
+    def __init__(self, config_loader: ConfigLoader = None, ocifs_manager: OCIFSManager = None):
         """
         Initialize the DownloadManager with robust timeout and retry settings.
         """
         
+        self.ocifs_manager = ocifs_manager
         self.max_concurrent = config_loader.get_var('download_manager.max_concurrent') if config_loader else 2
         self.max_retries = config_loader.get_var('download_manager.max_retries') if config_loader else 5
         self.initial_delay = config_loader.get_var('download_manager.initial_delay') if config_loader else 2
@@ -140,53 +141,61 @@ class DownloadManager:
                     total_size = 0
                 
                 logger.info(f"Downloading {file_name}: {remaining_size} bytes remaining")
-                
-                # Ensure directory exists
-                Path(os.path.dirname(filepath)).mkdir(parents=True, exist_ok=True)
-                
+
+                if self.ocifs_manager:
+                    file_flux = self.ocifs_manager.open(filename=filepath, mode=file_mode)
+                    fs = self.ocifs_manager.fs
+                else:
+                    # Ensure directory exists
+                    Path(os.path.dirname(filepath)).mkdir(parents=True, exist_ok=True)
+                    file_flux = open(filepath, file_mode)
+                    fs = os
+
                 # Download with progress
                 downloaded_this_session = 0
-                with open(filepath, file_mode) as f:
-                    with tqdm(
-                        total=remaining_size if remaining_size > 0 else None,
-                        initial=0,
-                        unit='B',
-                        unit_scale=True,
-                        unit_divisor=1024,
-                        desc=f"{'Resuming' if resume_pos > 0 else 'Downloading'} {file_name}",
-                        ncols=100,
-                        ascii=True,
-                        bar_format=(
-                            "{l_bar}{bar} | {n_fmt}/{total_fmt} [{percentage:3.0f}%] "
-                            "• {rate_fmt} • Elapsed: {elapsed} • ETA: {remaining}"
-                        ),
-                    ) as progress_bar:
-                        try:
-                            async for chunk in resp.content.iter_chunked(self.chunk_size):
-                                if not chunk:
-                                    break
-                                f.write(chunk)
-                                downloaded_this_session += len(chunk)
-                                progress_bar.update(len(chunk))
-                                
-                                # Flush periodically to ensure data is written
-                                if downloaded_this_session % (self.chunk_size * 10) == 0:
-                                    f.flush()
-                                    os.fsync(f.fileno())
-                        
-                        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                            # Ensure we flush any remaining data
-                            f.flush()
-                            os.fsync(f.fileno())
-                            
-                            # If it's a response error with status, return False with status
-                            if isinstance(e, aiohttp.ClientResponseError) and e.status:
-                                logger.warning(f"Mid-download error for {file_name}: HTTP {e.status}")
-                                return False, e.status
-                            
-                            # For other errors, raise to be handled by retry logic
-                            raise e
                 
+                with tqdm(
+                    total=remaining_size if remaining_size > 0 else None,
+                    initial=0,
+                    unit='B',
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=f"{'Resuming' if resume_pos > 0 else 'Downloading'} {file_name}",
+                    ascii=True,
+                    bar_format=(
+                        "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+                    ),
+                ) as progress_bar:
+                    try:
+                        async for chunk in resp.content.iter_chunked(self.chunk_size):
+                            if not chunk:
+                                break
+                            file_flux.write(chunk)
+                            downloaded_this_session += len(chunk)
+                            progress_bar.update(len(chunk))
+                            
+                            # Flush periodically to ensure data is written
+                            if downloaded_this_session % (self.chunk_size * 10) == 0:
+                                file_flux.flush()
+                                if fs == os:
+                                    fs.fsync(file_flux.fileno())
+
+                    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                        # Ensure we flush any remaining data
+                        file_flux.flush()
+                        if fs == os:
+                            fs.fsync(file_flux.fileno())
+
+                        # If it's a response error with status, return False with status
+                        if isinstance(e, aiohttp.ClientResponseError) and e.status:
+                            logger.warning(f"Mid-download error for {file_name}: HTTP {e.status}")
+                            return False, e.status
+                        
+                        # For other errors, raise to be handled by retry logic
+                        raise e
+                    finally:
+                        file_flux.close()
+
                 # Verify download completeness if we have content length
                 if total_size > 0:
                     final_size = os.path.getsize(filepath)

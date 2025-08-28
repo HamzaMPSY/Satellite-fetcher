@@ -11,7 +11,7 @@ import argparse
 import os
 from loguru import logger
 from providers import Copernicus, Usgs, OpenTopography, Cds
-from utilities import ConfigLoader, GeometryHandler
+from utilities import ConfigLoader, GeometryHandler, OCIFSManager
 from hashlib import md5
 
 def main():
@@ -31,8 +31,15 @@ def main():
     parser.add_argument("--end-date", type=str, required=False, help="End date for search (YYYY-MM-DD)")
     parser.add_argument("--aoi_file", type=str, default="example_aoi.wkt", help="Path to AOI file (in WKT format)")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to configuration YAML file")
+    parser.add_argument("--log-type", type=str, default="all", choices=["all", "tqdm"], help="Log type: 'all' to show all logs, 'tqdm' to show only tqdm progress bars")
+    parser.add_argument("--destination", type=str, default="local", choices=["local", "oci"], help="Type of destination (local or OCI)")
+    parser.add_argument("--bucket", type=str, default="mosaic", help="OCI bucket name")
+    parser.add_argument("--profile", type=str, default="DEFAULT", help="OCI profile to use")
 
     args = parser.parse_args()
+
+    if args.log_type == "tqdm":
+        logger.remove(0)
 
     # Load configuration file for provider credentials and endpoints
     configuration = ConfigLoader(config_file_path=args.config)
@@ -55,8 +62,13 @@ def main():
         logger.error(f"Unknown provider: {args.provider}. Exiting.")
         exit(1)
 
+    # check if destination is OCI
+    if args.destination == "oci":
+        ocifs = OCIFSManager(bucket=args.bucket, profile=args.profile)
+        logger.info(f"Initialized OCIFS manager with profile: {args.profile}")
+
     # Initialize the selected provider with loaded configuration
-    provider_instance = provider_cls(config_loader=configuration)
+    provider_instance = provider_cls(config_loader=configuration, ocifs_manager=ocifs)
     logger.info(f"Initialized provider: {args.provider}")
 
     logger.info(f"Searching for products with provider: {args.provider}, collection: {args.collection}, product_type: {args.product_type}, dates: {args.start_date} to {args.end_date}")

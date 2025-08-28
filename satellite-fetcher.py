@@ -16,20 +16,20 @@ from pathlib import Path
 def show_live_logs(log_path="nohup.out"):
     log_path = Path(log_path)
     batch_re = re.compile(
-        r"^(?P<desc>.+?):\s*"                  # Description before colon
-        r"(?P<percent>\s*\d+)%\|\s*.*\|\s*"    # Percent and bar
-        r"(?P<done>\d+)/(?P<total>\d+)\s*"     # Done/Total tasks
-        r"\[\s*(?P<elapsed>[0-9:]+)<(?P<eta>[0-9:]+)\]"  # Elapsed and ETA
+        r"^Concurrent Downloads:\s*"             # Description before colon
+        r"(?P<percent>\d+)%\|\s*[^\|]*\|\s*"     # Percent and bar (allowing any content between |)
+        r"(?P<done>\d+)/(?P<total>\d+)\s*"       # Done/Total tasks
+        r"\[\s*(?P<elapsed>[0-9:?]+)<(?P<eta>[^\]]+)\]\s*"  # Elapsed and ETA/remaining (anything until ])
+        r"(?P<rate>[^\s]*/?[^\s]*?)?\s*$"        # Optional rate like '?it/s' or '5.00it/s'
     )
-    file_re = re.compile(
-        r"^(?P<desc>.+?):\s*"                        # Description before colon
-        r"(?P<percent>\s*\d+)%\|\s*.*\|\s*"          # First % (with optional leading spaces) before bar
-        r"(?P<done>[\d\.]+[kMGTP]?B?)/"              # Done amount (e.g. 40.0M)
-        r"(?P<total>[\d\.]+[kMGTP]?B?)\s*"           # Total amount (e.g. 100.0M)
-        r"\[\s*(?P<percent2>\d+)%\]\s*"              # Second % inside [ ]
-        r"•\s*(?P<rate>[^\s•]+)\s*"                  # Rate (e.g. 1.23MB/s)
-        r"•\s*Elapsed:\s*(?P<elapsed>[^•]+?)\s*"     # Elapsed time
-        r"•\s*ETA:\s*(?P<eta>[^\x1b]+)"              # ETA (until color codes or EOL)
+
+
+    # New regex for download progress bars (the ones in your log)
+    download_re = re.compile(
+        r"^Downloading\s+(?P<filename>.+?):\s*"        # Filename
+        r"(?P<percent>\d+)%\|\s*.*?\|\s*"              # Percent + bar
+        r"(?P<done>[\d\.]+[kMGTP]?)/(?P<total>[\d\.]+[kMGTP]?)\s*"  # Done/Total with units
+        r"\[(?P<elapsed>[0-9:]+)<(?P<eta>[0-9:?\-]+)\]"  # Elapsed and ETA
     )
     with st.container():
         progress_bars_info = {}
@@ -41,7 +41,7 @@ def show_live_logs(log_path="nohup.out"):
                 line = line.strip()
                 m = batch_re.search(line)
                 if m:
-                    desc = m.group("desc").strip()
+                    desc = "Concurrent Downloads"
                     percent = int(m.group("percent"))
                     done, total = int(m.group("done")), int(m.group("total"))
                     progress_bars_info[desc] = {
@@ -49,16 +49,15 @@ def show_live_logs(log_path="nohup.out"):
                         "percent": percent
                     }
                     continue
-                m = file_re.search(line)
+                m = download_re.search(line)
                 if m:
-                    desc = m.group("desc").strip()
+                    desc = m.group("filename").strip()
                     percent = int(m.group("percent"))
                     done, total = m.group("done"), m.group("total")
-                    rate = m.group("rate").strip()
                     elapsed = m.group("elapsed").strip()
                     eta = m.group("eta").strip()
                     progress_bars_info[desc] = {
-                        "label": f"📥 {desc} ({done}/{total}) — {rate} | Elapsed: {elapsed} | ETA: {eta}",
+                        "label": f"📥 {desc} ({done}/{total}) | Elapsed: {elapsed} | ETA: {eta}",
                         "percent": percent
                     }
                     continue

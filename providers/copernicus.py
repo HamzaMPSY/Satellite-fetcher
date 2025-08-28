@@ -2,11 +2,12 @@ import requests
 from datetime import datetime, timedelta
 from typing import Dict, List
 from loguru import logger
-from utilities import ConfigLoader, DownloadManager
+from utilities import ConfigLoader, DownloadManager, OCIFSManager
 from providers.provider_base import ProviderBase
 from shapely.geometry import Polygon
 import asyncio
 import aiohttp
+
 
 
 class Copernicus(ProviderBase):
@@ -27,7 +28,7 @@ class Copernicus(ProviderBase):
         download_manager (DownloadManager): Download manager for handling file downloads.
     """
 
-    def __init__(self, config_loader: ConfigLoader):
+    def __init__(self, config_loader: ConfigLoader, ocifs_manager: OCIFSManager = None):
         """
         Initialize Copernicus provider from the given config loader.
 
@@ -57,7 +58,7 @@ class Copernicus(ProviderBase):
         # Obtain access token on init
         logger.info("Obtaining access token for Copernicus provider.")
         self.access_token = self.get_access_token()
-        self.download_manager = DownloadManager(config_loader=config_loader)
+        self.download_manager = DownloadManager(config_loader=config_loader, ocifs_manager=ocifs_manager)
         self.session = requests.Session()
 
     def get_access_token(self) -> str:
