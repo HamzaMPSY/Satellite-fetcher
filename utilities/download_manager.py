@@ -198,7 +198,12 @@ class DownloadManager:
 
                 # Verify download completeness if we have content length
                 if total_size > 0:
-                    final_size = os.path.getsize(filepath)
+                    if fs == os:
+                        final_size = os.path.getsize(filepath)
+                    else:
+                        # Construct OCIFS path for fsspec's size() call
+                        oci_path = f"oci://{self.ocifs_manager.bucket}@{self.ocifs_manager.namespace}/{filepath}"
+                        final_size = fs.size(oci_path)
                     if final_size != total_size:
                         logger.warning(f"Download size mismatch for {file_name}: got {final_size}, expected {total_size}")
                         return False, resp.status

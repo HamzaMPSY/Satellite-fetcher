@@ -8,6 +8,8 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from loguru import logger
 from hashlib import md5
 
+from utilities.ocifs_manager import OCIFSManager
+
 class OpenTopography(ProviderBase):
     """
     Provider for accessing and downloading topographic data from the OpenTopography API.
@@ -23,7 +25,7 @@ class OpenTopography(ProviderBase):
         download_manager (DownloadManager): Handles downloading and saving of data products.
     """
 
-    def __init__(self, config_loader: ConfigLoader):
+    def __init__(self, config_loader: ConfigLoader, ocifs_manager: OCIFSManager):
         """
         Initialize the OpenTopography provider with configuration values.
 
@@ -36,7 +38,7 @@ class OpenTopography(ProviderBase):
         self.service_url = config_loader.get_var("providers.openTopography.base_urls.service_url")
         self.api_key = config_loader.get_var("providers.openTopography.credentials.api_key")
         logger.info("Initializing OpenTopography Provider and obtaining API token.")
-        self.download_manager = DownloadManager(config_loader=config_loader)
+        self.download_manager = DownloadManager(config_loader=config_loader, ocifs_manager=ocifs_manager)
         self.session = requests.Session()
 
 

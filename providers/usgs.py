@@ -7,8 +7,8 @@ from typing import List, Dict
 from shapely import Polygon
 
 from .provider_base import ProviderBase
-from utilities import ConfigLoader, DownloadManager
-from urllib.parse import urlparse, parse_qs
+from utilities import ConfigLoader, DownloadManager, OCIFSManager
+from urllib.parse import urlparse
 import concurrent.futures
 
 # Using loguru for enhanced logging throughout this provider.
@@ -30,7 +30,7 @@ class Usgs(ProviderBase):
         download_manager (DownloadManager): Download manager instance for product downloads.
     """
 
-    def __init__(self, config_loader: ConfigLoader):
+    def __init__(self, config_loader: ConfigLoader, ocifs_manager: OCIFSManager = None):
         """
         Initialize the USGS Provider using configuration values from the provided ConfigLoader.
 
@@ -44,7 +44,7 @@ class Usgs(ProviderBase):
         self.session = requests.Session()
         logger.info("Initializing USGS Provider and obtaining API token.")
         self.get_access_token()
-        self.download_manager = DownloadManager(config_loader=config_loader)
+        self.download_manager = DownloadManager(config_loader=config_loader, ocifs_manager=ocifs_manager)
         self.config_loader = config_loader
 
     def get_access_token(self) -> str:
