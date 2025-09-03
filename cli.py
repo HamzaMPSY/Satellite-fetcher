@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--start-date", type=str, required=False, help="Start date for search (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, required=False, help="End date for search (YYYY-MM-DD)")
     parser.add_argument("--aoi_file", type=str, default="example_aoi.wkt", help="Path to AOI file (in WKT format)")
+    parser.add_argument("--crop-aoi", type=bool, default=False, help="Whether to crop the AOI")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to configuration YAML file")
     parser.add_argument("--log-type", type=str, default="all", choices=["all", "tqdm"], help="Log type: 'all' to show all logs, 'tqdm' to show only tqdm progress bars")
     parser.add_argument("--destination", type=str, default="local", choices=["local", "oci"], help="Type of destination (local or OCI)")
@@ -66,7 +67,8 @@ def main():
     if args.destination == "oci":
         ocifs = OCIFSManager(bucket=args.bucket, profile=args.profile)
         logger.info(f"Initialized OCIFS manager with profile: {args.profile}")
-
+    else:
+        ocifs = None
     # Initialize the selected provider with loaded configuration
     provider_instance = provider_cls(config_loader=configuration, ocifs_manager=ocifs)
     logger.info(f"Initialized provider: {args.provider}")
@@ -87,7 +89,16 @@ def main():
         # Download each product one by one if any were found
         if products:
             logger.info(f"Found {len(products)} products. Downloading all products individually...")
-            provider_instance.download_products(product_ids=products, output_dir=os.path.join("downloads", md5(geom.wkt.encode()).hexdigest(), args.start_date.replace('/', '') + '_' + args.end_date.replace('/', '') ,args.provider , args.collection, args.product_type))
+            start_clean = args.start_date.replace('/', '') if args.start_date else None
+            end_clean = args.end_date.replace('/', '') if args.end_date else None
+            date_segment = "_".join([p for p in [start_clean, end_clean] if p]) if (start_clean or end_clean) else None
+            path_parts = ["downloads", md5(geom.wkt.encode()).hexdigest(), date_segment, args.provider, args.collection, args.product_type]
+            path_parts = [str(p) for p in path_parts if p]
+            output_dir = os.path.join(*path_parts)
+            provider_instance.download_products(product_ids=products, output_dir=output_dir)
+            if args.crop_aoi:
+                logger.info("Cropping AOI...")
+                geometry_handler.crop_aoi(folder_path=output_dir, provider=args.provider, aoi=geom)
         else:
             logger.info("No products found for the given options.")
 
