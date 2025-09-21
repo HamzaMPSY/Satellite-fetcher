@@ -1,14 +1,17 @@
-from shapely.geometry import Polygon
-from typing import List, Dict
-from providers import ProviderBase
-from utilities import ConfigLoader, DownloadManager
+from hashlib import md5
+from typing import Dict, List
+from urllib.parse import parse_qs, urlencode, urlparse
+
 import requests
-from urllib.parse import urlencode, urlparse, parse_qs
+
 # Using loguru for enhanced logging throughout this provider.
 from loguru import logger
-from hashlib import md5
+from shapely.geometry import Polygon
 
+from providers.provider_base import ProviderBase
+from utilities import ConfigLoader, DownloadManager
 from utilities.ocifs_manager import OCIFSManager
+
 
 class OpenTopography(ProviderBase):
     """
@@ -35,29 +38,34 @@ class OpenTopography(ProviderBase):
         Args:
             config_loader (ConfigLoader): Loads required configuration variables for provider operation.
         """
-        self.service_url = config_loader.get_var("providers.openTopography.base_urls.service_url")
-        self.api_key = config_loader.get_var("providers.openTopography.credentials.api_key")
+        self.service_url = config_loader.get_var(
+            "providers.openTopography.base_urls.service_url"
+        )
+        self.api_key = config_loader.get_var(
+            "providers.openTopography.credentials.api_key"
+        )
         logger.info("Initializing OpenTopography Provider and obtaining API token.")
-        self.download_manager = DownloadManager(config_loader=config_loader, ocifs_manager=ocifs_manager)
+        self.download_manager = DownloadManager(
+            config_loader=config_loader, ocifs_manager=ocifs_manager
+        )
         self.session = requests.Session()
-
 
     def get_access_token(self) -> str:
         """
-        Placeholder for compatibility with other providers. 
+        Placeholder for compatibility with other providers.
         OpenTopography does not require explicit access token retrieval; API key is sufficient.
         """
         pass  # OpenTopography does not require a token-based authentication like other providers.
 
-
-    def search_products(self,
-                        collection: str,
-                        aoi: Polygon,
-                        product_type: str=None,
-                        start_date: str=None,
-                        end_date: str=None,
-                        tile_id: str=None
-                        ) -> List[Dict]:
+    def search_products(
+        self,
+        collection: str,
+        aoi: Polygon,
+        product_type: str = None,
+        start_date: str = None,
+        end_date: str = None,
+        tile_id: str = None,
+    ) -> List[Dict]:
         """
         Search for DEM products from OpenTopography within a specified AOI and collection.
 
@@ -74,7 +82,9 @@ class OpenTopography(ProviderBase):
         Returns:
             List[Dict]: List containing query result information, such as constructed URLs for download.
         """
-        logger.info(f"Searching products in collection {collection} with product_type={product_type} for {start_date} to {end_date}.")
+        logger.info(
+            f"Searching products in collection {collection} with product_type={product_type} for {start_date} to {end_date}."
+        )
 
         # Prepare the search payload with the collection, product type, and date range.
         payload = {
@@ -84,14 +94,16 @@ class OpenTopography(ProviderBase):
             "west": aoi.bounds[0],
             "east": aoi.bounds[2],
             "outputFormat": "GTiff",
-            "API_Key": self.api_key
+            "API_Key": self.api_key,
         }
 
         # Send the search request to the USGS API.
         results = self._create_url(self.service_url, payload)
         return [results]
 
-    def download_products(self, product_ids: List[str], output_dir: str = "downloads") -> List[str]:
+    def download_products(
+        self, product_ids: List[str], output_dir: str = "downloads"
+    ) -> List[str]:
         """
         Download DEM products using URLs or identifiers.
 
@@ -108,22 +120,28 @@ class OpenTopography(ProviderBase):
         logger.info(f"Downloading {len(product_ids)} products to {output_dir}.")
 
         product_dict = {
-            'urls': [],
-            'file_names': [],
+            "urls": [],
+            "file_names": [],
         }
         # Add headers for authentication (if needed by DownloadManager)
-        product_dict['headers'] = {}
+        product_dict["headers"] = {}
 
         for product in product_ids:
             # Extract Landsat product ID from query string in download URL
             parsed_url = urlparse(product)
             query_params = parse_qs(parsed_url.query)
             # Determine file name based on landsat_product_id in URL; fallback to "unknown.tif"
-            file_name = query_params.get("demtype", [None])[0] + md5(product.encode()).hexdigest() + ".tif"
-            product_dict['urls'].append(product)
-            product_dict['file_names'].append(file_name)
+            file_name = (
+                query_params.get("demtype", [None])[0]
+                + md5(product.encode()).hexdigest()
+                + ".tif"
+            )
+            product_dict["urls"].append(product)
+            product_dict["file_names"].append(file_name)
 
-        logger.info(f"Initiating download for {len(product_dict['urls'])} files using DownloadManager.")
+        logger.info(
+            f"Initiating download for {len(product_dict['urls'])} files using DownloadManager."
+        )
         self.download_manager.download_products(product_dict, output_dir)
         logger.info("All downloads triggered; check output directory for results.")
 

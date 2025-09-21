@@ -1,6 +1,8 @@
-from .copernicus import Copernicus
-from .usgs import Usgs
-from .provider_base import ProviderBase
-from .open_topography import OpenTopography
 from .cds import Cds
-__all__ = ["Copernicus", "Usgs", "ProviderBase", "OpenTopography", "Cds"]
+from .copernicus import Copernicus
+from .modis import Modis
+from .open_topography import OpenTopography
+from .provider_base import ProviderBase
+from .usgs import Usgs
+
+__all__ = ["Copernicus", "Usgs", "ProviderBase", "OpenTopography", "Cds", "Modis"]

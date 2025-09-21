@@ -1,18 +1,19 @@
-from datetime import datetime
-import os
-import requests
-import json
-from typing import List, Dict
-
-from shapely import Polygon
-
-from .provider_base import ProviderBase
-from utilities import ConfigLoader, DownloadManager, OCIFSManager
-from urllib.parse import urlparse
 import concurrent.futures
+import json
+import os
+from datetime import datetime
+from typing import Dict, List
+from urllib.parse import urlparse
+
+import requests
 
 # Using loguru for enhanced logging throughout this provider.
 from loguru import logger
+from shapely import Polygon
+
+from providers.provider_base import ProviderBase
+from utilities import ConfigLoader, DownloadManager, OCIFSManager
+
 
 class Usgs(ProviderBase):
     """
@@ -44,14 +45,16 @@ class Usgs(ProviderBase):
         self.session = requests.Session()
         logger.info("Initializing USGS Provider and obtaining API token.")
         self.get_access_token()
-        self.download_manager = DownloadManager(config_loader=config_loader, ocifs_manager=ocifs_manager)
+        self.download_manager = DownloadManager(
+            config_loader=config_loader, ocifs_manager=ocifs_manager
+        )
         self.config_loader = config_loader
 
     def get_access_token(self) -> str:
         """
         Authenticates with the USGS API and stores the resulting API key for future requests.
         """
-        payload = {'username': self.username, 'token': self.token}
+        payload = {"username": self.username, "token": self.token}
         logger.info("Requesting USGS API token using provided credentials.")
         resp = self._send_request(self.service_url + "login-token", payload)
         self.api_key = resp  # The API key becomes the token for subsequent requests
@@ -71,18 +74,17 @@ class Usgs(ProviderBase):
         # Ensure polygon is closed for GeoJSON, as USGS expects this format
         if coords[0] != coords[-1]:
             coords.append(coords[0])
-        return {
-            "type": "Polygon",
-            "coordinates": [ [list(coord) for coord in coords] ]
-        }
+        return {"type": "Polygon", "coordinates": [[list(coord) for coord in coords]]}
 
-    def search_products(self,
-                        collection: str,
-                        product_type: str,
-                        start_date: str = None,
-                        end_date: str = None,
-                        aoi: Polygon = None,
-                        tile_id: str = None) -> List[Dict]:
+    def search_products(
+        self,
+        collection: str,
+        product_type: str,
+        start_date: str = None,
+        end_date: str = None,
+        aoi: Polygon = None,
+        tile_id: str = None,
+    ) -> List[Dict]:
         """
         Search for satellite scenes in a specific collection, product type, and date range within the provided AOI.
 
@@ -96,47 +98,54 @@ class Usgs(ProviderBase):
         Returns:
             List[Dict]: List of entity IDs of scenes available for bulk download.
         """
-        logger.info(f"Searching products in collection {collection} with product_type={product_type} for {start_date} to {end_date}.")
+        logger.info(
+            f"Searching products in collection {collection} with product_type={product_type} for {start_date} to {end_date}."
+        )
         self.dataset = collection
 
         # Build spatial filter using AOI
-        spatial_filter = {
-            "filterType": "geojson",
-            "geoJson": self._aoi_to_geojson(aoi)
-        }
+        spatial_filter = {"filterType": "geojson", "geoJson": self._aoi_to_geojson(aoi)}
         # Build acquisition (temporal) filter
         scene_filter = {
             "spatialFilter": spatial_filter,
-            "acquisitionFilter": {
-                "start": start_date,
-                "end": end_date
-            },
+            "acquisitionFilter": {"start": start_date, "end": end_date},
         }
         scene_payload = {
-            'datasetName': collection,
-            'sceneFilter': scene_filter,
-            'maxResults': 1000,  # Adjust this as necessary for your use-case
+            "datasetName": collection,
+            "sceneFilter": scene_filter,
+            "maxResults": 1000,  # Adjust this as necessary for your use-case
         }
 
         # Send the search request to the USGS API.
-        scenes = self._send_request(os.path.join(self.service_url, "scene-search"), scene_payload, self.api_key)
-        logger.info(f"Found {scenes.get('totalHits', 0)} scenes matching the dataset '{collection}'.")
+        scenes = self._send_request(
+            os.path.join(self.service_url, "scene-search"), scene_payload, self.api_key
+        )
+        logger.info(
+            f"Found {scenes.get('totalHits', 0)} scenes matching the dataset '{collection}'."
+        )
 
         products = []
         # Only collect entityIds that have a downloadable 'bulk' option
-        if scenes.get('recordsReturned', 0) > 0 and "results" in scenes:
-            for result in scenes['results']:
+        if scenes.get("recordsReturned", 0) > 0 and "results" in scenes:
+            for result in scenes["results"]:
                 # Only add scene if a bulk download option exists
-                if result['options']['bulk'] == True and product_type[1:] in result['displayId']:
-                    for option in result['metadata']:
-                        if option.get('fieldName') == 'Satellite' and option.get('value') == int(product_type[0]):
-                            products.append(result['entityId'])
+                if (
+                    result["options"]["bulk"] == True
+                    and product_type[1:] in result["displayId"]
+                ):
+                    for option in result["metadata"]:
+                        if option.get("fieldName") == "Satellite" and option.get(
+                            "value"
+                        ) == int(product_type[0]):
+                            products.append(result["entityId"])
                             break
 
         logger.info(f"Returning {len(products)} downloadable product entity IDs.")
         return products
 
-    def download_products(self, product_ids: List[str], output_dir: str = "downloads") -> List[str]:
+    def download_products(
+        self, product_ids: List[str], output_dir: str = "downloads"
+    ) -> List[str]:
         """
         Download all products (scenes) given a list of entity IDs for the set dataset.
 
@@ -147,11 +156,17 @@ class Usgs(ProviderBase):
         Returns:
             List[str]: List of file paths for the downloaded products (if supported by the download manager).
         """
-        logger.info(f"Starting download for {len(product_ids)} products to directory '{output_dir}'.")
+        logger.info(
+            f"Starting download for {len(product_ids)} products to directory '{output_dir}'."
+        )
         # STEP 1: Retrieve available download options for entity IDs
         payload = {"datasetName": self.dataset, "entityIds": ",".join(product_ids)}
-        logger.debug(f"Requesting download options for dataset '{self.dataset}' and product_ids: {product_ids}")
-        options = self._send_request(self.service_url + "download-options", payload, self.api_key)
+        logger.debug(
+            f"Requesting download options for dataset '{self.dataset}' and product_ids: {product_ids}"
+        )
+        options = self._send_request(
+            self.service_url + "download-options", payload, self.api_key
+        )
 
         # Extract list of available options
         downloads = []
@@ -160,11 +175,13 @@ class Usgs(ProviderBase):
         else:
             option_list = options
         for opt in option_list:
-            if opt.get("available") and opt.get("entityId") and opt.get("id") and "Bundle" in opt.get("productName"):
-                downloads.append({
-                    "entityId": opt["entityId"],
-                    "productId": opt["id"]
-                })
+            if (
+                opt.get("available")
+                and opt.get("entityId")
+                and opt.get("id")
+                and "Bundle" in opt.get("productName")
+            ):
+                downloads.append({"entityId": opt["entityId"], "productId": opt["id"]})
 
         if not downloads:
             logger.error("No available downloads for the selected products.")
@@ -174,23 +191,29 @@ class Usgs(ProviderBase):
         label = datetime.now().strftime("dl_%Y%m%d_%H%M%S")
         req_payload = {"downloads": downloads, "label": label}
         logger.info(f"Submitting download request for {len(downloads)} products.")
-        req_results = self._send_request(self.service_url + "download-request", req_payload, self.api_key)
-        final_downloads = req_results.get("availableDownloads", []) if isinstance(req_results, dict) else []
+        req_results = self._send_request(
+            self.service_url + "download-request", req_payload, self.api_key
+        )
+        final_downloads = (
+            req_results.get("availableDownloads", [])
+            if isinstance(req_results, dict)
+            else []
+        )
         logger.info(f"Found {len(final_downloads)} available downloads after polling.")
 
         product_dict = {
-            'urls': [],
-            'file_names': [],
+            "urls": [],
+            "file_names": [],
         }
         # Add headers for authentication (if needed by DownloadManager)
-        product_dict['headers'] = {}
+        product_dict["headers"] = {}
         # Add token refresh callback for 401 handling
-        product_dict['refresh_token_callback'] = self.get_access_token
+        product_dict["refresh_token_callback"] = self.get_access_token
 
-        product_dict['urls'] = [download['url'] for download in final_downloads]
+        product_dict["urls"] = [download["url"] for download in final_downloads]
 
         def get_filename(download):
-            with requests.get(download['url'], stream=True) as r:
+            with requests.get(download["url"], stream=True) as r:
                 # First try content-disposition header
                 if "Content-Disposition" in r.headers:
                     cd = r.headers["Content-Disposition"]
@@ -198,14 +221,20 @@ class Usgs(ProviderBase):
                     filename = cd.split("filename=")[-1].strip('"')
                 else:
                     # fallback: get from URL path
-                    filename = urlparse(download['url']).path.split("/")[-1]
+                    filename = urlparse(download["url"]).path.split("/")[-1]
             return filename
 
         max_concurrent = self.config_loader.get_var("download_manager.max_concurrent")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-            product_dict['file_names'] = list(executor.map(get_filename, final_downloads))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_concurrent
+        ) as executor:
+            product_dict["file_names"] = list(
+                executor.map(get_filename, final_downloads)
+            )
 
-        logger.info(f"Initiating download for {len(product_dict['urls'])} files using DownloadManager.")
+        logger.info(
+            f"Initiating download for {len(product_dict['urls'])} files using DownloadManager."
+        )
         self.download_manager.download_products(product_dict, output_dir)
         logger.info("All downloads triggered; check output directory for results.")
 
@@ -224,11 +253,13 @@ class Usgs(ProviderBase):
         Raises:
             Exception: If the HTTP request fails, or API returns an error.
         """
-        headers = {'Content-Type': 'application/json'}
+        headers = {"Content-Type": "application/json"}
         if api_key:
-            headers['X-Auth-Token'] = api_key
+            headers["X-Auth-Token"] = api_key
 
-        logger.debug(f"Sending POST request to {url} with data={data} and headers={headers}")
+        logger.debug(
+            f"Sending POST request to {url} with data={data} and headers={headers}"
+        )
         resp = self.session.post(url, json.dumps(data), headers=headers)
         if resp.status_code != 200:
             logger.error(f"HTTP {resp.status_code} error from {url}: {resp.text}")
@@ -240,7 +271,11 @@ class Usgs(ProviderBase):
             logger.error(f"Error parsing JSON response from {url}: {e}")
             raise Exception(f"Error parsing JSON response from {url}: {e}")
 
-        if output.get('errorCode') is not None:
-            logger.error(f"API Error {output['errorCode']}: {output.get('errorMessage')}")
-            raise Exception(f"API Error {output['errorCode']}: {output.get('errorMessage')}")
-        return output['data']
+        if output.get("errorCode") is not None:
+            logger.error(
+                f"API Error {output['errorCode']}: {output.get('errorMessage')}"
+            )
+            raise Exception(
+                f"API Error {output['errorCode']}: {output.get('errorMessage')}"
+            )
+        return output["data"]

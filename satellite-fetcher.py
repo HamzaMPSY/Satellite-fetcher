@@ -1,33 +1,34 @@
-import streamlit as st
-from loguru import logger
-from utilities import ConfigLoader
-from streamlit_file_browser import st_file_browser
-from streamlit_folium import st_folium
 import os
-import folium
-from shapely.geometry import Polygon
-import re, time 
+import re
+import time
 from pathlib import Path
 
+import folium
+import streamlit as st
+from loguru import logger
+from shapely.geometry import Polygon
+from streamlit_file_browser import st_file_browser
+from streamlit_folium import st_folium
+
+from utilities import ConfigLoader
 
 
 # --- Live log function (tail -f alike for Streamlit) ---
-@st.fragment(run_every='2000ms')  # refresh every 2s
+@st.fragment(run_every="2000ms")  # refresh every 2s
 def show_live_logs(log_path="nohup.out"):
     log_path = Path(log_path)
     batch_re = re.compile(
-        r"^Concurrent Downloads:\s*"             # Description before colon
-        r"(?P<percent>\d+)%\|\s*[^\|]*\|\s*"     # Percent and bar (allowing any content between |)
-        r"(?P<done>\d+)/(?P<total>\d+)\s*"       # Done/Total tasks
+        r"^Concurrent Downloads:\s*"  # Description before colon
+        r"(?P<percent>\d+)%\|\s*[^\|]*\|\s*"  # Percent and bar (allowing any content between |)
+        r"(?P<done>\d+)/(?P<total>\d+)\s*"  # Done/Total tasks
         r"\[\s*(?P<elapsed>[0-9:?]+)<(?P<eta>[^\]]+)\]\s*"  # Elapsed and ETA/remaining (anything until ])
-        r"(?P<rate>[^\s]*/?[^\s]*?)?\s*$"        # Optional rate like '?it/s' or '5.00it/s'
+        r"(?P<rate>[^\s]*/?[^\s]*?)?\s*$"  # Optional rate like '?it/s' or '5.00it/s'
     )
-
 
     # New regex for download progress bars (the ones in your log)
     download_re = re.compile(
-        r"^Downloading\s+(?P<filename>.+?):\s*"        # Filename
-        r"(?P<percent>\d+)%\|\s*.*?\|\s*"              # Percent + bar
+        r"^Downloading\s+(?P<filename>.+?):\s*"  # Filename
+        r"(?P<percent>\d+)%\|\s*.*?\|\s*"  # Percent + bar
         r"(?P<done>[\d\.]+[kMGTP]?)/(?P<total>[\d\.]+[kMGTP]?)\s*"  # Done/Total with units
         r"\[(?P<elapsed>[0-9:]+)<(?P<eta>[0-9:?\-]+)\]"  # Elapsed and ETA
     )
@@ -46,7 +47,7 @@ def show_live_logs(log_path="nohup.out"):
                     done, total = int(m.group("done")), int(m.group("total"))
                     progress_bars_info[desc] = {
                         "label": f"🌐 {desc} ({done}/{total})",
-                        "percent": percent
+                        "percent": percent,
                     }
                     continue
                 m = download_re.search(line)
@@ -58,7 +59,7 @@ def show_live_logs(log_path="nohup.out"):
                     eta = m.group("eta").strip()
                     progress_bars_info[desc] = {
                         "label": f"📥 {desc} ({done}/{total}) | Elapsed: {elapsed} | ETA: {eta}",
-                        "percent": percent
+                        "percent": percent,
                     }
                     continue
                 # Collect non-matching lines to display as plain logs if wanted
@@ -78,31 +79,29 @@ def show_live_logs(log_path="nohup.out"):
 def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10):
     # Create the base map
     m = folium.Map(
-        location=[center_lat, center_lng], 
-        zoom_start=zoom,
-        tiles='OpenStreetMap'
+        location=[center_lat, center_lng], zoom_start=zoom, tiles="OpenStreetMap"
     )
     folium.TileLayer(
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        attr='Esri', name='Satellite', overlay=False, control=True
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="Satellite",
+        overlay=False,
+        control=True,
     ).add_to(m)
-    
+
     # Add drawing tools
     draw = folium.plugins.Draw(
         export=False,
-        position='topleft',
+        position="topleft",
         draw_options={
-            'polyline': False,
-            'rectangle': True,
-            'polygon': True,
-            'circle': False,
-            'marker': False,
-            'circlemarker': False,
+            "polyline": False,
+            "rectangle": True,
+            "polygon": True,
+            "circle": False,
+            "marker": False,
+            "circlemarker": False,
         },
-        edit_options={
-            'edit': True,
-            'remove': True
-        }
+        edit_options={"edit": True, "remove": True},
     )
     draw.add_to(m)
     # Display the map and capture interactions
@@ -111,7 +110,7 @@ def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10):
         key="drawing_map",
         width="100%",
         height=500,
-        returned_objects=["all_drawings"]
+        returned_objects=["all_drawings"],
     )
     return m, map_data
 
@@ -124,7 +123,7 @@ logger.info("Configuration loaded successfully.")
 # Initialize session state
 if "geometry" not in st.session_state:
     st.session_state["geometry"] = ""
-    
+
 # ---------- CUSTOM SVG ----------
 satellite_icon_svg = """
     <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" 
@@ -147,7 +146,8 @@ calendar_icon_svg = """
 
 
 # ---------- CSS STYLES ----------
-st.markdown("""
+st.markdown(
+    """
     <style>
     /* Card styling */
     .card {
@@ -175,39 +175,66 @@ st.markdown("""
         border-radius: 8px !important;
     }
     </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 # ---------- VARIABLES ----------
 # Provider → Satellite mapping
 satellite_options = {
     "Copernicus": ["SENTINEL-1", "SENTINEL-2", "SENTINEL-3", "SENTINEL-5P"],
     "USGS": ["landsat_ot_c2_l1", "landsat_ot_c2_l2"],
-    "OpenTopography": ["SRTMGL3 (SRTM GL3 90m)",
-                        "SRTMGL1 (SRTM GL1 30m)",
-                        "SRTMGL1_E (SRTM GL1 Ellipsoidal 30m)",
-                        "AW3D30 (ALOS World 3D 30m)",
-                        "AW3D30_E (ALOS World 3D Ellipsoidal, 30m)",
-                        "SRTM15Plus (Global Bathymetry SRTM15+ V2.1 500m)",
-                        "NASADEM (NASADEM Global DEM)",
-                        "COP30 (Copernicus Global DSM 30m)",
-                        "COP90 (Copernicus Global DSM 90m)",
-                        "EU_DTM (DTM 30m)",
-                        "GEDI_L3 (DTM 1000m)",
-                        "GEBCOIceTopo (Global Bathymetry 500m)",
-                        "GEBCOSubIceTopo (Global Bathymetry 500m)",
-                        "CA_MRDEM_DSM (DSM 30m)",
-                        "CA_MRDEM_DTM (DTM 30m)"],
-    "CDS": []
+    "OpenTopography": [
+        "SRTMGL3 (SRTM GL3 90m)",
+        "SRTMGL1 (SRTM GL1 30m)",
+        "SRTMGL1_E (SRTM GL1 Ellipsoidal 30m)",
+        "AW3D30 (ALOS World 3D 30m)",
+        "AW3D30_E (ALOS World 3D Ellipsoidal, 30m)",
+        "SRTM15Plus (Global Bathymetry SRTM15+ V2.1 500m)",
+        "NASADEM (NASADEM Global DEM)",
+        "COP30 (Copernicus Global DSM 30m)",
+        "COP90 (Copernicus Global DSM 90m)",
+        "EU_DTM (DTM 30m)",
+        "GEDI_L3 (DTM 1000m)",
+        "GEBCOIceTopo (Global Bathymetry 500m)",
+        "GEBCOSubIceTopo (Global Bathymetry 500m)",
+        "CA_MRDEM_DSM (DSM 30m)",
+        "CA_MRDEM_DTM (DTM 30m)",
+    ],
+    "CDS": [],
 }
 # Product types for each satellite
 # This can be extended based on actual product types available for each satellite
 product_types_options = {
     "SENTINEL-1": ["RAW", "GRD", "SLC", "IW_SLC__1S"],
     "SENTINEL-2": ["S2MSI1C", "S2MSI2A"],
-    "SENTINEL-3": ["S3OL1EFR", "S3OL1ERR", "S3SL1RBT", "S3OL2WFR", "S3OL2WRR", "S3OL2LFR", "S3OL2LRR", "S3SL2LST", "S3SL2FRP", "S3SR2LAN", "S3SY2SYN", "S3SY2VGP", "S3SY2VG1", "S3SY2V10", "S3SY2AOD"],
-    "SENTINEL-5P": ["L2__NO2___", "L2__CH4___", "L2__CO____", "L2__O3____", "L2__SO2___", "L2__HCHO__"],
-    "landsat_ot_c2_l1": ['8L1TP', '8L1GT', '8L1GS', '9L1TP', '9L1GT', '9L1GS'],
-    "landsat_ot_c2_l2": ['8L2SP', '8L2SR', '9L2SP', '9L2SR']
+    "SENTINEL-3": [
+        "S3OL1EFR",
+        "S3OL1ERR",
+        "S3SL1RBT",
+        "S3OL2WFR",
+        "S3OL2WRR",
+        "S3OL2LFR",
+        "S3OL2LRR",
+        "S3SL2LST",
+        "S3SL2FRP",
+        "S3SR2LAN",
+        "S3SY2SYN",
+        "S3SY2VGP",
+        "S3SY2VG1",
+        "S3SY2V10",
+        "S3SY2AOD",
+    ],
+    "SENTINEL-5P": [
+        "L2__NO2___",
+        "L2__CH4___",
+        "L2__CO____",
+        "L2__O3____",
+        "L2__SO2___",
+        "L2__HCHO__",
+    ],
+    "landsat_ot_c2_l1": ["8L1TP", "8L1GT", "8L1GS", "9L1TP", "9L1GT", "9L1GS"],
+    "landsat_ot_c2_l2": ["8L2SP", "8L2SR", "9L2SP", "9L2SR"],
 }
 
 # ---------- TABS ----------
@@ -218,39 +245,56 @@ with tabs[0]:
         # Provider & Satellite Selection
         st.markdown(
             f'<div class="section-title">{satellite_icon_svg} Provider & Satellite Selection</div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
-        st.markdown('<div class="section-subtitle">Choose your satellite data provider and specific satellite</div>', unsafe_allow_html=True)
-        col1, col2 , col3 = st.columns(3)
+        st.markdown(
+            '<div class="section-subtitle">Choose your satellite data provider and specific satellite</div>',
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns(3)
         with col1:
             provider = st.selectbox("Provider", list(satellite_options.keys()))
         with col2:
             satellite = st.selectbox("Satellite", satellite_options.get(provider, []))
         with col3:
-            product_type = st.selectbox("Product Type", product_types_options.get(satellite, []))
+            product_type = st.selectbox(
+                "Product Type", product_types_options.get(satellite, [])
+            )
     with st.container(border=True):
         # Geographic Area
-        drawing_map , map_data= create_drawing_map(center_lat = 12.193479, center_lng = 123.326770, zoom=5)
-        st.markdown(f'<div class="section-title">{geometry_icon_svg} Geographic Area</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-subtitle">Define the area of interest using GeoJSON or WKT format</div>', unsafe_allow_html=True)
+        drawing_map, map_data = create_drawing_map(
+            center_lat=12.193479, center_lng=123.326770, zoom=5
+        )
+        st.markdown(
+            f'<div class="section-title">{geometry_icon_svg} Geographic Area</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="section-subtitle">Define the area of interest using GeoJSON or WKT format</div>',
+            unsafe_allow_html=True,
+        )
         # Process and display polygon data
-        if map_data['all_drawings'] is not None and len(map_data['all_drawings']) > 0:
+        if map_data["all_drawings"] is not None and len(map_data["all_drawings"]) > 0:
             # Extract polygons from the drawing data
             current_polygons = []
-            for feature in map_data['all_drawings']:
-                if feature['geometry']['type'] in ['Polygon', 'Rectangle']:
-                    coordinates = feature['geometry']['coordinates'][0]  # Get outer ring
-                    current_polygons.append({
-                        'type': feature['geometry']['type'],
-                        'coordinates': coordinates,
-                        'properties': feature.get('properties', {})
-                    })
+            for feature in map_data["all_drawings"]:
+                if feature["geometry"]["type"] in ["Polygon", "Rectangle"]:
+                    coordinates = feature["geometry"]["coordinates"][
+                        0
+                    ]  # Get outer ring
+                    current_polygons.append(
+                        {
+                            "type": feature["geometry"]["type"],
+                            "coordinates": coordinates,
+                            "properties": feature.get("properties", {}),
+                        }
+                    )
 
             # Create Shapely polygons and get WKT strings
             wkt_polygons = []
             for poly_info in current_polygons:
                 try:
-                    polygon = Polygon(poly_info['coordinates'])
+                    polygon = Polygon(poly_info["coordinates"])
                     wkt_polygons.append(polygon.wkt)
                 except Exception as e:
                     wkt_polygons.append(f"# Error creating polygon: {e}")
@@ -265,27 +309,33 @@ with tabs[0]:
                     "Polygons in WKT or GeoJSON",
                     value="\n".join(wkt_polygons),
                     height=100,
-                    key="polygon_data"
+                    key="polygon_data",
                 )
             else:
                 geometries = st.text_area(
                     "Polygons in WKT or GeoJSON",
                     value="No polygons drawn yet. Start drawing on the map!",
                     height=100,
-                    key="empty_polygon_data"
+                    key="empty_polygon_data",
                 )
         else:
             geometries = st.text_area(
                 "Polygons in WKT or GeoJSON",
                 value="No polygons drawn yet. Start drawing on the map!",
                 height=100,
-                key="no_polygon_data"
+                key="no_polygon_data",
             )
 
     with st.container(border=True):
         # Time Range
-        st.markdown(f'<div class="section-title">{calendar_icon_svg} Time Range</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-subtitle">Specify the date range for satellite imagery</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">{calendar_icon_svg} Time Range</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="section-subtitle">Specify the date range for satellite imagery</div>',
+            unsafe_allow_html=True,
+        )
         col1, col2 = st.columns(2)
         with col1:
             start_date = st.date_input("Start Date")
@@ -311,29 +361,32 @@ with tabs[0]:
                 # empty nohup.out file
                 open("nohup.out", "w").close()
                 # call the cli script with the appropriate arguments
-                os.system(f"nohup python cli.py --provider {provider.lower()} --collection {satellite.split(' ')[0]} --product-type {product_type} --start-date {start_date} --end-date {end_date} &")
+                os.system(
+                    f"nohup python cli.py --provider {provider.lower()} --collection {satellite.split(' ')[0]} --product-type {product_type} --start-date {start_date} --end-date {end_date} &"
+                )
                 # Show logs live like tail -f
                 show_live_logs()
 
 with tabs[1]:
-        def sort(files):
-            return sorted(files, key=lambda x: x["size"])
-        
-        event = st_file_browser(
-            os.path.join('downloads'),
-            file_ignores=None,
-            key="A",
-            show_choose_file=True,
-            show_choose_folder=True,
-            show_delete_file=True,
-            show_download_file=True,
-            show_new_folder=True,
-            show_upload_file=True,
-            show_rename_file=True,
-            show_rename_folder=True,
-            use_cache=True,
-            sort=sort,
-        )
+
+    def sort(files):
+        return sorted(files, key=lambda x: x["size"])
+
+    event = st_file_browser(
+        os.path.join("downloads"),
+        file_ignores=None,
+        key="A",
+        show_choose_file=True,
+        show_choose_folder=True,
+        show_delete_file=True,
+        show_download_file=True,
+        show_new_folder=True,
+        show_upload_file=True,
+        show_rename_file=True,
+        show_rename_folder=True,
+        use_cache=True,
+        sort=sort,
+    )
 
 with tabs[2]:
     # show the content of config.yaml

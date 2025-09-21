@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict
+from typing import Dict, List
 
 from shapely import Polygon
+
 
 class ProviderBase(ABC):
     """
@@ -31,13 +32,15 @@ class ProviderBase(ABC):
         pass
 
     @abstractmethod
-    def search_products(self,
-                        collection: str,
-                        product_type: str,
-                        start_date: str,
-                        end_date: str,
-                        aoi: Polygon,
-                        tile_id: str=None) -> List[Dict]:
+    def search_products(
+        self,
+        collection: str,
+        product_type: str,
+        start_date: str,
+        end_date: str,
+        aoi: Polygon,
+        tile_id: str = None,
+    ) -> List[Dict]:
         """
         Search for products in the provider's catalogue.
 
