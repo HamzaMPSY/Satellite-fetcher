@@ -159,12 +159,15 @@ class Copernicus(ProviderBase):
             )
 
         # Add AOI filter in WKT format (if provided)
+        if tile_id:
+            query_params[
+                "$filter"
+            ] += f" and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'tileId' and att/OData.CSC.StringAttribute/Value eq '{tile_id}')"
+
         if aoi:
             query_params["$filter"] += (
                 f" and OData.CSC.Intersects(area=geography'SRID=4326;" f"{aoi.wkt}')"
             )
-        if tile_id:
-            query_params["$filter"] += f" and contains(Name,'{tile_id}') "
 
         # Order results by acquisition date, most recent first, limit to 1000 results
         query_params["$orderby"] = "ContentDate/Start desc"

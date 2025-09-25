@@ -126,14 +126,16 @@ def main():
         f"Searching for products with provider: {args.provider}, collection: {args.collection}, product_type: {args.product_type}, dates: {args.start_date} to {args.end_date}"
     )
 
-    # Execute the search for available products matching the filters
-    for geom in geometry_handler.geometries:
+    # If args.tile_id is provided, and the provider is copernicus we will use it with out looking at the aoi
+    if args.tile_id and args.provider.lower() == "copernicus":
+        logger.info(
+            f"Tile ID provided ({args.tile_id}), ignoring AOI for Copernicus search."
+        )
         products = provider_instance.search_products(
             collection=args.collection,
             product_type=args.product_type,
             start_date=args.start_date,
             end_date=args.end_date,
-            aoi=geom,
             tile_id=args.tile_id,
         )
 
@@ -151,7 +153,7 @@ def main():
             )
             path_parts = [
                 "downloads",
-                md5(geom.wkt.encode()).hexdigest(),
+                md5(args.tile_id.encode()).hexdigest(),
                 date_segment,
                 args.provider,
                 args.collection,
@@ -162,13 +164,55 @@ def main():
             provider_instance.download_products(
                 product_ids=products, output_dir=output_dir
             )
-            if args.crop_aoi:
-                logger.info("Cropping AOI...")
-                geometry_handler.crop_aoi(
-                    folder_path=output_dir, provider=args.provider, aoi=geom
-                )
         else:
             logger.info("No products found for the given options.")
+    else:
+        logger.info("No Tile ID provided or provider is not Copernicus, using AOI.")
+        # Execute the search for available products matching the filters
+        for geom in geometry_handler.geometries:
+            products = provider_instance.search_products(
+                collection=args.collection,
+                product_type=args.product_type,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                aoi=geom,
+                tile_id=args.tile_id,
+            )
+
+            # Download each product one by one if any were found
+            if products:
+                logger.info(
+                    f"Found {len(products)} products. Downloading all products individually..."
+                )
+                start_clean = (
+                    args.start_date.replace("/", "") if args.start_date else None
+                )
+                end_clean = args.end_date.replace("/", "") if args.end_date else None
+                date_segment = (
+                    "_".join([p for p in [start_clean, end_clean] if p])
+                    if (start_clean or end_clean)
+                    else None
+                )
+                path_parts = [
+                    "downloads",
+                    md5(geom.wkt.encode()).hexdigest(),
+                    date_segment,
+                    args.provider,
+                    args.collection,
+                    args.product_type,
+                ]
+                path_parts = [str(p) for p in path_parts if p]
+                output_dir = os.path.join(*path_parts)
+                provider_instance.download_products(
+                    product_ids=products, output_dir=output_dir
+                )
+                if args.crop_aoi:
+                    logger.info("Cropping AOI...")
+                    geometry_handler.crop_aoi(
+                        folder_path=output_dir, provider=args.provider, aoi=geom
+                    )
+            else:
+                logger.info("No products found for the given options.")
 
     logger.info("Search and download completed successfully!")
 
