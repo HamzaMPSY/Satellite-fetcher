@@ -1,15 +1,15 @@
 import os
 import re
-import time
 from pathlib import Path
 
 import folium
+import geopandas as gpd
+import shapely
 import streamlit as st
 from loguru import logger
 from shapely.geometry import Polygon
 from streamlit_file_browser import st_file_browser
 from streamlit_folium import st_folium
-
 from utilities import ConfigLoader
 
 
@@ -76,7 +76,7 @@ def show_live_logs(log_path="nohup.out"):
                 st.write(l)
 
 
-def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10):
+def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10, tiles_gdf=None):
     # Create the base map
     m = folium.Map(
         location=[center_lat, center_lng], zoom_start=zoom, tiles="OpenStreetMap"
@@ -88,6 +88,14 @@ def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10):
         overlay=False,
         control=True,
     ).add_to(m)
+
+    # Add tile boundaries if available
+    if tiles_gdf is not None:
+        folium.GeoJson(
+            tiles_gdf,
+            name="All Tiles",
+            style_function=lambda x: {"color": "gray", "weight": 1, "fillOpacity": 0},
+        ).add_to(m)
 
     # Add drawing tools
     draw = folium.plugins.Draw(
@@ -104,15 +112,18 @@ def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10):
         edit_options={"edit": True, "remove": True},
     )
     draw.add_to(m)
-    # Display the map and capture interactions
-    map_data = st_folium(
-        m,
-        key="drawing_map",
-        width="100%",
-        height=500,
-        returned_objects=["all_drawings"],
-    )
-    return m, map_data
+
+    # Add layer control
+    folium.LayerControl().add_to(m)
+
+    return m
+
+
+def init():
+    # Load the shapefile
+    shapefile_path = "data/Sentinel-2-tiles/sentinel_2_index_shapefile.shp"
+    sentinel2_tiles = gpd.read_file(shapefile_path)
+    return {"SENTINEL-2": sentinel2_tiles}
 
 
 # ---------- PAGE CONFIG ----------
@@ -144,6 +155,7 @@ geometry_icon_svg = """
 calendar_icon_svg = """
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-calendar h-5 w-5"><path d="M8 2v4"></path><path d="M16 2v4"></path><rect width="18" height="18" x="3" y="4" rx="2"></rect><path d="M3 10h18"></path></svg>"""
 
+sat_tiles = init()
 
 # ---------- CSS STYLES ----------
 st.markdown(
@@ -202,6 +214,12 @@ satellite_options = {
         "CA_MRDEM_DTM (DTM 30m)",
     ],
     "CDS": [],
+    "GoogleEarthEngine": [
+        "COPERNICUS/S2_SR",
+        "LANDSAT/LC08/C02/T1_L2",
+        "MODIS/006/MOD13Q1",
+        "USGS/SRTMGL1_003",
+    ],
 }
 # Product types for each satellite
 # This can be extended based on actual product types available for each satellite
@@ -262,8 +280,12 @@ with tabs[0]:
             )
     with st.container(border=True):
         # Geographic Area
-        drawing_map, map_data = create_drawing_map(
-            center_lat=12.193479, center_lng=123.326770, zoom=5
+        tiles_gdf = sat_tiles.get(satellite)
+        drawing_map = create_drawing_map(
+            center_lat=12.193479,
+            center_lng=123.326770,
+            zoom=5,
+            tiles_gdf=tiles_gdf,
         )
         st.markdown(
             f'<div class="section-title">{geometry_icon_svg} Geographic Area</div>',
@@ -272,6 +294,14 @@ with tabs[0]:
         st.markdown(
             '<div class="section-subtitle">Define the area of interest using GeoJSON or WKT format</div>',
             unsafe_allow_html=True,
+        )
+        # Display the map and capture interactions
+        map_data = st_folium(
+            drawing_map,
+            key="drawing_map",
+            width="100%",
+            height=500,
+            returned_objects=["all_drawings"],
         )
         # Process and display polygon data
         if map_data["all_drawings"] is not None and len(map_data["all_drawings"]) > 0:
@@ -296,12 +326,47 @@ with tabs[0]:
                 try:
                     polygon = Polygon(poly_info["coordinates"])
                     wkt_polygons.append(polygon.wkt)
-                except Exception as e:
+                except ValueError as e:
                     wkt_polygons.append(f"# Error creating polygon: {e}")
 
             # Update session state
             st.session_state.polygons = current_polygons
             st.session_state.polygons_wkt = wkt_polygons
+
+            # Find intersecting tiles
+            tiles_gdf = sat_tiles.get(satellite)
+            intersecting_tiles = []
+            if tiles_gdf is not None:
+                for poly_info in current_polygons:
+                    try:
+                        polygon = Polygon(poly_info["coordinates"])
+                        intersects = tiles_gdf[tiles_gdf.intersects(polygon)]
+                        intersecting_tiles.extend(intersects["Name"].tolist())
+                    except ValueError:
+                        pass
+            st.session_state.intersecting_tiles = list(set(intersecting_tiles))
+
+            # Add intersecting tiles layer to the map
+            if intersecting_tiles:
+                intersects_gdf = tiles_gdf[tiles_gdf["Name"].isin(intersecting_tiles)]
+                folium.GeoJson(
+                    intersects_gdf,
+                    name="Intersecting Tiles",
+                    style_function=lambda x: {
+                        "color": "red",
+                        "weight": 3,
+                        "fillColor": "red",
+                        "fillOpacity": 0.3,
+                    },
+                ).add_to(drawing_map)
+                # Update the map display with intersecting tiles
+                st_folium(
+                    drawing_map,
+                    key="drawing_map",
+                    width="100%",
+                    height=500,
+                    returned_objects=["all_drawings"],
+                )
 
             # Display WKT data in text area
             if wkt_polygons:

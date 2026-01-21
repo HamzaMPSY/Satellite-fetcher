@@ -10,6 +10,7 @@ Satellite Fetcher is a Python toolkit for downloading and processing satellite a
 
 - [Copernicus Collections and Product Types](./copernicus_collections.md): Sentinel missions, product types, and OData query tips.
 - [OData Query Examples](./odata_examples.md): Example queries for filtering Copernicus data.
+- [Google Earth Engine Provider](./google_earth_engine.md): Setup and usage for Google Earth Engine.
 - [Ideas & TODO](./future_ideas.md): Design notes and future plans.
 
 For installation and core usage, refer to the [README](../README.md).

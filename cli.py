@@ -13,7 +13,7 @@ from hashlib import md5
 
 from loguru import logger
 
-from providers import Cds, Copernicus, Modis, OpenTopography, Usgs
+from providers import Cds, Copernicus, GoogleEarthEngine, Modis, OpenTopography, Usgs
 from utilities import ConfigLoader, GeometryHandler, OCIFSManager
 
 
@@ -32,8 +32,8 @@ def main():
         "--provider",
         type=str,
         required=True,
-        choices=["copernicus", "usgs", "opentopography", "cds", "modis"],
-        help="Data provider (copernicus , usgs or open_topography)",
+        choices=["copernicus", "usgs", "opentopography", "cds", "modis", "google_earth_engine"],
+        help="Data provider (copernicus , usgs, open_topography or google_earth_engine)",
     )
     parser.add_argument("--collection", type=str, required=True, help="collection name")
     parser.add_argument(
@@ -105,6 +105,7 @@ def main():
         "opentopography": OpenTopography,
         "cds": Cds,
         "modis": Modis,
+        "google_earth_engine": GoogleEarthEngine,
     }
     # Select provider based on input argument
     provider_cls = provider_map.get(args.provider.lower())

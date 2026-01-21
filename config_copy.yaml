@@ -9,3 +9,9 @@ providers:
         - base_url: https://catalogue.dataspace.copernicus.eu
         - token_url: https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token
         - download_url: https://zipper.dataspace.copernicus.eu
+  - google_earth_engine:
+      name: Google Earth Engine
+      description: Google Earth Engine combines a multi-petabyte catalog of satellite imagery and geospatial datasets with planetary-scale analysis capabilities.
+      credentials:
+        project_id: <your_project_id>
+        service_account_json: <path_to_service_account_json_optional>

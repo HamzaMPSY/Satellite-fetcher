@@ -1,15 +1,18 @@
-import base64
-import json
+import os
+import shutil
+import tempfile
+import zipfile
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List
 
 import cdsapi
-import requests
 from loguru import logger
 from shapely.geometry import Polygon
+from tqdm import tqdm
 
 from providers.provider_base import ProviderBase
-from utilities import ConfigLoader, DownloadManager
+from utilities import ConfigLoader, OCIFSManager
 
 
 class Cds(ProviderBase):
@@ -17,24 +20,23 @@ class Cds(ProviderBase):
     Provider for interacting with the Copernicus Climate Data Store (CDS) API for climate data access.
     """
 
-    def __init__(self, config_loader: ConfigLoader):
+    def __init__(self, config_loader: ConfigLoader, ocifs_manager: OCIFSManager):
         """
         Initialize the CDS Provider using configuration values from the provided ConfigLoader.
         """
         self.service_url = config_loader.get_var("providers.cds.base_urls.service_url")
         self.api_key = config_loader.get_var("providers.cds.credentials.api_key")
-        self.user_id = config_loader.get_var("providers.cds.credentials.user_id")
-        self.session = requests.Session()
+        self.datasets = config_loader.get_var("providers.cds.datasets")
+        self.variables = config_loader.get_var("providers.cds.variables")
+        self.ocifs_manager = ocifs_manager
         logger.info("Initializing CDS Provider.")
-        self.download_manager = DownloadManager(config_loader=config_loader)
-        self.access_token = self.get_access_token()
+        self.client = cdsapi.Client(url=self.service_url, key=self.api_key)
 
     def get_access_token(self) -> str:
         """
         Authenticates with the CDS API and stores the resulting API key for future requests.
         """
-        token = base64.b64encode(f"{self.user_id}:{self.api_key}".encode()).decode()
-        return token
+        return self.api_key
 
     def search_products(
         self,
@@ -43,78 +45,76 @@ class Cds(ProviderBase):
         start_date: str,
         end_date: str,
         aoi: Polygon,
+        tile_id: str = None,
     ) -> List[Dict]:
-        """ """
+        """Search and download products in CDS API using cdsapi library"""
+        # mapping the keys with actual api values
+        collection = self.datasets[collection]
+        variables = [self.variables[var] for var in product_type.split(",")]
+
         logger.info(
-            f"Searching products in collection {collection} with product_type={product_type} for {start_date} to {end_date}."
+            f"Searching products in collection {collection} with product_type={variables} for {start_date} to {end_date}."
         )
+        products = []
+        # Convert strings to datetime objects
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
 
-        # Construct the search payload
-        payload = {
-            "variable": ["radiative_forcing_of_carbon_dioxide"],
-            "forcing_type": "instantaneous",
-            "band": ["long_wave"],
-            "sky_type": ["all_sky"],
-            "level": ["surface"],
-            "version": ["2"],
-            "year": ["2018"],
-            "month": ["06"],
-        }
-
-        products = self._send_request(
-            f"{self.service_url}/{collection}/execution", payload
-        )
-
+        minx, miny, maxx, maxy = aoi.bounds
+        west, east = sorted([minx, maxx])
+        south, north = sorted([miny, maxy])
+        area = [north, west, south, east]
+        # Loop over each day
+        current = start
+        while current <= end:
+            request = {
+                "date": [current.strftime("%Y-%m-%d")],
+                "time": ["12:00"],
+                "data_format": "netcdf_zip",
+                "variable": variables,
+                "area": area,
+            }
+            products.append(
+                {
+                    "result": self.client.retrieve(collection, request),
+                    "file_name": f'CAMS_{current.strftime("%Y-%m-%d")}.nc',
+                }
+            )
+            current += timedelta(days=1)
+        logger.info(f"Found {len(products)} products")
         return products
 
     def download_products(
-        self, product_ids: List[str], output_dir: str = "downloads"
+        self, product_ids: List, output_dir: str = "downloads"
     ) -> List[str]:
-        """ """
+        """Use the cdsapi itself to download the products"""
         logger.info(
             f"Starting download for {len(product_ids)} products to directory '{output_dir}'."
         )
-
-    def _send_request(self, url: str, payload: dict):
-        """
-        Send a POST request to the given cds URL with JSON data and specified (optional) API key.
-
-        Args:
-            url (str): Endpoint URL.
-            payload (dict): Data to be sent in the request body.
-
-        Returns:
-            The 'data' field from the JSON response if successful.
-
-        Raises:
-            Exception: If the HTTP request fails, or API returns an error.
-        """
-
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json",
-            "User-Agent": "ecmwf-datastores-client/0.4.0",
-            "PRIVATE-TOKEN": f"{self.api_key}",
-        }
-
-        logger.debug(
-            f"Sending POST request to {url} with data={payload} and headers={headers}"
-        )
-        resp = self.session.post(url, json.dumps(payload), headers=headers)
-        if resp.status_code != 200:
-            logger.error(f"HTTP {resp.status_code} error from {url}: {resp.text}")
-            raise Exception(f"HTTP {resp.status_code} error from {url}: {resp.text}")
-        try:
-            output = resp.json()
-        except Exception as e:
-            logger.error(f"Error parsing JSON response from {url}: {e}")
-            raise Exception(f"Error parsing JSON response from {url}: {e}")
-
-        if output.get("errorCode") is not None:
-            logger.error(
-                f"API Error {output['errorCode']}: {output.get('errorMessage')}"
+        output_dir = output_dir.replace(",", "_")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        for product in tqdm(product_ids, desc="Downloading Cams:"):
+            zip_path = os.path.join(output_dir, product["file_name"])
+            product["result"].download(
+                target=os.path.join(output_dir, product["file_name"])
             )
-            raise Exception(
-                f"API Error {output['errorCode']}: {output.get('errorMessage')}"
-            )
-        return output["data"]
+            tmp_dir = tempfile.mkdtemp()  # create a temporary directory
+            # Step 1: Unzip to temp folder
+            with zipfile.ZipFile(
+                os.path.join(output_dir, product["file_name"]), "r"
+            ) as zip_ref:
+                zip_ref.extractall(tmp_dir)
+            # Step 2: Find the extracted file (there should be only one)
+            extracted_files = os.listdir(tmp_dir)
+            if len(extracted_files) != 1:
+                raise ValueError(
+                    f"Expected one file in {zip_path}, found: {extracted_files}"
+                )
+            tmp_file_path = os.path.join(tmp_dir, extracted_files[0])
+            # Step 3: Delete the original zip file
+            os.remove(zip_path)
+            # Step 4: Rename/move the extracted file to the same name as the zip (without .zip)
+            shutil.move(tmp_file_path, zip_path)
+            # Clean up temp dir
+            os.rmdir(tmp_dir)
+        logger.info("Successfully Downloaded All Products")
