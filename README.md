@@ -48,7 +48,24 @@ Provider modules are located in the `providers/` directory and can be extended f
 
 Edit `config.yaml` to set up API keys, regions, product types, and provider-specific parameters as needed.
 
-## Development
+
+## Example
+
+```bash
+python cli.py --provider copernicus --collection SENTINEL-2 --product-type S2MSI2A --start-date 2025-12-15 --end-date 2025-12-31
+```
+This command will:
+
+ - Connect to the Copernicus API.
+
+ - Search for Sentinel-2 Level-2A (S2MSI2A) products available between 2025-12-15 and 2025-12-31.
+
+ - Download all matching products to the default output folder (./downloads unless configured otherwise).
+
+
+⚠️ Make sure the desired WKT polygon is located in example_aoi.wkt before running this command.
+
+ ## Development
 
 - Extend or add providers in `providers/`
 - Utility scripts are in `utilities/`
