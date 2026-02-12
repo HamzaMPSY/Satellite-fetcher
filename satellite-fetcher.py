@@ -1,45 +1,57 @@
+# satellite-fetcher.py
 import os
 import re
+import datetime as dt
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import folium
+from folium import plugins
 import geopandas as gpd
 import shapely
 import streamlit as st
 from loguru import logger
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, shape, mapping
+from shapely import wkt as shapely_wkt
 from streamlit_file_browser import st_file_browser
 from streamlit_folium import st_folium
+
 from utilities import ConfigLoader
 
 
-# --- Live log function (tail -f alike for Streamlit) ---
+# -------------------------
+# Live log (tail -f)
+# -------------------------
 @st.fragment(run_every="2000ms")  # refresh every 2s
 def show_live_logs(log_path="nohup.out"):
     log_path = Path(log_path)
+
     batch_re = re.compile(
-        r"^Concurrent Downloads:\s*"  # Description before colon
-        r"(?P<percent>\d+)%\|\s*[^\|]*\|\s*"  # Percent and bar (allowing any content between |)
-        r"(?P<done>\d+)/(?P<total>\d+)\s*"  # Done/Total tasks
-        r"\[\s*(?P<elapsed>[0-9:?]+)<(?P<eta>[^\]]+)\]\s*"  # Elapsed and ETA/remaining (anything until ])
-        r"(?P<rate>[^\s]*/?[^\s]*?)?\s*$"  # Optional rate like '?it/s' or '5.00it/s'
+        r"^Concurrent Downloads:\s*"
+        r"(?P<percent>\d+)%\|\s*[^\|]*\|\s*"
+        r"(?P<done>\d+)/(?P<total>\d+)\s*"
+        r"\[\s*(?P<elapsed>[0-9:?]+)<(?P<eta>[^\]]+)\]\s*"
+        r"(?P<rate>[^\s]*/?[^\s]*?)?\s*$"
     )
 
-    # New regex for download progress bars (the ones in your log)
     download_re = re.compile(
-        r"^Downloading\s+(?P<filename>.+?):\s*"  # Filename
-        r"(?P<percent>\d+)%\|\s*.*?\|\s*"  # Percent + bar
-        r"(?P<done>[\d\.]+[kMGTP]?)/(?P<total>[\d\.]+[kMGTP]?)\s*"  # Done/Total with units
-        r"\[(?P<elapsed>[0-9:]+)<(?P<eta>[0-9:?\-]+)\]"  # Elapsed and ETA
+        r"^Downloading\s+(?P<filename>.+?):\s*"
+        r"(?P<percent>\d+)%\|\s*.*?\|\s*"
+        r"(?P<done>[\d\.]+[kMGTP]?)/(?P<total>[\d\.]+[kMGTP]?)\s*"
+        r"\[(?P<elapsed>[0-9:]+)<(?P<eta>[0-9:?\-]+)\]"
     )
+
     with st.container():
         progress_bars_info = {}
         non_progress_lines = []
+
         if log_path.exists():
             with log_path.open("r") as f:
                 lines = f.readlines()
+
             for line in lines:
                 line = line.strip()
+
                 m = batch_re.search(line)
                 if m:
                     desc = "Concurrent Downloads"
@@ -50,6 +62,7 @@ def show_live_logs(log_path="nohup.out"):
                         "percent": percent,
                     }
                     continue
+
                 m = download_re.search(line)
                 if m:
                     desc = m.group("filename").strip()
@@ -62,25 +75,174 @@ def show_live_logs(log_path="nohup.out"):
                         "percent": percent,
                     }
                     continue
-                # Collect non-matching lines to display as plain logs if wanted
+
                 if line:
                     non_progress_lines.append(line)
-        # Render all detected progress bars
-        for desc, pb in progress_bars_info.items():
+
+        for _, pb in progress_bars_info.items():
             st.write(pb["label"])
             st.progress(pb["percent"])
-        # Optionally, display last 4 non-progress lines for context
+
         if non_progress_lines:
             st.markdown("#### Recent Logs")
-            for l in non_progress_lines[-4:]:
+            for l in non_progress_lines[-6:]:
                 st.write(l)
 
 
-def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10, tiles_gdf=None):
-    # Create the base map
-    m = folium.Map(
-        location=[center_lat, center_lng], zoom_start=zoom, tiles="OpenStreetMap"
-    )
+# -------------------------
+# Tiles + geometry helpers
+# -------------------------
+def _load_sentinel2_tiles(shapefile_path: str) -> Optional[gpd.GeoDataFrame]:
+    p = Path(shapefile_path)
+    if not p.exists():
+        st.warning(
+            "Sentinel-2 tiles shapefile not found.\n\n"
+            f"Expected: `{shapefile_path}`\n\n"
+            "Create it by placing the shapefile pack here (at minimum: .shp .shx .dbf .prj)."
+        )
+        return None
+
+    try:
+        gdf = gpd.read_file(shapefile_path)
+
+        # Ensure geometry
+        if gdf is None or gdf.empty:
+            st.warning("Sentinel-2 tiles file loaded but appears empty.")
+            return None
+
+        # Ensure CRS is EPSG:4326 for folium/shapely lat/lon
+        if gdf.crs is None:
+            # If unknown, assume WGS84; adjust if your dataset is different.
+            gdf = gdf.set_crs(epsg=4326)
+        else:
+            gdf = gdf.to_crs(epsg=4326)
+
+        return gdf
+    except Exception as e:
+        st.warning(f"Failed to load Sentinel-2 tiles shapefile: {e}")
+        return None
+
+
+def _tile_name_column(gdf: gpd.GeoDataFrame) -> Optional[str]:
+    candidates = ["Name", "name", "TILE_ID", "tile_id", "utm_zone", "MGRS_TILE", "mgrs"]
+    for c in candidates:
+        if c in gdf.columns:
+            return c
+    # last resort: any string column
+    for c in gdf.columns:
+        if c != "geometry" and gdf[c].dtype == object:
+            return c
+    return None
+
+
+def _parse_map_drawings(map_data) -> List[Polygon]:
+    polys: List[Polygon] = []
+    if not map_data:
+        return polys
+
+    drawings = map_data.get("all_drawings") or []
+    for feat in drawings:
+        try:
+            geom = feat.get("geometry")
+            if not geom:
+                continue
+
+            gtype = geom.get("type")
+            if gtype == "Polygon":
+                # GeoJSON coords are [lng, lat]
+                coords = geom["coordinates"][0]
+                poly = Polygon(coords)
+                if poly.is_valid and not poly.is_empty:
+                    polys.append(poly)
+
+            # Some Draw plugins may label rectangles as Polygon anyway; ignore custom "Rectangle" type.
+        except Exception:
+            continue
+
+    return polys
+
+
+def _compute_intersections(
+    aoi_polys: List[Polygon],
+    tiles_gdf: Optional[gpd.GeoDataFrame],
+) -> Tuple[List[str], Optional[gpd.GeoDataFrame]]:
+    if tiles_gdf is None or not aoi_polys:
+        return [], None
+
+    name_col = _tile_name_column(tiles_gdf)
+    if name_col is None:
+        st.warning("Tiles file has no usable name/id column; cannot list tile names.")
+        return [], None
+
+    # Union AOI to reduce intersection calls
+    aoi_union = shapely.union_all(aoi_polys)
+
+    try:
+        # Spatial filter (fast path if spatial index available)
+        candidates = tiles_gdf[tiles_gdf.intersects(aoi_union)]
+        if candidates.empty:
+            return [], candidates
+
+        tile_names = candidates[name_col].astype(str).unique().tolist()
+        tile_names.sort()
+        return tile_names, candidates
+    except Exception:
+        return [], None
+
+
+def _square_wkt(center_lat: float, center_lng: float, side_km: float) -> str:
+    # Approx conversion: 1 deg lat ~ 111 km; 1 deg lon ~ 111 km * cos(lat)
+    half_km = side_km / 2.0
+    dlat = half_km / 111.0
+    dlon = half_km / (111.0 * max(0.05, abs(shapely.cos(shapely.radians(center_lat)))))
+
+    # WKT expects (lng lat)
+    lng1, lng2 = center_lng - dlon, center_lng + dlon
+    lat1, lat2 = center_lat - dlat, center_lat + dlat
+    poly = Polygon([(lng1, lat1), (lng2, lat1), (lng2, lat2), (lng1, lat2), (lng1, lat1)])
+    return poly.wkt
+
+
+def _parse_text_geometry(text: str) -> Optional[shapely.Geometry]:
+    if not text or not text.strip():
+        return None
+    t = text.strip()
+
+    # GeoJSON
+    if t.startswith("{"):
+        try:
+            import json
+            obj = json.loads(t)
+            # Feature / FeatureCollection / Geometry
+            if "type" in obj and obj["type"] == "Feature":
+                return shape(obj["geometry"])
+            if "type" in obj and obj["type"] == "FeatureCollection":
+                # take union of all geometries
+                geoms = [shape(f["geometry"]) for f in obj.get("features", []) if f.get("geometry")]
+                if not geoms:
+                    return None
+                return shapely.union_all(geoms)
+            return shape(obj)
+        except Exception:
+            return None
+
+    # WKT
+    try:
+        return shapely_wkt.loads(t)
+    except Exception:
+        return None
+
+
+def _build_map(
+    center_lat: float,
+    center_lng: float,
+    zoom: int,
+    aoi_geom: Optional[shapely.Geometry],
+    tiles_intersects_gdf: Optional[gpd.GeoDataFrame],
+    show_tiles_layer: bool,
+) -> folium.Map:
+    m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom, tiles="OpenStreetMap")
+
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri",
@@ -89,16 +251,27 @@ def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10, tiles_gdf=None):
         control=True,
     ).add_to(m)
 
-    # Add tile boundaries if available
-    if tiles_gdf is not None:
+    plugins.Fullscreen(position="topleft").add_to(m)
+    plugins.MousePosition(position="bottomleft").add_to(m)
+    plugins.Geocoder(position="topright", collapsed=True).add_to(m)
+
+    # AOI (current)
+    if aoi_geom is not None and not aoi_geom.is_empty:
         folium.GeoJson(
-            tiles_gdf,
-            name="All Tiles",
-            style_function=lambda x: {"color": "gray", "weight": 1, "fillOpacity": 0},
+            mapping(aoi_geom),
+            name="AOI",
+            style_function=lambda _: {"color": "#fbbf24", "weight": 3, "fillOpacity": 0.15},
         ).add_to(m)
 
-    # Add drawing tools
-    draw = folium.plugins.Draw(
+    # Intersecting tiles only (recommended)
+    if tiles_intersects_gdf is not None and not tiles_intersects_gdf.empty and show_tiles_layer:
+        folium.GeoJson(
+            tiles_intersects_gdf,
+            name="Intersecting Tiles",
+            style_function=lambda _: {"color": "#3b82f6", "weight": 2, "fillOpacity": 0.05},
+        ).add_to(m)
+
+    draw = plugins.Draw(
         export=False,
         position="topleft",
         draw_options={
@@ -113,86 +286,88 @@ def create_drawing_map(center_lat=0.0, center_lng=0.0, zoom=10, tiles_gdf=None):
     )
     draw.add_to(m)
 
-    # Add layer control
     folium.LayerControl().add_to(m)
-
     return m
 
 
+# -------------------------
+# Init
+# -------------------------
 def init():
-    # Load the shapefile
+    # Keep EXACT same path your code expects (no path change)
     shapefile_path = "data/Sentinel-2-tiles/sentinel_2_index_shapefile.shp"
-    sentinel2_tiles = gpd.read_file(shapefile_path)
+    sentinel2_tiles = _load_sentinel2_tiles(shapefile_path)
     return {"SENTINEL-2": sentinel2_tiles}
 
 
-# ---------- PAGE CONFIG ----------
+# -------------------------
+# Page config + state
+# -------------------------
 st.set_page_config(page_title="Satellite Imagery Downloader", layout="wide")
-# Here you would call the function to download products based on the selected options
+
 configuration = ConfigLoader(config_file_path="config.yaml")
 logger.info("Configuration loaded successfully.")
-# Initialize session state
-if "geometry" not in st.session_state:
-    st.session_state["geometry"] = ""
 
-# ---------- CUSTOM SVG ----------
-satellite_icon_svg = """
-    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" 
-    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" 
-    stroke-linecap="round" stroke-linejoin="round">
-    <path d="M13 7 9 3 5 7l4 4"></path>
-    <path d="m17 11 4 4-4 4-4-4"></path>
-    <path d="m8 12 4 4 6-6-4-4Z"></path>
-    <path d="m16 8 3-3"></path>
-    <path d="M9 21a6 6 0 0 0-6-6"></path>
-    </svg>
-"""
+today = dt.date.today()
 
-geometry_icon_svg = """
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-map-pin h-5 w-5"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"></path><circle cx="12" cy="10" r="3"></circle></svg>
-"""
+if "geometry_text" not in st.session_state:
+    st.session_state["geometry_text"] = ""
+if "intersecting_tiles" not in st.session_state:
+    st.session_state["intersecting_tiles"] = []
+if "start_date" not in st.session_state:
+    st.session_state["start_date"] = today - dt.timedelta(days=7)
+if "end_date" not in st.session_state:
+    st.session_state["end_date"] = today
+if "map_center" not in st.session_state:
+    st.session_state["map_center"] = (48.8566, 2.3522)  # default: Paris
+if "map_zoom" not in st.session_state:
+    st.session_state["map_zoom"] = 8
+if "last_aoi_wkt" not in st.session_state:
+    st.session_state["last_aoi_wkt"] = ""
 
-calendar_icon_svg = """
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-calendar h-5 w-5"><path d="M8 2v4"></path><path d="M16 2v4"></path><rect width="18" height="18" x="3" y="4" rx="2"></rect><path d="M3 10h18"></path></svg>"""
 
-sat_tiles = init()
-
-# ---------- CSS STYLES ----------
+# -------------------------
+# UI styling
+# -------------------------
 st.markdown(
     """
     <style>
-    /* Card styling */
-    .card {
-        background-color: white;
-        border-radius: 15px;
-        padding: 20px;
-        margin-bottom: 20px;
-        box-shadow: 0px 2px 5px rgba(0,0,0,0.5);
-    }
-
-    /* Section headers */
-    .section-title {
-        font-weight: 600;
-        font-size: 1.1rem;
-        margin-bottom: 8px;
-    }
-    .section-subtitle {
-        font-size: 0.85rem;
-        color: #777;
-        margin-bottom: 15px;
-    }
-
-    /* Input fields */
-    .stTextInput input, .stDateInput input, textarea, select {
-        border-radius: 8px !important;
-    }
+      :root { --card: rgba(255,255,255,0.92); --border: rgba(0,0,0,0.08); }
+      .app-title { font-size: 1.35rem; font-weight: 700; }
+      .app-sub { color: rgba(0,0,0,0.55); margin-top: -6px; }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 16px 16px 10px 16px;
+        box-shadow: 0 6px 20px rgba(0,0,0,0.06);
+        margin-bottom: 14px;
+      }
+      .section-title { font-weight: 650; font-size: 1.05rem; margin-bottom: 6px; }
+      .section-subtitle { font-size: 0.85rem; color: rgba(0,0,0,0.55); margin-bottom: 10px; }
+      .muted { color: rgba(0,0,0,0.6); font-size: 0.9rem; }
+      .stTextInput input, .stDateInput input, textarea, select { border-radius: 10px !important; }
+      .stButton > button { border-radius: 12px; padding: 0.55rem 0.9rem; }
     </style>
-""",
+    """,
     unsafe_allow_html=True,
 )
 
-# ---------- VARIABLES ----------
-# Provider → Satellite mapping
+hdr_l, hdr_r = st.columns([3, 1])
+with hdr_l:
+    st.markdown('<div class="app-title">Satellite Imagery Downloader</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="app-sub">Draw or paste an AOI, pick a time range, and download products.</div>',
+        unsafe_allow_html=True,
+    )
+with hdr_r:
+    st.write("")
+    st.write("")
+
+
+# -------------------------
+# Providers / satellites
+# -------------------------
 satellite_options = {
     "Copernicus": ["SENTINEL-1", "SENTINEL-2", "SENTINEL-3", "SENTINEL-5P"],
     "USGS": ["landsat_ot_c2_l1", "landsat_ot_c2_l2"],
@@ -221,8 +396,7 @@ satellite_options = {
         "USGS/SRTMGL1_003",
     ],
 }
-# Product types for each satellite
-# This can be extended based on actual product types available for each satellite
+
 product_types_options = {
     "SENTINEL-1": ["RAW", "GRD", "SLC", "IW_SLC__1S"],
     "SENTINEL-2": ["S2MSI1C", "S2MSI2A"],
@@ -255,182 +429,246 @@ product_types_options = {
     "landsat_ot_c2_l2": ["8L2SP", "8L2SR", "9L2SP", "9L2SR"],
 }
 
-# ---------- TABS ----------
+
+# -------------------------
+# Load tiles
+# -------------------------
+sat_tiles = init()
+
+
+# -------------------------
+# Tabs
+# -------------------------
 tabs = st.tabs(["Configuration", "Results", "Settings"])
 
 with tabs[0]:
-    with st.container(border=True):
-        # Provider & Satellite Selection
-        st.markdown(
-            f'<div class="section-title">{satellite_icon_svg} Provider & Satellite Selection</div>',
-            unsafe_allow_html=True,
+    # Provider & Satellite
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Provider & Satellite</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-subtitle">Choose your provider, satellite and product type.</div>',
+        unsafe_allow_html=True,
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        provider = st.selectbox("Provider", list(satellite_options.keys()))
+    with c2:
+        satellite = st.selectbox("Satellite", satellite_options.get(provider, []))
+    with c3:
+        product_type = st.selectbox("Product Type", product_types_options.get(satellite, []))
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # AOI
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Area of Interest</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-subtitle">Draw on map, paste WKT/GeoJSON, or create a preset square (Copernicus-like).</div>',
+        unsafe_allow_html=True,
+    )
+
+    aoi_mode = st.radio(
+        "AOI input method",
+        ["Draw on map", "Preset square", "Paste WKT/GeoJSON"],
+        horizontal=True,
+    )
+
+    # Tiles only for Sentinel-2
+    tiles_gdf = sat_tiles.get("SENTINEL-2") if satellite == "SENTINEL-2" else None
+
+    # Preset square
+    if aoi_mode == "Preset square":
+        cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 1])
+        with cc1:
+            center_lat = st.number_input("Center lat", value=float(st.session_state["map_center"][0]), format="%.6f")
+        with cc2:
+            center_lng = st.number_input("Center lng", value=float(st.session_state["map_center"][1]), format="%.6f")
+        with cc3:
+            side_km = st.number_input("Square side (km)", min_value=0.1, value=25.0, step=5.0)
+        with cc4:
+            if st.button("Use this square"):
+                sq_wkt = _square_wkt(center_lat, center_lng, side_km)
+                st.session_state["geometry_text"] = sq_wkt
+                st.session_state["last_aoi_wkt"] = sq_wkt
+
+        st.session_state["map_center"] = (center_lat, center_lng)
+
+    # Paste
+    if aoi_mode == "Paste WKT/GeoJSON":
+        st.session_state["geometry_text"] = st.text_area(
+            "WKT or GeoJSON",
+            value=st.session_state.get("geometry_text", ""),
+            height=110,
         )
-        st.markdown(
-            '<div class="section-subtitle">Choose your satellite data provider and specific satellite</div>',
-            unsafe_allow_html=True,
+
+    # Draw on map
+    aoi_geom = _parse_text_geometry(st.session_state.get("geometry_text", ""))
+
+    show_tiles_layer = st.toggle(
+        "Show intersecting Sentinel-2 tiles on the map",
+        value=True,
+        help="Only works for Sentinel-2 if tiles shapefile is available.",
+    )
+
+    center_lat, center_lng = st.session_state["map_center"]
+    zoom = st.session_state["map_zoom"]
+
+    # If we already have an AOI text geometry, compute intersects
+    tile_names, intersects_gdf = _compute_intersections(
+        [aoi_geom] if aoi_geom is not None and aoi_geom.geom_type in ["Polygon", "MultiPolygon"] else [],
+        tiles_gdf,
+    )
+
+    # Map (draw mode)
+    if aoi_mode == "Draw on map":
+        # Build map without drawings first
+        m = _build_map(
+            center_lat=center_lat,
+            center_lng=center_lng,
+            zoom=zoom,
+            aoi_geom=aoi_geom,
+            tiles_intersects_gdf=intersects_gdf,
+            show_tiles_layer=show_tiles_layer,
         )
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            provider = st.selectbox("Provider", list(satellite_options.keys()))
-        with col2:
-            satellite = st.selectbox("Satellite", satellite_options.get(provider, []))
-        with col3:
-            product_type = st.selectbox(
-                "Product Type", product_types_options.get(satellite, [])
-            )
-    with st.container(border=True):
-        # Geographic Area
-        tiles_gdf = sat_tiles.get(satellite)
-        drawing_map = create_drawing_map(
-            center_lat=12.193479,
-            center_lng=123.326770,
-            zoom=5,
-            tiles_gdf=tiles_gdf,
-        )
-        st.markdown(
-            f'<div class="section-title">{geometry_icon_svg} Geographic Area</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            '<div class="section-subtitle">Define the area of interest using GeoJSON or WKT format</div>',
-            unsafe_allow_html=True,
-        )
-        # Display the map and capture interactions
+
         map_data = st_folium(
-            drawing_map,
+            m,
             key="drawing_map",
             width="100%",
-            height=500,
+            height=520,
             returned_objects=["all_drawings"],
         )
-        # Process and display polygon data
-        if map_data["all_drawings"] is not None and len(map_data["all_drawings"]) > 0:
-            # Extract polygons from the drawing data
-            current_polygons = []
-            for feature in map_data["all_drawings"]:
-                if feature["geometry"]["type"] in ["Polygon", "Rectangle"]:
-                    coordinates = feature["geometry"]["coordinates"][
-                        0
-                    ]  # Get outer ring
-                    current_polygons.append(
-                        {
-                            "type": feature["geometry"]["type"],
-                            "coordinates": coordinates,
-                            "properties": feature.get("properties", {}),
-                        }
-                    )
 
-            # Create Shapely polygons and get WKT strings
-            wkt_polygons = []
-            for poly_info in current_polygons:
-                try:
-                    polygon = Polygon(poly_info["coordinates"])
-                    wkt_polygons.append(polygon.wkt)
-                except ValueError as e:
-                    wkt_polygons.append(f"# Error creating polygon: {e}")
+        # Parse drawings into polygons
+        drawn_polys = _parse_map_drawings(map_data)
 
-            # Update session state
-            st.session_state.polygons = current_polygons
-            st.session_state.polygons_wkt = wkt_polygons
+        if drawn_polys:
+            # Persist AOI = union of drawn polygons
+            aoi_union = shapely.union_all(drawn_polys)
+            st.session_state["last_aoi_wkt"] = aoi_union.wkt
+            st.session_state["geometry_text"] = aoi_union.wkt
+            aoi_geom = aoi_union
 
-            # Find intersecting tiles
-            tiles_gdf = sat_tiles.get(satellite)
-            intersecting_tiles = []
-            if tiles_gdf is not None:
-                for poly_info in current_polygons:
-                    try:
-                        polygon = Polygon(poly_info["coordinates"])
-                        intersects = tiles_gdf[tiles_gdf.intersects(polygon)]
-                        intersecting_tiles.extend(intersects["Name"].tolist())
-                    except ValueError:
-                        pass
-            st.session_state.intersecting_tiles = list(set(intersecting_tiles))
+            tile_names, intersects_gdf = _compute_intersections(drawn_polys, tiles_gdf)
 
-            # Add intersecting tiles layer to the map
-            if intersecting_tiles:
-                intersects_gdf = tiles_gdf[tiles_gdf["Name"].isin(intersecting_tiles)]
-                folium.GeoJson(
-                    intersects_gdf,
-                    name="Intersecting Tiles",
-                    style_function=lambda x: {
-                        "color": "red",
-                        "weight": 3,
-                        "fillColor": "red",
-                        "fillOpacity": 0.3,
-                    },
-                ).add_to(drawing_map)
-                # Update the map display with intersecting tiles
-                st_folium(
-                    drawing_map,
-                    key="drawing_map",
-                    width="100%",
-                    height=500,
-                    returned_objects=["all_drawings"],
-                )
+    # Geometry text area (always visible, reflects current AOI)
+    if st.session_state.get("geometry_text"):
+        st.text_area(
+            "AOI (WKT/GeoJSON used for download)",
+            value=st.session_state["geometry_text"],
+            height=110,
+            key="aoi_display",
+        )
+    else:
+        st.text_area(
+            "AOI (WKT/GeoJSON used for download)",
+            value="No AOI yet. Draw a polygon/rectangle, paste WKT/GeoJSON, or use a preset square.",
+            height=110,
+            key="aoi_empty",
+        )
 
-            # Display WKT data in text area
-            if wkt_polygons:
-                geometries = st.text_area(
-                    "Polygons in WKT or GeoJSON",
-                    value="\n".join(wkt_polygons),
-                    height=100,
-                    key="polygon_data",
-                )
-            else:
-                geometries = st.text_area(
-                    "Polygons in WKT or GeoJSON",
-                    value="No polygons drawn yet. Start drawing on the map!",
-                    height=100,
-                    key="empty_polygon_data",
-                )
+    # Tile results (Sentinel-2)
+    if satellite == "SENTINEL-2":
+        if tiles_gdf is None:
+            st.info("Sentinel-2 tiles overlay is disabled because the tiles shapefile is missing or failed to load.")
         else:
-            geometries = st.text_area(
-                "Polygons in WKT or GeoJSON",
-                value="No polygons drawn yet. Start drawing on the map!",
-                height=100,
-                key="no_polygon_data",
-            )
-
-    with st.container(border=True):
-        # Time Range
-        st.markdown(
-            f'<div class="section-title">{calendar_icon_svg} Time Range</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            '<div class="section-subtitle">Specify the date range for satellite imagery</div>',
-            unsafe_allow_html=True,
-        )
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("Start Date")
-        with col2:
-            end_date = st.date_input("End Date")
-    with st.container(border=False, horizontal_alignment="center"):
-        # Download Button
-        if st.button("Download Products"):
-            if not geometries:
-                st.error("Please provide a valid geometry.")
-            elif not start_date or not end_date:
-                st.error("Please specify both start and end dates.")
+            if tile_names:
+                st.markdown("**Intersecting tiles**")
+                st.write(", ".join(tile_names))
             else:
-                # save the geometry in file depending on the kind wkt or geojson
-                if geometries.strip().startswith("{"):
-                    # GeoJSON format
-                    with open("example_aoi.geojson", "w") as geojson_file:
-                        geojson_file.write(geometries)
-                else:
-                    # WKT format
-                    with open("example_aoi.wkt", "w") as wkt_file:
-                        wkt_file.write(geometries)
-                # empty nohup.out file
-                open("nohup.out", "w").close()
-                # call the cli script with the appropriate arguments
-                os.system(
-                    f"nohup python cli.py --provider {provider.lower()} --collection {satellite.split(' ')[0]} --product-type {product_type} --start-date {start_date} --end-date {end_date} &"
-                )
-                # Show logs live like tail -f
-                show_live_logs()
+                st.markdown('<span class="muted">No intersecting tiles detected (or no AOI).</span>', unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Time Range
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Time Range</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-subtitle">Start date must be ≤ end date. Dates cannot be in the future.</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Date constraints:
+    # - start_date max = today
+    # - end_date max = today
+    # - end_date min = start_date
+    # - if start_date > end_date, auto-fix end_date = start_date
+    d1, d2 = st.columns(2)
+    with d1:
+        start_date = st.date_input(
+            "Start Date",
+            value=st.session_state["start_date"],
+            max_value=today,
+            key="start_date_input",
+        )
+    with d2:
+        end_date = st.date_input(
+            "End Date",
+            value=st.session_state["end_date"],
+            min_value=start_date,
+            max_value=today,
+            key="end_date_input",
+        )
+
+    # Persist + safety
+    if end_date < start_date:
+        end_date = start_date
+        st.session_state["end_date_input"] = end_date
+        st.warning("End Date was before Start Date; it has been adjusted.")
+
+    st.session_state["start_date"] = start_date
+    st.session_state["end_date"] = end_date
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Download
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Download</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-subtitle">This runs the CLI in background and streams logs from <code>nohup.out</code>.</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Build CLI command preview (Copernicus-like)
+    aoi_text = st.session_state.get("geometry_text", "").strip()
+    aoi_is_geojson = aoi_text.startswith("{")
+    aoi_file = "example_aoi.geojson" if aoi_is_geojson else "example_aoi.wkt"
+
+    cli_cmd = (
+        f"python cli.py "
+        f"--provider {provider.lower()} "
+        f"--collection {satellite.split(' ')[0]} "
+        f"--product-type {product_type} "
+        f"--start-date {start_date} "
+        f"--end-date {end_date} "
+        f"--aoi_file {aoi_file}"
+    )
+
+    st.code(cli_cmd, language="bash")
+
+    if st.button("Download Products", use_container_width=True):
+        if not aoi_text:
+            st.error("Please provide a valid AOI (draw/paste/preset square).")
+        elif not start_date or not end_date:
+            st.error("Please specify both start and end dates.")
+        else:
+            # Save AOI to file (WKT or GeoJSON)
+            if aoi_is_geojson:
+                with open(aoi_file, "w") as f:
+                    f.write(aoi_text)
+            else:
+                with open(aoi_file, "w") as f:
+                    f.write(aoi_text)
+
+            # Reset log file
+            open("nohup.out", "w").close()
+
+            # Run CLI in background
+            os.system(f"nohup {cli_cmd} &")
+
+            # Live logs
+            show_live_logs()
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with tabs[1]:
 
@@ -454,7 +692,6 @@ with tabs[1]:
     )
 
 with tabs[2]:
-    # show the content of config.yaml
     with open("config.yaml", "r") as config_file:
         config_content = config_file.read()
     st.code(config_content, language="yaml")
