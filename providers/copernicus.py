@@ -1,6 +1,7 @@
 import asyncio
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 import requests
@@ -11,225 +12,192 @@ from providers.provider_base import ProviderBase
 from utilities import ConfigLoader, DownloadManager, OCIFSManager
 
 
+def _date_list(start: str, end: str) -> List[Tuple[str, str]]:
+    """Generate one-day (start, end) intervals between two dates (inclusive)."""
+    start_dt = datetime.strptime(start, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end, "%Y-%m-%d").date()
+    ranges = []
+    curr = start_dt
+    while curr <= end_dt:
+        day_start = curr.strftime("%Y-%m-%d")
+        day_end = (curr + timedelta(days=1)).strftime("%Y-%m-%d")
+        ranges.append((day_start, day_end))
+        curr += timedelta(days=1)
+    return ranges
+
+
+def _download_one_day(args) -> int:
+    """
+    Worker function for download_date_range().  Instantiates a new Copernicus
+    instance, effectue la recherche pour un jour et télécharge les produits.
+    """
+    (
+        config_path,
+        collection,
+        product_type,
+        day_start,
+        day_end,
+        aoi,
+        tile_id,
+        max_concurrent,
+        output_dir,
+    ) = args
+    config_loader = ConfigLoader(config_file_path=config_path)
+    provider = Copernicus(config_loader=config_loader, max_concurrent=max_concurrent)
+    product_ids = provider.search_products(
+        collection=collection,
+        product_type=product_type,
+        start_date=day_start,
+        end_date=day_end,
+        aoi=aoi,
+        tile_id=tile_id,
+    )
+    if not product_ids:
+        return 0
+    provider.download_products(product_ids, output_dir=output_dir)
+    return len(product_ids)
+
+
 class Copernicus(ProviderBase):
     """
-    Provider for interacting with the Copernicus Data Space Ecosystem (CDSE).
-
-    This class provides authentication, search, and download functionality for the Copernicus
-    satellite image catalogue. It handles OAuth2 authentication, product queries, and file downloads.
-
-    Attributes:
-        base_url (str): Base catalogue URL for CDSE API.
-        token_url (str): OAuth2 token endpoint.
-        download_url (str): File download endpoint.
-        username (str): Copernicus account username.
-        password (str): Copernicus account password.
-        access_token (str): OAuth2 access token.
-        session (requests.Session): HTTP session for requests.
-        download_manager (DownloadManager): Download manager for handling file downloads.
+    Accès aux produits de la Copernicus Data Space.  Supporte la recherche et
+    le téléchargement en mode concurrent.  Respecte la limite de quatre
+    connexions simultanées pour les utilisateurs généraux:contentReference[oaicite:1]{index=1}.
     """
 
-    def __init__(self, config_loader: ConfigLoader, ocifs_manager: OCIFSManager = None):
-        """
-        Initialize Copernicus provider from the given config loader.
-
-        Args:
-            config_loader (ConfigLoader): Loads configuration for credentials and URLs.
-        Raises:
-            ValueError: If username or password is missing in configuration.
-        """
-        # Load required URLs from config
+    def __init__(
+        self,
+        config_loader: ConfigLoader,
+        ocifs_manager: OCIFSManager = None,
+        max_concurrent: Optional[int] = None,
+    ):
+        # URL de base, URL du token et URL de téléchargement
         self.base_url = config_loader.get_var("providers.copernicus.base_urls.base_url")
-        self.token_url = config_loader.get_var(
-            "providers.copernicus.base_urls.token_url"
-        )
-        self.download_url = config_loader.get_var(
-            "providers.copernicus.base_urls.download_url"
-        )
+        self.token_url = config_loader.get_var("providers.copernicus.base_urls.token_url")
+        self.download_url = config_loader.get_var("providers.copernicus.base_urls.download_url")
 
-        # Load credentials
-        self.username = config_loader.get_var(
-            "providers.copernicus.credentials.cdse_username"
-        )
-        self.password = config_loader.get_var(
-            "providers.copernicus.credentials.cdse_password"
-        )
-
-        # Check for missing credentials
+        # Identifiants
+        self.username = config_loader.get_var("providers.copernicus.credentials.cdse_username")
+        self.password = config_loader.get_var("providers.copernicus.credentials.cdse_password")
         if not self.username or not self.password:
-            logger.error("Username or password is not set in the configuration file.")
-            raise ValueError(
-                "Please set cdse_username and cdse_password in your config.yaml file"
-            )
+            raise ValueError("Missing Copernicus credentials in config.yaml")
 
-        self.max_retries = config_loader.get_var("download_manager.max_retries")
-        self.initial_delay = config_loader.get_var("download_manager.initial_delay")
-        self.backoff_factor = config_loader.get_var("download_manager.backoff_factor")
+        # Gestionnaire de téléchargement
+        self.download_manager = DownloadManager(config_loader=config_loader, ocifs_manager=ocifs_manager)
 
-        # Obtain access token on init
+        # Si max_concurrent est fourni, on écrase la configuration par défaut
+        if max_concurrent:
+            self.download_manager.max_concurrent = max_concurrent
+
+        # Paramètres de retry du DownloadManager utilisés pour fetch_product_infos()
+        self.max_retries = config_loader.get_var("download_manager.max_retries", 5)
+        self.initial_delay = config_loader.get_var("download_manager.initial_delay", 2)
+        self.backoff_factor = config_loader.get_var("download_manager.backoff_factor", 1.5)
+
+        # Création de la session HTTP et obtention du token
+        self.session = requests.Session()
         logger.info("Obtaining access token for Copernicus provider.")
         self.access_token = self.get_access_token()
-        self.download_manager = DownloadManager(
-            config_loader=config_loader, ocifs_manager=ocifs_manager
-        )
-        self.session = requests.Session()
 
     def get_access_token(self) -> str:
-        """
-        Obtain OAuth2 access token from Copernicus Identity Service.
-
-        Returns:
-            str: Access token string.
-
-        Raises:
-            requests.exceptions.RequestException: If token acquisition fails.
-        """
-        # Prepare required parameters for OAuth2 password flow
+        """Authenticate against the Copernicus API and return the access token."""
         data = {
             "client_id": "cdse-public",
             "username": self.username,
             "password": self.password,
             "grant_type": "password",
         }
-
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        try:
-            logger.info("Requesting OAuth2 token from Copernicus Identity Service.")
-            response = requests.post(self.token_url, data=data, headers=headers)
-            response.raise_for_status()
-
-            token_data = response.json()
-            self.access_token = token_data["access_token"]
-
-            logger.info("Successfully obtained access token")
-            return self.access_token
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get access token: {e}")
-            if hasattr(e.response, "text"):
-                logger.error(f"Response: {e.response.text}")
-            raise
+        response = requests.post(self.token_url, data=data, headers=headers)
+        response.raise_for_status()
+        token_data = response.json()
+        self.access_token = token_data["access_token"]
+        return self.access_token
 
     def search_products(
         self,
         collection: str = "SENTINEL-2",
         product_type: str = "S2MSI2A",
-        start_date: str = None,
-        end_date: str = None,
-        aoi: Polygon = None,
-        tile_id: str = None,
-    ) -> List[Dict]:
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        aoi: Optional[Polygon] = None,
+        tile_id: Optional[str] = None,
+    ) -> List[str]:
         """
-        Search for products in the Copernicus catalogue by collection, date, type, and AOI.
-
-        Args:
-            collection (str, optional): Satellite collection name. Defaults to "SENTINEL-2".
-            product_type (str, optional): Specific product type. Defaults to "S2MSI2A".
-            start_date (str, optional): Search start date (YYYY-MM-DD). Defaults to 30 days ago.
-            end_date (str, optional): Search end date (YYYY-MM-DD). Defaults to today.
-            aoi (Polygon, optional): Area of interest as a Shapely Polygon.
-
-        Returns:
-            List[Dict]: List of product IDs found in the Copernicus catalogue.
-
-        Raises:
-            requests.exceptions.RequestException: If the search request fails.
+        Requête OData pour obtenir les identifiants de produits.  Si les
+        paramètres date ou aoi sont omis, l’intervalle couvre les 30 derniers
+        jours.
         """
-        # Set default date range if none provided
         if not start_date:
             start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
         if not end_date:
             end_date = datetime.now().strftime("%Y-%m-%d")
 
-        # Build the query filter for OData API
         query_params = {
             "$filter": (
                 f"Collection/Name eq '{collection}' "
                 f"and ContentDate/Start gt '{start_date}T00:00:00Z' "
                 f"and ContentDate/Start lt '{end_date}T23:59:59Z'"
-            )
+            ),
+            "$orderby": "ContentDate/Start desc",
+            "$top": "1000",
         }
 
-        # Restrict by product type if specified
         if product_type:
             query_params["$filter"] += (
-                f" and Attributes/OData.CSC.StringAttribute/any("
-                f"att:att/Name eq 'productType' and "
+                " and Attributes/OData.CSC.StringAttribute/any("
+                "att:att/Name eq 'productType' and "
                 f"att/OData.CSC.StringAttribute/Value eq '{product_type}')"
             )
 
-        # Add AOI filter in WKT format (if provided)
         if tile_id:
-            query_params[
-                "$filter"
-            ] += f" and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'tileId' and att/OData.CSC.StringAttribute/Value eq '{tile_id}')"
+            query_params["$filter"] += (
+                " and Attributes/OData.CSC.StringAttribute/any("
+                "att:att/Name eq 'tileId' and "
+                f"att/OData.CSC.StringAttribute/Value eq '{tile_id}')"
+            )
 
         if aoi:
             query_params["$filter"] += (
-                f" and OData.CSC.Intersects(area=geography'SRID=4326;" f"{aoi.wkt}')"
+                " and OData.CSC.Intersects(area=geography'SRID=4326;"
+                f"{aoi.wkt}')"
             )
 
-        # Order results by acquisition date, most recent first, limit to 1000 results
-        query_params["$orderby"] = "ContentDate/Start desc"
-        query_params["$top"] = "1000"
-
         headers = {"Authorization": f"Bearer {self.access_token}"}
+        url = f"{self.base_url}/odata/v1/Products"
 
-        logger.info(
-            f"Searching for products in collection '{collection}' from {start_date} to {end_date}."
-        )
-        logger.debug(f"Query parameters: {query_params}")
+        response = self.session.get(url, params=query_params, headers=headers)
+        response.raise_for_status()
 
-        try:
-            url = f"{self.base_url}/odata/v1/Products"
-            logger.debug("Sending search request to Copernicus API.")
-            response = self.session.get(url, params=query_params, headers=headers)
-            response.raise_for_status()
+        data = response.json()
+        products = data.get("value", [])
+        logger.info(f"Found {len(products)} products between {start_date} and {end_date}")
+        return [p["Id"] for p in products]
 
-            data = response.json()
-            products = data.get("value", [])
-            # Log total found products by query
-            logger.info(f"Found {len(products)} products")
-            # Return list of IDs only
-            return [product["Id"] for product in products]
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Search failed: {e}")
-            raise
-
-    def download_products(
-        self, product_ids: List[str], output_dir: str = "downloads"
-    ) -> List[str]:
+    def download_products(self, product_ids: List[str], output_dir: str = "downloads") -> List[str]:
         """
-        Download the specified products using the Copernicus OData API.
-
-        Args:
-            product_ids (List[str]): List of Copernicus product IDs to download.
-            output_dir (str, optional): Output directory for saving zipped products. Defaults to "downloads".
-
-        Returns:
-            List[str]: List of downloaded file paths (if supported by DownloadManager).
+        Download multiple products concurrently.  Uses fetch_product_infos() to
+        retrieve download URLs in parallel, puis remet la main au
+        DownloadManager.
         """
-        logger.info(
-            f"Starting download for {len(product_ids)} Copernicus products to directory '{output_dir}'."
-        )
-        product_dict = {
+        logger.info(f"Starting download for {len(product_ids)} Copernicus products to '{output_dir}'.")
+        product_dict: Dict[str, List] = {
             "urls": [],
             "file_names": [],
+            "headers": {"Authorization": f"Bearer {self.access_token}"},
+            "refresh_token_callback": self.get_access_token,
         }
-        # Add authorization header with the current access token
-        product_dict["headers"] = {"Authorization": f"Bearer {self.access_token}"}
-        # Add token refresh callback for 401 handling
-        product_dict["refresh_token_callback"] = self.get_access_token
 
-        # Iterate through product IDs and prepare download URLs
-        logger.debug("Preparing download URLs for products.")
+        # Ajuster le parallélisme pour la collecte des métadonnées (maximum 10)
+        max_info_conc = min(10, max(2, int(self.download_manager.max_concurrent) * 2))
 
-        # Run the concurrent fetch
-        logger.debug("Preparing download URLs for products concurrently.")
         product_infos = asyncio.run(
             self.fetch_product_infos(
-                product_ids, self.base_url, self.download_url, product_dict["headers"]
+                product_ids=product_ids,
+                base_url=self.base_url,
+                download_url=self.download_url,
+                headers=product_dict["headers"],
+                max_concurrent=max_info_conc,
             )
         )
 
@@ -238,83 +206,101 @@ class Copernicus(ProviderBase):
                 product_dict["urls"].append(info["download_url"])
                 product_dict["file_names"].append(info["file_name"])
 
-        logger.info(
-            f"Triggering DownloadManager for {len(product_dict['urls'])} product(s)."
-        )
-        self.download_manager.download_products(product_dict, output_dir)
+        logger.info(f"Triggering DownloadManager for {len(product_dict['urls'])} product(s).")
+        return self.download_manager.download_products(product_dict, output_dir)
 
-    async def fetch_product_infos(self, product_ids, base_url, download_url, headers):
+    def download_date_range(
+        self,
+        collection: str,
+        product_type: str,
+        start_date: str,
+        end_date: str,
+        aoi: Optional[Polygon] = None,
+        tile_id: Optional[str] = None,
+        workers: int = 1,
+        concurrent_per_worker: int = 2,
+        output_dir: str = "downloads",
+        config_path: str = "config.yaml",
+    ) -> int:
         """
-        Fetch product information concurrently for multiple product IDs, with smart retries and 429 handling.
-
-        Args:
-            product_ids (List[str]): List of product IDs to fetch.
-            base_url (str): Base URL for the Copernicus API.
-            download_url (str): Download URL for the products.
-            headers (Dict[str, str]): Headers including authorization token.
-
-        Returns:
-            List[Dict]: List of dictionaries containing download URLs and file names for each product.
+        Découpe une période en jours et télécharge les produits de chaque jour
+        avec un parallélisme contrôlé.  Vérifie que workers × concurrent_per_worker ≤ 4.
         """
+        total_conc = workers * concurrent_per_worker
+        if total_conc > 4:
+            raise ValueError(
+                f"Total concurrency {total_conc} exceeds the Copernicus limit of 4 simultaneous connections"
+            )
+        day_ranges = _date_list(start_date, end_date)
+        args = [
+            (
+                config_path,
+                collection,
+                product_type,
+                day_start,
+                day_end,
+                aoi,
+                tile_id,
+                concurrent_per_worker,
+                output_dir,
+            )
+            for (day_start, day_end) in day_ranges
+        ]
+        downloaded = 0
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_download_one_day, arg) for arg in args]
+            for fut in as_completed(futures):
+                downloaded += fut.result()
+        logger.info(f"Downloaded {downloaded} products across {len(day_ranges)} day(s).")
+        return downloaded
 
-        async def fetch_with_retry(session, url, product_id):
+    async def fetch_product_infos(
+        self,
+        product_ids: List[str],
+        base_url: str,
+        download_url: str,
+        headers: Dict[str, str],
+        max_concurrent: int = 10,
+    ) -> List[Dict]:
+        """
+        Concurrent retrieval of product metadata via OData.  Limits the number
+        of simultaneous requests using aiohttp semaphores.
+        """
+        sem = asyncio.Semaphore(max_concurrent)
+        timeout = aiohttp.ClientTimeout(total=60, connect=20, sock_read=30)
+
+        async def fetch_one(session: aiohttp.ClientSession, product_id: str):
+            url = f"{base_url}/odata/v1/Products({product_id})"
             delay = self.initial_delay
             for attempt in range(1, self.max_retries + 1):
-                try:
-                    async with session.get(url) as resp:
-                        if resp.status == 429:
-                            # Too many requests, use Retry-After if present, else exponential backoff
-                            retry_after = resp.headers.get("Retry-After")
-                            if retry_after:
-                                wait_time = int(retry_after)
-                                logger.warning(
-                                    f"429 Too Many Requests for {product_id}, retry-after {wait_time}s (attempt {attempt}/{self.max_retries})"
-                                )
-                                await asyncio.sleep(wait_time)
-                            else:
-                                logger.warning(
-                                    f"429 Too Many Requests for {product_id}, exponential backoff {delay}s (attempt {attempt}/{self.max_retries})"
-                                )
+                async with sem:
+                    try:
+                        async with session.get(url) as resp:
+                            if resp.status == 429:
+                                retry_after = resp.headers.get("Retry-After")
+                                wait = int(retry_after) if retry_after else delay
+                                logger.warning(f"429 for {product_id}, wait {wait}s (attempt {attempt}/{self.max_retries})")
+                                await asyncio.sleep(wait)
+                                delay = min(delay * self.backoff_factor, 60)
+                                continue
+                            if 500 <= resp.status < 600:
+                                logger.warning(f"HTTP {resp.status} for {product_id}, retry in {delay}s")
                                 await asyncio.sleep(delay)
-                            continue
-                        elif 500 <= resp.status < 600:
-                            # Transient server error, retry
-                            logger.warning(
-                                f"HTTP {resp.status} for {product_id}, retrying in {delay}s (attempt {attempt}/{self.max_retries})"
-                            )
-                            await asyncio.sleep(delay)
-                            continue
-                        resp.raise_for_status()
-                        product_info = await resp.json()
-                        download_url_full = (
-                            f"{download_url}/odata/v1/Products({product_id})/$value"
-                        )
-                        return {
-                            "download_url": download_url_full,
-                            "file_name": f"{product_info['Name']}.zip",
-                        }
-                except aiohttp.ClientError as e:
-                    logger.warning(
-                        f"Client error for {product_id}: {e} (attempt {attempt}/{self.max_retries}), retrying in {delay}s"
-                    )
-                    await asyncio.sleep(delay)
-                except Exception as e:
-                    logger.error(
-                        f"Unexpected error for {product_id}: {e} (attempt {attempt}/{self.max_retries}), not retrying further"
-                    )
-                    break
-                delay *= self.backoff_factor
-            logger.error(
-                f"Download failed for product ID {product_id} after {self.max_retries} attempts"
-            )
+                                delay = min(delay * self.backoff_factor, 60)
+                                continue
+                            resp.raise_for_status()
+                            product_info = await resp.json()
+                            return {
+                                "download_url": f"{download_url}/odata/v1/Products({product_id})/$value",
+                                "file_name": f"{product_info['Name']}.zip",
+                            }
+                    except aiohttp.ClientError as e:
+                        logger.warning(f"Client error for {product_id}: {e} (attempt {attempt}/{self.max_retries})")
+                        await asyncio.sleep(delay)
+                        delay = min(delay * self.backoff_factor, 60)
+            logger.error(f"Failed product info for {product_id} after {self.max_retries} attempts")
             return None
 
-        async with aiohttp.ClientSession(headers=headers, trust_env=True) as session:
-            tasks = [
-                fetch_with_retry(
-                    session, f"{base_url}/odata/v1/Products({product_id})", product_id
-                )
-                for product_id in product_ids
-            ]
-            infos = await asyncio.gather(*tasks, return_exceptions=False)
-            return infos
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout, trust_env=True) as session:
+            tasks = [fetch_one(session, pid) for pid in product_ids]
+            return await asyncio.gather(*tasks, return_exceptions=False)

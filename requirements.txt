@@ -15,3 +15,5 @@ streamlit==1.54.0
 streamlit_file_browser==3.2.22
 streamlit_folium==0.26.1
 tqdm==4.66.5
+
+

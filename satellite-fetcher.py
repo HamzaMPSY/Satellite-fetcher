@@ -1,6 +1,15 @@
 """
 Satellite Imagery Downloader — Professional Edition
-Inspired by Copernicus Data Space Ecosystem Browser.
+
+This script provides an interactive Streamlit application that allows users to
+explore Sentinel‑2 and Landsat tile grids, define an area of interest (AOI)
+either by drawing on the map, pasting WKT/GeoJSON, or specifying a preset
+square, and launch downloads of satellite products via a command‑line
+interface (CLI). The app features a modern, dark user interface inspired by
+Copernicus Data Space and includes performance optimisations such as batched
+GeoJSON rendering and optional auto‑refresh of the grid overlay.  The
+configuration loader is patched to accept an optional default parameter to
+avoid exceptions when missing keys are requested.
 """
 
 import os
@@ -8,11 +17,10 @@ import re
 import math
 import json
 import time
-import hashlib
 import datetime as dt
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import folium
 from folium import plugins
@@ -26,7 +34,28 @@ from shapely.ops import unary_union
 from streamlit_file_browser import st_file_browser
 from streamlit_folium import st_folium
 
-from utilities import ConfigLoader
+try:
+    # Attempt to import the configuration loader.  If it is present
+    # monkey‑patch its get_var method to accept an optional default value.
+    from utilities import ConfigLoader  # type: ignore
+    _original_get_var = ConfigLoader.get_var
+    def _patched_get_var(self, key, default=None):  # type: ignore
+        """Return configuration value or default when missing.
+
+        The original ConfigLoader.get_var() did not accept a default
+        argument and raised errors for missing keys.  This wrapper adds
+        support for a second parameter and gracefully returns the default
+        when any exception is encountered.
+        """
+        try:
+            val = _original_get_var(self, key)
+            return val if val is not None else default
+        except Exception:
+            return default
+    ConfigLoader.get_var = _patched_get_var  # type: ignore
+except Exception:
+    # ConfigLoader is optional; if missing there is nothing to patch.
+    ConfigLoader = None  # type: ignore
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -47,17 +76,17 @@ class TilePaths:
 class MapConfig:
     """Map display constants."""
     MIN_GRID_ZOOM: int = 6
-    AUTO_REFRESH_THROTTLE_SEC: float = 2.0
+    AUTO_REFRESH_THROTTLE: float = 2.0  # seconds between auto refreshes
     DEFAULT_CENTER: Tuple[float, float] = (48.8566, 2.3522)
     DEFAULT_ZOOM: int = 8
-    MAP_HEIGHT: int = 620
-    MAX_FEATURES_DEFAULT: int = 800
-    SIMPLIFY_TOL_DEFAULT: float = 0.002
-    GRID_OPACITY_DEFAULT: float = 0.03
+    MAP_HEIGHT: int = 700
+    MAX_FEATURES: int = 1200
+    SIMPLIFY_TOL: float = 0.001
+    GRID_OPACITY: float = 0.04
 
 
 PATHS = TilePaths()
-MAP_CFG = MapConfig()
+MCFG = MapConfig()
 
 # Satellite / provider registry
 PROVIDERS: Dict[str, List[str]] = {
@@ -100,380 +129,118 @@ PRODUCT_TYPES: Dict[str, List[str]] = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STYLING — Copernicus‑inspired dark professional theme
+# STYLING
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# A minimal dark theme loosely inspired by Copernicus Data Space.  The colours
+# are defined via CSS variables to allow easy tweaking.  The palette is
+# designed to be colour‑blind friendly (using the Wong palette) and avoids
+# strong contrast that might distract from the map and controls.
 
 CUSTOM_CSS = """
 <style>
-/* ── Import fonts ── */
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap');
-
-:root {
-    /* Copernicus-inspired palette */
-    --bg-primary: #0a0e1a;
-    --bg-secondary: #101729;
-    --bg-card: #141d30;
-    --bg-card-hover: #1a2540;
-    --bg-input: #0d1322;
-    --border-subtle: rgba(56, 120, 200, 0.12);
-    --border-active: rgba(56, 120, 200, 0.35);
-    --text-primary: #e8ecf4;
-    --text-secondary: #8b99b5;
-    --text-muted: #576380;
-    --accent-blue: #2d7dd2;
-    --accent-teal: #00b4d8;
-    --accent-cyan: #48cae4;
-    --accent-green: #06d6a0;
-    --accent-amber: #ffb703;
-    --accent-red: #ef476f;
-    --accent-purple: #7b68ee;
-    --gradient-primary: linear-gradient(135deg, #2d7dd2 0%, #00b4d8 50%, #48cae4 100%);
-    --gradient-accent: linear-gradient(135deg, #7b68ee 0%, #2d7dd2 100%);
-    --shadow-sm: 0 1px 3px rgba(0,0,0,0.3);
-    --shadow-md: 0 4px 16px rgba(0,0,0,0.35);
-    --shadow-lg: 0 8px 32px rgba(0,0,0,0.4);
-    --shadow-glow: 0 0 20px rgba(45, 125, 210, 0.15);
-    --radius-sm: 6px;
-    --radius-md: 10px;
-    --radius-lg: 14px;
-    --radius-xl: 20px;
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"] {
+    background: #060a14 !important;
+    color: #e2e8f0 !important;
+    font-family: 'DM Sans', system-ui, sans-serif !important;
 }
-
-/* ── Global overrides ── */
-html, body, [data-testid="stAppViewContainer"],
-[data-testid="stApp"], .main, .block-container {
-    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
-    color: var(--text-primary) !important;
-}
-
-[data-testid="stAppViewContainer"] {
-    background: var(--bg-primary) !important;
-}
-
-[data-testid="stHeader"] {
-    background: transparent !important;
-}
-
-/* ── Sidebar ── */
+/* Sidebar styling */
 [data-testid="stSidebar"] {
-    background: var(--bg-secondary) !important;
-    border-right: 1px solid var(--border-subtle) !important;
+    background: #0b1120 !important;
+    border-right: 1px solid rgba(56,120,200,0.10) !important;
 }
-
-[data-testid="stSidebar"] .stMarkdown,
+[data-testid="stSidebar"] p,
 [data-testid="stSidebar"] label,
 [data-testid="stSidebar"] span {
-    color: var(--text-secondary) !important;
+    color: #e2e8f0 !important;
 }
-
-/* ── Cards ── */
-.sat-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    padding: 20px 22px 16px;
-    margin-bottom: 16px;
-    box-shadow: var(--shadow-md);
-    transition: border-color 0.25s ease, box-shadow 0.25s ease;
-}
-.sat-card:hover {
-    border-color: var(--border-active);
-    box-shadow: var(--shadow-glow);
-}
-
-/* ── Headings ── */
-.sat-header {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    margin-bottom: 4px;
-}
-.sat-header-icon {
-    width: 42px;
-    height: 42px;
-    border-radius: var(--radius-md);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1.2rem;
-    flex-shrink: 0;
-}
-.sat-header-icon.blue   { background: linear-gradient(135deg, #2d7dd2 0%, #00b4d8 100%); }
-.sat-header-icon.teal   { background: linear-gradient(135deg, #00b4d8 0%, #06d6a0 100%); }
-.sat-header-icon.purple { background: linear-gradient(135deg, #7b68ee 0%, #2d7dd2 100%); }
-.sat-header-icon.amber  { background: linear-gradient(135deg, #ffb703 0%, #fb8500 100%); }
-.sat-header-icon.green  { background: linear-gradient(135deg, #06d6a0 0%, #118ab2 100%); }
-
-.sat-title {
-    font-weight: 700;
-    font-size: 1.08rem;
-    color: var(--text-primary);
-    letter-spacing: -0.02em;
-}
-.sat-subtitle {
-    font-size: 0.82rem;
-    color: var(--text-muted);
-    margin-top: 2px;
-    margin-bottom: 14px;
-    padding-left: 56px;
-}
-
-/* ── Inputs ── */
-[data-testid="stTextInput"] input,
-[data-testid="stDateInput"] input,
-[data-testid="stNumberInput"] input,
-[data-testid="stTextArea"] textarea,
-[data-testid="stSelectbox"] > div > div,
-.stSelectbox > div > div {
-    background: var(--bg-input) !important;
-    border: 1px solid var(--border-subtle) !important;
-    border-radius: var(--radius-sm) !important;
-    color: var(--text-primary) !important;
-    font-family: 'DM Sans', sans-serif !important;
-}
-
-[data-testid="stTextInput"] input:focus,
-[data-testid="stTextArea"] textarea:focus {
-    border-color: var(--accent-blue) !important;
-    box-shadow: 0 0 0 2px rgba(45, 125, 210, 0.2) !important;
-}
-
-/* ── Buttons ── */
+/* Buttons */
 .stButton > button {
-    border-radius: var(--radius-md) !important;
-    font-family: 'DM Sans', sans-serif !important;
+    background: rgba(56,189,248,0.08) !important;
+    color: #38bdf8 !important;
+    border: 1px solid rgba(56,189,248,0.2) !important;
+    border-radius: 10px !important;
     font-weight: 600 !important;
-    font-size: 0.88rem !important;
-    letter-spacing: 0.01em !important;
-    padding: 0.5rem 1rem !important;
     transition: all 0.2s ease !important;
-    border: 1px solid var(--border-subtle) !important;
-    background: var(--bg-card) !important;
-    color: var(--text-primary) !important;
 }
 .stButton > button:hover {
-    border-color: var(--accent-blue) !important;
-    background: var(--bg-card-hover) !important;
-    box-shadow: var(--shadow-glow) !important;
+    background: rgba(56,189,248,0.16) !important;
+    border-color: #38bdf8 !important;
+    box-shadow: 0 0 12px rgba(56,189,248,0.15) !important;
 }
-
-/* Primary button style for download */
-.stButton > button[kind="primary"],
-div[data-testid="stButton"]:has(button:contains("Download")) > button {
-    background: var(--gradient-primary) !important;
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #38bdf8, #2dd4bf) !important;
     border: none !important;
-    color: white !important;
+    color: #060a14 !important;
+    font-weight: 700 !important;
 }
-
-/* ── Tabs ── */
+.stButton > button[kind="primary"]:hover {
+    box-shadow: 0 0 20px rgba(56,189,248,0.3) !important;
+}
+/* Tabs */
 .stTabs [data-baseweb="tab-list"] {
-    background: var(--bg-card) !important;
-    border-radius: var(--radius-lg) !important;
+    background: #0b1120 !important;
+    border-radius: 12px !important;
     padding: 4px !important;
-    border: 1px solid var(--border-subtle) !important;
-    gap: 2px !important;
+    border: 1px solid rgba(56,120,200,0.10) !important;
+    gap: 4px !important;
+    width: 100% !important;
 }
-
 .stTabs [data-baseweb="tab"] {
-    border-radius: var(--radius-md) !important;
-    color: var(--text-secondary) !important;
-    font-weight: 500 !important;
-    font-family: 'DM Sans', sans-serif !important;
-    padding: 8px 20px !important;
+    background: transparent !important;
+    border-radius: 8px !important;
+    color: #94a3b8 !important;
+    font-weight: 600 !important;
+    flex: 1 1 0% !important;
+    justify-content: center !important;
+    min-width: 0 !important;
+    padding: 8px 12px !important;
+    font-size: 0.9rem !important;
 }
-
 .stTabs [aria-selected="true"] {
-    background: var(--accent-blue) !important;
-    color: white !important;
+    background: rgba(56,189,248,0.14) !important;
+    color: #38bdf8 !important;
+    box-shadow: 0 0 8px rgba(56,189,248,0.08) !important;
 }
-
-.stTabs [data-baseweb="tab-panel"] {
-    padding-top: 16px !important;
+.stTabs [data-baseweb="tab"]:hover:not([aria-selected="true"]) {
+    background: rgba(56,189,248,0.06) !important;
+    color: #e2e8f0 !important;
 }
-
-/* ── Dividers ── */
-hr {
-    border-color: var(--border-subtle) !important;
-    opacity: 0.5 !important;
-}
-
-/* ── Checkboxes ── */
-[data-testid="stCheckbox"] label span {
-    color: var(--text-secondary) !important;
-    font-size: 0.88rem !important;
-}
-
-/* ── Code blocks ── */
-code, .stCodeBlock {
-    font-family: 'JetBrains Mono', monospace !important;
-    font-size: 0.83rem !important;
-}
-pre {
-    background: var(--bg-input) !important;
-    border: 1px solid var(--border-subtle) !important;
-    border-radius: var(--radius-md) !important;
-}
-
-/* ── Progress bars ── */
-.stProgress > div > div {
-    background: var(--gradient-primary) !important;
-    border-radius: 100px !important;
-}
-
-/* ── Custom components ── */
-.product-badge {
-    background: var(--gradient-primary);
-    color: white;
-    padding: 14px 24px;
-    border-radius: var(--radius-lg);
-    text-align: center;
-    font-weight: 700;
-    font-size: 1.05rem;
-    letter-spacing: -0.01em;
-    margin: 12px 0;
-    box-shadow: var(--shadow-md), 0 0 30px rgba(45, 125, 210, 0.2);
-}
-
-.tile-chip {
-    display: inline-block;
-    background: var(--bg-card);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-sm);
-    padding: 3px 10px;
-    margin: 2px 3px;
-    font-size: 0.78rem;
-    color: var(--accent-cyan);
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 500;
-}
-
-.stat-row {
-    display: flex;
-    gap: 12px;
-    margin: 10px 0;
-}
-.stat-item {
-    flex: 1;
-    background: var(--bg-card);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md);
-    padding: 14px 16px;
-    text-align: center;
-}
-.stat-value {
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: var(--accent-cyan);
-    font-family: 'JetBrains Mono', monospace;
-}
-.stat-label {
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin-top: 4px;
-}
-
-.color-legend-pro {
-    background: var(--bg-card);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md);
-    padding: 14px 16px;
-    margin: 12px 0;
-}
-.legend-title {
-    font-weight: 600;
-    font-size: 0.82rem;
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 10px;
-}
-.legend-item {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin: 7px 0;
-    font-size: 0.82rem;
-    color: var(--text-secondary);
-}
-.legend-swatch {
-    width: 20px;
-    height: 10px;
-    border-radius: 3px;
-    flex-shrink: 0;
-}
-
-/* ── Map container ── */
-.map-wrapper {
-    border-radius: var(--radius-lg);
-    overflow: hidden;
-    border: 1px solid var(--border-subtle);
-    box-shadow: var(--shadow-lg);
-}
-
-/* ── Notification banners ── */
-.info-banner {
-    background: rgba(45, 125, 210, 0.08);
-    border: 1px solid rgba(45, 125, 210, 0.2);
-    border-radius: var(--radius-md);
-    padding: 10px 16px;
-    font-size: 0.85rem;
-    color: var(--accent-cyan);
-    margin: 8px 0;
-}
-
-/* ── Scrollbar ── */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--bg-primary); }
-::-webkit-scrollbar-thumb { background: var(--border-active); border-radius: 100px; }
-::-webkit-scrollbar-thumb:hover { background: var(--accent-blue); }
-
-/* ── Multiselect tags ── */
-[data-testid="stMultiSelect"] span[data-baseweb="tag"] {
-    background: var(--bg-card-hover) !important;
-    border: 1px solid var(--border-active) !important;
-    border-radius: var(--radius-sm) !important;
-    color: var(--accent-cyan) !important;
-    font-family: 'JetBrains Mono', monospace !important;
-    font-size: 0.78rem !important;
-}
-
-/* ── Expander ── */
+/* Expander */
 [data-testid="stExpander"] {
-    background: var(--bg-card) !important;
-    border: 1px solid var(--border-subtle) !important;
-    border-radius: var(--radius-md) !important;
+    background: #111827 !important;
+    border: 1px solid rgba(56,120,200,0.10) !important;
+    border-radius: 10px !important;
 }
-
-/* ── Captions ── */
-.stCaption, [data-testid="stCaption"] {
-    color: var(--text-muted) !important;
-    font-size: 0.78rem !important;
+/* Code blocks */
+pre, code {
+    background: #0b1120 !important;
+    color: #e2e8f0 !important;
+    border-radius: 8px !important;
 }
-
-/* ── Remove default padding ── */
-.block-container {
-    padding-top: 2rem !important;
-    padding-bottom: 1rem !important;
-}
+/* Scrollbars */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: #060a14; }
+::-webkit-scrollbar-thumb { background: rgba(56,189,248,0.18); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(56,189,248,0.3); }
 </style>
 """
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GEO UTILITIES (pure functions — no Streamlit state)
+# GEO UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def ensure_4326(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Reproject to WGS‑84 if needed."""
+def ensure_4326(gdf: Optional[gpd.GeoDataFrame]) -> Optional[gpd.GeoDataFrame]:
+    """Reproject a GeoDataFrame to WGS‑84 (EPSG:4326) if needed."""
     if gdf is None or gdf.empty:
         return gdf
     return gdf.set_crs(epsg=4326) if gdf.crs is None else gdf.to_crs(epsg=4326)
 
 
-def get_name_column(gdf: Optional[gpd.GeoDataFrame], system: str) -> Optional[str]:
-    """Resolve the tile‑name column for a GeoDataFrame."""
+def get_name_col(gdf: Optional[gpd.GeoDataFrame], system: str) -> Optional[str]:
+    """Return the column name that holds the tile identifier for a grid system."""
     if gdf is None or gdf.empty:
         return None
     candidates = (
@@ -490,25 +257,35 @@ def get_name_column(gdf: Optional[gpd.GeoDataFrame], system: str) -> Optional[st
     return None
 
 
-def safe_union(geoms):
-    """Shapely ≥2 / <2 compatible union."""
+def safe_union(geoms: List[shapely.geometry.base.BaseGeometry]):
+    """Compute the union of multiple geometries in a Shapely 1.x/2.x compatible way."""
     try:
         return shapely.union_all(geoms)
     except Exception:
         return unary_union(geoms)
 
 
-def bounds_from_leaflet(bounds) -> Optional[Tuple[float, float, float, float]]:
-    """Extract (minx, miny, maxx, maxy) from Leaflet bounds dict."""
+def bounds_from_leaflet(bounds: Any) -> Optional[Tuple[float, float, float, float]]:
+    """Extract a bounding box from Leaflet bounds structure.
+
+    Parameters
+    ----------
+    bounds: dict or None
+        The bounds returned by st_folium.  It should contain either
+        `_southWest`/`_northEast` keys or `southWest`/`northEast` keys.
+
+    Returns
+    -------
+    tuple or None
+        (minx, miny, maxx, maxy) if valid, otherwise None.
+    """
     if not bounds:
         return None
-
     def _f(x):
         try:
             return float(x) if x is not None else None
         except (TypeError, ValueError):
             return None
-
     if isinstance(bounds, dict):
         sw = bounds.get("_southWest") or bounds.get("southWest")
         ne = bounds.get("_northEast") or bounds.get("northEast")
@@ -518,6 +295,7 @@ def bounds_from_leaflet(bounds) -> Optional[Tuple[float, float, float, float]]:
         if None in vals:
             return None
         minx, miny, maxx, maxy = vals
+        # normalise if reversed
         if maxx < minx:
             minx, maxx = maxx, minx
         if maxy < miny:
@@ -527,12 +305,14 @@ def bounds_from_leaflet(bounds) -> Optional[Tuple[float, float, float, float]]:
 
 
 def fallback_bbox(lat: float, lng: float, zoom: int) -> Tuple[float, float, float, float]:
+    """Generate a fallback bounding box around a point when map bounds are unknown."""
     w = 360.0 / (2 ** max(0, zoom))
     h = 180.0 / (2 ** max(0, zoom))
     return (lng - w * 0.6, lat - h * 0.6, lng + w * 0.6, lat + h * 0.6)
 
 
-def bbox_key(bbox: Optional[Tuple], nd: int = 4):
+def bbox_key(bbox: Optional[Tuple], nd: int = 4) -> Optional[Tuple]:
+    """Round a bounding box to a fixed precision so that small jitters are ignored."""
     if bbox is None:
         return None
     try:
@@ -541,45 +321,39 @@ def bbox_key(bbox: Optional[Tuple], nd: int = 4):
         return None
 
 
-def filter_gdf_in_bbox(
+def filter_gdf_bbox(
     gdf: Optional[gpd.GeoDataFrame],
-    bbox_ll: Optional[Tuple[float, float, float, float]],
+    bbox: Optional[Tuple[float, float, float, float]],
     max_features: int,
     simplify_tol: float,
     keep_cols: Optional[List[str]] = None,
 ) -> Optional[gpd.GeoDataFrame]:
-    """Clip GeoDataFrame to bounding box, simplify, and limit features."""
-    if gdf is None or gdf.empty or bbox_ll is None:
+    """Clip a GeoDataFrame to a bounding box, simplify shapes and limit features."""
+    if gdf is None or gdf.empty or bbox is None:
         return None
-
-    bb = box(*bbox_ll)
+    bb = box(*bbox)
     try:
         sub = gdf[gdf.intersects(bb)].copy()
     except Exception:
         sub = gdf.copy()
-
     if sub.empty:
         return sub
-
     cols = ([c for c in (keep_cols or []) if c in sub.columns]) + ["geometry"]
-    cols = list(dict.fromkeys(cols))  # deduplicate, preserve order
+    cols = list(dict.fromkeys(cols))
     sub = sub[cols].copy() if keep_cols else sub[["geometry"]].copy()
-
     if simplify_tol > 0:
         try:
             sub["geometry"] = sub.geometry.simplify(simplify_tol, preserve_topology=True)
         except Exception:
             pass
-
     return sub.iloc[:max_features].copy() if len(sub) > max_features else sub
 
 
-def parse_text_geometry(text: str) -> Optional[shapely.Geometry]:
-    """Parse WKT or GeoJSON text into a Shapely geometry."""
+def parse_geometry(text: str) -> Optional[shapely.geometry.base.BaseGeometry]:
+    """Parse a WKT or GeoJSON string into a Shapely geometry."""
     if not text or not text.strip():
         return None
     t = text.strip()
-
     if t.startswith("{"):
         try:
             obj = json.loads(t)
@@ -597,39 +371,41 @@ def parse_text_geometry(text: str) -> Optional[shapely.Geometry]:
         return None
 
 
-def make_square_wkt(lat: float, lng: float, side_km: float) -> str:
-    half = side_km / 2.0
+def make_square_wkt(lat: float, lng: float, km: float) -> str:
+    """Return a WKT square centred on (lat, lng) with a side length in km."""
+    half = km / 2.0
     dlat = half / 111.0
     dlon = half / (111.0 * max(0.05, abs(math.cos(math.radians(lat)))))
-    poly = Polygon([
+    p = Polygon([
         (lng - dlon, lat - dlat), (lng + dlon, lat - dlat),
         (lng + dlon, lat + dlat), (lng - dlon, lat + dlat),
         (lng - dlon, lat - dlat),
     ])
-    return shapely_wkt.dumps(poly, rounding_precision=6)
+    return shapely_wkt.dumps(p, rounding_precision=6)
 
 
 def compute_intersections(
-    aoi_polys: List[Polygon],
-    tiles_gdf: Optional[gpd.GeoDataFrame],
-    name_col: Optional[str],
+    polys: List[Polygon],
+    gdf: Optional[gpd.GeoDataFrame],
+    ncol: Optional[str],
 ) -> Tuple[List[str], Optional[gpd.GeoDataFrame]]:
-    if tiles_gdf is None or tiles_gdf.empty or not aoi_polys or not name_col:
+    """Find tiles intersecting a set of polygons and return their names and subset."""
+    if gdf is None or gdf.empty or not polys or not ncol:
         return [], None
-    aoi_union = safe_union(aoi_polys)
     try:
-        candidates = tiles_gdf[tiles_gdf.intersects(aoi_union)].copy()
-        if candidates.empty:
-            return [], candidates
-        candidates = candidates[[name_col, "geometry"]].copy()
-        names = sorted(candidates[name_col].astype(str).unique().tolist())
-        return names, candidates
+        au = safe_union(polys)
+        c = gdf[gdf.intersects(au)].copy()
+        if c.empty:
+            return [], c
+        c = c[[ncol, "geometry"]].copy()
+        return sorted(c[ncol].astype(str).unique().tolist()), c
     except Exception as e:
-        logger.error(f"Intersection error: {e}")
+        logger.error(f"Intersection: {e}")
         return [], None
 
 
-def find_tiles_by_query(gdf: gpd.GeoDataFrame, col: str, query: str, limit: int = 50) -> gpd.GeoDataFrame:
+def find_tiles(gdf: gpd.GeoDataFrame, col: str, query: str, limit: int = 50) -> gpd.GeoDataFrame:
+    """Search for tiles whose names match a query string (case insensitive)."""
     q = (query or "").strip()
     if not q:
         return gdf.iloc[0:0]
@@ -637,69 +413,76 @@ def find_tiles_by_query(gdf: gpd.GeoDataFrame, col: str, query: str, limit: int 
     exact = gdf[s.str.upper() == q.upper()]
     if not exact.empty:
         return exact[[col, "geometry"]].copy()
-    contains = gdf[s.str.contains(q, case=False, na=False)]
-    return contains[[col, "geometry"]].iloc[:limit].copy()
+    return gdf[s.str.contains(q, case=False, na=False)][[col, "geometry"]].iloc[:limit].copy()
 
 
-def parse_map_drawings(map_data) -> List[Polygon]:
+def parse_drawings(md: Dict[str, Any]) -> List[Polygon]:
+    """Extract drawn polygons from the map draw tool metadata."""
     polys: List[Polygon] = []
-    if not map_data:
+    if not md:
         return polys
-    for feat in (map_data.get("all_drawings") or []):
+    for feat in (md.get("all_drawings") or []):
         try:
-            geom = feat.get("geometry")
-            if not geom:
+            g = feat.get("geometry")
+            if not g:
                 continue
-            coords = geom.get("coordinates", [[]])[0]
-            poly = Polygon(coords)
-            if poly.is_valid and not poly.is_empty:
-                polys.append(poly)
-        except Exception as e:
-            logger.warning(f"Drawing parse failed: {e}")
+            coords = g.get("coordinates", [[]])[0]
+            if len(coords) < 3:
+                continue
+            p = Polygon(coords)
+            if p.is_valid and not p.is_empty:
+                polys.append(p)
+        except Exception:
+            pass
     return polys
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TILE COLORING
+# TILE COLOURING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _sentinel_color(name: str) -> str:
+def _s2_color(n: str) -> str:
+    """Compute a Sentinel‑2 tile colour from its zone number to ensure variety."""
     try:
-        zone = max(1, min(60, int(str(name)[:2])))
-        hue = 190 + int((zone - 1) * (40 / 60))
-        return f"hsl({hue}, 70%, 52%)"
+        z = max(1, min(60, int(str(n)[:2])))
+        hue = 195 + int((z - 1) * 30 / 60)
+        return f"hsl({hue},75%,48%)"
     except Exception:
-        return "#2d7dd2"
+        return "#0077BB"
 
 
-def _landsat_color(name: str) -> str:
+def _ls_color(n: str) -> str:
+    """Compute a Landsat tile colour from its path number for variety."""
     try:
-        path = max(1, min(233, int(str(name)[:3])))
-        hue = 20 + int((path - 1) * (25 / 233))
-        return f"hsl({hue}, 80%, 55%)"
+        p = max(1, min(233, int(str(n)[:3])))
+        hue = 18 + int((p - 1) * 28 / 233)
+        return f"hsl({hue},85%,52%)"
     except Exception:
-        return "#ffb703"
+        return "#EE7733"
 
 
-def tile_style_fn(colorize: bool, opacity: float, system: str):
-    def _fn(feat):
-        props = feat.get("properties", {}) or {}
-        if system == "landsat":
-            name = props.get("PR") or props.get("PATH_ROW") or props.get("name") or ""
-            c = _landsat_color(name) if colorize else "#d97706"
+def grid_style(colorize: bool, opacity: float, sys: str):
+    """Return a Folium style function for grid cells."""
+    def fn(f):
+        pr = f.get("properties", {}) or {}
+        if sys == "landsat":
+            n = pr.get("PR") or pr.get("PATH_ROW") or pr.get("name") or ""
+            c = _ls_color(n) if colorize else "#EE7733"
         else:
-            name = props.get("Name") or props.get("name") or ""
-            c = _sentinel_color(name) if colorize else "#2d7dd2"
-        return {"color": c, "weight": 1, "fillOpacity": opacity}
-    return _fn
+            n = pr.get("Name") or pr.get("name") or ""
+            c = _s2_color(n) if colorize else "#0077BB"
+        return {"color": c, "weight": 1.2, "fillOpacity": opacity}
+    return fn
 
 
-def selected_style(_feat):
-    return {"color": "#ef476f", "weight": 3.5, "fillOpacity": 0.12, "dashArray": "6, 4"}
+def sel_style(_: Dict[str, Any]) -> Dict[str, Any]:
+    """Style for selected tiles."""
+    return {"color": "#EE3377", "weight": 3, "fillOpacity": 0.12, "dashArray": "6,4"}
 
 
-def intersect_style(_feat):
-    return {"color": "#7b68ee", "weight": 2, "fillOpacity": 0.08}
+def int_style(_: Dict[str, Any]) -> Dict[str, Any]:
+    """Style for intersecting tiles."""
+    return {"color": "#AA3377", "weight": 2.2, "fillOpacity": 0.09}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -707,7 +490,8 @@ def intersect_style(_feat):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner="Loading Sentinel-2 grid…")
-def load_s2_data() -> Tuple[Optional[gpd.GeoDataFrame], Optional[gpd.GeoDataFrame]]:
+def load_s2() -> Tuple[Optional[gpd.GeoDataFrame], Optional[gpd.GeoDataFrame]]:
+    """Load Sentinel‑2 tiles and no‑coverage zones from GeoJSON or shapefile."""
     tiles, nocov = None, None
     for p in [PATHS.S2_GEOJSON, PATHS.S2_SHAPEFILE]:
         if Path(p).exists() and tiles is None:
@@ -718,20 +502,19 @@ def load_s2_data() -> Tuple[Optional[gpd.GeoDataFrame], Optional[gpd.GeoDataFram
 
 
 @st.cache_data(show_spinner="Loading Landsat WRS-2 grid…")
-def load_landsat_data() -> Optional[gpd.GeoDataFrame]:
+def load_landsat() -> Optional[gpd.GeoDataFrame]:
+    """Load Landsat WRS-2 tiles from GeoJSON or shapefile."""
     for p in [PATHS.LANDSAT_GEOJSON, PATHS.LANDSAT_SHAPEFILE]:
         if Path(p).exists():
             return ensure_4326(gpd.read_file(p))
     return None
 
 
-def load_all_tiles() -> Dict[str, Dict]:
-    s2_tiles, s2_nocov = load_s2_data()
-    landsat = load_landsat_data()
-    return {
-        "sentinel-2": {"tiles": s2_tiles, "nocov": s2_nocov},
-        "landsat": {"tiles": landsat, "nocov": None},
-    }
+def load_tiles() -> Dict[str, Dict[str, Any]]:
+    """Load both Sentinel‑2 and Landsat tiles into a dictionary."""
+    s2, s2n = load_s2()
+    ls = load_landsat()
+    return {"sentinel-2": {"tiles": s2, "nocov": s2n}, "landsat": {"tiles": ls, "nocov": None}}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -741,81 +524,102 @@ def load_all_tiles() -> Dict[str, Dict]:
 def build_map(
     center: Tuple[float, float],
     zoom: int,
-    aoi_geom: Optional[shapely.Geometry],
+    aoi_geom: Optional[shapely.geometry.base.BaseGeometry],
     tiles_vis: Optional[gpd.GeoDataFrame],
     nocov_vis: Optional[gpd.GeoDataFrame],
-    intersects_gdf: Optional[gpd.GeoDataFrame],
-    selected_gdf: Optional[gpd.GeoDataFrame],
+    inter_gdf: Optional[gpd.GeoDataFrame],
+    sel_gdf: Optional[gpd.GeoDataFrame],
     opts: Dict[str, Any],
-    name_col: Optional[str],
-    tile_system: str,
+    ncol: Optional[str],
+    tilesys: str,
 ) -> folium.Map:
+    """Build a Folium map with base layers and optional overlays for tiles, AOI, etc."""
     m = folium.Map(
         location=list(center),
         zoom_start=zoom,
-        tiles="CartoDB dark_matter",
-        attr="CartoDB",
+        tiles=None,
+        control_scale=True,
+        prefer_canvas=True,
     )
-
-    # Satellite layer
+    # Satellite base layer
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri", name="Satellite", overlay=False, control=True,
+        max_native_zoom=19, max_zoom=22,
     ).add_to(m)
-
-    # OpenStreetMap
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap", overlay=False, control=True).add_to(m)
-
+    # Dark base layer
+    folium.TileLayer(
+        "CartoDB dark_matter", name="Dark", overlay=False, control=True,
+    ).add_to(m)
+    # Streets base layer
+    folium.TileLayer(
+        "OpenStreetMap", name="Streets", overlay=False, control=True,
+    ).add_to(m)
+    # Fullscreen control
     plugins.Fullscreen(position="topleft").add_to(m)
-    plugins.MousePosition(position="bottomleft", prefix="<span style='color:#48cae4'>").add_to(m)
 
-    # AOI layer
+    # AOI polygon (yellow‑green)
     if aoi_geom and not aoi_geom.is_empty:
         folium.GeoJson(
             mapping(aoi_geom), name="AOI",
             style_function=lambda _: {
-                "color": "#ffb703", "weight": 2.5,
-                "fillOpacity": 0.08, "dashArray": "4, 4",
+                "color": "#CCBB44", "weight": 2.5, "fillOpacity": 0.10, "dashArray": "5,5",
             },
         ).add_to(m)
 
-    # Grid tiles
+    # Grid layer
     if opts.get("show_grid") and tiles_vis is not None and not getattr(tiles_vis, "empty", True):
-        kw = {}
-        if name_col and name_col in tiles_vis.columns:
+        kw: Dict[str, Any] = {}
+        if ncol and ncol in tiles_vis.columns:
             kw["tooltip"] = folium.GeoJsonTooltip(
-                fields=[name_col], aliases=["Tile"], sticky=False,
-                style="background:rgba(10,14,26,0.9);color:#48cae4;border:1px solid rgba(56,120,200,0.3);border-radius:6px;padding:6px 10px;font-family:JetBrains Mono,monospace;font-size:12px",
+                fields=[ncol], aliases=["Tile"], sticky=False,
+                style="background:rgba(6,10,20,.9);color:#48cae4;border:1px solid rgba(56,120,200,.25);border-radius:6px;padding:4px 8px;font-size:11px;font-family:'JetBrains Mono',monospace;",
             )
-            kw["popup"] = folium.GeoJsonPopup(fields=[name_col], aliases=["Tile"])
-        label = "Landsat WRS-2" if tile_system == "landsat" else "Sentinel-2 MGRS"
+            kw["popup"] = folium.GeoJsonPopup(fields=[ncol], aliases=["Tile"])
         folium.GeoJson(
-            tiles_vis, name=label,
-            style_function=tile_style_fn(opts.get("colorize", True), opts.get("opacity", 0.03), tile_system),
+            tiles_vis,
+            name="Landsat WRS-2" if tilesys == "landsat" else "Sentinel-2 MGRS",
+            style_function=grid_style(opts.get("colorize", True), opts.get("opacity", 0.03), tilesys),
             **kw,
         ).add_to(m)
 
-    # No‑coverage
+    # No coverage zones
     if opts.get("show_nocov") and nocov_vis is not None and not getattr(nocov_vis, "empty", True):
-        folium.GeoJson(
-            nocov_vis, name="No Coverage",
-            style_function=lambda _: {"color": "#ef476f", "weight": 1.5, "fillOpacity": 0.03},
+        folium.GeoJson(nocov_vis, name="No Coverage",
+            style_function=lambda _: {"color": "#CC3311", "weight": 1.5, "fillOpacity": 0.04},
         ).add_to(m)
 
     # Intersecting tiles
-    if opts.get("show_intersects") and intersects_gdf is not None and not getattr(intersects_gdf, "empty", True):
-        folium.GeoJson(intersects_gdf, name="Intersecting", style_function=intersect_style).add_to(m)
+    if opts.get("show_inter") and inter_gdf is not None and not getattr(inter_gdf, "empty", True):
+        kw2: Dict[str, Any] = {}
+        if ncol and ncol in inter_gdf.columns:
+            kw2["tooltip"] = folium.GeoJsonTooltip(
+                fields=[ncol], aliases=["Tile"], sticky=False,
+                style="background:rgba(6,10,20,.9);color:#e48abf;border:1px solid rgba(56,120,200,.25);border-radius:6px;padding:4px 8px;font-size:11px;font-family:'JetBrains Mono',monospace;",
+            )
+        folium.GeoJson(inter_gdf, name="Intersecting", style_function=int_style, **kw2).add_to(m)
 
     # Selected tiles
-    if opts.get("show_selected") and selected_gdf is not None and not getattr(selected_gdf, "empty", True):
-        folium.GeoJson(selected_gdf, name="Selected", style_function=selected_style).add_to(m)
+    if opts.get("show_sel") and sel_gdf is not None and not getattr(sel_gdf, "empty", True):
+        kw3: Dict[str, Any] = {}
+        if ncol and ncol in sel_gdf.columns:
+            kw3["tooltip"] = folium.GeoJsonTooltip(
+                fields=[ncol], aliases=["Selected"], sticky=False,
+                style="background:rgba(6,10,20,.9);color:#f88cb0;border:1px solid rgba(56,120,200,.25);border-radius:6px;padding:4px 8px;font-size:11px;font-family:'JetBrains Mono',monospace;",
+            )
+        folium.GeoJson(sel_gdf, name="Selected", style_function=sel_style, **kw3).add_to(m)
 
     # Draw controls
     plugins.Draw(
-        export=False, position="topleft",
+        export=False,
+        position="topleft",
         draw_options={
-            "polyline": False, "rectangle": True, "polygon": True,
-            "circle": False, "marker": False, "circlemarker": False,
+            "polyline": False,
+            "rectangle": {"shapeOptions": {"color": "#CCBB44", "weight": 2, "fillOpacity": 0.08}},
+            "polygon": {"shapeOptions": {"color": "#CCBB44", "weight": 2, "fillOpacity": 0.08}},
+            "circle": False,
+            "marker": False,
+            "circlemarker": False,
         },
         edit_options={"edit": True, "remove": True},
     ).add_to(m)
@@ -825,51 +629,184 @@ def build_map(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LIVE LOG DISPLAY
+# DOWNLOAD MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.fragment(run_every="2000ms")
-def show_live_logs(log_path: str = "nohup.out"):
-    lp = Path(log_path)
-    batch_re = re.compile(
-        r"Concurrent Downloads:\s*(?P<pct>\d+)%\|.*?\|\s*(?P<d>\d+)/(?P<t>\d+)"
+def reset_downloads(dl_dir: str = "downloads") -> None:
+    """Clear all previous downloads and logs before a new run."""
+    dl_path = Path(dl_dir)
+    if dl_path.exists():
+        # Use shutil.rmtree to remove entire directory tree
+        import shutil
+        shutil.rmtree(dl_path, ignore_errors=True)
+    dl_path.mkdir(parents=True, exist_ok=True)
+    log_path = Path("nohup.out")
+    if log_path.exists():
+        # Clear previous log output
+        log_path.write_text("")
+    # Remove session state keys related to downloads
+    for key in list(st.session_state.keys()):
+        if key.startswith("dl_"):
+            del st.session_state[key]
+    st.session_state["dl_start_time"] = None
+    st.session_state["dl_total_products"] = 0
+    st.session_state["dl_completed"] = 0
+    st.session_state["dl_running"] = False
+
+
+def count_downloaded_products(dl_dir: str = "downloads") -> Tuple[int, float]:
+    """Count downloaded files and total size in MB in the specified directory."""
+    dl_path = Path(dl_dir)
+    if not dl_path.exists():
+        return 0, 0.0
+    real_files = [f for f in dl_path.rglob("*") if f.is_file()]
+    total_size = sum(f.stat().st_size for f in real_files) / (1024 * 1024)
+    return len(real_files), total_size
+
+
+def parse_download_logs(path: str = "nohup.out") -> Dict[str, Any]:
+    """Parse nohup.out for progress bars, file bars, product count and errors."""
+    lp = Path(path)
+    if not lp.exists():
+        return {"batch": None, "files": {}, "logs": [], "products_found": 0, "errors": []}
+    brx = re.compile(
+        r"Concurrent Downloads:\s*(?P<pct>\d+)%\|.*?\|\s*(?P<d>\d+)/(?:\d+)")
+    drx = re.compile(
+        r"Downloading\s+(?P<fn>.+?):\s*(?P<pct>\d+)%\|.*?\|\s*(?P<d>[\d.]+\S*)/(?P<t>[\d.]+\S*)\s*\[(?:.+?)<(?P<eta>[0-9:?\-]+)\]"
     )
-    dl_re = re.compile(
-        r"Downloading\s+(?P<fn>.+?):\s*(?P<pct>\d+)%\|.*?\|\s*"
-        r"(?P<d>[\d.]+[kMGTP]?)/(?P<t>[\d.]+[kMGTP]?)\s*\[(?P<el>[0-9:]+)<(?P<eta>[0-9:?\-]+)\]"
-    )
+    prx = re.compile(r"Found\s+(?P<n>\d+)\s+products?", re.IGNORECASE)
+    erx = re.compile(r"(error|exception|failed|traceback)", re.IGNORECASE)
+    result: Dict[str, Any] = {"batch": None, "files": {}, "logs": [], "products_found": 0, "errors": []}
+    try:
+        text = lp.read_text(errors="replace")
+    except Exception:
+        return result
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        mb = brx.search(line)
+        if mb:
+            result["batch"] = {
+                "done": int(mb.group("d")),
+                "pct": int(mb.group("pct")),
+            }
+            continue
+        md = drx.search(line)
+        if md:
+            result["files"][md.group("fn")] = {
+                "pct": int(md.group("pct")),
+                "done": md.group("d"),
+                "total": md.group("t"),
+                "eta": md.group("eta"),
+            }
+            continue
+        mp = prx.search(line)
+        if mp:
+            result["products_found"] = max(result["products_found"], int(mp.group("n")))
+            continue
+        if erx.search(line):
+            result["errors"].append(line)
+            continue
+        if line:
+            result["logs"].append(line)
+    return result
 
-    bars, logs = {}, []
-    if lp.exists():
-        for line in lp.read_text().splitlines():
-            line = line.strip()
-            mb = batch_re.search(line)
-            if mb:
-                bars["batch"] = {"label": f"Concurrent ({mb.group('d')}/{mb.group('t')})", "pct": int(mb.group("pct"))}
-                continue
-            md = dl_re.search(line)
-            if md:
-                bars[md.group("fn")] = {
-                    "label": f"{md.group('fn')} ({md.group('d')}/{md.group('t')}) ETA {md.group('eta')}",
-                    "pct": int(md.group("pct")),
-                }
-                continue
-            if line:
-                logs.append(line)
 
-    for pb in bars.values():
-        st.caption(pb["label"])
-        st.progress(pb["pct"])
-    if logs:
-        for l in logs[-5:]:
-            st.text(l)
+def _format_eta(seconds: float) -> str:
+    """Format seconds into a human‑readable ETA string."""
+    if seconds > 3600:
+        return f"{seconds / 3600:.1f}h"
+    elif seconds > 60:
+        return f"{seconds / 60:.0f}m {seconds % 60:.0f}s"
+    else:
+        return f"{seconds:.0f}s"
+
+
+def render_download_progress() -> None:
+    """Render styled download progress indicators from the parsed logs."""
+    logs = parse_download_logs()
+    n_files, total_mb = count_downloaded_products()
+    if logs.get("products_found", 0) > 0:
+        st.session_state["dl_total_products"] = logs["products_found"]
+    total_products = st.session_state.get("dl_total_products", 0)
+    batch = logs.get("batch")
+    if batch:
+        done, pct = batch.get("done", 0), batch.get("pct", 0)
+        st.session_state["dl_completed"] = done
+        start_ts = st.session_state.get("dl_start_time")
+        eta_str = "calculating…"
+        if start_ts and done > 0:
+            elapsed = time.time() - start_ts
+            remaining = (elapsed / done) * (max(total_products, done) - done)
+            eta_str = _format_eta(remaining)
+        st.markdown(f"""<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;margin-bottom:8px;'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;'>
+                <div style='font-family:JetBrains Mono,monospace;font-size:0.78rem;color:#e2e8f0;font-weight:600;'>Batch Progress</div>
+                <div style='font-family:JetBrains Mono,monospace;font-size:0.7rem;color:#fbbf24;'>ETA: {eta_str}</div>
+            </div>
+            <div style='height:6px;background:#1a2236;border-radius:3px;overflow:hidden;margin-bottom:4px;'>
+                <div style='height:100%;width:{pct}%;background:linear-gradient(90deg,#38bdf8,#2dd4bf);border-radius:3px;transition:width 0.3s ease;'></div>
+            </div>
+            <div style='display:flex;justify-content:space-between;font-family:JetBrains Mono,monospace;font-size:0.65rem;color:#64748b;'>
+                <span>{done}/{total_products or '—'} products</span><span>{pct}%</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
+    for fname, info in logs.get("files", {}).items():
+        short = fname if len(fname) < 40 else fname[:18] + "…" + fname[-18:]
+        pct = info.get("pct", 0)
+        st.markdown(f"""<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;margin-bottom:6px;'>
+            <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;'>
+                <div style='font-family:JetBrains Mono,monospace;font-size:0.75rem;color:#e2e8f0;font-weight:600;'>{short}</div>
+                <div style='font-family:JetBrains Mono,monospace;font-size:0.68rem;color:#fbbf24;'>ETA: {info.get('eta')}</div>
+            </div>
+            <div style='height:6px;background:#1a2236;border-radius:3px;overflow:hidden;margin-bottom:4px;'>
+                <div style='height:100%;width:{pct}%;background:linear-gradient(90deg,#a78bfa,#fb7185);border-radius:3px;transition:width 0.3s ease;'></div>
+            </div>
+            <div style='display:flex;justify-content:space-between;font-family:JetBrains Mono,monospace;font-size:0.65rem;color:#64748b;'>
+                <span>{info.get('done')}/{info.get('total')}</span><span>{pct}%</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
+    # Stats row
+    completed = st.session_state.get("dl_completed", 0)
+    products_display = total_products if total_products else "—"
+    st.markdown(f"""<div style='display:flex;gap:8px;margin-top:6px;'>
+        <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:10px;text-align:center;'>
+            <div style='font-size:1.3rem;font-family:JetBrains Mono,monospace;color:#2dd4bf;font-weight:700;'>{products_display}</div>
+            <div style='font-size:0.68rem;color:#64748b;text-transform:uppercase;letter-spacing:0.06em;'>Products Found</div>
+        </div>
+        <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:10px;text-align:center;'>
+            <div style='font-size:1.3rem;font-family:JetBrains Mono,monospace;color:#e2e8f0;font-weight:700;'>{completed}</div>
+            <div style='font-size:0.68rem;color:#64748b;text-transform:uppercase;letter-spacing:0.06em;'>Downloaded</div>
+        </div>
+        <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:10px;text-align:center;'>
+            <div style='font-size:1.3rem;font-family:JetBrains Mono,monospace;color:#a78bfa;font-weight:700;'>{n_files}</div>
+            <div style='font-size:0.68rem;color:#64748b;text-transform:uppercase;letter-spacing:0.06em;'>Files</div>
+        </div>
+        <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:10px;text-align:center;'>
+            <div style='font-size:1.3rem;font-family:JetBrains Mono,monospace;color:#fbbf24;font-weight:700;'>{total_mb:.1f} MB</div>
+            <div style='font-size:0.68rem;color:#64748b;text-transform:uppercase;letter-spacing:0.06em;'>Total Size</div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+    # Error log and recent log lines
+    if logs.get("errors"):
+        with st.expander(f"⚠️ Errors ({len(logs['errors'])})", expanded=False):
+            for err in logs["errors"][-10:]:
+                st.text(err)
+    if logs.get("logs"):
+        with st.expander("📜 Recent Logs", expanded=False):
+            for line in logs["logs"][-15:]:
+                st.text(line)
+    if not batch and not logs.get("files") and not logs.get("logs"):
+        st.markdown('<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#38bdf8;">ℹ️ Waiting for download output…</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SESSION STATE INITIALIZATION
+# SESSION STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def init_state():
+def init_state() -> None:
+    """Initialise session state with default values without overriding existing keys."""
     defaults = {
         "tile_system": "sentinel-2",
         "geometry_text": "",
@@ -877,70 +814,86 @@ def init_state():
         "selected_tiles": [],
         "start_date": dt.date.today() - dt.timedelta(days=7),
         "end_date": dt.date.today(),
-        "map_center": MAP_CFG.DEFAULT_CENTER,
-        "map_zoom": MAP_CFG.DEFAULT_ZOOM,
+        "map_center": MCFG.DEFAULT_CENTER,
+        "map_zoom": MCFG.DEFAULT_ZOOM,
         "map_bounds": None,
         "last_click_popup": None,
         "last_aoi_wkt": "",
         "last_drawings_hash": None,
         "show_grid": True,
         "show_nocov": False,
-        "show_intersects": True,
-        "show_selected": True,
-        "colorize_grid": True,
-        "grid_opacity": MAP_CFG.GRID_OPACITY_DEFAULT,
-        "max_grid_features": MAP_CFG.MAX_FEATURES_DEFAULT,
-        "simplify_tol": MAP_CFG.SIMPLIFY_TOL_DEFAULT,
-        "click_to_select": False,
-        "grid_cache_params": None,
-        "grid_auto_refresh": False,
-        "grid_last_refresh_ts": 0.0,
+        "show_inter": True,
+        "show_sel": True,
+        "colorize": True,
+        "opacity": MCFG.GRID_OPACITY,
+        "max_feat": MCFG.MAX_FEATURES,
+        "simp_tol": MCFG.SIMPLIFY_TOL,
+        "click_sel": False,
+        "gc_params": None,
+        "auto_refresh": False,  # auto refresh disabled by default for stability
+        "gc_last_ts": 0.0,
+        "provider": "Copernicus",
+        "satellite": "SENTINEL-2",
+        "product": "S2MSI2A",
+        "dl_start_time": None,
+        "dl_total_products": 0,
+        "dl_completed": 0,
+        "dl_running": False,
     }
     for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
+        if k not in st.session_state:
+            st.session_state[k] = v
+    # Separate cache keys for each tile system: sentinel-2 and landsat
+    for s in ("sentinel-2", "landsat"):
+        for x in ("bk", "tiles", "nocov", "ts"):
+            key = f"gc_{s}_{x}"
+            if key not in st.session_state:
+                st.session_state[key] = 0.0 if x == "ts" else None
 
-    for sys in ("sentinel-2", "landsat"):
-        for suffix in ("bbox_key", "tiles", "nocov", "updated_ts"):
-            val = 0.0 if suffix == "updated_ts" else None
-            st.session_state.setdefault(f"gc_{sys}_{suffix}", val)
+
+def _ss_get(key: str, default: Any = None) -> Any:
+    """Safe getter for session_state that never raises."""
+    return st.session_state.get(key, default)
 
 
-def update_grid_cache(tiles_gdf, nocov_gdf, name_col, bbox, system):
-    pfx = f"gc_{system}"
-    st.session_state[f"{pfx}_bbox_key"] = bbox_key(bbox)
-    st.session_state[f"{pfx}_updated_ts"] = time.time()
-    st.session_state[f"{pfx}_tiles"] = filter_gdf_in_bbox(
-        tiles_gdf, bbox,
-        max_features=int(st.session_state.get("max_grid_features", MAP_CFG.MAX_FEATURES_DEFAULT)),
-        simplify_tol=float(st.session_state.get("simplify_tol", MAP_CFG.SIMPLIFY_TOL_DEFAULT)),
-        keep_cols=[name_col],
+def update_cache(gdf: gpd.GeoDataFrame, nocov: Optional[gpd.GeoDataFrame], ncol: Optional[str], bbox: Tuple[float, float, float, float], sys: str) -> None:
+    """Update the cached grid overlay for the given tile system and bounding box."""
+    pfx = f"gc_{sys}"
+    st.session_state[f"{pfx}_bk"] = bbox_key(bbox)
+    st.session_state[f"{pfx}_ts"] = time.time()
+    st.session_state[f"{pfx}_tiles"] = filter_gdf_bbox(
+        gdf, bbox,
+        int(_ss_get("max_feat", MCFG.MAX_FEATURES)),
+        float(_ss_get("simp_tol", MCFG.SIMPLIFY_TOL)),
+        keep_cols=[ncol] if ncol else None,
     )
-    if system == "sentinel-2" and nocov_gdf is not None and st.session_state.get("show_nocov"):
-        st.session_state[f"{pfx}_nocov"] = filter_gdf_in_bbox(
-            nocov_gdf, bbox, max_features=600,
-            simplify_tol=float(st.session_state.get("simplify_tol", MAP_CFG.SIMPLIFY_TOL_DEFAULT)),
+    if sys == "sentinel-2" and nocov is not None and _ss_get("show_nocov"):
+        st.session_state[f"{pfx}_nocov"] = filter_gdf_bbox(
+            nocov, bbox, 600,
+            float(_ss_get("simp_tol", MCFG.SIMPLIFY_TOL)),
         )
     else:
         st.session_state[f"{pfx}_nocov"] = None
 
 
-def sync_map_viewport(map_data, eps: float = 0.01):
-    """Sync viewport with anti‑jitter tolerance."""
-    if not map_data:
+def sync_viewport(md: Dict[str, Any], eps: float = 0.01) -> None:
+    """Synchronise the map viewport stored in session state with the returned metadata."""
+    if not md:
         return
-    z = map_data.get("zoom")
+    z = md.get("zoom")
     if z is not None:
         try:
             z = int(z)
-            if abs(z - int(st.session_state.get("map_zoom", z))) >= 1:
+            cur_z = int(_ss_get("map_zoom", z))
+            if abs(z - cur_z) >= 1:
                 st.session_state["map_zoom"] = z
         except Exception:
             pass
-    c = map_data.get("center")
-    if c and "lat" in c and "lng" in c:
+    c = md.get("center")
+    if c and isinstance(c, dict) and "lat" in c and "lng" in c:
         try:
             lat, lng = float(c["lat"]), float(c["lng"])
-            old = st.session_state.get("map_center", (lat, lng))
+            old = _ss_get("map_center", (lat, lng))
             if abs(lat - old[0]) > eps or abs(lng - old[1]) > eps:
                 st.session_state["map_center"] = (round(lat, 4), round(lng, 4))
         except Exception:
@@ -948,517 +901,608 @@ def sync_map_viewport(map_data, eps: float = 0.01):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HTML HELPERS
+# SIDEBAR RENDERING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def card_header(icon: str, title: str, subtitle: str, color: str = "blue"):
-    st.markdown(f"""
-        <div class="sat-header">
-            <div class="sat-header-icon {color}">{icon}</div>
-            <div class="sat-title">{title}</div>
-        </div>
-        <div class="sat-subtitle">{subtitle}</div>
+def render_sidebar(sat_tiles: Dict[str, Dict[str, Any]], gdf: Optional[gpd.GeoDataFrame], nocov: Optional[gpd.GeoDataFrame], ncol: Optional[str], skey: str) -> Tuple[str, str, str, str, bool]:
+    """Render the sidebar controls and return selections and refresh flag."""
+    refresh = False
+    # Logo and title
+    st.sidebar.markdown("""
+    <div style="text-align:center;padding:.3rem 0 .6rem">
+        <div style="font-size:1.6rem">🛰️</div>
+        <div style="font-size:1rem;font-weight:700;color:#e2e8f0">Sat Downloader</div>
+        <div style="font-size:.65rem;color:#64748b;letter-spacing:.06em">PROFESSIONAL EDITION</div>
+    </div>""", unsafe_allow_html=True)
+    # Provider selection
+    st.sidebar.markdown(
+        '<div style="display:flex;align-items:center;gap:6px;padding-top:0.3rem"><span>📡</span><span style="font-weight:600;font-size:0.88rem;">Data Source</span></div>',
+        unsafe_allow_html=True,
+    )
+    provider = st.sidebar.selectbox(
+        "Provider", list(PROVIDERS.keys()),
+        index=list(PROVIDERS.keys()).index(_ss_get("provider", "Copernicus")),
+        key="sb_prov",
+    )
+    st.session_state["provider"] = provider
+    missions = PROVIDERS.get(provider, [])
+    if missions:
+        ds = _ss_get("satellite", missions[0])
+        satellite = st.sidebar.selectbox(
+            "Mission", missions,
+            index=missions.index(ds) if ds in missions else 0,
+            key="sb_sat",
+        )
+    else:
+        satellite = st.sidebar.text_input("Mission", value="", key="sb_sat_t")
+    st.session_state["satellite"] = satellite
+    prods = PRODUCT_TYPES.get(satellite, [])
+    if prods:
+        dp = _ss_get("product", prods[0])
+        product = st.sidebar.selectbox(
+            "Product", prods,
+            index=prods.index(dp) if dp in prods else 0,
+            key="sb_prod",
+        )
+    else:
+        product = st.sidebar.text_input("Product", value="", key="sb_prod_t")
+    st.session_state["product"] = product
+    st.sidebar.markdown('<hr style="border-color:rgba(56,120,200,0.10)">', unsafe_allow_html=True)
+    # Tile system
+    st.sidebar.markdown(
+        '<div style="display:flex;align-items:center;gap:6px;padding-top:0.3rem"><span>🛰️</span><span style="font-weight:600;font-size:0.88rem;">Tile System</span></div>',
+        unsafe_allow_html=True,
+    )
+    opts_list: List[str] = []
+    labs: Dict[str, str] = {}
+    if sat_tiles.get("sentinel-2", {}).get("tiles") is not None:
+        opts_list.append("sentinel-2")
+        labs["sentinel-2"] = "Sentinel-2 (MGRS)"
+    if sat_tiles.get("landsat", {}).get("tiles") is not None:
+        opts_list.append("landsat")
+        labs["landsat"] = "Landsat (WRS-2)"
+    if opts_list:
+        ns = st.sidebar.radio(
+            "Grid", opts_list, format_func=lambda x: labs.get(x, x),
+            index=opts_list.index(skey) if skey in opts_list else 0,
+            horizontal=True, label_visibility="collapsed",
+        )
+        if ns != skey:
+            st.session_state["tile_system"] = ns
+            st.session_state["selected_tiles"] = []
+            st.session_state["intersecting_tiles"] = []
+            st.rerun()
+    # Legend (colour‑blind friendly)
+    st.sidebar.markdown("""
+    <div style="margin:.3rem 0">
+        <div style="display:flex;align-items:center;gap:10px;font-size:0.8rem;color:#94a3b8;margin:3px 0;"><div style="width:18px;height:10px;border-radius:3px;background:#0077BB"></div>Sentinel-2</div>
+        <div style="display:flex;align-items:center;gap:10px;font-size:0.8rem;color:#94a3b8;margin:3px 0;"><div style="width:18px;height:10px;border-radius:3px;background:#EE7733"></div>Landsat</div>
+        <div style="display:flex;align-items:center;gap:10px;font-size:0.8rem;color:#94a3b8;margin:3px 0;"><div style="width:18px;height:10px;border-radius:3px;background:#CCBB44"></div>AOI</div>
+        <div style="display:flex;align-items:center;gap:10px;font-size:0.8rem;color:#94a3b8;margin:3px 0;"><div style="width:18px;height:10px;border-radius:3px;background:#AA3377"></div>Intersecting</div>
+        <div style="display:flex;align-items:center;gap:10px;font-size:0.8rem;color:#94a3b8;margin:3px 0;"><div style="width:18px;height:10px;border-radius:3px;background:#EE3377"></div>Selected</div>
+    </div>
     """, unsafe_allow_html=True)
-
-
-def card_open():
-    st.markdown('<div class="sat-card">', unsafe_allow_html=True)
-
-def card_close():
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.sidebar.markdown('<hr style="border-color:rgba(56,120,200,0.10)">', unsafe_allow_html=True)
+    # AOI mode
+    st.sidebar.markdown(
+        '<div style="display:flex;align-items:center;gap:6px;padding-top:0.3rem"><span>📐</span><span style="font-weight:600;font-size:0.88rem;">Area of Interest</span></div>',
+        unsafe_allow_html=True,
+    )
+    aoi_choices = ["Draw on map", "Preset square", "Paste WKT / GeoJSON"]
+    aoi_mode = st.sidebar.radio(
+        "AOI", aoi_choices,
+        horizontal=False, label_visibility="collapsed",
+        index=aoi_choices.index(_ss_get("aoi_mode", "Draw on map")),
+    )
+    st.session_state["aoi_mode"] = aoi_mode
+    if aoi_mode == "Preset square":
+        c1, c2 = st.sidebar.columns(2)
+        with c1:
+            sq_lat = st.number_input(
+                "Lat", value=float(st.session_state["map_center"][0]),
+                format="%.4f", key="sq_lat",
+            )
+        with c2:
+            sq_lng = st.number_input(
+                "Lng", value=float(st.session_state["map_center"][1]),
+                format="%.4f", key="sq_lng",
+            )
+        sq_km = st.sidebar.number_input(
+            "Side (km)", min_value=0.1, value=25.0, step=5.0, key="sq_km",
+        )
+        if st.sidebar.button("✅ Apply", use_container_width=True):
+            st.session_state["geometry_text"] = make_square_wkt(sq_lat, sq_lng, sq_km)
+            st.session_state["map_center"] = (sq_lat, sq_lng)
+            st.rerun()
+    elif aoi_mode == "Paste WKT / GeoJSON":
+        st.session_state["geometry_text"] = st.sidebar.text_area(
+            "WKT/GeoJSON",
+            value=_ss_get("geometry_text", ""),
+            height=100, label_visibility="collapsed",
+            placeholder="Paste WKT or GeoJSON…",
+        )
+    else:
+        st.sidebar.caption("Draw rectangle/polygon on the map.")
+    atxt = _ss_get("geometry_text", "")
+    if atxt:
+        with st.sidebar.expander("📋 AOI Preview", expanded=False):
+            st.code(atxt[:400] + ("…" if len(atxt) > 400 else ""), language="text")
+            if st.button("🗑️ Clear", use_container_width=True, key="clr_aoi"):
+                st.session_state["geometry_text"] = ""
+                st.session_state["last_aoi_wkt"] = ""
+                st.session_state["intersecting_tiles"] = []
+                st.rerun()
+    st.sidebar.markdown('<hr style="border-color:rgba(56,120,200,0.10)">', unsafe_allow_html=True)
+    # Time range
+    st.sidebar.markdown(
+        '<div style="display:flex;align-items:center;gap:6px;padding-top:0.3rem"><span>📅</span><span style="font-weight:600;font-size:0.88rem;">Time Range</span></div>',
+        unsafe_allow_html=True,
+    )
+    today = dt.date.today()
+    d1, d2 = st.sidebar.columns(2)
+    with d1:
+        sd = st.date_input("Start", value=st.session_state["start_date"], max_value=today, key="sd")
+    with d2:
+        ed = st.date_input("End", value=st.session_state["end_date"], min_value=sd, max_value=today, key="ed")
+    if ed < sd:
+        ed = sd
+    st.session_state["start_date"] = sd
+    st.session_state["end_date"] = ed
+    st.sidebar.markdown('<hr style="border-color:rgba(56,120,200,0.10)">', unsafe_allow_html=True)
+    # Grid display settings
+    st.sidebar.markdown(
+        '<div style="display:flex;align-items:center;gap:6px;padding-top:0.3rem"><span>🔲</span><span style="font-weight:600;font-size:0.88rem;">Grid & Display</span></div>',
+        unsafe_allow_html=True,
+    )
+    if gdf is not None and ncol:
+        g1, g2 = st.sidebar.columns(2)
+        with g1:
+            st.session_state["show_grid"] = st.checkbox("Grid", value=st.session_state["show_grid"], key="cg")
+            st.session_state["show_inter"] = st.checkbox("Intersects", value=st.session_state["show_inter"], key="ci")
+            st.session_state["click_sel"] = st.checkbox("Click-select", value=st.session_state["click_sel"], key="cc")
+        with g2:
+            st.session_state["colorize"] = st.checkbox("Colorize", value=st.session_state["colorize"], key="cz")
+            st.session_state["show_sel"] = st.checkbox("Selected", value=st.session_state["show_sel"], key="cs")
+            if skey == "sentinel-2":
+                st.session_state["show_nocov"] = st.checkbox(
+                    "No-cov", value=st.session_state["show_nocov"],
+                    disabled=(nocov is None), key="cn",
+                )
+        with st.sidebar.expander("⚙️ Advanced", expanded=False):
+            st.session_state["max_feat"] = int(st.number_input(
+                "Max features", 200, 8000, int(st.session_state["max_feat"]), step=200, key="mf",
+            ))
+            st.session_state["opacity"] = float(st.slider(
+                "Fill opacity", 0.0, 0.2, float(st.session_state["opacity"]), step=0.01, key="op",
+            ))
+            st.session_state["simp_tol"] = float(st.slider(
+                "Simplify (°)", 0.0, 0.02, float(st.session_state["simp_tol"]), step=0.001, key="si",
+            ))
+        # Invalidate cache if parameters changed
+        cur = (int(st.session_state["max_feat"]), float(st.session_state["simp_tol"]), skey)
+        if _ss_get("gc_params") != cur:
+            st.session_state["gc_params"] = cur
+            for s in ("sentinel-2", "landsat"):
+                for x in ("tiles", "nocov", "bk"):
+                    st.session_state[f"gc_{s}_{x}"] = None
+        # Refresh and auto refresh options
+        a, b = st.sidebar.columns(2)
+        with a:
+            refresh = st.button("🔄 Refresh", use_container_width=True, key="ref")
+        with b:
+            st.session_state["auto_refresh"] = st.checkbox(
+                "Auto", value=st.session_state["auto_refresh"], key="ar",
+            )
+        pfx = f"gc_{skey}"
+        if _ss_get(f"{pfx}_bk") is None:
+            st.sidebar.caption("⏳ Cache empty — refresh")
+        else:
+            age = time.time() - float(_ss_get(f"{pfx}_ts", 0))
+            st.sidebar.caption(f"Cache: {age:.0f}s ago")
+    else:
+        st.sidebar.info(f"No grid data for {skey}.")
+    st.sidebar.markdown('<hr style="border-color:rgba(56,120,200,0.10)">', unsafe_allow_html=True)
+    # Tile search and selection
+    st.sidebar.markdown(
+        '<div style="display:flex;align-items:center;gap:6px;padding-top:0.3rem"><span>🔍</span><span style="font-weight:600;font-size:0.88rem;">Tile Search</span></div>',
+        unsafe_allow_html=True,
+    )
+    if gdf is not None and ncol:
+        q = st.sidebar.text_input(
+            "Search", placeholder="e.g. 34UED or 233062",
+            label_visibility="collapsed", key=f"ts_{skey}",
+        )
+        if q:
+            matches = find_tiles(gdf, ncol, q, 50)
+            mids = matches[ncol].astype(str).tolist() if not matches.empty else []
+            if not mids:
+                st.sidebar.caption("No matches.")
+            else:
+                pk = st.sidebar.selectbox(
+                    "Results", mids, index=0, key=f"tm_{skey}",
+                    label_visibility="collapsed",
+                )
+                b1, b2, b3 = st.sidebar.columns(3)
+                with b1:
+                    if st.button("➕", use_container_width=True, key=f"ta_{skey}", help="Add"):
+                        sel = set(map(str, st.session_state["selected_tiles"]))
+                        sel.add(pk)
+                        st.session_state["selected_tiles"] = sorted(sel)
+                        st.rerun()
+                with b2:
+                    if st.button("🔄", use_container_width=True, key=f"tr_{skey}", help="Replace"):
+                        st.session_state["selected_tiles"] = [pk]
+                        st.rerun()
+                with b3:
+                    if st.button("🎯", use_container_width=True, key=f"tz_{skey}", help="Zoom"):
+                        row = gdf[gdf[ncol].astype(str) == str(pk)]
+                        if not row.empty:
+                            ct = row.iloc[0].geometry.centroid
+                            st.session_state["map_center"] = (float(ct.y), float(ct.x))
+                            st.session_state["map_zoom"] = max(int(st.session_state["map_zoom"]), 10)
+                            st.rerun()
+        all_names = sorted(gdf[ncol].astype(str).unique().tolist()) if ncol else []
+        cur_sel = st.sidebar.multiselect(
+            "Selected", all_names,
+            default=st.session_state["selected_tiles"],
+            key=f"ms_{skey}", label_visibility="collapsed",
+        )
+        st.session_state["selected_tiles"] = cur_sel
+        if cur_sel:
+            if st.sidebar.button("✕ Clear", use_container_width=True, key=f"tc_{skey}"):
+                st.session_state["selected_tiles"] = []
+                st.rerun()
+    return provider, satellite, product, aoi_mode, refresh
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN APPLICATION
+# MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def main():
+def main() -> None:
+    """Entry point for the Streamlit application."""
     st.set_page_config(
         page_title="Satellite Imagery Downloader",
         page_icon="🛰️",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
-
+    # Apply custom CSS styling
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    # Initialise session state
     init_state()
-
-    configuration = ConfigLoader(config_file_path="config.yaml")
-    sat_tiles = load_all_tiles()
-    today = dt.date.today()
-
-    # ── Header ──
-    st.markdown("""
-        <div style="display:flex;align-items:center;gap:16px;margin-bottom:6px">
-            <div style="
-                width:48px;height:48px;border-radius:12px;
-                background:linear-gradient(135deg,#2d7dd2 0%,#00b4d8 50%,#48cae4 100%);
-                display:flex;align-items:center;justify-content:center;
-                font-size:1.5rem;box-shadow:0 4px 20px rgba(45,125,210,0.35);
-            ">🛰️</div>
-            <div>
-                <div style="font-size:1.4rem;font-weight:700;letter-spacing:-0.03em;color:#e8ecf4">
-                    Satellite Imagery Downloader
-                </div>
-                <div style="font-size:0.82rem;color:#576380;margin-top:1px">
-                    Sentinel-2 &nbsp;·&nbsp; Landsat &nbsp;·&nbsp; DEM &nbsp;·&nbsp; Grid Explorer &nbsp;·&nbsp; CLI Download
-                </div>
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-
-    # ── Current tile system ──
-    sys_key = st.session_state.get("tile_system", "sentinel-2")
-    tiles_data = sat_tiles.get(sys_key, {})
-    tiles_gdf = tiles_data.get("tiles")
-    nocov_gdf = tiles_data.get("nocov")
-    name_col = get_name_column(tiles_gdf, sys_key) if tiles_gdf is not None else None
-
-    # ── Tabs ──
-    tab_config, tab_results, tab_settings = st.tabs(["⚙  Configuration", "📂  Results", "🔧  Settings"])
-
-    # ══════════════════════════════════════════════════════════════
-    # TAB: Configuration
-    # ══════════════════════════════════════════════════════════════
-    with tab_config:
-
-        # ── Provider & Satellite card ──
-        card_open()
-        card_header("📡", "Data Source", "Select your provider, satellite mission, and product type.", "blue")
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            provider = st.selectbox("Provider", list(PROVIDERS.keys()), label_visibility="collapsed",
-                                     help="Data provider")
-        with c2:
-            satellite = st.selectbox("Mission", PROVIDERS.get(provider, []), label_visibility="collapsed",
-                                      help="Satellite mission")
-        with c3:
-            product_type = st.selectbox("Product", PRODUCT_TYPES.get(satellite, []), label_visibility="collapsed",
-                                         help="Product type")
-        card_close()
-
-        # ── AOI + Grid Explorer ──
-        card_open()
-        card_header("🗺️", "Area of Interest & Grid Explorer",
-                     "Define your AOI and explore the satellite tile grid interactively.", "teal")
-
-        map_col, ctrl_col = st.columns([2.2, 1.0], gap="large")
-
-        refresh_grid = False
-
-        with ctrl_col:
-            # Tile system selector
-            with st.expander("🛰️ **Tile System**", expanded=True):
-                sys_options = []
-                sys_labels = {}
-                if sat_tiles.get("sentinel-2", {}).get("tiles") is not None:
-                    sys_options.append("sentinel-2")
-                    sys_labels["sentinel-2"] = "Sentinel-2 (MGRS)"
-                if sat_tiles.get("landsat", {}).get("tiles") is not None:
-                    sys_options.append("landsat")
-                    sys_labels["landsat"] = "Landsat (WRS-2)"
-
-                if sys_options:
-                    new_sys = st.radio(
-                        "Grid", sys_options,
-                        format_func=lambda x: sys_labels.get(x, x),
-                        index=sys_options.index(sys_key) if sys_key in sys_options else 0,
-                        label_visibility="collapsed",
-                        horizontal=True,
-                    )
-                    if new_sys != sys_key:
-                        st.session_state["tile_system"] = new_sys
-                        st.session_state["selected_tiles"] = []
-                        st.session_state["intersecting_tiles"] = []
-                        st.rerun()
-
-                # Color legend
-                st.markdown("""
-                <div class="color-legend-pro">
-                    <div class="legend-title">Layer Colors</div>
-                    <div class="legend-item">
-                        <div class="legend-swatch" style="background:linear-gradient(90deg,hsl(190,70%,52%),hsl(230,70%,52%))"></div>
-                        Sentinel-2 tiles
-                    </div>
-                    <div class="legend-item">
-                        <div class="legend-swatch" style="background:linear-gradient(90deg,hsl(20,80%,55%),hsl(45,80%,55%))"></div>
-                        Landsat tiles
-                    </div>
-                    <div class="legend-item">
-                        <div class="legend-swatch" style="background:#7b68ee"></div>
-                        AOI intersections
-                    </div>
-                    <div class="legend-item">
-                        <div class="legend-swatch" style="background:#ef476f"></div>
-                        Selected tiles
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            # AOI input
-            with st.expander("📐 **AOI Input**", expanded=True):
-                aoi_mode = st.radio(
-                    "Method", ["Draw on map", "Preset square", "Paste WKT / GeoJSON"],
-                    horizontal=False, label_visibility="collapsed",
-                )
-                if aoi_mode == "Preset square":
-                    pc1, pc2 = st.columns(2)
-                    with pc1:
-                        sq_lat = st.number_input("Lat", value=float(st.session_state["map_center"][0]), format="%.6f")
-                    with pc2:
-                        sq_lng = st.number_input("Lng", value=float(st.session_state["map_center"][1]), format="%.6f")
-                    sq_side = st.number_input("Side (km)", min_value=0.1, value=25.0, step=5.0)
-                    if st.button("Apply square AOI", use_container_width=True):
-                        st.session_state["geometry_text"] = make_square_wkt(sq_lat, sq_lng, sq_side)
-                        st.session_state["map_center"] = (sq_lat, sq_lng)
-                        st.rerun()
-
-                if aoi_mode == "Paste WKT / GeoJSON":
-                    st.session_state["geometry_text"] = st.text_area(
-                        "WKT or GeoJSON", value=st.session_state.get("geometry_text", ""), height=120,
-                        label_visibility="collapsed", placeholder="Paste WKT or GeoJSON…",
-                    )
-
-            # Grid options
-            with st.expander("🔲 **Grid Options**", expanded=False):
-                if tiles_gdf is None or name_col is None:
-                    st.error(f"No grid data for **{sys_key}**.")
-                else:
-                    st.session_state["show_grid"] = st.checkbox("Show grid", value=st.session_state["show_grid"])
-                    st.session_state["colorize_grid"] = st.checkbox("Colorize", value=st.session_state["colorize_grid"])
-                    if sys_key == "sentinel-2":
-                        st.session_state["show_nocov"] = st.checkbox("No-coverage zones", value=st.session_state["show_nocov"], disabled=(nocov_gdf is None))
-                    st.session_state["show_intersects"] = st.checkbox("Intersecting tiles", value=st.session_state["show_intersects"])
-                    st.session_state["show_selected"] = st.checkbox("Selected tiles", value=st.session_state["show_selected"])
-                    st.session_state["click_to_select"] = st.checkbox("Click to select", value=st.session_state["click_to_select"])
-
-                    st.session_state["max_grid_features"] = int(st.number_input(
-                        "Max features", 200, 8000, int(st.session_state["max_grid_features"]), step=200))
-                    st.session_state["grid_opacity"] = float(st.slider(
-                        "Fill opacity", 0.0, 0.2, float(st.session_state["grid_opacity"]), step=0.01))
-                    st.session_state["simplify_tol"] = float(st.slider(
-                        "Simplify (°)", 0.0, 0.02, float(st.session_state["simplify_tol"]), step=0.001))
-
-                    # Invalidate cache on param change
-                    cur_params = (int(st.session_state["max_grid_features"]), float(st.session_state["simplify_tol"]), sys_key)
-                    if st.session_state.get("grid_cache_params") != cur_params:
-                        st.session_state["grid_cache_params"] = cur_params
-                        for s in ("sentinel-2", "landsat"):
-                            for suf in ("tiles", "nocov", "bbox_key"):
-                                st.session_state[f"gc_{s}_{suf}"] = None
-
-                    refresh_grid = st.button("🔄 Update Grid Overlay", use_container_width=True)
-                    st.session_state["grid_auto_refresh"] = st.checkbox(
-                        "Auto-refresh (throttled)", value=st.session_state["grid_auto_refresh"])
-
-                    pfx = f"gc_{sys_key}"
-                    if st.session_state.get(f"{pfx}_bbox_key") is None:
-                        st.caption("Cache empty — click **Update Grid Overlay**")
-                    else:
-                        age = time.time() - float(st.session_state.get(f"{pfx}_updated_ts", 0))
-                        st.caption(f"Cache age: {age:.0f}s")
-
-            # Tile search
-            with st.expander("🔍 **Tile Search & Selection**", expanded=True):
-                if tiles_gdf is not None and name_col:
-                    query = st.text_input(
-                        "Search", placeholder="e.g. 34UED or 233062",
-                        label_visibility="collapsed", key=f"tsearch_{sys_key}")
-
-                    if query:
-                        matches = find_tiles_by_query(tiles_gdf, name_col, query, 50)
-                        match_ids = matches[name_col].astype(str).tolist() if not matches.empty else []
-                        if not match_ids:
-                            st.caption("No matches found.")
-                        else:
-                            picked = st.selectbox("Results", match_ids, index=0, key=f"tmatch_{sys_key}",
-                                                   label_visibility="collapsed")
-                            bc1, bc2, bc3 = st.columns(3)
-                            with bc1:
-                                if st.button("➕ Add", use_container_width=True, key=f"tadd_{sys_key}"):
-                                    sel = set(map(str, st.session_state["selected_tiles"]))
-                                    sel.add(picked)
-                                    st.session_state["selected_tiles"] = sorted(sel)
-                                    st.rerun()
-                            with bc2:
-                                if st.button("🔄 Replace", use_container_width=True, key=f"trep_{sys_key}"):
-                                    st.session_state["selected_tiles"] = [picked]
-                                    st.rerun()
-                            with bc3:
-                                if st.button("🎯 Zoom", use_container_width=True, key=f"tzoom_{sys_key}"):
-                                    row = tiles_gdf[tiles_gdf[name_col].astype(str) == str(picked)]
-                                    if not row.empty:
-                                        c = row.iloc[0].geometry.centroid
-                                        st.session_state["map_center"] = (float(c.y), float(c.x))
-                                        st.session_state["map_zoom"] = max(int(st.session_state["map_zoom"]), 10)
-                                        st.rerun()
-
-                    current_sel = st.multiselect(
-                        "Selected", tiles_gdf[name_col].astype(str).unique().tolist(),
-                        default=st.session_state["selected_tiles"], key=f"msel_{sys_key}",
-                        label_visibility="collapsed",
-                    )
-                    st.session_state["selected_tiles"] = current_sel
-                    if st.button("✕ Clear selection", use_container_width=True, key=f"tclear_{sys_key}"):
-                        st.session_state["selected_tiles"] = []
-                        st.rerun()
-
-            # AOI preview
-            with st.expander("📋 **AOI Preview**", expanded=False):
-                st.text_area(
-                    "AOI", value=st.session_state.get("geometry_text", "") or "No AOI defined.",
-                    height=100, key="aoi_ro", label_visibility="collapsed", disabled=True,
-                )
-
-        # ── Parse AOI ──
-        aoi_geom = parse_text_geometry(st.session_state.get("geometry_text", ""))
+    # Load tiles
+    sat_tiles = load_tiles()
+    # Determine current system key and relevant data
+    skey = _ss_get("tile_system", "sentinel-2")
+    td = sat_tiles.get(skey, {})
+    gdf = td.get("tiles")
+    nocov = td.get("nocov")
+    ncol = get_name_col(gdf, skey) if gdf is not None else None
+    # Render sidebar controls
+    provider, satellite, product, aoi_mode, do_refresh = render_sidebar(
+        sat_tiles, gdf, nocov, ncol, skey,
+    )
+    # Page header
+    st.markdown("""<div style='display:flex;align-items:center;gap:14px;margin-bottom:4px;'>
+        <div style='font-size:1.6rem;background:linear-gradient(135deg,#38bdf8,#2dd4bf);width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(56,189,248,0.35);'>🛰️</div>
+        <div><div style='font-size:1.25rem;font-weight:700;color:#e2e8f0;'>Satellite Imagery Downloader</div><div style='font-size:0.72rem;color:#64748b;letter-spacing:.04em;'>Sentinel-2 · Landsat · DEM · Grid Explorer · CLI Download</div></div>
+    </div>""", unsafe_allow_html=True)
+    # Tabs: Map, Download, Results, Settings
+    tab_map, tab_dl, tab_res, tab_set = st.tabs(["🗺️ Map", "⬇️ Download", "📂 Results", "🔧 Settings"])
+    # Map tab
+    with tab_map:
+        aoi_geom = parse_geometry(_ss_get("geometry_text", ""))
         aoi_polys: List[Polygon] = []
         if aoi_geom and not aoi_geom.is_empty:
             if aoi_geom.geom_type == "Polygon":
                 aoi_polys = [aoi_geom]
             elif aoi_geom.geom_type == "MultiPolygon":
                 aoi_polys = list(aoi_geom.geoms)
-
-        tile_names, intersects_gdf = compute_intersections(aoi_polys, tiles_gdf, name_col)
-        st.session_state["intersecting_tiles"] = tile_names or []
-
-        selected_gdf = None
-        if tiles_gdf is not None and name_col and st.session_state["selected_tiles"]:
-            selset = set(map(str, st.session_state["selected_tiles"]))
-            selected_gdf = tiles_gdf[tiles_gdf[name_col].astype(str).isin(selset)][[name_col, "geometry"]].copy()
-            if selected_gdf.empty:
-                selected_gdf = None
-
+        tnames, inter_gdf = compute_intersections(aoi_polys, gdf, ncol)
+        st.session_state["intersecting_tiles"] = tnames or []
+        sel_gdf: Optional[gpd.GeoDataFrame] = None
+        if gdf is not None and ncol and st.session_state["selected_tiles"]:
+            ss = set(map(str, st.session_state["selected_tiles"]))
+            sel_gdf = gdf[gdf[ncol].astype(str).isin(ss)][[ncol, "geometry"]].copy()
+            if sel_gdf.empty:
+                sel_gdf = None
+        pfx = f"gc_{skey}"
         # Manual refresh
-        if refresh_grid and tiles_gdf is not None and name_col and st.session_state.get("show_grid"):
-            bb = bounds_from_leaflet(st.session_state.get("map_bounds"))
-            if bb is None:
-                clat, clng = st.session_state["map_center"]
-                bb = fallback_bbox(clat, clng, int(st.session_state["map_zoom"]))
-            update_grid_cache(tiles_gdf, nocov_gdf, name_col, bb, sys_key)
-
-        pfx = f"gc_{sys_key}"
-        tiles_visible = st.session_state.get(f"{pfx}_tiles")
-        nocov_visible = st.session_state.get(f"{pfx}_nocov")
-
+        if do_refresh and gdf is not None and ncol and _ss_get("show_grid"):
+            bb = bounds_from_leaflet(_ss_get("map_bounds"))
+            if not bb:
+                lat, lng = st.session_state["map_center"]
+                bb = fallback_bbox(lat, lng, int(st.session_state["map_zoom"]))
+            update_cache(gdf, nocov, ncol, bb, skey)
+        # Retrieve cached overlays
+        tv = _ss_get(f"{pfx}_tiles")
+        nv = _ss_get(f"{pfx}_nocov")
         center = st.session_state["map_center"]
         zoom = int(st.session_state["map_zoom"])
-
-        show_grid_eff = (
-            st.session_state.get("show_grid", False)
-            and zoom >= MAP_CFG.MIN_GRID_ZOOM
-            and tiles_visible is not None
-            and not getattr(tiles_visible, "empty", True)
+        sg = (
+            _ss_get("show_grid")
+            and zoom >= MCFG.MIN_GRID_ZOOM
+            and tv is not None
+            and not getattr(tv, "empty", True)
         )
-        show_nocov_eff = (
-            sys_key == "sentinel-2"
-            and st.session_state.get("show_nocov", False)
-            and nocov_visible is not None
-            and not getattr(nocov_visible, "empty", True)
+        sn = (
+            skey == "sentinel-2"
+            and _ss_get("show_nocov")
+            and nv is not None
+            and not getattr(nv, "empty", True)
         )
-
-        # ── Map ──
-        with map_col:
-            if st.session_state.get("show_grid") and zoom < MAP_CFG.MIN_GRID_ZOOM:
-                st.markdown(f'<div class="info-banner">Zoom in to level {MAP_CFG.MIN_GRID_ZOOM}+ to render the grid (current: {zoom})</div>', unsafe_allow_html=True)
-
-            if st.session_state.get("show_grid") and st.session_state.get(f"{pfx}_bbox_key") is None:
-                st.markdown('<div class="info-banner">Grid cache empty — click <b>Update Grid Overlay</b> in the sidebar</div>', unsafe_allow_html=True)
-
-            opts = {
-                "show_grid": show_grid_eff,
-                "show_nocov": show_nocov_eff,
-                "show_intersects": st.session_state["show_intersects"],
-                "show_selected": st.session_state["show_selected"],
-                "colorize": st.session_state["colorize_grid"],
-                "opacity": st.session_state["grid_opacity"],
-            }
-
-            m = build_map(
-                center=center, zoom=zoom, aoi_geom=aoi_geom,
-                tiles_vis=tiles_visible if show_grid_eff else None,
-                nocov_vis=nocov_visible if show_nocov_eff else None,
-                intersects_gdf=intersects_gdf, selected_gdf=selected_gdf,
-                opts=opts, name_col=name_col, tile_system=sys_key,
+        if _ss_get("show_grid") and zoom < MCFG.MIN_GRID_ZOOM:
+            st.markdown(
+                f'<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#fbbf24;">⚠️ Zoom to {MCFG.MIN_GRID_ZOOM}+ for grid (current: {zoom})</div>',
+                unsafe_allow_html=True,
             )
-
-            returned = ["all_drawings", "bounds", "zoom", "center"]
-            if st.session_state["click_to_select"]:
-                returned.append("last_object_clicked_popup")
-
-            st.markdown('<div class="map-wrapper">', unsafe_allow_html=True)
-            map_data = st_folium(m, key="main_map", width="100%", height=MAP_CFG.MAP_HEIGHT, returned_objects=returned)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            # Sync viewport
-            if map_data and map_data.get("bounds"):
-                b = bounds_from_leaflet(map_data["bounds"])
-                if b is not None:
-                    st.session_state["map_bounds"] = map_data["bounds"]
-            sync_map_viewport(map_data)
-
-            # Auto‑refresh grid
-            if (tiles_gdf is not None and name_col and st.session_state.get("show_grid")
-                    and st.session_state.get("grid_auto_refresh")):
-                bbox_now = bounds_from_leaflet(map_data.get("bounds") if map_data else None)
-                if bbox_now is not None:
-                    k_now = bbox_key(bbox_now)
-                    k_cached = st.session_state.get(f"{pfx}_bbox_key")
-                    now = time.time()
-                    if (k_now != k_cached and
-                            (now - float(st.session_state.get("grid_last_refresh_ts", 0))) >= MAP_CFG.AUTO_REFRESH_THROTTLE_SEC):
-                        st.session_state["grid_last_refresh_ts"] = now
-                        update_grid_cache(tiles_gdf, nocov_gdf, name_col, bbox_now, sys_key)
-                        st.rerun()
-
-            # Draw‑on‑map AOI
-            if aoi_mode == "Draw on map":
-                drawn = parse_map_drawings(map_data)
-                if drawn:
-                    union = safe_union(drawn)
-                    new_wkt = shapely_wkt.dumps(union, rounding_precision=6)
-                    drawings = map_data.get("all_drawings", []) if map_data else []
-                    dhash = hash(json.dumps(drawings, sort_keys=True))
-                    if (new_wkt and dhash != st.session_state.get("last_drawings_hash")
-                            and new_wkt != st.session_state.get("last_aoi_wkt", "")):
-                        st.session_state.update({"last_aoi_wkt": new_wkt, "last_drawings_hash": dhash, "geometry_text": new_wkt})
-                        st.rerun()
-
-            # Click‑to‑select
-            if st.session_state["click_to_select"] and map_data:
-                popup = map_data.get("last_object_clicked_popup")
-                if popup and popup != st.session_state.get("last_click_popup"):
-                    st.session_state["last_click_popup"] = popup
-                    pat = r"\b\d{2}[A-Z]{3}\b" if sys_key == "sentinel-2" else r"\b\d{6}\b"
-                    m_id = re.search(pat, str(popup).upper() if sys_key == "sentinel-2" else str(popup))
-                    if m_id:
-                        tid = m_id.group(0)
-                        sel = set(map(str, st.session_state["selected_tiles"]))
-                        sel.symmetric_difference_update({tid})
-                        st.session_state["selected_tiles"] = sorted(sel)
-                        st.rerun()
-
-            # ── Stats row ──
-            n_inter = len(st.session_state["intersecting_tiles"])
-            n_sel = len(st.session_state["selected_tiles"])
-            st.markdown(f"""
-            <div class="stat-row">
-                <div class="stat-item">
-                    <div class="stat-value">{n_inter}</div>
-                    <div class="stat-label">Intersecting</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value">{n_sel}</div>
-                    <div class="stat-label">Selected</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value">{sys_key.split('-')[0].upper()}</div>
-                    <div class="stat-label">Grid System</div>
-                </div>
+        if _ss_get("show_grid") and _ss_get(f"{pfx}_bk") is None:
+            st.markdown(
+                '<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#38bdf8;">ℹ️ Grid cache empty — click Refresh in sidebar</div>',
+                unsafe_allow_html=True,
+            )
+        opts = {
+            "show_grid": sg,
+            "show_nocov": sn,
+            "show_inter": st.session_state["show_inter"],
+            "show_sel": st.session_state["show_sel"],
+            "colorize": st.session_state["colorize"],
+            "opacity": st.session_state["opacity"],
+        }
+        m = build_map(
+            center, zoom, aoi_geom,
+            tv if sg else None,
+            nv if sn else None,
+            inter_gdf, sel_gdf, opts, ncol, skey,
+        )
+        ret = ["all_drawings", "bounds", "zoom", "center"]
+        if st.session_state["click_sel"]:
+            ret.append("last_object_clicked_popup")
+        st.markdown('<div style="border-radius:14px;overflow:hidden;border:1px solid rgba(56,120,200,0.10);box-shadow:0 4px 20px rgba(0,0,0,0.3);">', unsafe_allow_html=True)
+        md = st_folium(m, key="mm", width="100%", height=MCFG.MAP_HEIGHT, returned_objects=ret)
+        st.markdown('</div>', unsafe_allow_html=True)
+        if md and md.get("bounds"):
+            b = bounds_from_leaflet(md["bounds"])
+            if b:
+                st.session_state["map_bounds"] = md["bounds"]
+            sync_viewport(md)
+        # Auto refresh grid overlay when panning/zooming
+        if gdf is not None and ncol and _ss_get("show_grid") and _ss_get("auto_refresh"):
+            bnow = bounds_from_leaflet(md.get("bounds") if md else None)
+            if bnow:
+                kn = bbox_key(bnow)
+                kc = _ss_get(f"{pfx}_bk")
+                now = time.time()
+                # Only refresh if bounding box has changed and throttle interval has passed
+                if kn != kc and (now - float(_ss_get("gc_last_ts", 0))) >= MCFG.AUTO_REFRESH_THROTTLE:
+                    st.session_state["gc_last_ts"] = now
+                    update_cache(gdf, nocov, ncol, bnow, skey)
+                    st.rerun()
+        # Draw on map AOI handling
+        if aoi_mode == "Draw on map":
+            drawn = parse_drawings(md)
+            if drawn:
+                u = safe_union(drawn)
+                nw = shapely_wkt.dumps(u, rounding_precision=6)
+                drs = md.get("all_drawings", []) if md else []
+                dh = hash(json.dumps(drs, sort_keys=True))
+                if (
+                    nw
+                    and dh != _ss_get("last_drawings_hash")
+                    and nw != _ss_get("last_aoi_wkt", "")
+                ):
+                    st.session_state.update({
+                        "last_aoi_wkt": nw,
+                        "last_drawings_hash": dh,
+                        "geometry_text": nw,
+                    })
+                    st.rerun()
+        # Click select/deselect
+        if st.session_state["click_sel"] and md:
+            popup = md.get("last_object_clicked_popup")
+            if popup and popup != _ss_get("last_click_popup"):
+                st.session_state["last_click_popup"] = popup
+                pat = r"\b\d{2}[A-Z]{3}\b" if skey == "sentinel-2" else r"\b\d{6}\b"
+                mi = re.search(pat, str(popup).upper() if skey == "sentinel-2" else str(popup))
+                if mi:
+                    tid = mi.group(0)
+                    sel = set(map(str, st.session_state["selected_tiles"]))
+                    sel.symmetric_difference_update({tid})
+                    st.session_state["selected_tiles"] = sorted(sel)
+                    st.rerun()
+        # Stats and lists
+        ni = len(st.session_state["intersecting_tiles"])
+        ns = len(st.session_state["selected_tiles"])
+        grid_label = skey.split('-')[0].upper()
+        st.markdown(f"""<div style='display:flex;gap:8px;margin-top:6px;'>
+            <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;text-align:center;'>
+                <div style='font-size:1.4rem;font-family:JetBrains Mono,monospace;color:#2dd4bf;font-weight:700;'>{ni}</div>
+                <div style='font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em;'>Intersecting</div>
             </div>
-            """, unsafe_allow_html=True)
-
-            # Tile chips
-            if tiles_gdf is not None and name_col:
+            <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;text-align:center;'>
+                <div style='font-size:1.4rem;font-family:JetBrains Mono,monospace;color:#e2e8f0;font-weight:700;'>{ns}</div>
+                <div style='font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em;'>Selected</div>
+            </div>
+            <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;text-align:center;'>
+                <div style='font-size:1.4rem;font-family:JetBrains Mono,monospace;color:#38bdf8;font-weight:700;'>{grid_label}</div>
+                <div style='font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em;'>Grid</div>
+            </div>
+            <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;text-align:center;'>
+                <div style='font-size:1.4rem;font-family:JetBrains Mono,monospace;color:#fbbf24;font-weight:700;'>{zoom}</div>
+                <div style='font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em;'>Zoom</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+        # Show lists in expanders with chips
+        if gdf is not None and ncol:
+            ca, cb = st.columns(2)
+            with ca:
                 if st.session_state["intersecting_tiles"]:
-                    with st.expander(f"Intersecting tiles ({n_inter})", expanded=False):
-                        chips = "".join(f'<span class="tile-chip">{t}</span>' for t in st.session_state["intersecting_tiles"][:40])
-                        st.markdown(chips, unsafe_allow_html=True)
-                        if n_inter > 40:
-                            st.caption(f"… and {n_inter - 40} more")
-                        csv = "tile\n" + "\n".join(st.session_state["intersecting_tiles"])
-                        st.download_button("Download CSV", data=csv,
-                                            file_name=f"{sys_key}_intersects.csv", mime="text/csv")
-
+                    with st.expander(f"🔮 Intersecting ({ni})", expanded=False):
+                        st.markdown(
+                            "".join(
+                                f'<span style="display:inline-block;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:16px;padding:4px 10px;margin:2px;font-size:11px;font-family:\'JetBrains Mono\',monospace;color:#e48abf;">{t}</span>'
+                                for t in st.session_state["intersecting_tiles"][:60]
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        if ni > 60:
+                            st.caption(f"…+{ni - 60}")
+                        st.download_button(
+                            "📥 CSV",
+                            data="tile\n" + "\n".join(st.session_state["intersecting_tiles"]),
+                            file_name=f"{skey}_intersects.csv", mime="text/csv",
+                        )
+            with cb:
                 if st.session_state["selected_tiles"]:
-                    with st.expander(f"Selected tiles ({n_sel})", expanded=False):
-                        chips = "".join(f'<span class="tile-chip">{t}</span>' for t in st.session_state["selected_tiles"])
-                        st.markdown(chips, unsafe_allow_html=True)
-                        csv2 = "tile\n" + "\n".join(map(str, st.session_state["selected_tiles"]))
-                        st.download_button("Download CSV", data=csv2,
-                                            file_name=f"{sys_key}_selected.csv", mime="text/csv")
-
-        card_close()
-
-        # ── Time Range ──
-        card_open()
-        card_header("📅", "Time Range", "Define the temporal window for your data search.", "purple")
-        d1, d2 = st.columns(2)
-        with d1:
-            start_date = st.date_input("Start", value=st.session_state["start_date"], max_value=today, key="sd")
-        with d2:
-            end_date = st.date_input("End", value=st.session_state["end_date"], min_value=start_date, max_value=today, key="ed")
-        if end_date < start_date:
-            end_date = start_date
-            st.warning("End date adjusted to match start date.")
-        st.session_state["start_date"] = start_date
-        st.session_state["end_date"] = end_date
-        card_close()
-
-        # ── Download ──
-        card_open()
-        card_header("⬇️", "Download", "Execute the CLI download command. Logs stream from nohup.out.", "green")
-
-        n_products = len(st.session_state.get("selected_tiles", []))
-        if n_products > 0:
-            st.markdown(f'<div class="product-badge">📦  {n_products} product{"s" if n_products != 1 else ""} queued for download</div>', unsafe_allow_html=True)
-
-        aoi_text = st.session_state.get("geometry_text", "").strip()
-        aoi_file = "example_aoi.geojson" if aoi_text.startswith("{") else "example_aoi.wkt"
+                    with st.expander(f"✅ Selected ({ns})", expanded=False):
+                        st.markdown(
+                            "".join(
+                                f'<span style="display:inline-block;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:16px;padding:4px 10px;margin:2px;font-size:11px;font-family:\'JetBrains Mono\',monospace;color:#f88cb0;">{t}</span>'
+                                for t in st.session_state["selected_tiles"]
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        st.download_button(
+                            "📥 CSV",
+                            data="tile\n" + "\n".join(map(str, st.session_state["selected_tiles"])),
+                            file_name=f"{skey}_selected.csv", mime="text/csv",
+                        )
+    # Download tab
+    with tab_dl:
+        st.markdown(
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>⬇️</span><span style="font-weight:600;font-size:0.94rem;">Download Manager</span><span style="font-size:0.72rem;color:#64748b;margin-left:auto;">CLI execution</span></div>',
+            unsafe_allow_html=True,
+        )
+        np_ = len(_ss_get("selected_tiles", []))
+        ni_ = len(_ss_get("intersecting_tiles", []))
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Provider", provider)
+        with c2:
+            st.metric("Mission", satellite)
+        with c3:
+            st.metric("Product", product)
+        st.markdown("---")
+        if _ss_get("dl_running"):
+            st.markdown('<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#06d6a0;">🔄 Download in progress…</div>', unsafe_allow_html=True)
+        elif np_ > 0:
+            tile_word = "tiles" if np_ != 1 else "tile"
+            st.markdown(f'<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#06d6a0;">📦 {np_} {tile_word} queued for download</div>', unsafe_allow_html=True)
+        elif ni_ > 0:
+            st.markdown(f'<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#38bdf8;">ℹ️ {ni_} intersecting — select tiles to download</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#fbbf24;">⚠️ No tiles — draw AOI or select tiles first</div>', unsafe_allow_html=True)
+        atxt = _ss_get("geometry_text", "").strip()
+        afile = "example_aoi.geojson" if atxt.startswith("{") else "example_aoi.wkt"
         cli_cmd = (
             f"python cli.py --provider {provider.lower()} "
-            f"--collection {satellite.split(' ')[0]} --product-type {product_type} "
-            f"--start-date {start_date} --end-date {end_date} --aoi_file {aoi_file}"
+            f"--collection {satellite.split(' ')[0]} --product-type {product} "
+            f"--start-date {st.session_state['start_date']} "
+            f"--end-date {st.session_state['end_date']} --aoi_file {afile}"
         )
         st.code(cli_cmd, language="bash")
-
-        if st.button("🚀 Start Download", use_container_width=True, type="primary"):
-            if not aoi_text:
-                st.error("Please define an AOI first.")
-            elif not start_date or not end_date:
-                st.error("Please set both start and end dates.")
-            else:
-                Path(aoi_file).write_text(aoi_text)
-                Path("nohup.out").write_text("")
-                os.system(f"nohup {cli_cmd} &")
-                show_live_logs()
-
-        card_close()
-
-    # ══════════════════════════════════════════════════════════════
-    # TAB: Results
-    # ══════════════════════════════════════════════════════════════
-    with tab_results:
-        card_open()
-        card_header("📂", "Downloaded Products", "Browse, manage and download your satellite data files.", "amber")
-
-        def sort_by_size(files):
-            return sorted(files, key=lambda x: x["size"])
-
-        _ = st_file_browser(
-            os.path.join("downloads"),
-            file_ignores=None, key="file_browser",
-            show_choose_file=True, show_choose_folder=True,
-            show_delete_file=True, show_download_file=True,
-            show_new_folder=True, show_upload_file=True,
-            show_rename_file=True, show_rename_folder=True,
-            use_cache=True, sort=sort_by_size,
+        d1, d2, d3 = st.columns([2, 1, 1])
+        with d1:
+            if st.button("🚀 Start Download", use_container_width=True, type="primary"):
+                if not atxt:
+                    st.error("Define an AOI first.")
+                else:
+                    reset_downloads()
+                    st.session_state["dl_running"] = True
+                    st.session_state["dl_start_time"] = time.time()
+                    Path(afile).write_text(atxt)
+                    Path("nohup.out").write_text("")
+                    # Launch the CLI download in background.  Use nohup to detach.
+                    os.system(f"nohup {cli_cmd} > nohup.out 2>&1 &")
+                    st.success("✅ Download started! Previous downloads cleared.")
+                    st.rerun()
+        with d2:
+            if st.button("⏹️ Stop", use_container_width=True):
+                # Attempt to stop the CLI by searching for python cli.py processes
+                os.system("pkill -f 'python cli.py'")
+                st.session_state["dl_running"] = False
+                st.warning("⏹️ Stopped.")
+        with d3:
+            if st.button("🗑️ Reset", use_container_width=True):
+                reset_downloads()
+                st.session_state["dl_running"] = False
+                st.info("🗑️ Downloads cleared.")
+                st.rerun()
+        st.markdown("---")
+        st.markdown(
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>📊</span><span style="font-weight:600;font-size:0.94rem;">Live Progress</span></div>',
+            unsafe_allow_html=True,
         )
-        card_close()
-
-    # ══════════════════════════════════════════════════════════════
-    # TAB: Settings
-    # ══════════════════════════════════════════════════════════════
-    with tab_settings:
-        card_open()
-        card_header("🔧", "Configuration", "View and manage your config.yaml settings.", "purple")
+        render_download_progress()
+        # Poll CLI process to determine if download has finished
+        if _ss_get("dl_running"):
+            result = os.popen("pgrep -f 'python cli.py'").read()
+            if not result.strip():
+                st.session_state["dl_running"] = False
+                st.markdown('<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#06d6a0;">✅ Download complete!</div>', unsafe_allow_html=True)
+            else:
+                # Brief pause then rerun to update progress
+                time.sleep(2)
+                st.rerun()
+    # Results tab
+    with tab_res:
+        st.markdown(
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>📂</span><span style="font-weight:600;font-size:0.94rem;">Downloaded Products</span></div>',
+            unsafe_allow_html=True,
+        )
+        dl_dir = "downloads"
+        Path(dl_dir).mkdir(exist_ok=True)
+        n_files, total_mb = count_downloaded_products(dl_dir)
+        st.markdown(f"""<div style='display:flex;gap:8px;margin:6px 0;'>
+            <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;text-align:center;'>
+                <div style='font-size:1.4rem;font-family:JetBrains Mono,monospace;color:#e2e8f0;font-weight:700;'>{n_files}</div>
+                <div style='font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em;'>Files</div>
+            </div>
+            <div style='flex:1;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;text-align:center;'>
+                <div style='font-size:1.4rem;font-family:JetBrains Mono,monospace;color:#2dd4bf;font-weight:700;'>{total_mb:.1f} MB</div>
+                <div style='font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em;'>Total Size</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+        # Use the file browser if available
+        if st_file_browser is not None:
+            st_file_browser(
+                dl_dir, key="fb",
+                show_choose_file=True, show_choose_folder=True,
+                show_delete_file=True, show_download_file=True,
+                show_new_folder=True, show_upload_file=True,
+                show_rename_file=True, show_rename_folder=True,
+                use_cache=True,
+            )
+        else:
+            files = [f for f in Path(dl_dir).rglob("*") if f.is_file()]
+            if files:
+                for f in sorted(files):
+                    sz = f.stat().st_size / (1024 * 1024)
+                    st.text(f"📄 {f.relative_to(dl_dir)} ({sz:.2f} MB)")
+            else:
+                st.info("No files yet.")
+    # Settings tab
+    with tab_set:
+        st.markdown(
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>🔧</span><span style="font-weight:600;font-size:0.94rem;">Configuration</span></div>',
+            unsafe_allow_html=True,
+        )
         try:
-            config_content = Path("config.yaml").read_text()
-            st.code(config_content, language="yaml")
+            st.code(Path("config.yaml").read_text(), language="yaml")
         except FileNotFoundError:
-            st.warning("config.yaml not found.")
-        card_close()
+            st.info("config.yaml not found.")
+        st.markdown("---")
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            st.metric(
+                "Center",
+                f"{st.session_state['map_center'][0]:.4f}, {st.session_state['map_center'][1]:.4f}",
+            )
+        with s2:
+            st.metric("Zoom", st.session_state["map_zoom"])
+        with s3:
+            st.metric("System", skey)
 
 
 if __name__ == "__main__":
