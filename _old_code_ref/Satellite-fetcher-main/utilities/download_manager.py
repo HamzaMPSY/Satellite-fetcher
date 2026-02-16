@@ -1,6 +1,5 @@
 import asyncio
 import os
-import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -68,29 +67,8 @@ class DownloadManager:
         self.chunk_size = (
             config_loader.get_var("download_manager.chunk_size")
             if config_loader
-            else 1024 * 1024
-        )  # 1MB default for better throughput
-
-        # Disk flush strategy (performance vs durability)
-        self.flush_interval_bytes = (
-            config_loader.get_var("download_manager.flush_interval_bytes")
-            if config_loader
-            else 64 * 1024 * 1024
-        )  # 64MB
-        self.force_fsync = (
-            config_loader.get_var("download_manager.force_fsync")
-            if config_loader
-            else False
-        )
-
-        try:
-            self.chunk_size = max(64 * 1024, int(self.chunk_size))
-        except Exception:
-            self.chunk_size = 1024 * 1024
-        try:
-            self.flush_interval_bytes = max(self.chunk_size, int(self.flush_interval_bytes))
-        except Exception:
-            self.flush_interval_bytes = 64 * 1024 * 1024
+            else 128 * 1024
+        )  # 128KB - smaller chunks
 
         # Conservative connection settings
         self.max_connections = (
@@ -118,10 +96,11 @@ class DownloadManager:
 
     def _create_session_with_timeouts(self) -> aiohttp.ClientSession:
         """Create an aiohttp session with conservative settings optimized for unreliable connections."""
+        # Timeouts
         timeout = aiohttp.ClientTimeout(
-            total=None,
-            connect=self.connect_timeout,
-            sock_read=None,
+            total=None,  # No global total timeout (file might take hours)
+            connect=self.connect_timeout,  # 30s or so is fine
+            sock_read=None,  # IMPORTANT: don't timeout between chunks
         )
 
         connector = aiohttp.TCPConnector(
@@ -130,86 +109,24 @@ class DownloadManager:
             enable_cleanup_closed=True,
             use_dns_cache=True,
             ttl_dns_cache=300,
-            keepalive_timeout=300,
+            keepalive_timeout=300,  # Keep TCP alive for longer
             resolver=aiohttp.AsyncResolver(),
-            family=0,
-            ssl=True,
+            family=0,  # IPv4 & IPv6
+            ssl=True,  # keep SSL verification unless provider is really broken
         )
 
         return aiohttp.ClientSession(
             timeout=timeout, connector=connector, trust_env=True, raise_for_status=False
         )
 
-    def _validate_product_ids(self, product_ids: Dict) -> bool:
-        """Validate that product_ids dict has the required structure.
-
-        FIX: The previous code would crash with a cryptic KeyError if a
-        provider returned an unexpected format.  This method logs a clear
-        error message and returns False so the caller can bail out
-        gracefully.
-
-        Expected structure::
-
-            {
-                "headers": dict,       # HTTP headers (auth token, etc.)
-                "urls": list[str],     # Download URLs
-                "file_names": list[str],  # Corresponding file names
-                "refresh_token_callback": callable | None,  # Optional
-            }
-        """
-        if not isinstance(product_ids, dict):
-            logger.error(
-                f"product_ids must be a dict, got {type(product_ids).__name__}. "
-                f"This usually means the provider's search_products() returned an "
-                f"unexpected type.  Value (truncated): {str(product_ids)[:200]}"
-            )
-            return False
-
-        required_keys = {"headers", "urls", "file_names"}
-        missing = required_keys - set(product_ids.keys())
-        if missing:
-            logger.error(
-                f"product_ids dict is missing required keys: {missing}. "
-                f"Available keys: {list(product_ids.keys())}. "
-                f"This usually means the provider's search/download interface "
-                f"changed or returned partial data."
-            )
-            return False
-
-        urls = product_ids.get("urls", [])
-        file_names = product_ids.get("file_names", [])
-        if not urls:
-            logger.warning("product_ids['urls'] is empty — nothing to download.")
-            return False
-        if len(urls) != len(file_names):
-            logger.error(
-                f"Mismatch: {len(urls)} URLs but {len(file_names)} file names. "
-                f"Cannot proceed with download."
-            )
-            return False
-
-        return True
-
     def download_products(
         self, product_ids: Dict, output_dir: str = "downloads"
     ) -> List[str]:
         """
         Download multiple products concurrently using asyncio and aiohttp.
-
-        FIX: Added validation of product_ids before starting downloads.
-        FIX: Wrapped asyncio.run in better error handling to surface issues.
         """
-        # ── FIX: Validate input before doing anything ────────────────
-        if not self._validate_product_ids(product_ids):
-            logger.error("Aborting download due to invalid product_ids.")
-            return []
-
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         logger.info(f"Ensured output directory exists: {output_dir}")
-        logger.info(
-            f"Starting download of {len(product_ids['urls'])} products "
-            f"to {output_dir} (max_concurrent={self.max_concurrent})"
-        )
 
         try:
             loop = asyncio.get_running_loop()
@@ -220,13 +137,6 @@ class DownloadManager:
             results = asyncio.run(
                 self._download_all_concurrent(product_ids, output_dir)
             )
-        except Exception as e:
-            logger.error(f"Fatal error in download orchestration: {e}")
-            results = []
-
-        logger.info(
-            f"Download batch complete: {len(results)}/{len(product_ids['urls'])} succeeded"
-        )
         return results
 
     async def _get_resume_position(self, filepath: str) -> int:
@@ -236,6 +146,7 @@ class DownloadManager:
 
         file_size = os.path.getsize(filepath)
         if file_size < self.min_resume_size:
+            # File too small, start over
             os.remove(filepath)
             return 0
 
@@ -249,29 +160,29 @@ class DownloadManager:
         headers: dict,
         filepath: str,
         file_name: str,
-    ) -> tuple[bool, int, int | None]:
-        """
-        Download a file with resume capability.
-        Returns (success, status_code, retry_after_seconds).
-        """
+    ) -> tuple[bool, int]:
+        """Download a file with resume capability. Returns (success, status_code)."""
         resume_pos = await self._get_resume_position(filepath)
 
+        # Set up range header for resume
         request_headers = headers.copy() if headers else {}
         if resume_pos > 0:
             request_headers["Range"] = f"bytes={resume_pos}-"
 
+        # Open file in appropriate mode
         file_mode = "ab" if resume_pos > 0 else "wb"
 
         try:
             async with session.get(url, headers=request_headers) as resp:
-                if resp.status == 416:
+                # Handle different status codes
+                if resp.status == 416:  # Range not satisfiable - file is complete
                     logger.info(f"File {file_name} already complete")
-                    return True, resp.status, None
-                elif resp.status == 206:
+                    return True, resp.status
+                elif resp.status == 206:  # Partial content - resume successful
                     logger.info(
                         f"Resuming download of {file_name} from byte {resume_pos}"
                     )
-                elif resp.status == 200:
+                elif resp.status == 200:  # Full content
                     if resume_pos > 0:
                         logger.warning(
                             f"Server doesn't support resume for {file_name}, starting over"
@@ -279,17 +190,11 @@ class DownloadManager:
                         resume_pos = 0
                         file_mode = "wb"
                 elif resp.status in [401, 429] or 500 <= resp.status < 600:
-                    retry_after = None
-                    if resp.status == 429:
-                        ra = resp.headers.get("Retry-After")
-                        try:
-                            retry_after = int(ra) if ra is not None else None
-                        except (ValueError, TypeError):
-                            retry_after = None
-                    return False, resp.status, retry_after
+                    return False, resp.status  # Let caller handle these errors
                 else:
                     resp.raise_for_status()
 
+                # Get content length
                 content_length = resp.headers.get("Content-Length")
                 if content_length:
                     remaining_size = int(content_length)
@@ -308,16 +213,12 @@ class DownloadManager:
                     )
                     fs = self.ocifs_manager.fs
                 else:
-                    parent = Path(filepath).parent
-                    parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        file_flux = open(filepath, file_mode)
-                    except FileNotFoundError:
-                        # Directory may have been removed concurrently (e.g. UI reset)
-                        parent.mkdir(parents=True, exist_ok=True)
-                        file_flux = open(filepath, file_mode)
+                    # Ensure directory exists
+                    Path(os.path.dirname(filepath)).mkdir(parents=True, exist_ok=True)
+                    file_flux = open(filepath, file_mode)
                     fs = os
 
+                # Download with progress
                 downloaded_this_session = 0
 
                 with tqdm(
@@ -333,46 +234,43 @@ class DownloadManager:
                     ),
                 ) as progress_bar:
                     try:
-                        bytes_since_flush = 0
                         async for chunk in resp.content.iter_chunked(self.chunk_size):
                             if not chunk:
                                 break
                             file_flux.write(chunk)
-                            chunk_len = len(chunk)
-                            downloaded_this_session += chunk_len
-                            bytes_since_flush += chunk_len
+                            downloaded_this_session += len(chunk)
                             progress_bar.update(len(chunk))
 
-                            if bytes_since_flush >= self.flush_interval_bytes:
+                            # Flush periodically to ensure data is written
+                            if downloaded_this_session % (self.chunk_size * 10) == 0:
                                 file_flux.flush()
-                                if fs == os and self.force_fsync:
+                                if fs == os:
                                     fs.fsync(file_flux.fileno())
-                                bytes_since_flush = 0
-
-                        # Ensure remaining buffered bytes hit disk before close/size check
-                        file_flux.flush()
-                        if fs == os and self.force_fsync:
-                            fs.fsync(file_flux.fileno())
 
                     except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                        # Ensure we flush any remaining data
                         file_flux.flush()
-                        if fs == os and self.force_fsync:
+                        if fs == os:
                             fs.fsync(file_flux.fileno())
 
+                        # If it's a response error with status, return False with status
                         if isinstance(e, aiohttp.ClientResponseError) and e.status:
                             logger.warning(
                                 f"Mid-download error for {file_name}: HTTP {e.status}"
                             )
-                            return False, e.status, None
+                            return False, e.status
 
+                        # For other errors, raise to be handled by retry logic
                         raise e
                     finally:
                         file_flux.close()
 
+                # Verify download completeness if we have content length
                 if total_size > 0:
                     if fs == os:
                         final_size = os.path.getsize(filepath)
                     else:
+                        # Construct OCIFS path for fsspec's size() call
                         oci_path = f"oci://{self.ocifs_manager.bucket}@{self.ocifs_manager.namespace}/{filepath}"
                         final_size = fs.size(oci_path)
                     if final_size != total_size:
@@ -382,13 +280,13 @@ class DownloadManager:
                         return False, resp.status
 
                 logger.info(f"Download complete: {filepath}")
-                return True, resp.status, None
+                return True, resp.status
 
         except Exception as e:
             logger.warning(
                 f"Download attempt failed for {file_name}: {type(e).__name__}: {e}"
             )
-            return False, 0, None
+            return False, 0  # 0 indicates exception, not HTTP error
 
     async def _download_all_concurrent(
         self, product_ids: Dict, output_dir: str
@@ -404,28 +302,11 @@ class DownloadManager:
         file_names = product_ids["file_names"]
         refresh_token_callback = product_ids.get("refresh_token_callback")
 
-        # ── FIX: Filter out empty URLs / file names ──────────────────
-        valid_pairs = [
-            (url, fname)
-            for url, fname in zip(urls, file_names)
-            if url and fname
-        ]
-        if len(valid_pairs) < len(urls):
-            logger.warning(
-                f"Filtered out {len(urls) - len(valid_pairs)} entries with empty URL or filename"
-            )
-        if not valid_pairs:
-            logger.error("No valid URL/filename pairs to download.")
-            return []
-
         semaphore = asyncio.Semaphore(self.max_concurrent)
-        rate_limit_until = 0.0
-        rate_limit_lock = asyncio.Lock()
 
         async def download_with_comprehensive_retry(
             session, url, headers, filepath, file_name
         ):
-            nonlocal rate_limit_until
             delay = self.initial_delay
             last_exception = None
             attempt = 0
@@ -433,25 +314,24 @@ class DownloadManager:
 
             while attempt < self.max_retries:
                 attempt += 1
-                async with rate_limit_lock:
-                    wait_for_rate_limit = rate_limit_until - time.monotonic()
-                if wait_for_rate_limit > 0:
-                    await asyncio.sleep(wait_for_rate_limit)
                 async with semaphore:
                     try:
                         logger.info(
                             f"Attempt {attempt}/{self.max_retries}: {file_name}"
                         )
 
+                        # Create a copy of headers (this will get the latest token if refreshed)
                         request_headers = headers.copy() if headers else {}
 
-                        success, status_code, retry_after = await self._download_with_resume(
+                        # Try to download with current headers
+                        success, status_code = await self._download_with_resume(
                             session, url, request_headers, filepath, file_name
                         )
 
                         if success:
                             return str(filepath)
 
+                        # Handle specific HTTP errors that we got back
                         if status_code == 401 and refresh_token_callback:
                             consecutive_refresh += 1
                             if consecutive_refresh > 3:
@@ -467,10 +347,12 @@ class DownloadManager:
                             )
                             try:
                                 new_token = refresh_token_callback()
+                                # Update the shared headers dict so all downloads get the new token
                                 headers["Authorization"] = f"Bearer {new_token}"
                                 logger.info(
                                     f"Token refreshed successfully, retrying {file_name} immediately"
                                 )
+                                # Don't increment attempt counter, retry immediately with new token
                                 attempt -= 1
                                 continue
                             except Exception as token_e:
@@ -481,39 +363,43 @@ class DownloadManager:
                                 break
 
                         elif status_code == 429:
-                            last_exception = Exception("HTTP 429 rate limited")
-                            if retry_after is not None:
-                                wait_time = int(max(3, min(retry_after, 300)))
-                            else:
-                                wait_time = int(max(10, min(delay, 180)))
-                            async with rate_limit_lock:
-                                rate_limit_until = max(
-                                    rate_limit_until, time.monotonic() + wait_time
-                                )
-                            logger.warning(
-                                f"429 Rate limited for {file_name}, backoff {wait_time}s"
-                            )
-                            await asyncio.sleep(wait_time)
-                            delay = min(delay * self.backoff_factor, 180)
+                            # Rate limiting - check for Retry-After header by making a HEAD request
+                            try:
+                                async with session.head(
+                                    url, headers=request_headers
+                                ) as head_resp:
+                                    retry_after = head_resp.headers.get("Retry-After")
+                                    if retry_after:
+                                        wait_time = min(
+                                            int(retry_after), 300
+                                        )  # Cap at 5 minutes
+                                        logger.warning(
+                                            f"429 Rate limited for {file_name}, waiting {wait_time}s"
+                                        )
+                                        await asyncio.sleep(wait_time)
+                                    else:
+                                        logger.warning(
+                                            f"429 Rate limited for {file_name}, backoff {delay}s"
+                                        )
+                                        await asyncio.sleep(delay)
+                            except (ValueError, TypeError):
+                                await asyncio.sleep(delay)
                             continue
 
                         elif 500 <= status_code < 600:
-                            last_exception = Exception(f"HTTP {status_code} server error")
                             logger.warning(
                                 f"Server error {status_code} for {file_name}, retrying in {delay}s"
                             )
                             await asyncio.sleep(delay)
-                            delay = min(delay * self.backoff_factor, 180)
                             continue
 
-                        elif status_code > 0:
+                        elif status_code > 0:  # Other HTTP error
                             error_msg = f"HTTP {status_code} for {file_name}"
                             logger.error(error_msg)
                             last_exception = Exception(error_msg)
                             break
 
-                        else:
-                            last_exception = Exception("download attempt failed without HTTP status")
+                        else:  # If status_code is 0, it was an exception during download
                             logger.warning(
                                 f"Download failed due to exception for {file_name}, retrying with backoff {delay}s"
                             )
@@ -521,6 +407,7 @@ class DownloadManager:
                             delay = min(delay * self.backoff_factor, 60)
                             continue
 
+                        # Reset consecutive refresh counter if not handling 401 (this line is reached only for non-401 cases)
                         consecutive_refresh = 0
 
                     except asyncio.TimeoutError as e:
@@ -528,8 +415,10 @@ class DownloadManager:
                             f"Timeout for {file_name} (attempt {attempt}/{self.max_retries}): {e}"
                         )
                         last_exception = e
+
+                        # For timeout errors, increase delay more aggressively
                         await asyncio.sleep(delay)
-                        delay = min(delay * 2, 120)
+                        delay = min(delay * 2, 120)  # Cap at 2 minutes
                         continue
 
                     except (
@@ -562,6 +451,7 @@ class DownloadManager:
             deferred.append((url, file_name))
             return None
 
+        # Create session with robust settings
         async with self._create_session_with_timeouts() as session:
             tasks = [
                 download_with_comprehensive_retry(
@@ -571,7 +461,7 @@ class DownloadManager:
                     os.path.join(output_dir, file_name),
                     file_name,
                 )
-                for url, file_name in valid_pairs
+                for url, file_name in zip(urls, file_names)
             ]
 
             with tqdm(
@@ -590,21 +480,16 @@ class DownloadManager:
                     finally:
                         pbar.update(1)
 
+        # Handle deferred downloads
         if deferred:
             logger.warning(
                 f"{len(deferred)} downloads deferred due to repeated failures"
             )
             deferred_file = os.path.join(output_dir, "deferred_downloads.txt")
-            try:
-                Path(output_dir).mkdir(parents=True, exist_ok=True)
-                with open(deferred_file, "w") as f:
-                    for url, fname in deferred:
-                        f.write(f"{url}\t{fname}\n")
-                logger.info(f"Deferred downloads saved to: {deferred_file}")
-            except Exception as e:
-                logger.warning(
-                    f"Could not write deferred downloads file '{deferred_file}': {e}"
-                )
+            with open(deferred_file, "w") as f:
+                for url, fname in deferred:
+                    f.write(f"{url}\t{fname}\n")
+            logger.info(f"Deferred downloads saved to: {deferred_file}")
 
         return results
 
@@ -621,7 +506,7 @@ class DownloadManager:
         logger.info(f"Starting download: {download_url} -> {filepath}")
 
         file_name = os.path.basename(filepath)
-        success, _, _ = await self._download_with_resume(
+        success, _ = await self._download_with_resume(
             session, download_url, headers, filepath, file_name
         )
 

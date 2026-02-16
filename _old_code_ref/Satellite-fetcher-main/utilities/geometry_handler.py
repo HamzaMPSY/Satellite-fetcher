@@ -36,10 +36,13 @@ class GeometryHandler:
         self.geometries = []
         self._load_geometry()
 
-    def _load_geometry(self) -> None:
+    def _load_geometry(self) -> Polygon:
         """
         Load geometry data from the specified file, supporting GeoJSON (.geojson)
         and Well-Known Text (.wkt) formats.
+
+        Returns:
+            Polygon: A Shapely geometry object loaded from the file.
 
         Raises:
             ValueError: If the file format is not supported.
@@ -47,10 +50,7 @@ class GeometryHandler:
         # Check for supported file extensions and load using the right library
         if self.file_path.endswith('.geojson'):
             logger.info(f"Loading geometry from GeoJSON file: {self.file_path}")
-            gdf = gpd.read_file(self.file_path)
-            for geom in gdf.geometry.values:
-                if geom is not None and not geom.is_empty:
-                    self.geometries.append(geom)
+            return gpd.read_file(self.file_path).geometry.values[0]
         elif self.file_path.endswith('.wkt'):
             logger.info(f"Loading geometry from WKT file: {self.file_path}")
             with open(self.file_path, 'r') as file:

@@ -78,6 +78,7 @@ let showInter = true;
 let showSel = true;
 let clickSelect = true;   // FIX: default to true so clicks always register
 let lastSentJSON = "";
+let clickSeq = 0;
 
 // FIX: Use SVG renderer for grid tiles to ensure tooltips and clicks work
 const gridRenderer = L.svg({padding:0.5});
@@ -113,8 +114,8 @@ function tileColor(name){
 }
 
 function tileStyle(name){
-    const isInter = interNames.has(name);
-    const isSel   = selNames.has(name);
+    const isInter = showInter && interNames.has(name);
+    const isSel   = showSel && selNames.has(name);
     if(isSel) return {color:"#EE3377",weight:3,fillOpacity:0.12,dashArray:"6,4"};
     if(isInter) return {color:"#AA3377",weight:2.2,fillOpacity:0.09};
     const c = colorize ? tileColor(name) : (tileSystem==="landsat"?"#EE7733":"#0077BB");
@@ -209,7 +210,8 @@ function sendDrawnAOI(){
 function onTileClick(name){
     if(!name) return;
     if(!clickSelect) return;
-    maybeSend({type:"tile_click", name:name});
+    clickSeq += 1;
+    maybeSend({type:"tile_click", name:name, seq:clickSeq});
     showToast("Tile: " + name + " (toggled)");
 }
 
@@ -244,6 +246,38 @@ function showToast(msg){
     setTimeout(function(){el.classList.remove("show")}, 2500);
 }
 
+function closeRing(coords){
+    if(!Array.isArray(coords) || coords.length < 3) return [];
+    const ring = coords.slice();
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    if(!last || first[0] !== last[0] || first[1] !== last[1]){
+        ring.push([first[0], first[1]]);
+    }
+    return ring;
+}
+
+function compactGeomToGeoJSON(t){
+    if(t && Array.isArray(t.g) && t.g.length){
+        if(t.g.length === 1){
+            return {type:"Polygon", coordinates:[closeRing(t.g[0])]};
+        }
+        return {
+            type:"MultiPolygon",
+            coordinates: t.g.map(function(r){ return [closeRing(r)]; })
+        };
+    }
+    const b = t.b;
+    return {
+        type:"Polygon",
+        coordinates:[[
+            [b[0],b[1]], [b[2],b[1]],
+            [b[2],b[3]], [b[0],b[3]],
+            [b[0],b[1]]
+        ]]
+    };
+}
+
 // ── Grid Display (client-side viewport filtering) ────────────────────
 function updateGridDisplay(){
     if(!map) return;
@@ -270,18 +304,10 @@ function updateGridDisplay(){
     const features = [];
     for(let i=0; i<visible.length; i++){
         const t = visible[i];
-        const b = t.b;
         features.push({
             type:"Feature",
             properties:{name:t.n},
-            geometry:{
-                type:"Polygon",
-                coordinates:[[
-                    [b[0],b[1]], [b[2],b[1]],
-                    [b[2],b[3]], [b[0],b[3]],
-                    [b[0],b[1]]
-                ]]
-            }
+            geometry: compactGeomToGeoJSON(t)
         });
     }
 
@@ -307,7 +333,7 @@ function updateGridDisplay(){
                 opacity:1
             });
             layer.on("click", function(e){
-                if(e && e.originalEvent){ L.DomEvent.stopPropagation(e.originalEvent); }
+                if(e){ L.DomEvent.stop(e); }
                 onTileClick(name);
             });
             layer.on("mouseover", function(){
@@ -367,6 +393,7 @@ let prevAoiHash = null;
 let prevNocovHash = null;
 let prevInterHash = null;
 let prevSelHash = null;
+let prevStyleKey = "";
 
 function onStreamlitRender(args){
     var opts = args.options ? JSON.parse(args.options) : {};
@@ -417,13 +444,24 @@ function onStreamlitRender(args){
     var newSel   = args.sel_names   || "[]";
     var interChanged = (newInter !== prevInterHash);
     var selChanged   = (newSel   !== prevSelHash);
+    var styleKey = [
+        tileSystem,
+        showInter ? "1" : "0",
+        showSel ? "1" : "0",
+        colorize ? "1" : "0",
+        String(gridOpacity)
+    ].join("|");
+    var styleChanged = (styleKey !== prevStyleKey);
 
     if(interChanged || selChanged){
         interNames = new Set(JSON.parse(newInter));
         selNames   = new Set(JSON.parse(newSel));
         prevInterHash = newInter;
         prevSelHash   = newSel;
+    }
+    if(interChanged || selChanged || styleChanged){
         refreshGridStyles();
+        prevStyleKey = styleKey;
     }
 
     updateZoomHint();

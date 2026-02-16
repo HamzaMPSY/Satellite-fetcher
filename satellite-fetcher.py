@@ -21,10 +21,8 @@ import math
 import json
 import time
 import hashlib
-try:
-    import signalx as signal  # optional, if present
-except ImportError:
-    import signal
+import subprocess
+import signal
 import datetime as dt
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
@@ -342,6 +340,7 @@ let showInter = true;
 let showSel = true;
 let clickSelect = true;   // FIX: default to true so clicks always register
 let lastSentJSON = "";
+let clickSeq = 0;
 
 // FIX: Use SVG renderer for grid tiles to ensure tooltips and clicks work
 const gridRenderer = L.svg({padding:0.5});
@@ -377,8 +376,8 @@ function tileColor(name){
 }
 
 function tileStyle(name){
-    const isInter = interNames.has(name);
-    const isSel   = selNames.has(name);
+    const isInter = showInter && interNames.has(name);
+    const isSel   = showSel && selNames.has(name);
     if(isSel) return {color:"#EE3377",weight:3,fillOpacity:0.12,dashArray:"6,4"};
     if(isInter) return {color:"#AA3377",weight:2.2,fillOpacity:0.09};
     const c = colorize ? tileColor(name) : (tileSystem==="landsat"?"#EE7733":"#0077BB");
@@ -473,7 +472,8 @@ function sendDrawnAOI(){
 function onTileClick(name){
     if(!name) return;
     if(!clickSelect) return;
-    maybeSend({type:"tile_click", name:name});
+    clickSeq += 1;
+    maybeSend({type:"tile_click", name:name, seq:clickSeq});
     showToast("Tile: " + name + " (toggled)");
 }
 
@@ -508,6 +508,38 @@ function showToast(msg){
     setTimeout(function(){el.classList.remove("show")}, 2500);
 }
 
+function closeRing(coords){
+    if(!Array.isArray(coords) || coords.length < 3) return [];
+    const ring = coords.slice();
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    if(!last || first[0] !== last[0] || first[1] !== last[1]){
+        ring.push([first[0], first[1]]);
+    }
+    return ring;
+}
+
+function compactGeomToGeoJSON(t){
+    if(t && Array.isArray(t.g) && t.g.length){
+        if(t.g.length === 1){
+            return {type:"Polygon", coordinates:[closeRing(t.g[0])]};
+        }
+        return {
+            type:"MultiPolygon",
+            coordinates: t.g.map(function(r){ return [closeRing(r)]; })
+        };
+    }
+    const b = t.b;
+    return {
+        type:"Polygon",
+        coordinates:[[
+            [b[0],b[1]], [b[2],b[1]],
+            [b[2],b[3]], [b[0],b[3]],
+            [b[0],b[1]]
+        ]]
+    };
+}
+
 // ── Grid Display (client-side viewport filtering) ────────────────────
 function updateGridDisplay(){
     if(!map) return;
@@ -534,18 +566,10 @@ function updateGridDisplay(){
     const features = [];
     for(let i=0; i<visible.length; i++){
         const t = visible[i];
-        const b = t.b;
         features.push({
             type:"Feature",
             properties:{name:t.n},
-            geometry:{
-                type:"Polygon",
-                coordinates:[[
-                    [b[0],b[1]], [b[2],b[1]],
-                    [b[2],b[3]], [b[0],b[3]],
-                    [b[0],b[1]]
-                ]]
-            }
+            geometry: compactGeomToGeoJSON(t)
         });
     }
 
@@ -571,7 +595,7 @@ function updateGridDisplay(){
                 opacity:1
             });
             layer.on("click", function(e){
-                if(e && e.originalEvent){ L.DomEvent.stopPropagation(e.originalEvent); }
+                if(e){ L.DomEvent.stop(e); }
                 onTileClick(name);
             });
             layer.on("mouseover", function(){
@@ -631,6 +655,7 @@ let prevAoiHash = null;
 let prevNocovHash = null;
 let prevInterHash = null;
 let prevSelHash = null;
+let prevStyleKey = "";
 
 function onStreamlitRender(args){
     var opts = args.options ? JSON.parse(args.options) : {};
@@ -681,13 +706,24 @@ function onStreamlitRender(args){
     var newSel   = args.sel_names   || "[]";
     var interChanged = (newInter !== prevInterHash);
     var selChanged   = (newSel   !== prevSelHash);
+    var styleKey = [
+        tileSystem,
+        showInter ? "1" : "0",
+        showSel ? "1" : "0",
+        colorize ? "1" : "0",
+        String(gridOpacity)
+    ].join("|");
+    var styleChanged = (styleKey !== prevStyleKey);
 
     if(interChanged || selChanged){
         interNames = new Set(JSON.parse(newInter));
         selNames   = new Set(JSON.parse(newSel));
         prevInterHash = newInter;
         prevSelHash   = newSel;
+    }
+    if(interChanged || selChanged || styleChanged){
         refreshGridStyles();
+        prevStyleKey = styleKey;
     }
 
     updateZoomHint();
@@ -851,6 +887,41 @@ def make_square_wkt(lat, lng, km):
     return shapely_wkt.dumps(p, rounding_precision=6)
 
 
+def zoom_for_bounds(bounds: Tuple[float, float, float, float]) -> int:
+    """Compute a practical Leaflet zoom level from lon/lat bounds span."""
+    try:
+        minx, miny, maxx, maxy = bounds
+        span = max(abs(float(maxx) - float(minx)), abs(float(maxy) - float(miny)))
+    except Exception:
+        return 10
+
+    if span > 120:
+        return 2
+    if span > 60:
+        return 3
+    if span > 30:
+        return 4
+    if span > 15:
+        return 5
+    if span > 8:
+        return 6
+    if span > 4:
+        return 7
+    if span > 2:
+        return 8
+    if span > 1:
+        return 9
+    if span > 0.5:
+        return 10
+    if span > 0.2:
+        return 11
+    if span > 0.1:
+        return 12
+    if span > 0.05:
+        return 13
+    return 14
+
+
 def compute_intersections(polys, gdf, ncol):
     """Return intersecting tile names and intersecting subset GeoDataFrame."""
     if gdf is None or gdf.empty or not polys or not ncol:
@@ -888,6 +959,176 @@ def find_tiles(gdf, col, query, limit=50):
 
 def _md5(s: str) -> str:
     return hashlib.md5(s.encode()).hexdigest()[:12]
+
+
+def _compact_rings(geom, simplify_tol: float = 0.0, precision: int = 4) -> List[List[List[float]]]:
+    """
+    Encode geometry as compact exterior rings:
+      - Polygon    -> [ring]
+      - MultiPolygon -> [ring1, ring2, ...]
+
+    Rings are not closed (first point not repeated at the end) to save bytes.
+    """
+    if geom is None or getattr(geom, "is_empty", True):
+        return []
+
+    g = geom
+    if simplify_tol > 0:
+        try:
+            g = g.simplify(simplify_tol, preserve_topology=True)
+        except Exception:
+            g = geom
+
+    polys = []
+    gtype = getattr(g, "geom_type", "")
+    if gtype == "Polygon":
+        polys = [g]
+    elif gtype == "MultiPolygon":
+        # Keep all parts; some polar/dateline tiles are multipart.
+        polys = [p for p in g.geoms if p is not None and not p.is_empty]
+    else:
+        return []
+
+    rings: List[List[List[float]]] = []
+    for p in polys:
+        try:
+            coords = [[round(float(x), precision), round(float(y), precision)] for x, y in p.exterior.coords]
+        except Exception:
+            continue
+        if len(coords) < 4:
+            continue
+        if coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) >= 3:
+            rings.append(coords)
+    return rings
+
+
+def selected_tiles_to_wkt(gdf, ncol, selected_tiles) -> str:
+    """Build a multi-line WKT text (one polygon per line) from selected tile IDs."""
+    if gdf is None or gdf.empty or not ncol or not selected_tiles:
+        return ""
+
+    sel = {str(t).strip() for t in selected_tiles if str(t).strip()}
+    if not sel:
+        return ""
+
+    try:
+        subset = gdf[gdf[ncol].astype(str).isin(sel)]
+    except Exception:
+        return ""
+
+    wkts: List[str] = []
+    for geom in subset.geometry:
+        if geom is None or getattr(geom, "is_empty", True):
+            continue
+        gtype = getattr(geom, "geom_type", "")
+        if gtype == "Polygon":
+            wkts.append(geom.wkt)
+        elif gtype == "MultiPolygon":
+            wkts.extend([p.wkt for p in geom.geoms if p is not None and not p.is_empty])
+    return "\n".join(wkts)
+
+
+def selected_tiles_to_geometry(gdf, ncol, selected_tiles):
+    """Build a dissolved geometry from selected tile IDs."""
+    if gdf is None or gdf.empty or not ncol or not selected_tiles:
+        return None
+    sel = {str(t).strip() for t in selected_tiles if str(t).strip()}
+    if not sel:
+        return None
+    try:
+        subset = gdf[gdf[ncol].astype(str).isin(sel)]
+    except Exception:
+        return None
+    geoms = [g for g in subset.geometry if g is not None and not getattr(g, "is_empty", True)]
+    return safe_union(geoms) if geoms else None
+
+
+@st.cache_data(show_spinner=False)
+def prepare_tile_helpers(_gdf_id: str, ncol: str, system: str) -> Tuple[List[str], Dict[str, Tuple[float, float]]]:
+    """Precompute tile names + representative points for O(1) lookup in UI events."""
+    gdf = st.session_state.get(f"_raw_gdf_{system}")
+    if gdf is None or gdf.empty or not ncol:
+        return [], {}
+
+    names = gdf[ncol].astype(str).tolist()
+    all_names = sorted(set(names))
+    centroids: Dict[str, Tuple[float, float]] = {}
+    for name, geom in zip(names, gdf.geometry):
+        if name in centroids or geom is None or getattr(geom, "is_empty", True):
+            continue
+        try:
+            rp = geom.representative_point()
+            centroids[name] = (float(rp.y), float(rp.x))
+        except Exception:
+            continue
+    return all_names, centroids
+
+
+@st.cache_data(show_spinner="Previewing products for this AOI…", ttl=180)
+def preview_products_cached(
+    provider: str,
+    collection: str,
+    product_type: str,
+    start_date: str,
+    end_date: str,
+    aoi_wkt: str,
+    max_items: int = 50,
+) -> Dict[str, Any]:
+    """
+    Fetch product preview for the current AOI.
+    Detailed preview is implemented for Copernicus and USGS.
+    """
+    out: Dict[str, Any] = {"total": 0, "items": [], "error": ""}
+    if not aoi_wkt:
+        out["error"] = "Define an AOI or select tiles first."
+        return out
+
+    try:
+        aoi_geom = shapely_wkt.loads(aoi_wkt)
+    except Exception as e:
+        out["error"] = f"Invalid AOI geometry for preview: {e}"
+        return out
+
+    try:
+        from utilities import ConfigLoader
+
+        cfg = ConfigLoader(config_file_path=str(PROJECT_ROOT / "config.yaml"))
+        if provider == "Copernicus":
+            from providers.copernicus import Copernicus
+
+            cp = Copernicus(config_loader=cfg)
+            detail = cp.search_products_detailed(
+                collection=collection,
+                product_type=product_type,
+                start_date=start_date,
+                end_date=end_date,
+                aoi=aoi_geom,
+                top=max(200, max_items * 4),
+            )
+        elif provider == "USGS":
+            from providers.usgs import Usgs
+
+            usgs = Usgs(config_loader=cfg)
+            detail = usgs.search_products_detailed(
+                collection=collection,
+                product_type=product_type,
+                start_date=start_date,
+                end_date=end_date,
+                aoi=aoi_geom,
+                max_items=max_items,
+            )
+        else:
+            out["error"] = f"Detailed preview list is currently unavailable for provider '{provider}'."
+            return out
+
+        items = detail.get("items", []) if isinstance(detail, dict) else []
+        out["total"] = int(detail.get("total", len(items))) if isinstance(detail, dict) else len(items)
+        out["items"] = items[:max_items]
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -950,12 +1191,20 @@ def prepare_compact_grid(_gdf_id: str, ncol: str, system: str) -> Tuple[str, str
     if gdf is None or gdf.empty or not ncol:
         return "[]", ""
     names = gdf[ncol].astype(str).tolist()
+    geoms = gdf.geometry.tolist()
     bdf = gdf.geometry.bounds.round(4)
+    include_geom = (system == "landsat")
+    simplify_tol = 0.02 if include_geom else 0.0
     features = []
-    for name, minx, miny, maxx, maxy in zip(
-        names, bdf["minx"], bdf["miny"], bdf["maxx"], bdf["maxy"]
+    for name, geom, minx, miny, maxx, maxy in zip(
+        names, geoms, bdf["minx"], bdf["miny"], bdf["maxx"], bdf["maxy"]
     ):
-        features.append({"n": name, "b": [minx, miny, maxx, maxy]})
+        item = {"n": name, "b": [float(minx), float(miny), float(maxx), float(maxy)]}
+        if include_geom:
+            rings = _compact_rings(geom, simplify_tol=simplify_tol, precision=4)
+            if rings:
+                item["g"] = rings
+        features.append(item)
     js = json.dumps(features, separators=(",", ":"))
     return js, _md5(js)
 
@@ -987,14 +1236,17 @@ def _close_log_fh():
             logger.warning(f"[DL] Error closing log fh: {e}")
 
 
-def reset_downloads(dl_dir: Optional[str] = None):
-    """Reset the downloads directory and UI tracking state."""
-    logger.info("[DL] reset_downloads() called")
+def reset_downloads(dl_dir: Optional[str] = None, clear_files: bool = True):
+    """Reset UI download state and optionally clear files in downloads directory."""
+    logger.info(f"[DL] reset_downloads() called (clear_files={clear_files})")
     dl_path = Path(dl_dir) if dl_dir else DOWNLOADS_DIR
-    if dl_path.exists():
-        import shutil
-        shutil.rmtree(dl_path, ignore_errors=True)
-    dl_path.mkdir(parents=True, exist_ok=True)
+    if clear_files:
+        if dl_path.exists():
+            import shutil
+            shutil.rmtree(dl_path, ignore_errors=True)
+        dl_path.mkdir(parents=True, exist_ok=True)
+    else:
+        dl_path.mkdir(parents=True, exist_ok=True)
 
     # Close any open log file handle
     _close_log_fh()
@@ -1005,7 +1257,7 @@ def reset_downloads(dl_dir: Optional[str] = None):
     except Exception:
         pass
     try:
-        PID_PATH.unlink(missing_ok=True)
+        PID_PATH.write_text("")
     except Exception:
         pass
     for key in list(st.session_state.keys()):
@@ -1160,6 +1412,116 @@ def _pid_is_running(pid: Optional[int]) -> bool:
         return False
 
 
+def _terminate_pid(pid: Optional[int], grace_seconds: float = 1.5) -> bool:
+    """Terminate PID with SIGTERM then SIGKILL fallback. Returns True if not running."""
+    if not pid:
+        return True
+    if not _pid_is_running(pid):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception as e:
+        logger.warning(f"[DL] Failed to SIGTERM PID {pid}: {e}")
+    deadline = time.time() + max(0.0, grace_seconds)
+    while time.time() < deadline:
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(0.1)
+    if _pid_is_running(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception as e:
+            logger.warning(f"[DL] Failed to SIGKILL PID {pid}: {e}")
+    return not _pid_is_running(pid)
+
+
+def _find_cli_pids() -> List[int]:
+    """Find background CLI downloader processes (best-effort)."""
+    try:
+        cp = subprocess.run(
+            ["pgrep", "-f", "cli.py --provider"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        pids: List[int] = []
+        for line in (cp.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                pid = int(line)
+            except Exception:
+                continue
+            if pid != os.getpid():
+                pids.append(pid)
+        return sorted(set(pids))
+    except Exception as e:
+        logger.debug(f"[DL] Unable to list CLI processes with pgrep: {e}")
+        return []
+
+
+def _unlock_download_runtime(kill_orphans: bool = False) -> bool:
+    """
+    Unlock download runtime state.
+    - Stops PID from job_pid/session.
+    - Optionally kills orphan cli.py processes.
+    """
+    ok = True
+    pid = st.session_state.get("dl_pid") or _read_pid()
+    if pid and _pid_is_running(pid):
+        logger.info(f"[DL] Unlock: terminating active PID {pid}")
+        ok = _terminate_pid(pid) and ok
+
+    if kill_orphans:
+        for opid in _find_cli_pids():
+            if pid and opid == pid:
+                continue
+            if _pid_is_running(opid):
+                logger.info(f"[DL] Unlock: terminating orphan PID {opid}")
+                ok = _terminate_pid(opid) and ok
+
+    _close_log_fh()
+    st.session_state["dl_running"] = False
+    st.session_state.pop("dl_pid", None)
+    try:
+        PID_PATH.write_text("")
+    except Exception:
+        pass
+    return ok
+
+
+def _bootstrap_download_runtime() -> None:
+    """
+    Initialize download runtime state on app startup.
+    Prevent stale nohup logs from appearing as an active download when no PID is alive.
+    """
+    if st.session_state.get("_dl_bootstrapped", False):
+        return
+
+    pid = st.session_state.get("dl_pid") or _read_pid()
+    alive = _pid_is_running(pid)
+
+    if alive:
+        st.session_state["dl_running"] = True
+        st.session_state["dl_pid"] = pid
+    else:
+        st.session_state["dl_running"] = False
+        st.session_state.pop("dl_pid", None)
+        try:
+            PID_PATH.write_text("")
+        except Exception:
+            pass
+        # Clear stale log content from previous runs to avoid "ghost download" UI.
+        try:
+            if NOHUP_PATH.exists() and NOHUP_PATH.stat().st_size > 0:
+                NOHUP_PATH.write_text("")
+        except Exception:
+            pass
+
+    st.session_state["_dl_bootstrapped"] = True
+
+
 def _check_cli_exists():
     """Check if cli.py exists and return its path, or None."""
     candidates = [
@@ -1174,9 +1536,101 @@ def _check_cli_exists():
     return None
 
 
+def _recent_rate_limit_hits(path: Optional[Path] = None, tail_chars: int = 25000) -> int:
+    """Count recent 429/rate-limit hits from the CLI log tail."""
+    lp = path or NOHUP_PATH
+    if not lp.exists():
+        return 0
+    try:
+        raw = lp.read_text(errors="replace")
+    except Exception:
+        return 0
+    tail = raw[-tail_chars:] if len(raw) > tail_chars else raw
+    return len(re.findall(r"(?:\b429\b|rate limit)", tail, flags=re.IGNORECASE))
+
+
+def _auto_parallel_strategy(
+    provider: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    preview_total: int,
+    selected_tile_count: int,
+) -> Dict[str, int]:
+    """
+    Auto-tune concurrency for practical speed while reducing overload risk.
+    Returns dict with:
+      - max_concurrent
+      - parallel_days
+      - concurrent_per_day
+    """
+    try:
+        n_days = max(1, (end_date - start_date).days + 1)
+    except Exception:
+        n_days = 1
+
+    est_products = max(1, int(preview_total or 0), int(selected_tile_count or 0))
+    recent_429 = _recent_rate_limit_hits()
+
+    if provider == "Copernicus":
+        # Target practical max without overloading CDSE.
+        parallel_days = 1
+        concurrent_per_day = 2
+        if n_days >= 10 and est_products >= 30 and recent_429 == 0:
+            parallel_days = 3
+            concurrent_per_day = 2
+        elif n_days >= 3 and est_products >= 10:
+            parallel_days = 2
+            concurrent_per_day = 2
+        elif est_products >= 4:
+            parallel_days = 1
+            concurrent_per_day = 3
+
+        # Adaptive throttle if previous run shows rate limiting.
+        if recent_429 >= 10:
+            parallel_days = 1
+            concurrent_per_day = 1
+        elif recent_429 >= 5:
+            parallel_days = min(parallel_days, 2)
+            concurrent_per_day = max(1, concurrent_per_day - 1)
+        elif recent_429 >= 2 and parallel_days >= 3:
+            parallel_days = 2
+
+        concurrent_per_day = max(1, min(3, concurrent_per_day))
+        total = max(1, parallel_days * concurrent_per_day)
+        if total > 6:
+            parallel_days = max(1, 6 // concurrent_per_day)
+            total = max(1, parallel_days * concurrent_per_day)
+        return {
+            "max_concurrent": max(1, min(4, concurrent_per_day if parallel_days > 1 else total)),
+            "parallel_days": max(1, parallel_days),
+            "concurrent_per_day": max(1, concurrent_per_day),
+        }
+
+    if provider == "USGS":
+        # USGS generally tolerates more parallelism than Copernicus.
+        if est_products <= 2:
+            mc = 3
+        elif est_products <= 8:
+            mc = 6
+        elif est_products <= 20:
+            mc = 8
+        else:
+            mc = 10
+        if n_days >= 7:
+            mc = min(12, mc + 2)
+        if recent_429 >= 5:
+            mc = max(2, mc - 2)
+        return {"max_concurrent": mc, "parallel_days": 1, "concurrent_per_day": 1}
+
+    return {"max_concurrent": 4, "parallel_days": 1, "concurrent_per_day": 1}
+
+
 def _build_download_command(
     provider, satellite, product, start_date, end_date, aoi_file,
     selected_tiles=None,
+    max_concurrent: int = 4,
+    parallel_days: int = 1,
+    concurrent_per_day: int = 2,
 ):
     """Build the CLI download command with proper arguments."""
     cli_path = _check_cli_exists()
@@ -1208,6 +1662,24 @@ def _build_download_command(
         collection,
     ]
 
+    try:
+        mc = max(1, int(max_concurrent))
+        cmd_parts.extend(["--max-concurrent", str(mc)])
+    except Exception:
+        pass
+
+    if cli_provider == "copernicus":
+        try:
+            pd = max(1, int(parallel_days))
+            cmd_parts.extend(["--parallel-days", str(pd)])
+        except Exception:
+            pass
+        try:
+            cpd = max(1, int(concurrent_per_day))
+            cmd_parts.extend(["--concurrent-per-day", str(cpd)])
+        except Exception:
+            pass
+
     if product and str(product).strip():
         cmd_parts.extend(["--product-type", str(product)])
 
@@ -1237,11 +1709,19 @@ def render_download_progress():
     n_files, total_mb = count_downloaded_products()
     phase = logs.get("phase", "starting")
 
+    pid = st.session_state.get("dl_pid") or _read_pid()
+    active_runtime = bool(st.session_state.get("dl_running")) and _pid_is_running(pid)
+    if not active_runtime and phase in {"starting", "initializing", "ready", "searching", "found", "downloading"}:
+        phase = "idle"
+        logs["batch"] = None
+        logs["files"] = {}
+
     if logs.get("products_found", 0) > 0:
         st.session_state["dl_total_products"] = logs["products_found"]
     total_products = st.session_state.get("dl_total_products", 0)
 
     phase_info = {
+        "idle":         ("ℹ️", "No active download.",               "#94a3b8"),
         "starting":     ("🔄", "Starting download process…",        "#94a3b8"),
         "initializing": ("⚙️", "Loading configuration & AOI…",      "#38bdf8"),
         "ready":        ("🔗", "Connecting to provider…",            "#38bdf8"),
@@ -1382,6 +1862,12 @@ def init_state():
         "dl_total_products": 0,
         "dl_completed": 0,
         "dl_running": False,
+        "dl_auto_cfg": {},
+        "preview_key": "",
+        "preview_items": [],
+        "preview_total": 0,
+        "preview_error": "",
+        "preview_fetched": False,
         "fly_to": None,
         "use_file_browser_component": False,
     }
@@ -1398,7 +1884,7 @@ def _ss(key, default=None):
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_sidebar(sat_tiles, gdf, nocov, ncol, skey):
+def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_centroids=None):
     st.sidebar.markdown("""
     <div style="text-align:center;padding:.3rem 0 .6rem">
         <div style="font-size:1.6rem">🛰️</div>
@@ -1467,7 +1953,25 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey):
             st.session_state["fly_to"] = json.dumps([sq_lat, sq_lng, 10])
             st.rerun()
     elif aoi_mode == "Paste WKT / GeoJSON":
-        st.session_state["geometry_text"] = st.sidebar.text_area("WKT/GeoJSON", value=_ss("geometry_text", ""), height=100, label_visibility="collapsed", placeholder="Paste WKT or GeoJSON…")
+        st.session_state["geometry_text"] = st.sidebar.text_area(
+            "WKT/GeoJSON",
+            value=_ss("geometry_text", ""),
+            height=100,
+            label_visibility="collapsed",
+            placeholder="Paste WKT or GeoJSON…",
+        )
+        raw_txt = st.session_state["geometry_text"].strip()
+        prev_txt = _ss("_last_paste_text", "")
+        if raw_txt != prev_txt:
+            st.session_state["_last_paste_text"] = raw_txt
+            g = parse_geometry(raw_txt) if raw_txt else None
+            if g is not None and not getattr(g, "is_empty", True):
+                ct = g.centroid
+                z = zoom_for_bounds(g.bounds)
+                st.session_state["map_center"] = [float(ct.y), float(ct.x)]
+                st.session_state["fly_to"] = json.dumps([float(ct.y), float(ct.x), int(z)])
+            elif raw_txt:
+                st.sidebar.caption("AOI invalide: impossible de zoomer (format WKT/GeoJSON non reconnu).")
     else:
         st.sidebar.caption("Draw rectangle/polygon on the map. Click tiles to select/deselect.")
 
@@ -1512,6 +2016,14 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey):
 
     st.sidebar.markdown('<div style="display:flex;align-items:center;gap:6px;padding-top:.3rem"><span>🔍</span><span style="font-weight:600;font-size:.88rem;">Tile Search</span></div>', unsafe_allow_html=True)
     if gdf is not None and ncol:
+        all_names = all_tile_names or []
+        all_names_set = set(all_names)
+        centroids = tile_centroids or {}
+        ms_widget_key = f"ms_widget_{skey}"
+        ms_sync_key = f"_ms_sync_sig_{skey}"
+        pick_mode_key = f"pick_mode_{skey}"
+        pick_index_key = f"pick_idx_{skey}"
+
         q = st.sidebar.text_input("Search", placeholder="e.g. 34UED or 233062", label_visibility="collapsed", key=f"ts_{skey}")
         if q:
             matches = find_tiles(gdf, ncol, q, 50)
@@ -1520,6 +2032,15 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey):
                 st.sidebar.caption("No matches.")
             else:
                 pk = st.sidebar.selectbox("Results", mids, index=0, key=f"tm_{skey}", label_visibility="collapsed")
+                focus_sig = f"{q}|{pk}"
+                prev_focus = _ss(f"_search_focus_{skey}", "")
+                if pk and focus_sig != prev_focus:
+                    cyx = centroids.get(str(pk))
+                    if cyx:
+                        st.session_state["map_center"] = [float(cyx[0]), float(cyx[1])]
+                        st.session_state["fly_to"] = json.dumps([float(cyx[0]), float(cyx[1]), 10])
+                    st.session_state[f"_search_focus_{skey}"] = focus_sig
+                    st.rerun()
                 b1, b2, b3 = st.sidebar.columns(3)
                 with b1:
                     if st.button("➕", use_container_width=True, key=f"ta_{skey}", help="Add"):
@@ -1533,22 +2054,105 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey):
                         st.rerun()
                 with b3:
                     if st.button("🎯", use_container_width=True, key=f"tz_{skey}", help="Zoom"):
-                        row = gdf[gdf[ncol].astype(str) == str(pk)]
-                        if not row.empty:
-                            ct = row.iloc[0].geometry.centroid
-                            st.session_state["map_center"] = [float(ct.y), float(ct.x)]
-                            st.session_state["fly_to"] = json.dumps([float(ct.y), float(ct.x), 10])
+                        cyx = centroids.get(str(pk))
+                        if cyx:
+                            st.session_state["map_center"] = [float(cyx[0]), float(cyx[1])]
+                            st.session_state["fly_to"] = json.dumps([float(cyx[0]), float(cyx[1]), 10])
                             st.rerun()
-        all_names = sorted(gdf[ncol].astype(str).unique().tolist()) if ncol else []
-        all_names_set = set(all_names)
         valid_sel = [t for t in st.session_state["selected_tiles"] if t in all_names_set]
         if len(valid_sel) != len(st.session_state["selected_tiles"]):
             st.session_state["selected_tiles"] = valid_sel
-        cur_sel = st.sidebar.multiselect("Selected", all_names, default=valid_sel, key=f"ms_{skey}", label_visibility="collapsed")
-        st.session_state["selected_tiles"] = cur_sel
+
+        # Force a safe widget reset when selection changes from map/search buttons.
+        sel_sig = "|".join(valid_sel)
+        if _ss(ms_sync_key, "") != sel_sig:
+            st.session_state.pop(ms_widget_key, None)
+            st.session_state[ms_sync_key] = sel_sig
+
+        widget_sel = st.sidebar.multiselect(
+            "Selected",
+            all_names,
+            default=valid_sel,
+            key=ms_widget_key,
+            label_visibility="collapsed",
+        )
+        cur_sel = [str(t) for t in widget_sel]
+        if sorted(cur_sel) != sorted(valid_sel):
+            st.session_state["selected_tiles"] = cur_sel
+            st.rerun()
+
+        pick_label = (
+            "🧭 Tile-by-tile mode: ON"
+            if bool(_ss(pick_mode_key, False))
+            else "🧭 Tile-by-tile mode: OFF"
+        )
+        if st.sidebar.button(
+            pick_label,
+            use_container_width=True,
+            key=f"pick_mode_btn_{skey}",
+            help="Sélectionne les tuiles une par une avec des boutons.",
+        ):
+            st.session_state[pick_mode_key] = not bool(_ss(pick_mode_key, False))
+            st.rerun()
+
+        if bool(_ss(pick_mode_key, False)):
+            inter_candidates = [str(t) for t in _ss("intersecting_tiles", []) if str(t) in all_names_set]
+            candidates = inter_candidates if inter_candidates else all_names
+            if not candidates:
+                st.sidebar.caption("No tile available for manual picker.")
+            else:
+                idx = int(_ss(pick_index_key, 0))
+                if idx < 0 or idx >= len(candidates):
+                    idx = 0
+                    st.session_state[pick_index_key] = 0
+                current_tile = str(candidates[idx])
+                is_selected = current_tile in set(map(str, st.session_state["selected_tiles"]))
+                st.sidebar.caption(f"Tile {idx + 1}/{len(candidates)}: {current_tile}")
+
+                nav1, nav2, nav3 = st.sidebar.columns(3)
+                with nav1:
+                    if st.button("⬅️", use_container_width=True, key=f"pick_prev_{skey}", help="Previous tile"):
+                        idx = (idx - 1) % len(candidates)
+                        st.session_state[pick_index_key] = idx
+                        nxt = str(candidates[idx])
+                        cyx = centroids.get(nxt)
+                        if cyx:
+                            st.session_state["map_center"] = [float(cyx[0]), float(cyx[1])]
+                            st.session_state["fly_to"] = json.dumps([float(cyx[0]), float(cyx[1]), 10])
+                        st.rerun()
+                with nav2:
+                    pick_btn = "➖ Unselect" if is_selected else "➕ Select"
+                    if st.button(pick_btn, use_container_width=True, key=f"pick_toggle_{skey}", help="Toggle current tile"):
+                        sel = set(map(str, st.session_state["selected_tiles"]))
+                        if current_tile in sel:
+                            sel.remove(current_tile)
+                        else:
+                            sel.add(current_tile)
+                        st.session_state["selected_tiles"] = sorted(sel)
+                        st.rerun()
+                with nav3:
+                    if st.button("➡️", use_container_width=True, key=f"pick_next_{skey}", help="Next tile"):
+                        idx = (idx + 1) % len(candidates)
+                        st.session_state[pick_index_key] = idx
+                        nxt = str(candidates[idx])
+                        cyx = centroids.get(nxt)
+                        if cyx:
+                            st.session_state["map_center"] = [float(cyx[0]), float(cyx[1])]
+                            st.session_state["fly_to"] = json.dumps([float(cyx[0]), float(cyx[1]), 10])
+                        st.rerun()
+
+                if st.sidebar.button("🎯 Zoom current tile", use_container_width=True, key=f"pick_zoom_{skey}"):
+                    cyx = centroids.get(current_tile)
+                    if cyx:
+                        st.session_state["map_center"] = [float(cyx[0]), float(cyx[1])]
+                        st.session_state["fly_to"] = json.dumps([float(cyx[0]), float(cyx[1]), 10])
+                        st.rerun()
+
         if cur_sel:
             if st.sidebar.button("✕ Clear", use_container_width=True, key=f"tc_{skey}"):
                 st.session_state["selected_tiles"] = []
+                st.session_state.pop(ms_widget_key, None)
+                st.session_state[ms_sync_key] = ""
                 st.rerun()
     return provider, satellite, product, aoi_mode
 
@@ -1561,6 +2165,7 @@ def main():
     st.set_page_config(page_title="Satellite Imagery Downloader", page_icon="🛰️", layout="wide", initial_sidebar_state="expanded")
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
     init_state()
+    _bootstrap_download_runtime()
 
     sat_tiles = load_tiles()
     skey = _ss("tile_system", "sentinel-2")
@@ -1574,7 +2179,15 @@ def main():
     if nocov is not None:
         st.session_state["_raw_nocov"] = nocov
 
-    provider, satellite, product, aoi_mode = render_sidebar(sat_tiles, gdf, nocov, ncol, skey)
+    all_tile_names: List[str] = []
+    tile_centroids: Dict[str, Tuple[float, float]] = {}
+    if gdf is not None and ncol:
+        gdf_id = f"{skey}_{ncol}_{len(gdf)}"
+        all_tile_names, tile_centroids = prepare_tile_helpers(gdf_id, ncol, skey)
+
+    provider, satellite, product, aoi_mode = render_sidebar(
+        sat_tiles, gdf, nocov, ncol, skey, all_tile_names, tile_centroids
+    )
 
     st.markdown("""<div style='display:flex;align-items:center;gap:14px;margin-bottom:4px;'>
         <div style='font-size:1.6rem;background:linear-gradient(135deg,#38bdf8,#2dd4bf);width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(56,189,248,0.35);'>🛰️</div>
@@ -1656,16 +2269,13 @@ def main():
                     st.session_state["intersecting_tiles"] = []
                     st.rerun()
             elif comp_result.get("type") == "tile_click":
-                tid = comp_result.get("name", "")
-                if tid and gdf is not None and ncol:
-                    valid_names = set(gdf[ncol].astype(str).unique())
-                    if tid in valid_names:
-                        sel = set(map(str, st.session_state["selected_tiles"]))
-                        sel.symmetric_difference_update({tid})
-                        st.session_state["selected_tiles"] = sorted(sel)
-                        st.rerun()
-                    else:
-                        logger.warning(f"Clicked tile '{tid}' not found in grid column '{ncol}'")
+                tid = str(comp_result.get("name", "")).strip()
+                if tid:
+                    sel = set(map(str, st.session_state["selected_tiles"]))
+                    sel.symmetric_difference_update({tid})
+                    new_sel = sorted(sel)
+                    st.session_state["selected_tiles"] = new_sel
+                    st.rerun()
 
         ni = len(st.session_state["intersecting_tiles"])
         ns = len(st.session_state["selected_tiles"])
@@ -1726,17 +2336,129 @@ def main():
         else:
             st.markdown('<div style="background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:8px;color:#fbbf24;">⚠️ No tiles — draw AOI or select tiles</div>', unsafe_allow_html=True)
 
-        atxt = _ss("geometry_text", "").strip()
-        afile = "example_aoi.geojson" if atxt.startswith("{") else "example_aoi.wkt"
-        aoi_path = PROJECT_ROOT / afile
-
         selected_tiles_for_cmd = _ss("selected_tiles", [])
+        selected_tiles_wkt = selected_tiles_to_wkt(gdf, ncol, selected_tiles_for_cmd)
+        selected_tiles_geom = selected_tiles_to_geometry(gdf, ncol, selected_tiles_for_cmd)
+        drawn_aoi_text = _ss("geometry_text", "").strip()
+        drawn_aoi_geom = parse_geometry(drawn_aoi_text) if drawn_aoi_text else None
+
+        use_selected_tiles_mode = bool(selected_tiles_wkt)
+        aoi_text_for_download = selected_tiles_wkt if use_selected_tiles_mode else drawn_aoi_text
+        preview_geom = selected_tiles_geom if use_selected_tiles_mode else drawn_aoi_geom
+        preview_wkt = preview_geom.wkt if (preview_geom is not None and not getattr(preview_geom, "is_empty", True)) else ""
+
+        if use_selected_tiles_mode:
+            aoi_path = PROJECT_ROOT / "selected_tiles_aoi.wkt"
+            st.caption("Mode recherche: tuiles sélectionnées (indépendant du polygone AOI).")
+        else:
+            afile = "example_aoi.geojson" if drawn_aoi_text.startswith("{") else "example_aoi.wkt"
+            aoi_path = PROJECT_ROOT / afile
+
+        collection = str(satellite).split(" ")[0]
+        preview_key = _md5(
+            "|".join(
+                [
+                    provider,
+                    collection,
+                    str(product),
+                    str(st.session_state["start_date"]),
+                    str(st.session_state["end_date"]),
+                    "tiles" if use_selected_tiles_mode else "aoi",
+                    preview_wkt,
+                ]
+            )
+        )
+        if _ss("preview_key", "") != preview_key:
+            st.session_state["preview_key"] = preview_key
+            st.session_state["preview_items"] = []
+            st.session_state["preview_total"] = 0
+            st.session_state["preview_error"] = ""
+            st.session_state["preview_fetched"] = False
+
+        pr1, pr2 = st.columns([2, 1])
+        with pr1:
+            st.markdown('<div style="font-weight:600;font-size:.84rem;color:#e2e8f0;">Products Preview</div>', unsafe_allow_html=True)
+        with pr2:
+            refresh_preview = st.button("🔎 Refresh Preview", use_container_width=True, key="refresh_preview")
+
+        auto_preview = bool(preview_wkt) and not _ss("preview_fetched", False)
+        if refresh_preview or auto_preview:
+            prev = preview_products_cached(
+                provider=provider,
+                collection=collection,
+                product_type=str(product),
+                start_date=str(st.session_state["start_date"]),
+                end_date=str(st.session_state["end_date"]),
+                aoi_wkt=preview_wkt,
+                max_items=50,
+            )
+            st.session_state["preview_items"] = prev.get("items", [])
+            st.session_state["preview_total"] = int(prev.get("total", 0) or 0)
+            st.session_state["preview_error"] = prev.get("error", "")
+            st.session_state["preview_fetched"] = True
+
+        if _ss("preview_error"):
+            st.warning(f"Preview: {_ss('preview_error')}")
+        else:
+            p_total = int(_ss("preview_total", 0))
+            p_items = _ss("preview_items", [])
+            if p_total > 0:
+                st.markdown(
+                    f"<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);"
+                    f"border-radius:10px;padding:8px;color:#2dd4bf;'>"
+                    f"🔎 {p_total} produit(s) trouvé(s) pour cette AOI</div>",
+                    unsafe_allow_html=True,
+                )
+                for it in p_items:
+                    name = str(it.get("name", it.get("id", "product")))
+                    tile = str(it.get("tile_id", "-"))
+                    sensing = str(it.get("sensing_time", "-"))
+                    size_mb = it.get("size_mb")
+                    size_txt = f"{size_mb} MB" if size_mb not in (None, "") else "-"
+                    st.markdown(
+                        f"<div style='background:#0f172a;border:1px solid rgba(56,120,200,0.10);"
+                        f"border-radius:10px;padding:8px;margin-top:6px;'>"
+                        f"<div style='font-family:JetBrains Mono;font-size:.73rem;color:#e2e8f0;font-weight:600;'>{name}</div>"
+                        f"<div style='font-family:JetBrains Mono;font-size:.66rem;color:#94a3b8;margin-top:3px;'>"
+                        f"Tile: {tile} · Date: {sensing} · Size: {size_txt}</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                if p_total > len(p_items):
+                    st.caption(f"Showing first {len(p_items)} results.")
+            elif _ss("preview_fetched", False):
+                st.info("Aucun produit trouvé pour cette AOI et cette période.")
+
+        auto_dl_cfg = _auto_parallel_strategy(
+            provider=provider,
+            start_date=st.session_state["start_date"],
+            end_date=st.session_state["end_date"],
+            preview_total=int(_ss("preview_total", 0)),
+            selected_tile_count=len(selected_tiles_for_cmd),
+        )
+        auto_max_concurrent = max(1, int(auto_dl_cfg.get("max_concurrent", 4)))
+        auto_parallel_days = max(1, int(auto_dl_cfg.get("parallel_days", 1)))
+        auto_concurrent_per_day = max(1, int(auto_dl_cfg.get("concurrent_per_day", 1)))
+        st.session_state["dl_auto_cfg"] = {
+            "max_concurrent": auto_max_concurrent,
+            "parallel_days": auto_parallel_days,
+            "concurrent_per_day": auto_concurrent_per_day,
+        }
+        if provider == "Copernicus":
+            st.caption(
+                f"⚡ Auto-speed: {auto_parallel_days} day worker(s) × "
+                f"{auto_concurrent_per_day} file(s)/day (max files={auto_max_concurrent})."
+            )
+        else:
+            st.caption(f"⚡ Auto-speed: max files in parallel = {auto_max_concurrent}.")
 
         cli_cmd, cli_err = _build_download_command(
             provider, satellite, product,
             st.session_state["start_date"], st.session_state["end_date"],
             str(aoi_path),
             selected_tiles=selected_tiles_for_cmd,
+            max_concurrent=auto_max_concurrent,
+            parallel_days=auto_parallel_days,
+            concurrent_per_day=auto_concurrent_per_day,
         )
 
         if cli_err:
@@ -1750,6 +2472,19 @@ def main():
                 "--provider", cli_provider,
                 "--collection", _collection,
             ]
+            try:
+                _cmd_parts.extend(["--max-concurrent", str(auto_max_concurrent)])
+            except Exception:
+                pass
+            if cli_provider == "copernicus":
+                try:
+                    _cmd_parts.extend(["--parallel-days", str(auto_parallel_days)])
+                except Exception:
+                    pass
+                try:
+                    _cmd_parts.extend(["--concurrent-per-day", str(auto_concurrent_per_day)])
+                except Exception:
+                    pass
             if product and str(product).strip():
                 _cmd_parts.extend(["--product-type", str(product)])
             _cmd_parts.extend([
@@ -1762,7 +2497,7 @@ def main():
 
         st.code(cli_cmd or "# cli.py not found", language="bash")
 
-        d1, d2, d3 = st.columns([2, 1, 1])
+        d1, d2, d3, d4 = st.columns([2, 1, 1, 1])
         with d1:
             if st.button("🚀 Start Download", use_container_width=True, type="primary"):
                 logger.info("=" * 40)
@@ -1770,23 +2505,39 @@ def main():
                 logger.info(f"[DL]   provider={provider} satellite={satellite} product={product}")
                 logger.info(f"[DL]   dates={st.session_state['start_date']} → {st.session_state['end_date']}")
                 logger.info(f"[DL]   selected_tiles={selected_tiles_for_cmd}")
-                logger.info(f"[DL]   AOI length={len(atxt)} chars")
+                logger.info(
+                    f"[DL]   parallel(auto)=max_concurrent={auto_max_concurrent} "
+                    f"parallel_days={auto_parallel_days} "
+                    f"concurrent_per_day={auto_concurrent_per_day}"
+                )
+                logger.info(f"[DL]   aoi_source={'selected_tiles' if use_selected_tiles_mode else 'drawn_aoi'}")
+                logger.info(f"[DL]   AOI length={len(aoi_text_for_download)} chars")
 
-                if not atxt:
-                    st.error("Define an AOI first.")
-                    logger.error("[DL] No AOI defined — aborting")
+                if not aoi_text_for_download:
+                    st.error("Définis un polygone AOI ou sélectionne au moins une tuile.")
+                    logger.error("[DL] No AOI/selected tiles defined — aborting")
                 elif cli_err:
                     st.error(f"Cannot start: {cli_err}")
                     logger.error(f"[DL] CLI error: {cli_err}")
                 else:
-                    reset_downloads()
+                    # Make sure no stale background process is still writing logs/files.
+                    unlocked = _unlock_download_runtime(kill_orphans=True)
+                    if not unlocked:
+                        st.error("Impossible d'arrêter un ancien téléchargement. Clique 🔓 Unlock puis réessaie.")
+                        st.stop()
+
+                    # Keep existing downloaded files; only reset runtime state/logs.
+                    reset_downloads(clear_files=False)
                     st.session_state["dl_running"] = True
                     st.session_state["dl_start_time"] = time.time()
 
                     # Write AOI file
                     try:
-                        aoi_path.write_text(atxt, encoding="utf-8")
-                        logger.info(f"[DL] AOI written to {aoi_path} ({len(atxt)} chars)")
+                        aoi_path.write_text(aoi_text_for_download, encoding="utf-8")
+                        logger.info(
+                            f"[DL] AOI written to {aoi_path} "
+                            f"({len(aoi_text_for_download)} chars, mode={'selected_tiles' if use_selected_tiles_mode else 'drawn_aoi'})"
+                        )
                     except Exception as e:
                         st.error(f"Failed to write AOI file: {e}")
                         logger.error(f"[DL] AOI write failed: {e}")
@@ -1819,34 +2570,13 @@ def main():
                     # Python process.  This is what the old code did.
                     # ══════════════════════════════════════════════════════
                     try:
-                        # Build the command EXACTLY like the old working code:
-                        #   os.system(f"nohup python cli.py --provider {provider.lower()} ... &")
-                        # But with: full python path, cd to project root, PID capture
-                        cli_provider = PROVIDER_CLI_MAP.get(provider, provider.lower())
-                        collection = str(satellite).split(" ")[0]
-
-                        # Build simple command string — NO shlex.quote
-                        cmd_args = (
-                            f"--provider {cli_provider} "
-                            f"--collection {collection} "
-                        )
-                        if product and str(product).strip():
-                            cmd_args += f"--product-type {product} "
-
-                        cmd_args += (
-                            f"--start-date {st.session_state['start_date']} "
-                            f"--end-date {st.session_state['end_date']} "
-                            f"--aoi_file {aoi_path} "
-                            f"--log-type all"
-                        )
-
-                        # The shell command: cd to project root, then nohup + background
-                        # This mirrors the old working code exactly.
+                        # Launch exactly the fully-built CLI command (already quoted),
+                        # preserving all options such as selected tile filters.
+                        import shlex
                         shell_cmd = (
-                            f"cd {PROJECT_ROOT} && "
-                            f"nohup {sys.executable} -u cli.py {cmd_args} "
-                            f"> nohup.out 2>&1 & "
-                            f"echo $! > job_pid"
+                            f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                            f"nohup {cli_cmd} > {shlex.quote(NOHUP_PATH.name)} 2>&1 & "
+                            f"echo $! > {shlex.quote(PID_PATH.name)}"
                         )
                         logger.info(f"[DL] Shell command: {shell_cmd}")
 
@@ -1891,33 +2621,23 @@ def main():
         with d2:
             if st.button("⏹️ Stop", use_container_width=True):
                 logger.info("[DL] ⏹ STOP button pressed")
-                pid = st.session_state.get("dl_pid") or _read_pid()
-                if pid and _pid_is_running(pid):
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        logger.info(f"[DL] Sent SIGTERM to PID {pid}")
-                    except Exception as e:
-                        logger.error(f"[DL] Failed to kill PID {pid}: {e}")
-                        # Try harder with SIGKILL
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except Exception:
-                            pass
-                else:
-                    logger.info(f"[DL] PID {pid} not running, nothing to stop")
-                _close_log_fh()
-                st.session_state["dl_running"] = False
-                try:
-                    PID_PATH.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                _unlock_download_runtime(kill_orphans=False)
                 st.warning("⏹️ Stopped.")
         with d3:
             if st.button("🗑️ Reset", use_container_width=True):
                 logger.info("[DL] 🗑 RESET button pressed")
-                reset_downloads()
+                _unlock_download_runtime(kill_orphans=True)
+                reset_downloads(clear_files=True)
                 st.info("🗑️ Cleared.")
                 st.rerun()
+        with d4:
+            if st.button("🔓 Unlock", use_container_width=True):
+                logger.info("[DL] 🔓 UNLOCK button pressed")
+                ok = _unlock_download_runtime(kill_orphans=True)
+                if ok:
+                    st.success("Runtime unlocked. Tu peux relancer un download.")
+                else:
+                    st.warning("Certaines tâches n'ont pas pu être arrêtées automatiquement.")
         st.markdown("---")
         render_download_progress()
         if _ss("dl_running"):
@@ -1929,7 +2649,7 @@ def main():
                 _close_log_fh()  # FIX: close log handle when process ends
                 st.session_state["dl_running"] = False
                 try:
-                    PID_PATH.unlink(missing_ok=True)
+                    PID_PATH.write_text("")
                 except Exception:
                     pass
                 final_logs = parse_download_logs()
