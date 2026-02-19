@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;background:#060a14;overflow:hidden}
+#map{width:100%;height:100%}
+.draw-toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#111827;border:1px solid rgba(56,189,248,.3);border-radius:12px;padding:10px 18px;color:#38bdf8;font:600 13px/1.4 'DM Sans',sans-serif;z-index:9999;display:none}
+.draw-toast.show{display:block}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="drawToast" class="draw-toast"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script>
+(function(){
+"use strict";
+const Streamlit = {
+  setComponentValue: function(v){
+    window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:setComponentValue",value:v},"*");
+  },
+  setFrameHeight: function(h){
+    window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:setFrameHeight",height:h},"*");
+  }
+};
+window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:componentReady",apiVersion:1},"*");
+
+let map = null;
+let drawnItems = null;
+let aoiLayer = null;
+let lastAoiHash = "";
+
+function showToast(msg){
+  const el = document.getElementById("drawToast");
+  if(!el) return;
+  el.textContent = msg;
+  el.classList.add("show");
+  setTimeout(function(){el.classList.remove("show")}, 2000);
+}
+
+function toPolygonWKT(latlngs){
+  if(!latlngs || latlngs.length < 3){ return ""; }
+  const coords = latlngs.map(function(ll){ return ll.lng.toFixed(6)+" "+ll.lat.toFixed(6); });
+  coords.push(coords[0]);
+  return "POLYGON((" + coords.join(",") + "))";
+}
+
+function layerToWKT(layer){
+  if(!layer){ return ""; }
+  const ll = layer.getLatLngs();
+  if(!ll || !ll.length){ return ""; }
+  const ring = ll[0] || ll;
+  return toPolygonWKT(ring);
+}
+
+function sendAOI(){
+  let wkt = "";
+  drawnItems.eachLayer(function(layer){ wkt = layerToWKT(layer) || wkt; });
+  Streamlit.setComponentValue({type:"aoi", wkt:wkt});
+}
+
+function initMap(center, zoom){
+  map = L.map("map",{center:center,zoom:zoom,maxZoom:19,minZoom:2});
+  const satellite = L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    {attribution:"Esri",maxNativeZoom:19,maxZoom:22}
+  );
+  const dark = L.tileLayer(
+    "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+    {attribution:"CartoDB",maxZoom:20}
+  );
+  const streets = L.tileLayer(
+    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    {attribution:"OSM",maxZoom:19}
+  );
+  satellite.addTo(map);
+  L.control.layers({"Satellite":satellite,"Dark":dark,"Streets":streets},{},{position:"topright",collapsed:true}).addTo(map);
+
+  drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+  const drawControl = new L.Control.Draw({
+    position:"topleft",
+    draw:{
+      polyline:false,circle:false,marker:false,circlemarker:false,
+      rectangle:{shapeOptions:{color:"#CCBB44",weight:2,fillOpacity:0.08}},
+      polygon:{shapeOptions:{color:"#CCBB44",weight:2,fillOpacity:0.08}}
+    },
+    edit:{featureGroup:drawnItems,edit:true,remove:true}
+  });
+  map.addControl(drawControl);
+  map.on(L.Draw.Event.CREATED, function(e){
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    sendAOI();
+    showToast("AOI updated");
+  });
+  map.on(L.Draw.Event.EDITED, function(){ sendAOI(); showToast("AOI edited"); });
+  map.on(L.Draw.Event.DELETED, function(){ drawnItems.clearLayers(); sendAOI(); showToast("AOI cleared"); });
+  Streamlit.setFrameHeight(700);
+}
+
+function updateExternalAOI(geojsonStr, hash){
+  if(hash === lastAoiHash){ return; }
+  lastAoiHash = hash;
+  if(aoiLayer){ map.removeLayer(aoiLayer); aoiLayer = null; }
+  drawnItems.clearLayers();
+  if(!geojsonStr || geojsonStr === "null"){ return; }
+  try{
+    const data = JSON.parse(geojsonStr);
+    aoiLayer = L.geoJSON(data, {
+      style:{color:"#CCBB44",weight:2.5,fillOpacity:0.08,dashArray:"5,5"}
+    }).addTo(map);
+  }catch(e){
+    console.error("AOI parse error", e);
+  }
+}
+
+function onRender(args){
+  const center = args.center ? JSON.parse(args.center) : [33.5731, -7.5898];
+  const zoom = args.zoom || 8;
+  if(!map){ initMap(center, zoom); }
+  if(args.fly_to && args.fly_to !== "null"){
+    try{
+      const ft = JSON.parse(args.fly_to);
+      if(Array.isArray(ft) && ft.length >= 2){
+        map.flyTo([ft[0], ft[1]], ft[2] || map.getZoom(), {duration:0.4});
+      }
+    }catch(_e){}
+  }
+  updateExternalAOI(args.aoi_geojson, args.aoi_hash || "");
+}
+
+window.addEventListener("message", function(event){
+  if(!event.data) return;
+  if(event.data.type === "streamlit:render"){
+    onRender(event.data.args || {});
+  }
+});
+})();
+</script>
+</body>
+</html>

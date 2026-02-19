@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nimbus-downloads-pvc
+  namespace: nimbuschain
+spec:
+  storageClassName: nimbus-local
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi

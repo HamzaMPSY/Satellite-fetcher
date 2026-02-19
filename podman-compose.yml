@@ -1,0 +1,107 @@
+services:
+  mongodb:
+    image: docker.io/library/mongo:7
+    container_name: nimbus-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  nimbus-api:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Containerfile
+    depends_on:
+      - mongodb
+    command: ["uvicorn", "nimbuschain_fetch_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      NIMBUS_RUNTIME_ROLE: api
+      NIMBUS_DB_BACKEND: ${NIMBUS_DB_BACKEND:-mongodb}
+      NIMBUS_DB_PATH: /data/nimbus.db
+      NIMBUS_MONGODB_URI: ${NIMBUS_MONGODB_URI_INTERNAL:-mongodb://mongodb:27017}
+      NIMBUS_MONGODB_DB: ${NIMBUS_MONGODB_DB:-nimbuschain_fetch}
+      NIMBUS_DATA_DIR: /data/downloads
+      NIMBUS_MAX_JOBS: ${NIMBUS_MAX_JOBS:-4}
+      NIMBUS_LOG_LEVEL: ${NIMBUS_LOG_LEVEL:-INFO}
+      NIMBUS_LOG_JSON: ${NIMBUS_LOG_JSON:-false}
+      NIMBUS_ENABLE_METRICS: ${NIMBUS_ENABLE_METRICS:-true}
+      NIMBUS_API_KEY: ${NIMBUS_API_KEY:-}
+      NIMBUS_CORS_ORIGINS: ${NIMBUS_CORS_ORIGINS:-http://localhost:8501}
+      NIMBUS_MAX_REQUEST_MB: ${NIMBUS_MAX_REQUEST_MB:-10}
+      NIMBUS_PROVIDER_LIMITS: ${NIMBUS_PROVIDER_LIMITS:-copernicus=2,usgs=4}
+      NIMBUS_QUEUE_POLL_SECONDS: ${NIMBUS_QUEUE_POLL_SECONDS:-1.0}
+      NIMBUS_STALE_JOB_SECONDS: ${NIMBUS_STALE_JOB_SECONDS:-900}
+      NIMBUS_COPERNICUS_BASE_URL: ${NIMBUS_COPERNICUS_BASE_URL:-https://catalogue.dataspace.copernicus.eu}
+      NIMBUS_COPERNICUS_TOKEN_URL: ${NIMBUS_COPERNICUS_TOKEN_URL:-https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token}
+      NIMBUS_COPERNICUS_DOWNLOAD_URL: ${NIMBUS_COPERNICUS_DOWNLOAD_URL:-https://zipper.dataspace.copernicus.eu}
+      NIMBUS_COPERNICUS_USERNAME: ${NIMBUS_COPERNICUS_USERNAME:-}
+      NIMBUS_COPERNICUS_PASSWORD: ${NIMBUS_COPERNICUS_PASSWORD:-}
+      NIMBUS_USGS_SERVICE_URL: ${NIMBUS_USGS_SERVICE_URL:-https://m2m.cr.usgs.gov/api/api/json/stable/}
+      NIMBUS_USGS_USERNAME: ${NIMBUS_USGS_USERNAME:-}
+      NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
+    volumes:
+      - ./data:/data
+
+  nimbus-worker:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Containerfile
+    depends_on:
+      - mongodb
+    command: ["nimbuschain-worker"]
+    environment:
+      NIMBUS_RUNTIME_ROLE: worker
+      NIMBUS_DB_BACKEND: ${NIMBUS_DB_BACKEND:-mongodb}
+      NIMBUS_DB_PATH: /data/nimbus.db
+      NIMBUS_MONGODB_URI: ${NIMBUS_MONGODB_URI_INTERNAL:-mongodb://mongodb:27017}
+      NIMBUS_MONGODB_DB: ${NIMBUS_MONGODB_DB:-nimbuschain_fetch}
+      NIMBUS_DATA_DIR: /data/downloads
+      NIMBUS_MAX_JOBS: ${NIMBUS_MAX_JOBS:-4}
+      NIMBUS_LOG_LEVEL: ${NIMBUS_LOG_LEVEL:-INFO}
+      NIMBUS_LOG_JSON: ${NIMBUS_LOG_JSON:-false}
+      NIMBUS_PROVIDER_LIMITS: ${NIMBUS_PROVIDER_LIMITS:-copernicus=2,usgs=4}
+      NIMBUS_QUEUE_POLL_SECONDS: ${NIMBUS_QUEUE_POLL_SECONDS:-1.0}
+      NIMBUS_STALE_JOB_SECONDS: ${NIMBUS_STALE_JOB_SECONDS:-900}
+      NIMBUS_COPERNICUS_BASE_URL: ${NIMBUS_COPERNICUS_BASE_URL:-https://catalogue.dataspace.copernicus.eu}
+      NIMBUS_COPERNICUS_TOKEN_URL: ${NIMBUS_COPERNICUS_TOKEN_URL:-https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token}
+      NIMBUS_COPERNICUS_DOWNLOAD_URL: ${NIMBUS_COPERNICUS_DOWNLOAD_URL:-https://zipper.dataspace.copernicus.eu}
+      NIMBUS_COPERNICUS_USERNAME: ${NIMBUS_COPERNICUS_USERNAME:-}
+      NIMBUS_COPERNICUS_PASSWORD: ${NIMBUS_COPERNICUS_PASSWORD:-}
+      NIMBUS_USGS_SERVICE_URL: ${NIMBUS_USGS_SERVICE_URL:-https://m2m.cr.usgs.gov/api/api/json/stable/}
+      NIMBUS_USGS_USERNAME: ${NIMBUS_USGS_USERNAME:-}
+      NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
+    volumes:
+      - ./data:/data
+
+  nimbus-ui:
+    build:
+      context: .
+      dockerfile: ui/Containerfile
+    depends_on:
+      - nimbus-api
+    ports:
+      - "${NIMBUS_UI_PORT:-8501}:8501"
+    environment:
+      NIMBUS_SERVICE_URL: ${NIMBUS_SERVICE_URL:-http://nimbus-api:8000}
+      NIMBUS_API_KEY: ${NIMBUS_API_KEY:-}
+      NIMBUS_UI_DATA_DIR: /data/downloads
+      NIMBUS_COPERNICUS_BASE_URL: ${NIMBUS_COPERNICUS_BASE_URL:-https://catalogue.dataspace.copernicus.eu}
+      NIMBUS_COPERNICUS_TOKEN_URL: ${NIMBUS_COPERNICUS_TOKEN_URL:-https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token}
+      NIMBUS_COPERNICUS_DOWNLOAD_URL: ${NIMBUS_COPERNICUS_DOWNLOAD_URL:-https://zipper.dataspace.copernicus.eu}
+      NIMBUS_COPERNICUS_USERNAME: ${NIMBUS_COPERNICUS_USERNAME:-}
+      NIMBUS_COPERNICUS_PASSWORD: ${NIMBUS_COPERNICUS_PASSWORD:-}
+      NIMBUS_USGS_SERVICE_URL: ${NIMBUS_USGS_SERVICE_URL:-https://m2m.cr.usgs.gov/api/api/json/stable/}
+      NIMBUS_USGS_USERNAME: ${NIMBUS_USGS_USERNAME:-}
+      NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
+    volumes:
+      - ./src:/app/src
+      - ./data:/data
+
+volumes:
+  mongodb_data:

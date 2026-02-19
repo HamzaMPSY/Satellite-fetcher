@@ -1,0 +1,1 @@
+{"job_id":"6a0b82b7cbb44920a442202f931a0c86","state":"succeeded","progress":100.0,"bytes_downloaded":885378498,"bytes_total":885378498,"started_at":"2026-02-18T11:54:07.028556Z","finished_at":"2026-02-18T11:57:10.315945Z","duration_seconds":183.287389,"errors":[],"provider":"copernicus","collection":"SENTINEL-2"}

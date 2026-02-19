@@ -1,0 +1,16 @@
+{
+  "mode": "parallel_3jobs",
+  "elapsed_seconds": 149.0,
+  "elapsed_minutes": 2.4833333333333334,
+  "jobs": 3,
+  "succeeded": 3,
+  "failed": 0,
+  "cancelled": 0,
+  "bytes_downloaded": 885378498,
+  "bytes_total": 885378498,
+  "job_ids": [
+    "97c8ad661e74452e95e9903bfc7e4aa1",
+    "14a3839935404d7782c39838f6e80463",
+    "7d6097f356814e0b80a06aaafcd3f89e"
+  ]
+}

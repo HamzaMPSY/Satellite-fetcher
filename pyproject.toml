@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.24.2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nimbuschain-fetch"
+version = "0.1.0"
+description = "NimbusChain Fetch core engine and FastAPI service"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "NimbusChain" }
+]
+dependencies = [
+  "anyio>=4.4.0",
+  "aiohttp>=3.10.0",
+  "fastapi>=0.115.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.9.0",
+  "pydantic-settings>=2.4.0",
+  "prometheus-client>=0.21.0",
+  "pymongo>=4.8.0",
+  "requests>=2.32.0",
+  "shapely>=2.0.0",
+  "uvicorn[standard]>=0.30.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+  "pytest-asyncio>=0.24.0",
+  "ruff>=0.6.0"
+]
+ui = [
+  "streamlit>=1.38.0",
+  "loguru>=0.7.2",
+  "geopandas>=1.0.1",
+  "streamlit_file_browser",
+  "pyproj>=3.7.0"
+]
+
+[project.scripts]
+nimbuschain-fetch = "nimbuschain_fetch.cli:main"
+nimbuschain-worker = "nimbuschain_fetch.worker:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+target-version = "py311"

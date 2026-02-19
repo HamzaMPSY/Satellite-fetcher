@@ -1,0 +1,6 @@
+Morocco 3-day single-job benchmark completed
+- Elapsed: 186.0 seconds
+- Elapsed: 3.10 minutes
+- State: succeeded
+- Bytes: 885378498/885378498
+- Report: /Users/mehdidinari/Desktop/backend nimbus/benchmark_results/20260218T115406Z_3d_single/report.json

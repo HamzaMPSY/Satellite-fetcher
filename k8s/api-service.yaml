@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nimbus-api
+  namespace: nimbuschain
+  labels:
+    app: nimbus-api
+spec:
+  selector:
+    app: nimbus-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

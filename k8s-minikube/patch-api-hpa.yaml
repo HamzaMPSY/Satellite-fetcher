@@ -1,0 +1,8 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nimbus-api
+  namespace: nimbuschain
+spec:
+  minReplicas: 1
+  maxReplicas: 2

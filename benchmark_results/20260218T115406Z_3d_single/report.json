@@ -1,0 +1,14 @@
+{
+  "mode": "single_job_3days",
+  "elapsed_seconds": 186.0,
+  "elapsed_minutes": 3.1,
+  "jobs": 1,
+  "succeeded": 1,
+  "failed": 0,
+  "cancelled": 0,
+  "bytes_downloaded": 885378498,
+  "bytes_total": 885378498,
+  "job_ids": [
+    "6a0b82b7cbb44920a442202f931a0c86"
+  ]
+}

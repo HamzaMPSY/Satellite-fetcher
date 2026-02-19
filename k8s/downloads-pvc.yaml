@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nimbus-downloads-pvc
+  namespace: nimbuschain
+spec:
+  # For multi-worker scaling, use a StorageClass that supports ReadWriteMany.
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 500Gi
