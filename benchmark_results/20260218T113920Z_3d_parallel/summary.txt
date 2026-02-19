@@ -1,6 +1,0 @@
-Morocco 3-day parallel benchmark completed
-- Elapsed: 149.0 seconds
-- Elapsed: 2.48 minutes
-- Jobs: 3 (succeeded=3, failed=0, cancelled=0)
-- Bytes: 885378498/885378498
-- Report: /Users/mehdidinari/Desktop/backend nimbus/benchmark_results/20260218T113920Z_3d_parallel/report.json

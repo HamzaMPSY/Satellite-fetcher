@@ -46,6 +46,7 @@ Worker container(s) (downloads + providers + checksums + manifest)
 
 ## Main docs
 
+- `/Users/mehdidinari/Desktop/backend nimbus/docs/COMPLETE_GUIDE_FR.md`
 - `/Users/mehdidinari/Desktop/backend nimbus/docs/README.md`
 - `/Users/mehdidinari/Desktop/backend nimbus/docs/DEPLOYMENT_3_LAYER.md`
 - `/Users/mehdidinari/Desktop/backend nimbus/docs/KUBERNETES_DEPLOYMENT.md`

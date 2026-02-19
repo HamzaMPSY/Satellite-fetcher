@@ -4,6 +4,9 @@ Start here if you want to understand the repository quickly.
 
 ## Main guides
 
+- `COMPLETE_GUIDE_FR.md`
+  - Full French guide from zero: architecture, containers, UI/API workflow, job lifecycle, terminal commands, tests, and troubleshooting.
+
 - `DEPLOYMENT_3_LAYER.md`
   - End-to-end Podman deployment of independent `api`, `worker`, and `ui` services, including scaling and troubleshooting.
 
@@ -21,8 +24,9 @@ Start here if you want to understand the repository quickly.
 
 ## Recommended reading order
 
-1. `DEPLOYMENT_3_LAYER.md`
-2. `KUBERNETES_DEPLOYMENT.md`
-3. `REPOSITORY_GUIDE.md`
-4. `API_REFERENCE.md`
-5. `integration_streamlit.md`
+1. `COMPLETE_GUIDE_FR.md`
+2. `DEPLOYMENT_3_LAYER.md`
+3. `KUBERNETES_DEPLOYMENT.md`
+4. `REPOSITORY_GUIDE.md`
+5. `API_REFERENCE.md`
+6. `integration_streamlit.md`
