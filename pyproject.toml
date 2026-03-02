@@ -39,13 +39,19 @@ ui = [
   "streamlit_file_browser",
   "pyproj>=3.7.0"
 ]
+zarr-service = [
+  "zarr>=2.18.0",
+  "numcodecs>=0.13.0",
+  "xarray>=2024.10.0"
+]
 
 [project.scripts]
 nimbuschain-fetch = "nimbuschain_fetch.cli:main"
 nimbuschain-worker = "nimbuschain_fetch.worker:main"
+nimbuschain-zarr-service = "nimbuschain_zarr_service.main:run"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui"]
+packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

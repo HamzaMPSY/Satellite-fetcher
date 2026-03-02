@@ -22,6 +22,12 @@ Start here if you want to understand the repository quickly.
 - `integration_streamlit.md`
   - How to replace subprocess CLI usage with direct/service client integration in Streamlit.
 
+- `ZARR_MASK_ARCHITECTURE_CONTRACTS.md`
+  - Frozen architecture and inter-service contracts for the future `fetcher -> zarr-converter -> mask` pipeline.
+
+- `ZARR_CONVERTER_SERVICE.md`
+  - Skeleton service notes for the new `zarr-converter-service`: endpoints, local run, and container build.
+
 ## Recommended reading order
 
 1. `COMPLETE_GUIDE_FR.md`
@@ -30,3 +36,5 @@ Start here if you want to understand the repository quickly.
 4. `REPOSITORY_GUIDE.md`
 5. `API_REFERENCE.md`
 6. `integration_streamlit.md`
+7. `ZARR_MASK_ARCHITECTURE_CONTRACTS.md`
+8. `ZARR_CONVERTER_SERVICE.md`
