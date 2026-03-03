@@ -28,6 +28,9 @@ Start here if you want to understand the repository quickly.
 - `ZARR_CONVERTER_SERVICE.md`
   - Skeleton service notes for the new `zarr-converter-service`: endpoints, local run, and container build.
 
+- `ZARR_DATA_MODEL.md`
+  - Frozen Zarr v1 data model: layout, dimensions, chunking, compression, and metadata contract.
+
 ## Recommended reading order
 
 1. `COMPLETE_GUIDE_FR.md`
@@ -38,3 +41,4 @@ Start here if you want to understand the repository quickly.
 6. `integration_streamlit.md`
 7. `ZARR_MASK_ARCHITECTURE_CONTRACTS.md`
 8. `ZARR_CONVERTER_SERVICE.md`
+9. `ZARR_DATA_MODEL.md`

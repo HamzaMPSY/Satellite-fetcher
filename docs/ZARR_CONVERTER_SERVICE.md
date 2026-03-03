@@ -43,6 +43,20 @@ Returns a simple health payload with:
 `conversion_ready` is `false` in the skeleton because the actual conversion
 logic is not implemented yet.
 
+## `GET /schema`
+
+Returns the current machine-readable Zarr model used as the baseline for the
+conversion service.
+
+This endpoint exposes:
+
+- layout paths
+- dimension order
+- canonical bands
+- required metadata
+- default chunks
+- default compression
+
 ## `POST /convert`
 
 Accepts the stage contract payload and returns an `accepted` response.
@@ -116,3 +130,6 @@ Not implemented yet:
 
 Those belong to the next implementation tasks.
 
+The Zarr data model itself is now frozen and documented separately in:
+
+- `/Users/mehdidinari/Desktop/backend nimbus/docs/ZARR_DATA_MODEL.md`
