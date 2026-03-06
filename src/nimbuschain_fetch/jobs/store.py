@@ -8,7 +8,29 @@ from typing import Any, Protocol
 @dataclass(slots=True)
 class JobListFilters:
     state: str | None = None
+    states: tuple[str, ...] = ()
     provider: str | None = None
+    collection: str | None = None
+    product_type: str | None = None
+    job_id_query: str | None = None
+    date_from: datetime | None = None
+    date_to: datetime | None = None
+    updated_from: datetime | None = None
+    updated_to: datetime | None = None
+    sort_by: str = "updated_at"
+    sort_desc: bool = True
+    page: int = 1
+    page_size: int = 20
+
+
+@dataclass(slots=True)
+class ArtifactListFilters:
+    artifact_type: str | None = None
+    provider: str | None = None
+    collection: str | None = None
+    scene_id: str | None = None
+    job_id: str | None = None
+    uri_query: str | None = None
     date_from: datetime | None = None
     date_to: datetime | None = None
     page: int = 1
@@ -56,6 +78,12 @@ class JobStore(Protocol):
         ...
 
     def get_result(self, job_id: str) -> dict[str, Any] | None:
+        ...
+
+    def upsert_artifact(self, artifact_payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+    def list_artifacts(self, filters: ArtifactListFilters) -> tuple[list[dict[str, Any]], int]:
         ...
 
     def requeue_incomplete_jobs(self) -> list[str]:

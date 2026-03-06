@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 import uuid
 from collections.abc import Callable
@@ -14,9 +15,12 @@ from nimbuschain_fetch.download.download_manager import DownloadCancelled, Downl
 from nimbuschain_fetch.geometry.aoi import parse_aoi
 from nimbuschain_fetch.jobs.events import stream_events as stream_persisted_events
 from nimbuschain_fetch.jobs.executor_inprocess import InProcessExecutor
-from nimbuschain_fetch.jobs.store import JobListFilters, JobStore
+from nimbuschain_fetch.jobs.store import ArtifactListFilters, JobListFilters, JobStore
 from nimbuschain_fetch.manifest import build_manifest_entry, checksums_for_paths, write_manifest
 from nimbuschain_fetch.models import (
+    ArtifactListResponse,
+    ArtifactRecord,
+    ArtifactUpsertRequest,
     BatchJobCreateRequest,
     DownloadProductsRequest,
     JobCreateRequest,
@@ -162,24 +166,90 @@ class NimbusFetcher:
         self,
         *,
         state: str | None,
+        states: tuple[str, ...] = (),
         provider: str | None,
+        collection: str | None = None,
+        product_type: str | None = None,
+        job_id_query: str | None = None,
         date_from: datetime | None,
         date_to: datetime | None,
+        updated_from: datetime | None = None,
+        updated_to: datetime | None = None,
+        sort_by: str = "updated_at",
+        sort_desc: bool = True,
         page: int,
         page_size: int,
     ) -> JobListResponse:
         rows, total = self.store.list_jobs(
             JobListFilters(
                 state=state,
+                states=states,
                 provider=provider,
+                collection=collection,
+                product_type=product_type,
+                job_id_query=job_id_query,
                 date_from=date_from,
                 date_to=date_to,
+                updated_from=updated_from,
+                updated_to=updated_to,
+                sort_by=sort_by,
+                sort_desc=sort_desc,
                 page=page,
                 page_size=page_size,
             )
         )
         return JobListResponse(
             items=[self._to_status_response(row) for row in rows],
+            total=total,
+            page=max(1, page),
+            page_size=max(1, page_size),
+        )
+
+    def upsert_artifact(self, request: ArtifactUpsertRequest) -> ArtifactRecord:
+        artifact_id = hashlib.md5(
+            request.artifact_uri.encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()
+        row = self.store.upsert_artifact(
+            {
+                **request.model_dump(mode="python"),
+                "artifact_id": artifact_id,
+                "artifact_type": request.artifact_type.value,
+                "provider": request.provider.value if request.provider else None,
+            }
+        )
+        return ArtifactRecord.model_validate(row)
+
+    def list_artifacts(
+        self,
+        *,
+        artifact_type: str | None,
+        provider: str | None,
+        collection: str | None,
+        scene_id: str | None,
+        job_id: str | None,
+        uri_query: str | None,
+        date_from: datetime | None,
+        date_to: datetime | None,
+        page: int,
+        page_size: int,
+    ) -> ArtifactListResponse:
+        rows, total = self.store.list_artifacts(
+            ArtifactListFilters(
+                artifact_type=artifact_type,
+                provider=provider,
+                collection=collection,
+                scene_id=scene_id,
+                job_id=job_id,
+                uri_query=uri_query,
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                page_size=page_size,
+            )
+        )
+        return ArtifactListResponse(
+            items=[ArtifactRecord.model_validate(row) for row in rows],
             total=total,
             page=max(1, page),
             page_size=max(1, page_size),
@@ -511,6 +581,10 @@ class NimbusFetcher:
             progress=float(row["progress"]),
             bytes_downloaded=int(row["bytes_downloaded"]),
             bytes_total=int(row["bytes_total"]),
+            product_type=row.get("product_type"),
+            tile_id=row.get("tile_id"),
+            created_at=self._parse_iso(row.get("created_at")),
+            updated_at=self._parse_iso(row.get("updated_at")),
             started_at=started_at,
             finished_at=finished_at,
             duration_seconds=duration_seconds,

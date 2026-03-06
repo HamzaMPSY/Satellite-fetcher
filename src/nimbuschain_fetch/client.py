@@ -12,6 +12,9 @@ from pydantic import TypeAdapter
 
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.models import (
+    ArtifactListResponse,
+    ArtifactRecord,
+    ArtifactUpsertRequest,
     BatchJobCreateRequest,
     BatchJobCreatedResponse,
     JobCreateRequest,
@@ -146,9 +149,17 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
         self,
         *,
         state: str | None = None,
+        state_in: str | None = None,
         provider: str | None = None,
+        collection: str | None = None,
+        product_type: str | None = None,
+        job_id_query: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        updated_from: str | None = None,
+        updated_to: str | None = None,
+        sort_by: str = "updated_at",
+        sort_desc: bool = True,
         page: int = 1,
         page_size: int = 20,
     ) -> JobListResponse:
@@ -161,9 +172,17 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
             return self._portal.call(
                 self._fetcher.list_jobs,
                 state=state,
+                states=tuple(item.strip() for item in (state_in or "").split(",") if item.strip()),
                 provider=provider,
+                collection=collection,
+                product_type=product_type,
+                job_id_query=job_id_query,
                 date_from=parsed_from,
                 date_to=parsed_to,
+                updated_from=datetime.fromisoformat(updated_from) if updated_from else None,
+                updated_to=datetime.fromisoformat(updated_to) if updated_to else None,
+                sort_by=sort_by,
+                sort_desc=sort_desc,
                 page=page,
                 page_size=page_size,
             )
@@ -173,9 +192,17 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
             f"{self.service_url}/v1/jobs",
             params={
                 "state": state,
+                "state_in": state_in,
                 "provider": provider,
+                "collection": collection,
+                "product_type": product_type,
+                "job_id_query": job_id_query,
                 "date_from": date_from,
                 "date_to": date_to,
+                "updated_from": updated_from,
+                "updated_to": updated_to,
+                "sort_by": sort_by,
+                "sort_desc": sort_desc,
                 "page": page,
                 "page_size": page_size,
             },
@@ -183,6 +210,69 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
         )
         response.raise_for_status()
         return JobListResponse.model_validate(response.json())
+
+    def upsert_artifact(self, artifact: ArtifactUpsertRequest | dict[str, Any]) -> ArtifactRecord:
+        payload = ArtifactUpsertRequest.model_validate(artifact)
+        if self.mode == "direct":
+            assert self._portal and self._fetcher
+            return self._portal.call(self._fetcher.upsert_artifact, payload)
+
+        assert self._session is not None
+        response = self._session.post(
+            f"{self.service_url}/v1/artifacts",
+            json=payload.model_dump(mode="json"),
+            timeout=30,
+        )
+        response.raise_for_status()
+        return ArtifactRecord.model_validate(response.json())
+
+    def list_artifacts(
+        self,
+        *,
+        artifact_type: str | None = None,
+        provider: str | None = None,
+        collection: str | None = None,
+        scene_id: str | None = None,
+        job_id: str | None = None,
+        uri_query: str | None = None,
+        include_local: bool = False,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> ArtifactListResponse:
+        if self.mode == "direct":
+            assert self._portal and self._fetcher
+            return self._portal.call(
+                self._fetcher.list_artifacts,
+                artifact_type=artifact_type,
+                provider=provider,
+                collection=collection,
+                scene_id=scene_id,
+                job_id=job_id,
+                uri_query=uri_query,
+                date_from=None,
+                date_to=None,
+                page=page,
+                page_size=page_size,
+            )
+
+        assert self._session is not None
+        response = self._session.get(
+            f"{self.service_url}/v1/artifacts",
+            params={
+                "artifact_type": artifact_type,
+                "provider": provider,
+                "collection": collection,
+                "scene_id": scene_id,
+                "job_id": job_id,
+                "uri_query": uri_query,
+                "include_local": include_local,
+                "page": page,
+                "page_size": page_size,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        return ArtifactListResponse.model_validate(response.json())
 
     def stream_events(
         self,

@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse
 
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.settings import get_settings
+from nimbuschain_fetch_service.api.artifacts import router as artifacts_router
 from nimbuschain_fetch_service.api.events import router as events_router
 from nimbuschain_fetch_service.api.health import router as health_router
 from nimbuschain_fetch_service.api.jobs import router as jobs_router
@@ -56,6 +57,7 @@ if settings.cors_origins:
 
 app.include_router(health_router)
 app.include_router(jobs_router)
+app.include_router(artifacts_router)
 app.include_router(events_router)
 app.include_router(metrics_router)
 

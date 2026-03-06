@@ -42,7 +42,10 @@ ui = [
 zarr-service = [
   "zarr>=2.18.0",
   "numcodecs>=0.13.0",
-  "xarray>=2024.10.0"
+  "xarray>=2024.10.0",
+  "rasterio>=1.4.0",
+  "h5netcdf>=1.4.0",
+  "h5py>=3.11.0"
 ]
 
 [project.scripts]

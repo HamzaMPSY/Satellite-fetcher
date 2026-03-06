@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbus-api
+  namespace: nimbuschain
+  labels:
+    app: nimbus-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nimbus-api
+  template:
+    metadata:
+      labels:
+        app: nimbus-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/v1/metrics"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/nimbuschain/nimbus-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: NIMBUS_RUNTIME_ROLE
+              value: "api"
+          envFrom:
+            - configMapRef:
+                name: nimbus-config
+            - secretRef:
+                name: nimbus-secrets
+          volumeMounts:
+            - name: downloads
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 8
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 25
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: downloads
+          persistentVolumeClaim:
+            claimName: nimbus-downloads-pvc

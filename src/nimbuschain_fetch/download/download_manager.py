@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from time import monotonic
 from typing import Callable
+from urllib.parse import unquote
 
 import aiohttp
 
@@ -165,11 +167,11 @@ class DownloadManager:
         output_dir: Path,
         headers: dict,
     ) -> Path:
-        file_path = output_dir / file_name
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-
         async with session.get(url, headers=headers) as response:
             response.raise_for_status()
+            resolved_name = self._resolve_output_name(file_name, response)
+            file_path = output_dir / resolved_name
+            file_path.parent.mkdir(parents=True, exist_ok=True)
             total: int | None = None
             content_length = response.headers.get("Content-Length")
             if content_length and content_length.isdigit():
@@ -186,12 +188,65 @@ class DownloadManager:
                     handle.write(chunk)
                     downloaded += len(chunk)
                     if self.progress_callback:
-                        self.progress_callback(file_name, len(chunk), downloaded, total)
+                        self.progress_callback(resolved_name, len(chunk), downloaded, total)
 
             elapsed = max(0.001, monotonic() - started)
             if self.progress_callback:
                 # Final heartbeat event with speed information inferred by caller.
-                self.progress_callback(file_name, 0, downloaded, total)
+                self.progress_callback(resolved_name, 0, downloaded, total)
 
             _ = elapsed
             return file_path
+
+    @staticmethod
+    def _is_generic_fallback_name(file_name: str) -> bool:
+        return bool(re.fullmatch(r"usgs_[^/]+_\d+\.zip", str(file_name or "").strip()))
+
+    @staticmethod
+    def _extract_filename_from_content_disposition(header_value: str | None) -> str:
+        if not header_value:
+            return ""
+
+        match = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", header_value, flags=re.IGNORECASE)
+        if match:
+            return Path(unquote(match.group(1).strip().strip('"'))).name
+
+        match = re.search(r'filename\s*=\s*"([^"]+)"', header_value, flags=re.IGNORECASE)
+        if match:
+            return Path(match.group(1).strip()).name
+
+        match = re.search(r"filename\s*=\s*([^;]+)", header_value, flags=re.IGNORECASE)
+        if match:
+            return Path(match.group(1).strip().strip('"')).name
+
+        return ""
+
+    def _resolve_output_name(self, requested_name: str, response: aiohttp.ClientResponse) -> str:
+        requested = Path(str(requested_name or "").strip()).name or "download"
+        requested_suffixes = "".join(Path(requested).suffixes)
+        requested_stem = requested
+        if requested_suffixes and requested.endswith(requested_suffixes):
+            requested_stem = requested[: -len(requested_suffixes)]
+
+        generic_requested = self._is_generic_fallback_name(requested)
+        if requested_suffixes and not generic_requested:
+            return requested
+
+        header_name = self._extract_filename_from_content_disposition(
+            response.headers.get("Content-Disposition")
+        )
+        header_suffixes = "".join(Path(header_name).suffixes) if header_name else ""
+
+        if requested_stem and requested_stem != "download" and header_suffixes and not generic_requested:
+            return f"{requested_stem}{header_suffixes}"
+        if header_name:
+            return header_name
+
+        path_name = Path(unquote(response.url.path)).name.strip()
+        path_suffixes = "".join(Path(path_name).suffixes) if path_name else ""
+        if requested_stem and requested_stem != "download" and path_suffixes and not generic_requested:
+            return f"{requested_stem}{path_suffixes}"
+        if path_name:
+            return path_name
+
+        return requested

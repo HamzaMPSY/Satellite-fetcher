@@ -24,6 +24,7 @@ import hashlib
 import subprocess
 import signal
 import datetime as dt
+import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ import shapely
 import streamlit as st
 import streamlit.components.v1 as components
 from loguru import logger
+from requests.adapters import HTTPAdapter
 from shapely.geometry import Polygon, mapping, box
 from shapely import wkt as shapely_wkt
 from shapely.ops import unary_union
@@ -61,6 +63,11 @@ try:
 except Exception:
     ConfigLoader = None
 
+# Prefer the mounted source tree inside the container over the installed wheel.
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 from nimbuschain_fetch_ui.aoi_utils import parse_aoi_text
 from nimbuschain_fetch_ui.job_api_runtime import (
     build_job_payload as build_job_payload_runtime,
@@ -81,11 +88,19 @@ from nimbuschain_fetch_ui.preview_local import preview_products_local
 # root (the folder containing this script) to behave consistently.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOWNLOADS_DIR = Path(os.getenv("NIMBUS_UI_DATA_DIR", "/data/downloads"))
+ZARR_STORES_DIR = DOWNLOADS_DIR / "zarr"
 NOHUP_PATH = PROJECT_ROOT / "nohup.out"
 PID_PATH = PROJECT_ROOT / "job_pid"
 DEFAULT_API_URL = os.getenv("NIMBUS_SERVICE_URL", "http://nimbus-api:8000")
 DEFAULT_API_KEY = os.getenv("NIMBUS_API_KEY", "")
+DEFAULT_ZARR_URL = os.getenv("NIMBUS_ZARR_SERVICE_URL", "http://nimbus-zarr:8010")
+RECENT_JOBS_WINDOW_HOURS = int(os.getenv("NIMBUS_UI_RECENT_JOBS_HOURS", "72"))
+RECENT_JOB_CATEGORY_MINUTES = int(os.getenv("NIMBUS_UI_RECENT_JOB_MINUTES", "60"))
+RECENT_JOBS_LIMIT = int(os.getenv("NIMBUS_UI_RECENT_JOBS_LIMIT", "80"))
+RECENT_JOBS_FETCH_LIMIT = max(100, RECENT_JOBS_LIMIT * 3)
+JOB_MONITOR_REFRESH_EVERY = os.getenv("NIMBUS_UI_JOB_REFRESH_EVERY", "3s")
 FINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
+ACTIVE_JOB_STATES = {"queued", "running", "cancel_requested"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGURU SETUP — File + console logging for diagnostics
@@ -158,8 +173,8 @@ PRODUCT_TYPES: Dict[str, List[str]] = {
         "L2__NO2___", "L2__CH4___", "L2__CO____",
         "L2__O3____", "L2__SO2___", "L2__HCHO__",
     ],
-    "landsat_ot_c2_l1": ["8L1TP", "8L1GT", "8L1GS", "9L1TP", "9L1GT", "9L1GS"],
-    "landsat_ot_c2_l2": ["8L2SP", "8L2SR", "9L2SP", "9L2SR"],
+    "landsat_ot_c2_l1": ["L1TP", "L1GT", "L1GS"],
+    "landsat_ot_c2_l2": ["L2SP", "L2SR"],
 }
 
 # ── FIX: Explicit mapping from UI provider name to CLI --provider value ──
@@ -176,68 +191,135 @@ PROVIDER_CLI_MAP: Dict[str, str] = {
 CUSTOM_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+:root {
+    --bg-0: #040814;
+    --bg-1: #08101f;
+    --bg-2: rgba(15, 23, 42, 0.78);
+    --panel: rgba(12, 18, 34, 0.82);
+    --panel-strong: rgba(17, 24, 39, 0.92);
+    --line: rgba(56, 120, 200, 0.14);
+    --line-strong: rgba(56, 189, 248, 0.28);
+    --text: #e2e8f0;
+    --muted: #8aa0bc;
+    --accent: #38bdf8;
+    --accent-2: #2dd4bf;
+    --shadow: 0 18px 48px rgba(2, 8, 23, 0.42);
+}
 html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"] {
-    background: #060a14 !important;
-    color: #e2e8f0 !important;
+    background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.12), transparent 28%),
+        radial-gradient(circle at top right, rgba(45, 212, 191, 0.08), transparent 24%),
+        linear-gradient(180deg, var(--bg-1) 0%, var(--bg-0) 56%, #02050d 100%) !important;
+    color: var(--text) !important;
     font-family: 'DM Sans', system-ui, sans-serif !important;
 }
+[data-testid="stHeader"] {
+    background: rgba(4, 8, 20, 0.72) !important;
+    backdrop-filter: blur(14px);
+}
+[data-testid="stMainBlockContainer"],
+.main .block-container {
+    padding-top: 4.5rem !important;
+    padding-bottom: 2rem !important;
+}
 [data-testid="stSidebar"] {
-    background: #0b1120 !important;
-    border-right: 1px solid rgba(56,120,200,0.10) !important;
+    background:
+        linear-gradient(180deg, rgba(8, 16, 31, 0.97), rgba(5, 10, 21, 0.98)) !important;
+    border-right: 1px solid var(--line) !important;
+    box-shadow: inset -1px 0 0 rgba(255,255,255,0.02) !important;
 }
 [data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span {
-    color: #e2e8f0 !important;
+    color: var(--text) !important;
+}
+[data-testid="stSidebar"] .stTextInput > div > div,
+[data-testid="stSidebar"] .stSelectbox > div > div,
+[data-testid="stSidebar"] .stDateInput > div > div,
+[data-testid="stSidebar"] .stTextArea textarea {
+    background: rgba(10, 16, 30, 0.9) !important;
+    border: 1px solid rgba(56, 120, 200, 0.12) !important;
+    border-radius: 12px !important;
 }
 .stButton > button {
     background: rgba(56,189,248,0.08) !important;
-    color: #38bdf8 !important;
+    color: var(--accent) !important;
     border: 1px solid rgba(56,189,248,0.2) !important;
-    border-radius: 10px !important;
+    border-radius: 12px !important;
     font-weight: 600 !important;
     transition: all 0.2s ease !important;
+    box-shadow: 0 10px 30px rgba(2, 8, 23, 0.22) !important;
 }
 .stButton > button:hover {
     background: rgba(56,189,248,0.16) !important;
-    border-color: #38bdf8 !important;
-    box-shadow: 0 0 12px rgba(56,189,248,0.15) !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 14px 36px rgba(56,189,248,0.12) !important;
+    transform: translateY(-1px);
 }
 .stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, #38bdf8, #2dd4bf) !important;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)) !important;
     border: none !important;
     color: #060a14 !important;
     font-weight: 700 !important;
 }
-.stTabs [data-baseweb="tab-list"] {
-    background: #0b1120 !important;
+.stTextInput > div > div > input,
+.stTextArea textarea,
+.stSelectbox > div > div,
+.stDateInput > div > div {
     border-radius: 12px !important;
-    padding: 4px !important;
-    border: 1px solid rgba(56,120,200,0.10) !important;
+}
+.stTabs [data-baseweb="tab-list"] {
+    background: linear-gradient(180deg, rgba(8,16,31,0.92), rgba(7,12,24,0.95)) !important;
+    border-radius: 16px !important;
+    padding: 6px !important;
+    border: 1px solid var(--line) !important;
     gap: 4px !important;
     width: 100% !important;
+    box-shadow: var(--shadow) !important;
 }
 .stTabs [data-baseweb="tab"] {
     background: transparent !important;
-    border-radius: 8px !important;
-    color: #94a3b8 !important;
+    border-radius: 12px !important;
+    color: var(--muted) !important;
     font-weight: 600 !important;
     flex: 1 1 0% !important;
     justify-content: center !important;
-    padding: 8px 12px !important;
+    padding: 10px 14px !important;
     font-size: 0.9rem !important;
 }
 .stTabs [aria-selected="true"] {
-    background: rgba(56,189,248,0.14) !important;
-    color: #38bdf8 !important;
+    background: linear-gradient(180deg, rgba(56,189,248,0.18), rgba(45,212,191,0.10)) !important;
+    color: var(--accent) !important;
+    border: 1px solid rgba(56,189,248,0.14) !important;
 }
 [data-testid="stExpander"] {
-    background: #111827 !important;
-    border: 1px solid rgba(56,120,200,0.10) !important;
-    border-radius: 10px !important;
+    background: var(--panel-strong) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+    box-shadow: var(--shadow) !important;
+}
+[data-testid="stMetric"] {
+    background: linear-gradient(180deg, rgba(12,18,34,0.92), rgba(9,14,28,0.92)) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 14px !important;
+    padding: 0.7rem 0.9rem !important;
+    box-shadow: var(--shadow) !important;
+}
+[data-testid="stMetricLabel"] {
+    color: var(--muted) !important;
+}
+[data-testid="stMetricValue"] {
+    color: var(--text) !important;
 }
 pre, code {
     background: #0b1120 !important;
-    color: #e2e8f0 !important;
+    color: var(--text) !important;
     border-radius: 8px !important;
+}
+[data-testid="stDataFrame"],
+[data-testid="stMarkdownContainer"] table {
+    border: 1px solid var(--line) !important;
+    border-radius: 14px !important;
+    overflow: hidden !important;
+    box-shadow: var(--shadow) !important;
 }
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: #060a14; }
@@ -246,6 +328,7 @@ pre, code {
 iframe[title="leaflet_map"] {
     border: none !important;
     border-radius: 14px !important;
+    box-shadow: var(--shadow) !important;
 }
 </style>
 """
@@ -1208,6 +1291,7 @@ def reset_downloads(dl_dir: Optional[str] = None, clear_files: bool = True):
     logger.info("[DL] Reset complete")
 
 
+@st.cache_data(ttl=2, show_spinner=False)
 def count_downloaded_products(dl_dir: Optional[str] = None):
     dl_path = Path(dl_dir) if dl_dir else DOWNLOADS_DIR
     if not dl_path.exists():
@@ -1795,9 +1879,11 @@ def init_state():
         "click_sel": True,
         "api_url": DEFAULT_API_URL,
         "api_key": DEFAULT_API_KEY,
+        "zarr_service_url": DEFAULT_ZARR_URL,
         "provider": "Copernicus",
         "satellite": "SENTINEL-2",
         "product": "S2MSI2A",
+        "usgs_satellite": "Any",
         "dl_auto_refresh": True,
         "dl_last_event_id": 0,
         "dl_last_sse_ok": 0.0,
@@ -1807,6 +1893,16 @@ def init_state():
         "job_status_cache": {},
         "job_result_cache": {},
         "job_event_log": [],
+        "dl_job_view": "all",
+        "dl_job_provider_filter": "current",
+        "dl_job_collection_filter": "",
+        "dl_job_product_filter": "",
+        "dl_job_id_query": "",
+        "zarr_history": [],
+        "zarr_selected_store": "",
+        "zarr_artifact_query": "",
+        "zarr_artifact_provider": "",
+        "zarr_artifact_collection": "",
         "dl_auto_cfg": {},
         "preview_key": "",
         "preview_items": [],
@@ -1819,6 +1915,8 @@ def init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    if st.session_state.get("dl_job_provider_filter") not in {"current", "all", "copernicus", "usgs"}:
+        st.session_state["dl_job_provider_filter"] = "current"
 
 
 def _ss(key, default=None):
@@ -1832,6 +1930,15 @@ def _api_headers(api_key: str) -> Dict[str, str]:
     return headers
 
 
+@st.cache_resource(show_spinner=False)
+def _http_session() -> requests.Session:
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 def _api_request(
     method: str,
     api_url: str,
@@ -1842,7 +1949,7 @@ def _api_request(
     params: Dict[str, Any] | None = None,
     timeout: int = 60,
 ) -> requests.Response:
-    return requests.request(
+    return _http_session().request(
         method=method,
         url=f"{api_url.rstrip('/')}{path}",
         headers=_api_headers(api_key),
@@ -1869,7 +1976,7 @@ def _drain_sse_events(
         params["since"] = since_id
     captured: List[str] = []
     try:
-        with requests.get(
+        with _http_session().get(
             f"{api_url.rstrip('/')}/v1/events",
             headers=_api_headers(api_key),
             params=params,
@@ -1934,26 +2041,54 @@ def _list_jobs(
     api_key: str,
     *,
     state: str | None = None,
+    state_in: str | None = None,
     provider: str | None = None,
+    collection: str | None = None,
+    product_type: str | None = None,
+    job_id_query: str | None = None,
+    date_from: dt.datetime | None = None,
+    date_to: dt.datetime | None = None,
+    updated_from: dt.datetime | None = None,
+    updated_to: dt.datetime | None = None,
+    sort_by: str = "updated_at",
+    sort_desc: bool = True,
     page: int = 1,
     page_size: int = 50,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], int]:
     params: Dict[str, Any] = {"page": page, "page_size": page_size}
     if state:
         params["state"] = state
+    if state_in:
+        params["state_in"] = state_in
     if provider:
         params["provider"] = provider
+    if collection:
+        params["collection"] = collection
+    if product_type:
+        params["product_type"] = product_type
+    if job_id_query:
+        params["job_id_query"] = job_id_query
+    if date_from:
+        params["date_from"] = date_from.astimezone(dt.timezone.utc).isoformat()
+    if date_to:
+        params["date_to"] = date_to.astimezone(dt.timezone.utc).isoformat()
+    if updated_from:
+        params["updated_from"] = updated_from.astimezone(dt.timezone.utc).isoformat()
+    if updated_to:
+        params["updated_to"] = updated_to.astimezone(dt.timezone.utc).isoformat()
+    params["sort_by"] = sort_by
+    params["sort_desc"] = sort_desc
     try:
         response = _api_request("GET", api_url, "/v1/jobs", api_key=api_key, params=params, timeout=30)
         if not response.ok:
-            return []
+            return [], 0
         body = response.json()
-        return list(body.get("items", []))
+        return list(body.get("items", [])), int(body.get("total", 0) or 0)
     except Exception:
-        return []
+        return [], 0
 
 
-def _upsert_known_jobs(job_ids: List[str]) -> None:
+def _upsert_known_jobs(job_ids: List[str], *, active_job_ids: List[str] | None = None) -> None:
     known = [str(item) for item in _ss("known_job_ids", [])]
     active = [str(item) for item in _ss("active_job_ids", [])]
     for job_id in job_ids:
@@ -1961,10 +2096,513 @@ def _upsert_known_jobs(job_ids: List[str]) -> None:
             continue
         if job_id not in known:
             known.insert(0, job_id)
+    for job_id in [str(item) for item in (active_job_ids or [])]:
+        if not job_id:
+            continue
         if job_id not in active:
             active.append(job_id)
     st.session_state["known_job_ids"] = known[:1000]
     st.session_state["active_job_ids"] = active[:1000]
+
+
+def _recent_jobs_cutoff() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max(1, RECENT_JOBS_WINDOW_HOURS))
+
+
+def _fetch_recent_provider_jobs(api_url: str, api_key: str, *, provider: str | None) -> List[Dict[str, Any]]:
+    rows, _total = _list_jobs(
+        api_url,
+        api_key,
+        provider=provider,
+        date_from=_recent_jobs_cutoff(),
+        page=1,
+        page_size=RECENT_JOBS_FETCH_LIMIT,
+    )
+    return rows
+
+
+def _parse_iso_datetime(value: Any) -> dt.datetime | None:
+    if isinstance(value, dt.datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _status_reference_time(row: Dict[str, Any]) -> dt.datetime | None:
+    for key in ("finished_at", "started_at", "updated_at", "created_at", "accepted_at"):
+        parsed = _parse_iso_datetime(row.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _is_recent_status(row: Dict[str, Any], now_utc: dt.datetime) -> bool:
+    state = str(row.get("state", "")).lower()
+    if state in ACTIVE_JOB_STATES:
+        return True
+    ref = _status_reference_time(row)
+    if ref is None:
+        return False
+    return (now_utc - ref) <= dt.timedelta(hours=max(1, RECENT_JOBS_WINDOW_HOURS))
+
+
+def _filter_recent_job_rows(rows: List[Dict[str, Any]], *, limit: int = RECENT_JOBS_LIMIT) -> List[Dict[str, Any]]:
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    filtered = [row for row in rows if _is_recent_status(row, now_utc)]
+
+    def _sort_key(row: Dict[str, Any]) -> Tuple[int, float]:
+        state = str(row.get("state", "")).lower()
+        ref = _status_reference_time(row) or dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
+        active_rank = 0 if state in ACTIVE_JOB_STATES else 1
+        return (active_rank, -ref.timestamp())
+
+    filtered.sort(key=_sort_key)
+    return filtered[: max(1, limit)]
+
+
+def _looks_like_scene_name(name: str) -> bool:
+    upper_name = str(name or "").upper()
+    if not upper_name:
+        return False
+    if upper_name.endswith(".SAFE") or upper_name.endswith(".SAFE.ZIP"):
+        return True
+    if upper_name.startswith(("S1", "S2")) and "_" in upper_name:
+        return True
+    if upper_name.startswith(("LC08_", "LC09_", "LE07_", "LT05_", "LT04_", "LM05_")):
+        return True
+    return False
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _manifest_source_candidates(limit: int = 200) -> List[str]:
+    if not DOWNLOADS_DIR.exists():
+        return []
+
+    candidates: Dict[str, float] = {}
+    for manifest_path in DOWNLOADS_DIR.rglob("manifest.json"):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        for raw_path_value in list(payload.get("paths", [])):
+            try:
+                raw_path = Path(str(raw_path_value))
+                if not raw_path.exists():
+                    continue
+                if raw_path.is_dir():
+                    candidates[str(raw_path)] = raw_path.stat().st_mtime
+                elif raw_path.is_file():
+                    candidates[str(raw_path)] = raw_path.stat().st_mtime
+            except OSError:
+                continue
+
+        parent_dir = manifest_path.parent
+        try:
+            for child in parent_dir.iterdir():
+                if _looks_like_scene_name(child.name):
+                    candidates[str(child)] = child.stat().st_mtime
+        except OSError:
+            continue
+
+    return [
+        item[0]
+        for item in sorted(candidates.items(), key=lambda pair: pair[1], reverse=True)[: max(1, limit)]
+    ]
+
+
+def _prune_known_job_ids(cache: Dict[str, Dict[str, Any]], active_ids: List[str]) -> None:
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    active_set = {str(job_id) for job_id in active_ids}
+    kept: List[str] = []
+    for job_id in [str(item) for item in _ss("known_job_ids", [])]:
+        if job_id in active_set:
+            kept.append(job_id)
+            continue
+        row = cache.get(job_id)
+        if row and _is_recent_status(row, now_utc):
+            kept.append(job_id)
+    st.session_state["known_job_ids"] = kept[:200]
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def _recent_source_candidates(limit: int = 200) -> List[str]:
+    if not DOWNLOADS_DIR.exists():
+        return []
+
+    def _is_supported_raw_file(path: Path) -> bool:
+        lower_name = path.name.lower()
+        if lower_name.endswith(".safe.zip"):
+            return True
+        return path.suffix.lower() in {".zip", ".tar", ".gz", ".tgz", ".nc", ".tif", ".tiff"}
+
+    def _is_supported_raw_dir(path: Path) -> bool:
+        lower_name = path.name.lower()
+        if lower_name.endswith(".safe") or lower_name.endswith(".zarr"):
+            return lower_name.endswith(".safe")
+        if _looks_like_scene_name(path.name):
+            return True
+        try:
+            children = list(path.iterdir())
+        except OSError:
+            return False
+        if any(child.is_file() and child.name.lower() == "manifest.safe" for child in children):
+            return True
+        if any(child.is_file() and child.name.upper().endswith("_MTL.TXT") for child in children):
+            return True
+        if any(child.is_file() and child.suffix.lower() == ".nc" for child in children):
+            return True
+        tif_count = sum(
+            1 for child in children if child.is_file() and child.suffix.lower() in {".tif", ".tiff", ".jp2"}
+        )
+        return tif_count >= 3
+
+    candidates: Dict[str, float] = {}
+    for path in DOWNLOADS_DIR.rglob("*"):
+        try:
+            if path.is_dir():
+                if _is_supported_raw_dir(path):
+                    candidates[str(path)] = path.stat().st_mtime
+            elif path.is_file() and _is_supported_raw_file(path):
+                candidates[str(path)] = path.stat().st_mtime
+        except OSError:
+            continue
+
+    for manifest_candidate in _manifest_source_candidates(limit=max(limit, 200)):
+        try:
+            manifest_path = Path(manifest_candidate)
+            if manifest_path.exists():
+                candidates[str(manifest_path)] = manifest_path.stat().st_mtime
+        except OSError:
+            continue
+
+    return [
+        item[0]
+        for item in sorted(candidates.items(), key=lambda pair: pair[1], reverse=True)[: max(1, limit)]
+    ]
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def _available_zarr_stores(limit: int = 120) -> List[Dict[str, Any]]:
+    if not ZARR_STORES_DIR.exists():
+        return []
+    stores: List[Dict[str, Any]] = []
+    for path in ZARR_STORES_DIR.rglob("*.zarr"):
+        if not path.is_dir():
+            continue
+        try:
+            stat = path.stat()
+            stores.append(
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "mtime": stat.st_mtime,
+                    "host_hint": _container_to_host_path_hint(str(path)),
+                    "entries": sorted(
+                        [child.name for child in path.iterdir() if child.is_dir() or child.is_file()]
+                    )[:12],
+                }
+            )
+        except OSError:
+            continue
+    stores.sort(key=lambda item: item["mtime"], reverse=True)
+    return stores[: max(1, limit)]
+
+
+def _list_artifacts(
+    api_url: str,
+    api_key: str,
+    *,
+    artifact_type: str | None = None,
+    provider: str | None = None,
+    collection: str | None = None,
+    scene_id: str | None = None,
+    job_id: str | None = None,
+    uri_query: str | None = None,
+    include_local: bool = False,
+    page: int = 1,
+    page_size: int = 100,
+) -> Tuple[List[Dict[str, Any]], int]:
+    params: Dict[str, Any] = {
+        "page": page,
+        "page_size": page_size,
+        "include_local": str(include_local).lower(),
+    }
+    if artifact_type:
+        params["artifact_type"] = artifact_type
+    if provider:
+        params["provider"] = provider
+    if collection:
+        params["collection"] = collection
+    if scene_id:
+        params["scene_id"] = scene_id
+    if job_id:
+        params["job_id"] = job_id
+    if uri_query:
+        params["uri_query"] = uri_query
+    try:
+        response = _api_request("GET", api_url, "/v1/artifacts", api_key=api_key, params=params, timeout=30)
+        if not response.ok:
+            return [], 0
+        body = response.json()
+        return list(body.get("items", [])), int(body.get("total", 0) or 0)
+    except Exception:
+        return [], 0
+
+
+def _path_size_bytes(path_value: str) -> int | None:
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.exists():
+        return None
+    try:
+        if path.is_file():
+            return int(path.stat().st_size)
+        total = 0
+        file_count = 0
+        for child in path.rglob("*"):
+            if not child.is_file():
+                continue
+            total += int(child.stat().st_size)
+            file_count += 1
+            if file_count > 5000:
+                return None
+        return total
+    except OSError:
+        return None
+
+
+def _register_zarr_artifact(
+    api_url: str,
+    api_key: str,
+    *,
+    convert_response: Dict[str, Any],
+    raw_uri: str,
+    provider: str,
+    collection: str,
+    scene_id: str,
+) -> bool:
+    zarr_uri = str(convert_response.get("zarr_uri", "")).strip()
+    if not zarr_uri:
+        return False
+    summary = convert_response.get("normalization_summary", {}) or {}
+    zarr_summary = summary.get("zarr_summary", {}) or {}
+    metadata = {
+        "normalization_summary": summary,
+        "registered_via": "streamlit_ui",
+    }
+    payload = {
+        "artifact_type": "zarr",
+        "artifact_uri": zarr_uri,
+        "provider": provider,
+        "collection": collection,
+        "scene_id": scene_id,
+        "source_uri": raw_uri,
+        "created_by_job_id": str(convert_response.get("job_id", "")).strip() or None,
+        "data_family": convert_response.get("data_family"),
+        "band_names": list(convert_response.get("band_names") or zarr_summary.get("band_names") or []),
+        "dimensions": list(convert_response.get("dimensions") or zarr_summary.get("dimensions") or []),
+        "shape": list(zarr_summary.get("shape") or []),
+        "size_bytes": _path_size_bytes(zarr_uri),
+        "metadata": metadata,
+    }
+    try:
+        response = _api_request("POST", api_url, "/v1/artifacts", api_key=api_key, payload=payload, timeout=30)
+        return bool(response.ok)
+    except Exception:
+        return False
+
+
+def _human_size(size_bytes: Any) -> str:
+    try:
+        value = int(size_bytes)
+    except Exception:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(value)
+    unit = units[0]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            break
+        size /= 1024.0
+    return f"{size:.1f} {unit}"
+
+
+def _job_matches_view(row: Dict[str, Any], view: str, *, now_utc: dt.datetime) -> bool:
+    state = str(row.get("state", "")).lower()
+    if view == "all":
+        return True
+    if view == "active":
+        return state in ACTIVE_JOB_STATES
+    if view == "succeeded":
+        return state == "succeeded"
+    if view == "failed":
+        return state == "failed"
+    if view == "cancelled":
+        return state == "cancelled"
+    if view == "recent":
+        ref = _status_reference_time(row)
+        return ref is not None and (now_utc - ref) <= dt.timedelta(minutes=max(1, RECENT_JOB_CATEGORY_MINUTES))
+    return True
+
+
+def _job_view_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    return {
+        "all": len(rows),
+        "active": len([row for row in rows if _job_matches_view(row, "active", now_utc=now_utc)]),
+        "succeeded": len([row for row in rows if _job_matches_view(row, "succeeded", now_utc=now_utc)]),
+        "failed": len([row for row in rows if _job_matches_view(row, "failed", now_utc=now_utc)]),
+        "cancelled": len([row for row in rows if _job_matches_view(row, "cancelled", now_utc=now_utc)]),
+        "recent": len([row for row in rows if _job_matches_view(row, "recent", now_utc=now_utc)]),
+    }
+
+
+def _filter_jobs_by_view(rows: List[Dict[str, Any]], view: str) -> List[Dict[str, Any]]:
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    return [row for row in rows if _job_matches_view(row, view, now_utc=now_utc)]
+
+
+def _provider_scope_value(scope: str, current_provider: str | None) -> str | None:
+    if scope == "current":
+        return current_provider
+    if scope == "all":
+        return None
+    return scope or None
+
+
+def _job_matches_scope_filters(
+    row: Dict[str, Any],
+    *,
+    provider: str | None,
+    collection_query: str,
+    product_query: str,
+    job_query: str,
+) -> bool:
+    row_provider = str(row.get("provider", "")).strip().lower()
+    row_collection = str(row.get("collection", "")).strip().lower()
+    row_product = str(row.get("product_type", "")).strip().lower()
+    row_job_id = str(row.get("job_id", "")).strip().lower()
+
+    if provider and row_provider != provider.lower():
+        return False
+    if collection_query and collection_query.lower() not in row_collection:
+        return False
+    if product_query and product_query.lower() not in row_product:
+        return False
+    if job_query and job_query.lower() not in row_job_id:
+        return False
+    return True
+
+
+def _filter_jobs_by_scope(
+    rows: List[Dict[str, Any]],
+    *,
+    provider: str | None,
+    collection_query: str,
+    product_query: str,
+    job_query: str,
+) -> List[Dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if _job_matches_scope_filters(
+            row,
+            provider=provider,
+            collection_query=collection_query,
+            product_query=product_query,
+            job_query=job_query,
+        )
+    ]
+
+
+def _merge_job_rows(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for rows in groups:
+        for row in rows:
+            job_id = str(row.get("job_id", "")).strip()
+            if not job_id:
+                continue
+            current = merged.get(job_id)
+            if current is None:
+                merged[job_id] = row
+                continue
+            current_ref = _status_reference_time(current) or dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
+            row_ref = _status_reference_time(row) or dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
+            if row_ref >= current_ref:
+                merged[job_id] = row
+    return sorted(
+        merged.values(),
+        key=lambda row: (_status_reference_time(row) or dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)).timestamp(),
+        reverse=True,
+    )
+
+
+def _guess_scene_id(raw_uri: str) -> str:
+    name = Path(raw_uri).name
+    for suffix in (".SAFE.zip", ".SAFE", ".tar.gz", ".tgz", ".tar", ".zip", ".nc", ".tif", ".tiff"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(raw_uri).stem
+
+
+def _guess_zarr_provider(raw_uri: str) -> str:
+    lower_name = str(raw_uri or "").lower()
+    if any(token in lower_name for token in ("landsat", "lc08", "lc09", "le07", "lt05")):
+        return "usgs"
+    return "copernicus"
+
+
+def _guess_zarr_collection(provider_api: str, scene_id: str) -> str:
+    scene_upper = str(scene_id or "").upper()
+    if provider_api == "usgs":
+        if "_L1" in scene_upper:
+            return "landsat_ot_c2_l1"
+        return "landsat_ot_c2_l2"
+    if scene_upper.startswith("S1"):
+        return "SENTINEL-1"
+    return "SENTINEL-2"
+
+
+def _default_zarr_output(scene_id: str) -> str:
+    safe_scene = re.sub(r"[^A-Za-z0-9._-]+", "_", (scene_id or "scene")).strip("._-")
+    if not safe_scene:
+        safe_scene = "scene"
+    return f"/data/downloads/zarr/{safe_scene}.zarr"
+
+
+def _container_to_host_path_hint(path_value: str) -> str:
+    if not path_value:
+        return ""
+    if path_value.startswith("/data/"):
+        return "." + path_value
+    if path_value == "/data":
+        return "./data"
+    return ""
+
+
+def _resolve_usgs_product_type(selected_product_type: str, selected_satellite: str) -> str:
+    product = str(selected_product_type or "").strip().upper()
+    if not product:
+        return ""
+    if product[0] in {"8", "9"} and product[1:].startswith("L"):
+        return product
+
+    sat = str(selected_satellite or "").strip()
+    if sat in {"08", "8"}:
+        return f"8{product}"
+    if sat in {"09", "9"}:
+        return f"9{product}"
+    return product
 
 
 def _build_job_payload(
@@ -1987,6 +2625,209 @@ def _build_job_payload(
         aoi_wkt=aoi_wkt,
         tile_id=tile_id,
     )
+
+
+def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
+    active_statuses, _ = _list_jobs(
+        _ss("api_url"),
+        _ss("api_key"),
+        state_in=",".join(sorted(ACTIVE_JOB_STATES)),
+        sort_by="updated_at",
+        sort_desc=True,
+        page=1,
+        page_size=200,
+    )
+    recent_statuses, _ = _list_jobs(
+        _ss("api_url"),
+        _ss("api_key"),
+        updated_from=_recent_jobs_cutoff(),
+        sort_by="updated_at",
+        sort_desc=True,
+        page=1,
+        page_size=RECENT_JOBS_FETCH_LIMIT,
+    )
+    statuses = _filter_recent_job_rows(
+        _merge_job_rows(active_statuses, recent_statuses),
+        limit=RECENT_JOBS_FETCH_LIMIT,
+    )
+    stats = summarize_statuses(statuses)
+    total_jobs = int(stats["total_jobs"])
+    running_jobs = int(stats["active_jobs"])
+    succeeded_jobs = int(stats["succeeded_jobs"])
+    failed_jobs = int(stats["failed_jobs"])
+    cancelled_jobs = int(stats["cancelled_jobs"])
+    bytes_done = int(stats["bytes_downloaded"])
+    bytes_total = int(stats["bytes_total"])
+    progress_pct = float(stats["progress"])
+    st.session_state["active_job_ids"] = [
+        str(item.get("job_id", "")).strip()
+        for item in active_statuses
+        if str(item.get("job_id", "")).strip()
+    ]
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        st.metric("Jobs", total_jobs)
+    with k2:
+        st.metric("Active", running_jobs)
+    with k3:
+        st.metric("Succeeded", succeeded_jobs)
+    with k4:
+        st.metric("Failed", failed_jobs)
+    with k5:
+        st.metric("Cancelled", cancelled_jobs)
+    st.progress(max(0.0, min(1.0, progress_pct / 100.0)))
+    st.caption(f"Global progress: {progress_pct:.2f}% ({bytes_done}/{bytes_total} bytes)")
+    st.caption(
+        f"Summary is computed from recent activity (last {RECENT_JOBS_WINDOW_HOURS}h) plus active jobs."
+    )
+    st.caption("Download panel shows recent activity plus active jobs. Full historical browsing stays in Results.")
+
+    provider_scope_value = str(_ss("dl_job_provider_filter", "current"))
+    collection_filter_value = str(_ss("dl_job_collection_filter", "")).strip()
+    product_filter_value = str(_ss("dl_job_product_filter", "")).strip()
+    job_query_value = str(_ss("dl_job_id_query", "")).strip()
+    filtered_statuses = _filter_jobs_by_scope(
+        statuses,
+        provider=_provider_scope_value(provider_scope_value, download_provider_api),
+        collection_query=collection_filter_value,
+        product_query=product_filter_value,
+        job_query=job_query_value,
+    )
+
+    filter_col1, filter_col2 = st.columns([2, 4])
+    with filter_col1:
+        job_view_counts = _job_view_counts(filtered_statuses)
+        job_view = st.radio(
+            "Visible jobs",
+            options=["all", "active", "succeeded", "failed", "cancelled", "recent"],
+            horizontal=True,
+            key="dl_job_view",
+            format_func=lambda value: {
+                "all": f"All ({job_view_counts['all']})",
+                "active": f"Active ({job_view_counts['active']})",
+                "succeeded": f"Succeeded ({job_view_counts['succeeded']})",
+                "failed": f"Failed ({job_view_counts['failed']})",
+                "cancelled": f"Cancelled ({job_view_counts['cancelled']})",
+                "recent": f"Recent {RECENT_JOB_CATEGORY_MINUTES}m ({job_view_counts['recent']})",
+            }[value],
+        )
+    with filter_col2:
+        adv1, adv2, adv3, adv4, adv5 = st.columns([1, 1, 1, 1, 0.8])
+        with adv1:
+            provider_scope = st.selectbox(
+                "Provider filter",
+                options=["current", "all", "copernicus", "usgs"],
+                key="dl_job_provider_filter",
+                format_func=lambda value: {
+                    "current": f"Current ({download_provider_api or '-'})",
+                    "all": "All providers",
+                    "copernicus": "Copernicus",
+                    "usgs": "USGS",
+                }[value],
+            )
+        with adv2:
+            collection_filter = st.text_input(
+                "Mission filter",
+                key="dl_job_collection_filter",
+                placeholder="e.g. SENTINEL-2",
+            ).strip()
+        with adv3:
+            product_filter = st.text_input(
+                "Product filter",
+                key="dl_job_product_filter",
+                placeholder="e.g. S2MSI2A / 8L1TP",
+            ).strip()
+        with adv4:
+            job_query = st.text_input(
+                "Job ID contains",
+                key="dl_job_id_query",
+                placeholder="job id fragment",
+            ).strip()
+        with adv5:
+            st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+            refresh_jobs_clicked = st.button("Refresh", use_container_width=True, key="refresh_jobs_button")
+
+    base_visible_statuses = _filter_jobs_by_scope(
+        statuses,
+        provider=_provider_scope_value(provider_scope, download_provider_api),
+        collection_query=collection_filter,
+        product_query=product_filter,
+        job_query=job_query,
+    )
+    visible_statuses = _filter_jobs_by_view(base_visible_statuses, job_view)
+    visible_total = len(base_visible_statuses)
+    if job_view == "recent":
+        st.caption(f"Showing jobs updated in the last {RECENT_JOB_CATEGORY_MINUTES} minutes inside the recent activity window.")
+    st.caption(f"Showing {len(visible_statuses)} / {visible_total} matching jobs in the recent activity panel.")
+    if refresh_jobs_clicked:
+        st.caption("Jobs list refreshed.")
+
+    result_cache = dict(_ss("job_result_cache", {}))
+    visible_succeeded_job_ids = [
+        str(item.get("job_id"))
+        for item in visible_statuses
+        if str(item.get("state", "")).lower() == "succeeded"
+    ]
+    missing_visible_result_ids = [
+        job_id for job_id in visible_succeeded_job_ids if job_id not in result_cache
+    ]
+    if missing_visible_result_ids:
+        result_cache.update(
+            _refresh_job_results(_ss("api_url"), _ss("api_key"), missing_visible_result_ids)
+        )
+        st.session_state["job_result_cache"] = result_cache
+
+    if not visible_statuses:
+        st.info("No jobs match the selected filter.")
+
+    for item in visible_statuses[:100]:
+        job_id = str(item.get("job_id", "unknown"))
+        state = str(item.get("state", "unknown"))
+        progress = float(item.get("progress", 0.0) or 0.0)
+        duration = item.get("duration_seconds")
+        errors = item.get("errors", []) or []
+        with st.container(border=True):
+            h1, h2, h3, h4 = st.columns([3, 1, 1, 1])
+            with h1:
+                st.markdown(f"**{job_id}**")
+                st.caption(
+                    f"{item.get('provider', '-')}/{item.get('collection', '-')} · "
+                    f"{item.get('product_type', '-')}"
+                )
+            with h2:
+                st.metric("State", state)
+            with h3:
+                st.metric("Progress", f"{progress:.2f}%")
+            with h4:
+                st.metric("Duration", f"{float(duration):.1f}s" if duration is not None else "-")
+            st.progress(max(0.0, min(1.0, progress / 100.0)))
+            st.caption(
+                f"{int(item.get('bytes_downloaded', 0) or 0)} / "
+                f"{int(item.get('bytes_total', 0) or 0)} bytes · "
+                f"Updated: {item.get('updated_at', '-')}"
+            )
+            if errors:
+                st.error("\n".join(str(err) for err in errors[:5]))
+            if state == "succeeded":
+                result = result_cache.get(job_id, {})
+                paths = list(result.get("paths", [])) if isinstance(result, dict) else []
+                if paths:
+                    st.caption(f"Result files: {len(paths)}")
+                    with st.expander("Result paths", expanded=False):
+                        for out_path in paths[:25]:
+                            st.code(str(out_path), language="text")
+                        if len(paths) > 25:
+                            st.caption(f"Showing first 25 / {len(paths)} paths.")
+
+
+@st.fragment(run_every=JOB_MONITOR_REFRESH_EVERY)
+def _render_download_jobs_panel_live(download_provider_api: str | None) -> None:
+    _render_download_jobs_panel_body(download_provider_api)
+
+
+def _render_download_jobs_panel_static(download_provider_api: str | None) -> None:
+    _render_download_jobs_panel_body(download_provider_api)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2042,6 +2883,15 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_
     else:
         product = st.sidebar.text_input("Product", value="", key="sb_prod_t")
     st.session_state["product"] = product
+    if provider == "USGS":
+        usgs_sat = st.sidebar.selectbox(
+            "Satellite",
+            options=["Any", "08", "09"],
+            index=["Any", "08", "09"].index(str(_ss("usgs_satellite", "Any")) if str(_ss("usgs_satellite", "Any")) in {"Any", "08", "09"} else "Any"),
+            key="sb_usgs_satellite",
+            help="Any = Landsat 8 et 9. 08/09 force le satellite.",
+        )
+        st.session_state["usgs_satellite"] = usgs_sat
     st.sidebar.markdown('<hr style="border-color:rgba(56,120,200,0.10)">', unsafe_allow_html=True)
 
     st.sidebar.markdown('<div style="display:flex;align-items:center;gap:6px;padding-top:.3rem"><span>🛰️</span><span style="font-weight:600;font-size:.88rem;">Tile System</span></div>', unsafe_allow_html=True)
@@ -2334,7 +3184,9 @@ def main():
         unsafe_allow_html=True,
     )
 
-    tab_map, tab_dl, tab_res, tab_set = st.tabs(["🗺️ Map", "⬇️ Download", "📂 Results", "🔧 Settings"])
+    tab_map, tab_dl, tab_zarr, tab_res, tab_set = st.tabs(
+        ["🗺️ Map", "⬇️ Download", "🧱 Zarr Conversion", "📂 Results", "🔧 Settings"]
+    )
 
     with tab_map:
         aoi_geom = parse_geometry(_ss("geometry_text", ""))
@@ -2436,6 +3288,13 @@ def main():
         )
 
     with tab_dl:
+        effective_product_type = str(product)
+        if provider == "USGS":
+            effective_product_type = _resolve_usgs_product_type(
+                selected_product_type=str(product),
+                selected_satellite=str(_ss("usgs_satellite", "Any")),
+            )
+
         st.markdown(
             '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>⬇️</span><span style="font-weight:600;font-size:.94rem;">Download Manager</span></div>',
             unsafe_allow_html=True,
@@ -2446,7 +3305,7 @@ def main():
         with c2:
             st.metric("Mission", satellite)
         with c3:
-            st.metric("Product", product)
+            st.metric("Product", effective_product_type)
         st.markdown("---")
 
         selected_tiles_for_cmd = _ss("selected_tiles", [])
@@ -2489,7 +3348,7 @@ def main():
                 [
                     provider,
                     collection,
-                    str(product),
+                    str(effective_product_type),
                     str(st.session_state["start_date"]),
                     str(st.session_state["end_date"]),
                     "tiles" if use_selected_tiles_mode else "aoi",
@@ -2518,7 +3377,7 @@ def main():
             prev = preview_products_cached(
                 provider=provider,
                 collection=collection,
-                product_type=str(product),
+                product_type=str(effective_product_type),
                 start_date=str(st.session_state["start_date"]),
                 end_date=str(st.session_state["end_date"]),
                 aoi_wkt=preview_wkt,
@@ -2585,7 +3444,7 @@ def main():
                             _build_job_payload(
                                 provider_label=provider,
                                 collection=collection,
-                                product_type=str(product),
+                                product_type=str(effective_product_type),
                                 start_date=st.session_state["start_date"],
                                 end_date=st.session_state["end_date"],
                                 aoi_wkt=aoi_text_for_download,
@@ -2602,7 +3461,7 @@ def main():
                         )
                         if response.ok:
                             created = [str(job_id) for job_id in response.json().get("job_ids", [])]
-                            _upsert_known_jobs(created)
+                            _upsert_known_jobs(created, active_job_ids=created)
                             st.success(f"Created {len(created)} jobs.")
                         else:
                             st.error(f"{response.status_code}: {response.text}")
@@ -2611,7 +3470,7 @@ def main():
                         payload = _build_job_payload(
                             provider_label=provider,
                             collection=collection,
-                            product_type=str(product),
+                            product_type=str(effective_product_type),
                             start_date=st.session_state["start_date"],
                             end_date=st.session_state["end_date"],
                             aoi_wkt=aoi_text_for_download,
@@ -2626,14 +3485,25 @@ def main():
                         )
                         if response.ok:
                             job_id = str(response.json().get("job_id", ""))
-                            _upsert_known_jobs([job_id])
+                            _upsert_known_jobs([job_id], active_job_ids=[job_id])
                             st.success(f"Created job: {job_id}")
                         else:
                             st.error(f"{response.status_code}: {response.text}")
                 except Exception as exc:
                     st.error(str(exc))
 
-        active_ids = [str(item) for item in _ss("active_job_ids", [])]
+        download_provider_api = PROVIDER_CLI_MAP.get(provider)
+        active_job_rows_for_stop, _ = _list_jobs(
+            _ss("api_url"),
+            _ss("api_key"),
+            state_in=",".join(sorted(ACTIVE_JOB_STATES)),
+            provider=download_provider_api,
+            sort_by="updated_at",
+            sort_desc=True,
+            page=1,
+            page_size=200,
+        )
+        active_ids = [str(item.get("job_id", "")).strip() for item in active_job_rows_for_stop if str(item.get("job_id", "")).strip()]
         if stop_clicked:
             cancelled = 0
             for job_id in active_ids:
@@ -2643,7 +3513,7 @@ def main():
                         cancelled += 1
                 except Exception:
                     continue
-            st.info(f"Cancel requested for {cancelled}/{len(active_ids)} jobs.")
+            st.info(f"Cancel requested for {cancelled}/{len(active_ids)} active jobs for {download_provider_api or provider}.")
 
         if reset_clicked or unlock_clicked:
             st.session_state["active_job_ids"] = []
@@ -2658,114 +3528,249 @@ def main():
             if unlock_clicked:
                 st.success("Tracker unlocked.")
 
-        discovered = []
-        discovered += [str(item.get("job_id")) for item in _list_jobs(_ss("api_url"), _ss("api_key"), state="queued", provider=PROVIDER_CLI_MAP.get(provider))]
-        discovered += [str(item.get("job_id")) for item in _list_jobs(_ss("api_url"), _ss("api_key"), state="running", provider=PROVIDER_CLI_MAP.get(provider))]
-        discovered += [str(item.get("job_id")) for item in _list_jobs(_ss("api_url"), _ss("api_key"), state="cancel_requested", provider=PROVIDER_CLI_MAP.get(provider))]
-        _upsert_known_jobs([job_id for job_id in discovered if job_id and job_id != "None"])
-
-        event_related_ids: List[str] = []
         if bool(_ss("dl_auto_refresh", True)):
-            events, next_since, err = _drain_sse_events(
-                _ss("api_url"),
-                _ss("api_key"),
-                int(_ss("dl_last_event_id", 0)),
-                read_timeout_seconds=0.35,
+            _render_download_jobs_panel_live(download_provider_api)
+        else:
+            _render_download_jobs_panel_static(download_provider_api)
+
+    with tab_zarr:
+        st.markdown(
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>🧱</span><span style="font-weight:600;font-size:.94rem;">Zarr Conversion</span></div>',
+            unsafe_allow_html=True,
+        )
+        zc1, zc2 = st.columns([3, 1])
+        with zc1:
+            st.session_state["zarr_service_url"] = st.text_input(
+                "Zarr service URL",
+                value=_ss("zarr_service_url", DEFAULT_ZARR_URL),
+                help="Example: http://nimbus-zarr:8010 (compose) or http://127.0.0.1:8010",
             )
-            if err:
-                st.session_state["dl_event_errors"] = int(_ss("dl_event_errors", 0)) + 1
-            else:
-                if events:
-                    st.session_state["job_event_log"] = (events + list(_ss("job_event_log", [])))[:200]
-                    event_related_ids = [str(ev.get("job_id", "")).strip() for ev in events if ev.get("job_id")]
-                    _upsert_known_jobs(event_related_ids)
-                st.session_state["dl_last_event_id"] = int(next_since)
-                st.session_state["dl_last_sse_ok"] = time.time()
-                st.session_state["dl_event_errors"] = 0
+        with zc2:
+            if st.button("Check Zarr health", use_container_width=True):
+                try:
+                    resp = _http_session().get(
+                        f"{_ss('zarr_service_url').rstrip('/')}/health",
+                        timeout=15,
+                    )
+                    if resp.ok:
+                        st.success(resp.json())
+                    else:
+                        st.error(f"{resp.status_code}: {resp.text}")
+                except Exception as exc:
+                    st.error(str(exc))
 
-        sse_stale = should_poll_fallback(last_sse_ok=float(_ss("dl_last_sse_ok", 0.0)))
-        poll_ids = list(dict.fromkeys([*[_id for _id in _ss("active_job_ids", [])], *event_related_ids]))
-        if not poll_ids:
-            poll_ids = [str(item) for item in _ss("known_job_ids", [])[:20]]
-        if sse_stale and poll_ids:
-            st.caption("SSE stream is silent; polling fallback is active.")
-        status_rows = _refresh_job_statuses(_ss("api_url"), _ss("api_key"), poll_ids) if poll_ids else {}
+        candidates = _recent_source_candidates()
+        if not candidates:
+            st.info("No recent raw files or source folders found in downloads.")
+        raw_uri = st.selectbox(
+            "Raw source",
+            options=candidates if candidates else [""],
+            index=0,
+            key="zarr_raw_uri",
+            help="Recent downloads and extracted source folders.",
+            format_func=lambda value: (
+                "-"
+                if not value
+                else f"{Path(str(value)).name}  |  {value}"
+            ),
+        )
 
-        cache = dict(_ss("job_status_cache", {}))
-        cache.update(status_rows)
-        st.session_state["job_status_cache"] = cache
+        guessed_scene = _guess_scene_id(raw_uri) if raw_uri else ""
+        default_provider = _guess_zarr_provider(raw_uri)
+        default_collection = _guess_zarr_collection(default_provider, guessed_scene)
+        default_output = _default_zarr_output(guessed_scene)
 
-        retained_active = filter_active_job_ids(cache)
-        st.session_state["active_job_ids"] = retained_active
+        # Keep form fields synchronized when the selected raw source changes.
+        last_raw = str(_ss("zarr_last_raw_uri", ""))
+        if raw_uri and raw_uri != last_raw:
+            st.session_state["zarr_last_raw_uri"] = raw_uri
+            st.session_state["zarr_provider_api"] = default_provider
+            st.session_state["zarr_collection_api"] = default_collection
+            st.session_state["zarr_scene_id"] = guessed_scene
+            st.session_state["zarr_output_uri"] = default_output
+            st.session_state["zarr_last_auto_output"] = default_output
 
-        ordered_ids = list(dict.fromkeys([*retained_active, *[str(item) for item in _ss("known_job_ids", [])]]))
-        statuses = [cache[job_id] for job_id in ordered_ids if job_id in cache]
-        stats = summarize_statuses(statuses)
-        total_jobs = int(stats["total_jobs"])
-        running_jobs = int(stats["active_jobs"])
-        succeeded_jobs = int(stats["succeeded_jobs"])
-        failed_jobs = int(stats["failed_jobs"])
-        cancelled_jobs = int(stats["cancelled_jobs"])
-        bytes_done = int(stats["bytes_downloaded"])
-        bytes_total = int(stats["bytes_total"])
-        progress_pct = float(stats["progress"])
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            provider_api = st.selectbox(
+                "Provider",
+                options=["copernicus", "usgs"],
+                index=0 if default_provider == "copernicus" else 1,
+                key="zarr_provider_api",
+            )
+        with col2:
+            collection_api = st.text_input(
+                "Collection",
+                value=_guess_zarr_collection(provider_api, guessed_scene),
+                key="zarr_collection_api",
+            )
+        with col3:
+            scene_id = st.text_input("Scene ID", value=guessed_scene, key="zarr_scene_id")
 
-        succeeded_job_ids = [str(item.get("job_id")) for item in statuses if str(item.get("state")) == "succeeded"]
-        result_cache = dict(_ss("job_result_cache", {}))
-        missing_result_ids = [job_id for job_id in succeeded_job_ids if job_id not in result_cache]
-        if missing_result_ids:
-            result_cache.update(_refresh_job_results(_ss("api_url"), _ss("api_key"), missing_result_ids))
-            st.session_state["job_result_cache"] = result_cache
+        auto_output = _default_zarr_output(scene_id)
+        current_output = str(_ss("zarr_output_uri", "")).strip()
+        last_auto_output = str(_ss("zarr_last_auto_output", "")).strip()
+        if (not current_output) or (current_output == last_auto_output):
+            st.session_state["zarr_output_uri"] = auto_output
+            st.session_state["zarr_last_auto_output"] = auto_output
 
-        k1, k2, k3, k4, k5 = st.columns(5)
-        with k1:
-            st.metric("Jobs", total_jobs)
-        with k2:
-            st.metric("Active", running_jobs)
-        with k3:
-            st.metric("Succeeded", succeeded_jobs)
-        with k4:
-            st.metric("Failed", failed_jobs)
-        with k5:
-            st.metric("Cancelled", cancelled_jobs)
-        st.progress(max(0.0, min(1.0, progress_pct / 100.0)))
-        st.caption(f"Global progress: {progress_pct:.2f}% ({bytes_done}/{bytes_total} bytes)")
+        output_uri = st.text_input(
+            "Output Zarr path",
+            value=_default_zarr_output(scene_id),
+            key="zarr_output_uri",
+            help="Use /data/... so the generated Zarr is visible on the host via ./data/...",
+        )
 
-        for item in statuses[:80]:
-            job_id = str(item.get("job_id", "unknown"))
-            state = str(item.get("state", "unknown"))
-            progress = float(item.get("progress", 0.0) or 0.0)
-            duration = item.get("duration_seconds")
-            errors = item.get("errors", []) or []
-            with st.container(border=True):
-                h1, h2, h3, h4 = st.columns([3, 1, 1, 1])
-                with h1:
-                    st.markdown(f"**{job_id}**")
-                    st.caption(f"{item.get('provider', '-')}/{item.get('collection', '-')}")
-                with h2:
-                    st.metric("State", state)
-                with h3:
-                    st.metric("Progress", f"{progress:.2f}%")
-                with h4:
-                    st.metric("Duration", f"{float(duration):.1f}s" if duration is not None else "-")
-                st.progress(max(0.0, min(1.0, progress / 100.0)))
-                st.caption(f"{int(item.get('bytes_downloaded', 0) or 0)} / {int(item.get('bytes_total', 0) or 0)} bytes")
-                if errors:
-                    st.error("\n".join(str(err) for err in errors[:5]))
-                if state == "succeeded":
-                    result = result_cache.get(job_id, {})
-                    paths = list(result.get("paths", [])) if isinstance(result, dict) else []
-                    if paths:
-                        st.caption(f"Result files: {len(paths)}")
-                        with st.expander("Result paths", expanded=False):
-                            for out_path in paths[:25]:
-                                st.code(str(out_path), language="text")
-                            if len(paths) > 25:
-                                st.caption(f"Showing first 25 / {len(paths)} paths.")
+        run_convert = st.button("Run Zarr conversion", type="primary", use_container_width=True, disabled=not raw_uri)
+        if run_convert:
+            scene_id_value = scene_id.strip() or guessed_scene or "scene"
+            output_uri_value = output_uri.strip()
+            if output_uri_value.startswith("/tmp/"):
+                output_uri_value = _default_zarr_output(scene_id_value)
+                st.info(f"Output path adjusted to mounted volume: {output_uri_value}")
 
-        if bool(_ss("dl_auto_refresh", True)) and running_jobs > 0:
-            time.sleep(2)
-            st.rerun()
+            payload = {
+                "job_id": f"zarr-{uuid.uuid4().hex[:12]}",
+                "pipeline_id": f"ui-zarr-{uuid.uuid4().hex[:8]}",
+                "trace_id": f"ui-zarr-{uuid.uuid4().hex[:8]}",
+                "provider": provider_api,
+                "collection": collection_api.strip(),
+                "scene_id": scene_id_value,
+                "raw_uri": raw_uri,
+                "raw_format": "archive",
+                "output_uri": output_uri_value,
+            }
+            try:
+                response = _http_session().post(
+                    f"{_ss('zarr_service_url').rstrip('/')}/convert",
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=300,
+                )
+                if response.ok:
+                    body = response.json()
+                    history = list(_ss("zarr_history", []))
+                    history.insert(0, body)
+                    st.session_state["zarr_history"] = history[:50]
+                    _register_zarr_artifact(
+                        _ss("api_url"),
+                        _ss("api_key"),
+                        convert_response=body,
+                        raw_uri=raw_uri,
+                        provider=provider_api,
+                        collection=collection_api.strip(),
+                        scene_id=scene_id_value,
+                    )
+                    _available_zarr_stores.clear()
+                    _recent_source_candidates.clear()
+                    zarr_uri = str(body.get("zarr_uri", "-"))
+                    host_hint = _container_to_host_path_hint(zarr_uri)
+                    if host_hint:
+                        st.success(f"Zarr conversion completed: {zarr_uri} (host: {host_hint})")
+                    else:
+                        st.success(f"Zarr conversion completed: {zarr_uri}")
+                else:
+                    st.error(f"{response.status_code}: {response.text}")
+            except Exception as exc:
+                st.error(str(exc))
+
+        st.markdown("---")
+        st.caption("Registered and discovered Zarr stores")
+        zaf1, zaf2, zaf3 = st.columns([2, 2, 3])
+        with zaf1:
+            zarr_provider_filter = st.selectbox(
+                "Artifact provider",
+                options=["", "copernicus", "usgs"],
+                key="zarr_artifact_provider",
+                format_func=lambda value: "All providers" if not value else value,
+            )
+        with zaf2:
+            zarr_collection_filter = st.text_input(
+                "Artifact mission",
+                key="zarr_artifact_collection",
+                placeholder="e.g. SENTINEL-2",
+            ).strip()
+        with zaf3:
+            zarr_artifact_query = st.text_input(
+                "Artifact path / scene search",
+                key="zarr_artifact_query",
+                placeholder="scene id or path fragment",
+            ).strip()
+
+        artifacts, artifacts_total = _list_artifacts(
+            _ss("api_url"),
+            _ss("api_key"),
+            artifact_type="zarr",
+            provider=zarr_provider_filter or None,
+            collection=zarr_collection_filter or None,
+            uri_query=zarr_artifact_query or None,
+            include_local=True,
+            page=1,
+            page_size=120,
+        )
+        if not artifacts:
+            st.info("No .zarr store found in the registry or on local disk yet.")
+        else:
+            st.caption(f"Showing {len(artifacts)} / {artifacts_total} Zarr stores.")
+            store_options = [str(item["artifact_uri"]) for item in artifacts]
+            selected_store = st.selectbox(
+                "Stored Zarr directory",
+                options=store_options,
+                index=0,
+                key="zarr_selected_store",
+                format_func=lambda value: next(
+                    (
+                        f"{Path(str(item['artifact_uri'])).name}  |  "
+                        f"{_container_to_host_path_hint(str(item['artifact_uri'])) or str(item['artifact_uri'])}"
+                        for item in artifacts
+                        if str(item["artifact_uri"]) == value
+                    ),
+                    value,
+                ),
+            )
+            selected_store_meta = next(
+                (item for item in artifacts if str(item["artifact_uri"]) == selected_store),
+                artifacts[0],
+            )
+            selected_host_hint = _container_to_host_path_hint(str(selected_store_meta.get("artifact_uri", "")))
+            meta_cols = st.columns(4)
+            with meta_cols[0]:
+                st.metric("Provider", str(selected_store_meta.get("provider", "-") or "-"))
+            with meta_cols[1]:
+                st.metric("Collection", str(selected_store_meta.get("collection", "-") or "-"))
+            with meta_cols[2]:
+                st.metric("Bands", len(selected_store_meta.get("band_names") or []))
+            with meta_cols[3]:
+                st.metric("Size", _human_size(selected_store_meta.get("size_bytes")))
+            st.code(
+                "\n".join(
+                    [
+                        f"Scene: {selected_store_meta.get('scene_id', '-')}",
+                        f"Container path: {selected_store_meta.get('artifact_uri', '-')}",
+                        f"Host path: {selected_host_hint or '-'}",
+                        f"Data family: {selected_store_meta.get('data_family', '-')}",
+                        f"Dimensions: {', '.join([str(v) for v in (selected_store_meta.get('dimensions') or [])]) or '-'}",
+                        f"Shape: {selected_store_meta.get('shape', []) or '-'}",
+                        f"Bands: {', '.join([str(v) for v in (selected_store_meta.get('band_names') or [])]) or '-'}",
+                        f"Source: {selected_store_meta.get('source_uri', '-')}",
+                        f"Updated: {selected_store_meta.get('updated_at', '-')}",
+                    ]
+                ),
+                language="text",
+            )
+
+        st.markdown("---")
+        st.caption("Recent Zarr conversions (session)")
+        zarr_history = list(_ss("zarr_history", []))
+        if not zarr_history:
+            st.info("No conversion executed in this session yet.")
+        else:
+            for item in zarr_history[:20]:
+                with st.container(border=True):
+                    st.markdown(f"**{item.get('job_id', '-') }**")
+                    st.caption(f"{item.get('data_family', '-') } · {item.get('zarr_uri', '-')}")
+                    st.caption(f"Bands: {', '.join([str(b) for b in (item.get('band_names') or [])])}")
+                    st.code(json.dumps(item.get("normalization_summary", {}), indent=2), language="json")
 
     with tab_res:
         st.markdown(
@@ -2775,7 +3780,20 @@ def main():
 
         state_filter = st.selectbox("State", ["", "queued", "running", "succeeded", "failed", "cancel_requested", "cancelled"], index=0)
         provider_filter = st.selectbox("Provider", ["", "copernicus", "usgs"], index=0)
-        jobs_rows = _list_jobs(_ss("api_url"), _ss("api_key"), state=state_filter or None, provider=provider_filter or None, page=1, page_size=100)
+        jobs_rows, jobs_total = _list_jobs(
+            _ss("api_url"),
+            _ss("api_key"),
+            state=state_filter or None,
+            provider=provider_filter or None,
+            date_from=_recent_jobs_cutoff(),
+            page=1,
+            page_size=RECENT_JOBS_FETCH_LIMIT,
+        )
+        jobs_rows = _filter_recent_job_rows(jobs_rows)
+        st.caption(
+            f"Showing recent jobs only (last {RECENT_JOBS_WINDOW_HOURS}h + active). "
+            f"{len(jobs_rows)} / {jobs_total} rows."
+        )
         if jobs_rows:
             st.dataframe(jobs_rows, use_container_width=True)
         else:

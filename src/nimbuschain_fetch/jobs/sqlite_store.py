@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from nimbuschain_fetch.jobs.store import JobListFilters
+from nimbuschain_fetch.jobs.store import ArtifactListFilters, JobListFilters
 
 
 class SQLiteJobStore:
@@ -33,6 +33,8 @@ class SQLiteJobStore:
                     job_type TEXT NOT NULL,
                     provider TEXT NOT NULL,
                     collection TEXT NOT NULL,
+                    product_type TEXT,
+                    tile_id TEXT,
                     request_json TEXT NOT NULL,
                     state TEXT NOT NULL,
                     progress REAL NOT NULL,
@@ -48,6 +50,14 @@ class SQLiteJobStore:
                 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
                 CREATE INDEX IF NOT EXISTS idx_jobs_provider ON jobs(provider);
                 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+                CREATE INDEX IF NOT EXISTS idx_jobs_provider_state_created
+                ON jobs(provider, state, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_jobs_provider_created
+                ON jobs(provider, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_jobs_collection_updated
+                ON jobs(collection, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_jobs_product_updated
+                ON jobs(product_type, updated_at DESC);
 
                 CREATE TABLE IF NOT EXISTS job_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,9 +77,49 @@ class SQLiteJobStore:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    artifact_type TEXT NOT NULL,
+                    artifact_uri TEXT NOT NULL UNIQUE,
+                    provider TEXT,
+                    collection TEXT,
+                    scene_id TEXT,
+                    source_uri TEXT,
+                    created_by_job_id TEXT,
+                    source_job_id TEXT,
+                    data_family TEXT,
+                    band_names_json TEXT NOT NULL,
+                    dimensions_json TEXT NOT NULL,
+                    shape_json TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_artifacts_type_updated
+                ON artifacts(artifact_type, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_provider_updated
+                ON artifacts(provider, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_collection_updated
+                ON artifacts(collection, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_scene_updated
+                ON artifacts(scene_id, updated_at DESC);
                 """
             )
+            self._ensure_column("jobs", "product_type", "TEXT")
+            self._ensure_column("jobs", "tile_id", "TEXT")
             self._conn.commit()
+
+    def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name in columns:
+            return
+        self._conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
     @staticmethod
     def _utc_now() -> str:
@@ -77,12 +127,15 @@ class SQLiteJobStore:
 
     @staticmethod
     def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
+        request = json.loads(row["request_json"])
         return {
             "job_id": row["job_id"],
             "job_type": row["job_type"],
             "provider": row["provider"],
             "collection": row["collection"],
-            "request": json.loads(row["request_json"]),
+            "product_type": (row["product_type"] if "product_type" in row.keys() else None) or request.get("product_type"),
+            "tile_id": (row["tile_id"] if "tile_id" in row.keys() else None) or request.get("tile_id"),
+            "request": request,
             "state": row["state"],
             "progress": float(row["progress"]),
             "bytes_downloaded": int(row["bytes_downloaded"]),
@@ -103,20 +156,24 @@ class SQLiteJobStore:
         request_payload: dict[str, Any],
     ) -> None:
         now = self._utc_now()
+        product_type = request_payload.get("product_type")
+        tile_id = request_payload.get("tile_id")
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO jobs(
-                    job_id, job_type, provider, collection, request_json, state,
+                    job_id, job_type, provider, collection, product_type, tile_id, request_json, state,
                     progress, bytes_downloaded, bytes_total, started_at, finished_at,
                     errors_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     job_type,
                     provider,
                     collection,
+                    product_type,
+                    tile_id,
                     json.dumps(request_payload),
                     "queued",
                     0.0,
@@ -168,20 +225,41 @@ class SQLiteJobStore:
         if filters.state:
             where.append("state = ?")
             params.append(filters.state)
+        if filters.states:
+            placeholders = ", ".join("?" for _ in filters.states)
+            where.append(f"state IN ({placeholders})")
+            params.extend(filters.states)
         if filters.provider:
             where.append("provider = ?")
             params.append(filters.provider)
+        if filters.collection:
+            where.append("collection = ?")
+            params.append(filters.collection)
+        if filters.product_type:
+            where.append("COALESCE(product_type, json_extract(request_json, '$.product_type')) = ?")
+            params.append(filters.product_type)
+        if filters.job_id_query:
+            where.append("job_id LIKE ?")
+            params.append(f"%{filters.job_id_query}%")
         if filters.date_from:
             where.append("created_at >= ?")
             params.append(filters.date_from.isoformat())
         if filters.date_to:
             where.append("created_at <= ?")
             params.append(filters.date_to.isoformat())
+        if filters.updated_from:
+            where.append("updated_at >= ?")
+            params.append(filters.updated_from.isoformat())
+        if filters.updated_to:
+            where.append("updated_at <= ?")
+            params.append(filters.updated_to.isoformat())
 
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         page = max(1, filters.page)
         page_size = max(1, min(200, filters.page_size))
         offset = (page - 1) * page_size
+        sort_by = filters.sort_by if filters.sort_by in {"created_at", "updated_at", "started_at", "finished_at"} else "updated_at"
+        sort_dir = "DESC" if filters.sort_desc else "ASC"
 
         with self._lock:
             total_row = self._conn.execute(
@@ -191,7 +269,7 @@ class SQLiteJobStore:
                 f"""
                 SELECT * FROM jobs
                 {where_sql}
-                ORDER BY created_at DESC
+                ORDER BY {sort_by} {sort_dir}, created_at DESC
                 LIMIT ? OFFSET ?
                 """,
                 [*params, page_size, offset],
@@ -281,6 +359,153 @@ class SQLiteJobStore:
         if not row:
             return None
         return json.loads(row["result_json"])
+
+    @staticmethod
+    def _row_to_artifact(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "artifact_id": row["artifact_id"],
+            "artifact_type": row["artifact_type"],
+            "artifact_uri": row["artifact_uri"],
+            "provider": row["provider"],
+            "collection": row["collection"],
+            "scene_id": row["scene_id"],
+            "source_uri": row["source_uri"],
+            "created_by_job_id": row["created_by_job_id"],
+            "source_job_id": row["source_job_id"],
+            "data_family": row["data_family"],
+            "band_names": json.loads(row["band_names_json"]),
+            "dimensions": json.loads(row["dimensions_json"]),
+            "shape": json.loads(row["shape_json"]),
+            "size_bytes": row["size_bytes"],
+            "metadata": json.loads(row["metadata_json"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_artifact(self, artifact_payload: dict[str, Any]) -> dict[str, Any]:
+        now = self._utc_now()
+        payload = {
+            "artifact_id": artifact_payload["artifact_id"],
+            "artifact_type": artifact_payload["artifact_type"],
+            "artifact_uri": artifact_payload["artifact_uri"],
+            "provider": artifact_payload.get("provider"),
+            "collection": artifact_payload.get("collection"),
+            "scene_id": artifact_payload.get("scene_id"),
+            "source_uri": artifact_payload.get("source_uri"),
+            "created_by_job_id": artifact_payload.get("created_by_job_id"),
+            "source_job_id": artifact_payload.get("source_job_id"),
+            "data_family": artifact_payload.get("data_family"),
+            "band_names_json": json.dumps(artifact_payload.get("band_names", [])),
+            "dimensions_json": json.dumps(artifact_payload.get("dimensions", [])),
+            "shape_json": json.dumps(artifact_payload.get("shape", [])),
+            "size_bytes": artifact_payload.get("size_bytes"),
+            "metadata_json": json.dumps(artifact_payload.get("metadata", {})),
+        }
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT created_at FROM artifacts WHERE artifact_uri = ?",
+                (payload["artifact_uri"],),
+            ).fetchone()
+            created_at = str(existing["created_at"]) if existing else now
+            self._conn.execute(
+                """
+                INSERT INTO artifacts(
+                    artifact_id, artifact_type, artifact_uri, provider, collection, scene_id,
+                    source_uri, created_by_job_id, source_job_id, data_family, band_names_json,
+                    dimensions_json, shape_json, size_bytes, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(artifact_uri) DO UPDATE SET
+                    artifact_id = excluded.artifact_id,
+                    artifact_type = excluded.artifact_type,
+                    provider = excluded.provider,
+                    collection = excluded.collection,
+                    scene_id = excluded.scene_id,
+                    source_uri = excluded.source_uri,
+                    created_by_job_id = excluded.created_by_job_id,
+                    source_job_id = excluded.source_job_id,
+                    data_family = excluded.data_family,
+                    band_names_json = excluded.band_names_json,
+                    dimensions_json = excluded.dimensions_json,
+                    shape_json = excluded.shape_json,
+                    size_bytes = excluded.size_bytes,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    payload["artifact_id"],
+                    payload["artifact_type"],
+                    payload["artifact_uri"],
+                    payload["provider"],
+                    payload["collection"],
+                    payload["scene_id"],
+                    payload["source_uri"],
+                    payload["created_by_job_id"],
+                    payload["source_job_id"],
+                    payload["data_family"],
+                    payload["band_names_json"],
+                    payload["dimensions_json"],
+                    payload["shape_json"],
+                    payload["size_bytes"],
+                    payload["metadata_json"],
+                    created_at,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_uri = ?",
+                (payload["artifact_uri"],),
+            ).fetchone()
+        return self._row_to_artifact(row)
+
+    def list_artifacts(self, filters: ArtifactListFilters) -> tuple[list[dict[str, Any]], int]:
+        where: list[str] = []
+        params: list[Any] = []
+        if filters.artifact_type:
+            where.append("artifact_type = ?")
+            params.append(filters.artifact_type)
+        if filters.provider:
+            where.append("provider = ?")
+            params.append(filters.provider)
+        if filters.collection:
+            where.append("collection = ?")
+            params.append(filters.collection)
+        if filters.scene_id:
+            where.append("scene_id = ?")
+            params.append(filters.scene_id)
+        if filters.job_id:
+            where.append("(created_by_job_id = ? OR source_job_id = ?)")
+            params.extend([filters.job_id, filters.job_id])
+        if filters.uri_query:
+            where.append("(artifact_uri LIKE ? OR source_uri LIKE ?)")
+            like_value = f"%{filters.uri_query}%"
+            params.extend([like_value, like_value])
+        if filters.date_from:
+            where.append("updated_at >= ?")
+            params.append(filters.date_from.isoformat())
+        if filters.date_to:
+            where.append("updated_at <= ?")
+            params.append(filters.date_to.isoformat())
+
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        page = max(1, filters.page)
+        page_size = max(1, min(200, filters.page_size))
+        offset = (page - 1) * page_size
+        with self._lock:
+            total_row = self._conn.execute(
+                f"SELECT COUNT(*) AS n FROM artifacts {where_sql}", params
+            ).fetchone()
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM artifacts
+                {where_sql}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, page_size, offset],
+            ).fetchall()
+        total = int(total_row["n"]) if total_row else 0
+        return [self._row_to_artifact(row) for row in rows], total
 
     def requeue_incomplete_jobs(self) -> list[str]:
         """Requeue jobs left in running/cancel_requested states after restart."""

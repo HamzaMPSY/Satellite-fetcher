@@ -2,25 +2,23 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME_DIR="${PROJECT_ROOT}/.k8s-port-forward"
+RUNTIME_DIR="${PROJECT_ROOT}/.runtime"
+API_PID_FILE="${RUNTIME_DIR}/k8s_api_port_forward.pid"
+UI_PID_FILE="${RUNTIME_DIR}/k8s_ui_port_forward.pid"
 
-stop_forward() {
-  local name="$1"
-  local pid_file="${RUNTIME_DIR}/${name}.pid"
-
-  if [[ ! -f "${pid_file}" ]]; then
-    echo "${name} was not exposed."
-    return
+stop_pid() {
+  local pid_file="$1"
+  if [ -f "${pid_file}" ]; then
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" >/dev/null 2>&1; then
+      kill "${pid}" >/dev/null 2>&1 || true
+    fi
+    rm -f "${pid_file}"
   fi
-
-  local pid
-  pid="$(cat "${pid_file}")"
-  if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
-    kill "${pid}" >/dev/null 2>&1 || true
-  fi
-  rm -f "${pid_file}"
-  echo "${name} tunnel stopped."
 }
 
-stop_forward "nimbus-ui"
-stop_forward "nimbus-api"
+stop_pid "${API_PID_FILE}"
+stop_pid "${UI_PID_FILE}"
+
+echo "Local Kubernetes port-forwards stopped."

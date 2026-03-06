@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import time
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -12,6 +13,32 @@ from shapely.geometry.base import BaseGeometry
 from nimbuschain_fetch.download.download_manager import DownloadManager
 from nimbuschain_fetch.providers.base import ProviderBase
 from nimbuschain_fetch.settings import Settings
+try:
+    from nimbuschain_fetch.usgs_product_type import usgs_product_type_matches
+except ModuleNotFoundError:
+    import re
+
+    def _normalize_usgs_product_type_from_display_id(display_id: str) -> str:
+        parts = [part.strip().upper() for part in str(display_id or "").split("_") if part.strip()]
+        if len(parts) < 2:
+            return ""
+        platform = parts[0]
+        product_code = parts[1]
+        digits = re.findall(r"\d", platform)
+        if not digits or not product_code.startswith("L"):
+            return ""
+        return f"{digits[-1]}{product_code}"
+
+    def usgs_product_type_matches(display_id: str, product_type: str) -> bool:
+        requested = str(product_type or "").strip().upper()
+        if not requested:
+            return True
+        display = str(display_id or "").strip().upper()
+        if not display:
+            return False
+        if requested in display:
+            return True
+        return requested == _normalize_usgs_product_type_from_display_id(display)
 
 
 class UsgsProvider(ProviderBase):
@@ -24,6 +51,7 @@ class UsgsProvider(ProviderBase):
         self.session = requests.Session()
         self.api_key: str | None = None
         self.dataset: str | None = None
+        self.scene_names: dict[str, str] = {}
 
         if not self.username or not self.token:
             raise ValueError("USGS credentials are missing in environment variables.")
@@ -37,16 +65,56 @@ class UsgsProvider(ProviderBase):
 
     def _send_request(self, endpoint: str, data: dict[str, Any]) -> Any:
         url = f"{self.service_url}{endpoint}"
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-Auth-Token"] = self.api_key
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["X-Auth-Token"] = self.api_key
 
-        response = self.session.post(url, json=data, headers=headers, timeout=60)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("errorCode"):
-            raise RuntimeError(f"USGS API error {payload['errorCode']}: {payload.get('errorMessage')}")
-        return payload.get("data")
+            try:
+                response = self.session.post(url, json=data, headers=headers, timeout=60)
+            except requests.RequestException as exc:
+                if attempt >= max_attempts:
+                    raise RuntimeError(
+                        f"USGS request failed on {endpoint} after {max_attempts} attempts: {exc}"
+                    ) from exc
+                time.sleep(min(8.0, 1.5 * attempt))
+                continue
+
+            if response.status_code in {429, 500, 502, 503, 504}:
+                if attempt < max_attempts:
+                    time.sleep(min(10.0, 2.0 * attempt))
+                    continue
+                body = (response.text or "").strip()[:500]
+                raise RuntimeError(
+                    f"USGS HTTP {response.status_code} on {endpoint} after {max_attempts} attempts. "
+                    f"Response: {body}"
+                )
+
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                body = (response.text or "").strip()[:500]
+                raise RuntimeError(
+                    f"USGS HTTP {response.status_code} on {endpoint}. Response: {body}"
+                ) from exc
+
+            payload = response.json()
+            if payload.get("errorCode"):
+                error_code = str(payload.get("errorCode"))
+                # Token can expire between calls: refresh once and retry transparently.
+                if (
+                    endpoint != "login-token"
+                    and error_code.upper() in {"AUTH_UNAUTHORIZED", "AUTH_INVALID", "AUTH_EXPIRED"}
+                    and attempt < max_attempts
+                ):
+                    self.get_access_token()
+                    time.sleep(0.5)
+                    continue
+                raise RuntimeError(f"USGS API error {error_code}: {payload.get('errorMessage')}")
+            return payload.get("data")
+
+        raise RuntimeError(f"USGS request failed on {endpoint}: retry budget exhausted")
 
     def search_products(
         self,
@@ -73,7 +141,7 @@ class UsgsProvider(ProviderBase):
                     "end": end_date,
                 },
             },
-            "maxResults": 1000,
+            "maxResults": 250,
         }
         data = self._send_request("scene-search", scene_payload)
         scenes = data.get("results", []) if isinstance(data, dict) else []
@@ -85,9 +153,12 @@ class UsgsProvider(ProviderBase):
             entity_id = scene.get("entityId")
             if not entity_id:
                 continue
-            if product_type and product_type not in str(scene.get("displayId", "")):
+            display_id = str(scene.get("displayId", "")).strip()
+            if not usgs_product_type_matches(display_id, product_type):
                 continue
-            product_ids.append(str(entity_id))
+            entity_id_str = str(entity_id)
+            self.scene_names[entity_id_str] = display_id or entity_id_str
+            product_ids.append(entity_id_str)
 
         return product_ids
 
@@ -130,11 +201,17 @@ class UsgsProvider(ProviderBase):
                 continue
             urls.append(str(url))
 
-            path_name = Path(unquote(urlparse(url).path)).name
-            if path_name and "." in path_name:
+            entity_id = str(item.get("entityId") or "").strip()
+            preferred_name = self.scene_names.get(entity_id) or f"usgs_{self.dataset}_{idx}"
+
+            path_name = Path(unquote(urlparse(url).path)).name.strip()
+            suffixes = "".join(Path(path_name).suffixes) if path_name else ""
+            if suffixes and "." not in Path(preferred_name).name:
+                file_names.append(f"{preferred_name}{suffixes}")
+            elif path_name and "." in path_name:
                 file_names.append(path_name)
             else:
-                file_names.append(f"usgs_{self.dataset}_{idx}.zip")
+                file_names.append(preferred_name)
 
         payload = {
             "headers": {},

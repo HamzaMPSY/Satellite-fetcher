@@ -1,193 +1,95 @@
 # NimbusChain Fetch
 
-NimbusChain Fetch is now organized as a **3-layer runtime architecture**:
+NimbusChain Fetch is a satellite download orchestrator with four runtime components:
 
-1. `backend` layer: async download workers (job execution only)
-2. `service` layer: FastAPI control plane + REST/SSE + CLI compatibility
-3. `ui` layer: Streamlit frontend
+- `nimbus-api`: FastAPI control plane for jobs, events, artifacts, and metrics
+- `nimbus-worker`: download execution worker for Copernicus and USGS
+- `nimbus-ui`: Streamlit UI for AOI selection, job tracking, and Zarr conversion
+- `nimbus-zarr`: conversion service from raw scenes to Zarr
 
-All layers are isolated in separate containers and connected through MongoDB + HTTP.
+## Repository layout
 
-## Legacy UI + Jobs API runtime
+- `src/nimbuschain_fetch/`: core engine, providers, job store, worker entrypoint
+- `src/nimbuschain_fetch_service/`: FastAPI API layer
+- `src/nimbuschain_fetch_ui/`: Streamlit frontend
+- `src/nimbuschain_zarr_service/`: Zarr conversion service
+- `data/Landsat-tiles/`: tracked Landsat tile index
+- `data/Sentinel-2-tiles/`: tracked Sentinel-2 tile index
+- `k8s/`: Kubernetes base manifests and overlays
+- `scripts/`: only the operational scripts kept in the repo
 
-The Streamlit UI (`/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_ui/app.py`) keeps the legacy UX logic
-(map, tile system/search/picker, download manager layout, results/settings tabs), but execution is now API-job based:
-
-- `Start Download`: `POST /v1/jobs` or `POST /v1/jobs/batch`
-- real-time tracking: `GET /v1/events` (SSE) with polling fallback on `/v1/jobs/{job_id}`
-- `Stop`: `DELETE /v1/jobs/{job_id}` on active jobs
-- `Reset` / `Unlock`: clear UI tracker state only (files on disk are preserved)
-
-Product preview remains local in the UI container (direct Copernicus/USGS calls) and requires provider credentials in `nimbus-ui` environment.
-
-## Repository packages
-
-- `src/nimbuschain_fetch`: core engine package (providers, orchestration, downloader, manifest, security).
-- `src/nimbuschain_fetch_service`: FastAPI API layer (thin wrapper around engine).
-- `src/nimbuschain_fetch_ui`: Streamlit UI layer (legacy-style UX, API-job based).
-
-## Runtime architecture
-
-```text
-Browser
-  |
-  v
-Streamlit UI container (port 8501)
-  |
-  v
-FastAPI API container (port 8000)  <------ CLI (service mode)
-  |   create/list/cancel jobs
-  v
-MongoDB (job state + events + results)
-  ^
-  | claim queued jobs
-Worker container(s) (downloads + providers + checksums + manifest)
-```
-
-## Main docs
-
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/COMPLETE_GUIDE_FR.md`
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/README.md`
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/DEPLOYMENT_3_LAYER.md`
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/KUBERNETES_DEPLOYMENT.md`
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/API_REFERENCE.md`
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/REPOSITORY_GUIDE.md`
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/integration_streamlit.md`
-
-## Podman quick start (recommended)
-
-### 1) Prepare environment
+## Quick start with Podman
 
 ```bash
 cd "/Users/mehdidinari/Desktop/backend nimbus"
 cp .env.example .env
 ```
 
-Set credentials in `.env`:
+Fill at least:
+
 - `NIMBUS_COPERNICUS_USERNAME`
 - `NIMBUS_COPERNICUS_PASSWORD`
 - `NIMBUS_USGS_USERNAME`
 - `NIMBUS_USGS_TOKEN`
 
-These credentials are used by:
-- `nimbus-worker` for real downloads
-- `nimbus-ui` for local product preview panel
-
-### 2) Ensure Podman machine is running (macOS)
+Start the stack:
 
 ```bash
-podman machine init
-podman machine start
-```
-
-If already created/running, Podman will just report it.
-
-### 3) Start all layers (api + worker + ui + mongodb)
-
-```bash
-cd "/Users/mehdidinari/Desktop/backend nimbus"
 ./scripts/10_up_stack.sh
 ```
 
-### 4) Verify
+Check the services:
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/health | python3 -m json.tool
-curl -s http://127.0.0.1:8000/v1/metrics | head -n 30
+curl -s http://127.0.0.1:8010/health | python3 -m json.tool
 ```
 
 Open:
-- API docs: `http://127.0.0.1:8000/docs`
-- UI: `http://127.0.0.1:8501`
 
-### 5) Stop stack
+- UI: `http://127.0.0.1:8501`
+- API docs: `http://127.0.0.1:8000/docs`
+
+Stop the stack:
 
 ```bash
-cd "/Users/mehdidinari/Desktop/backend nimbus"
 ./scripts/11_down_stack.sh
 ```
 
-## Docker Compose quick start (4 services)
+## Kubernetes
+
+For Minikube + Podman:
 
 ```bash
-cd "/Users/mehdidinari/Desktop/backend nimbus"
-cp .env.example .env
-# fill credentials in .env (Copernicus/USGS)
-./scripts/13_up_stack_docker.sh
-```
-
-Services:
-- `mongodb`
-- `nimbus-worker`
-- `nimbus-api`
-- `nimbus-ui`
-
-Open:
-- API docs: `http://127.0.0.1:8000/docs`
-- UI: `http://127.0.0.1:8501`
-
-Stop:
-
-```bash
-cd "/Users/mehdidinari/Desktop/backend nimbus"
-./scripts/14_down_stack_docker.sh
-```
-
-## Kubernetes quick start
-
-```bash
-cd "/Users/mehdidinari/Desktop/backend nimbus"
-brew install minikube
-MINIKUBE_MEMORY_MB=6144 ./scripts/32_k8s_bootstrap_minikube.sh
-podman build -f Containerfile -t ghcr.io/nimbuschain/nimbus-api:latest .
-podman build -f ui/Containerfile -t ghcr.io/nimbuschain/nimbus-ui:latest .
-./scripts/34_k8s_load_images_minikube.sh
+./scripts/32_k8s_bootstrap_minikube.sh
 ./scripts/33_k8s_apply_minikube.sh
-kubectl -n nimbuschain get pods
+./scripts/35_k8s_expose_local.sh
 ```
 
-Full guide:
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/KUBERNETES_DEPLOYMENT.md`
-
-## Scale download throughput
-
-Scale worker replicas:
+Stop local port-forwards:
 
 ```bash
-cd "/Users/mehdidinari/Desktop/backend nimbus"
-./scripts/12_scale_workers.sh 3
+./scripts/36_k8s_unexpose_local.sh
 ```
 
-Notes:
-- each worker claims queued jobs atomically from DB (no duplicate execution).
-- `NIMBUS_MAX_JOBS` controls per-worker concurrency.
-- total max parallelism ~= `worker_replicas * NIMBUS_MAX_JOBS` (subject to provider limits and external APIs).
+## Data policy
 
-## Test commands
+Tracked in git:
 
-Unit tests kept in repo:
-- `/Users/mehdidinari/Desktop/backend nimbus/tests/test_models.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/tests/test_engine.py`
+- `data/Landsat-tiles/`
+- `data/Sentinel-2-tiles/`
 
-Run with Podman:
+Ignored locally:
 
-```bash
-cd "/Users/mehdidinari/Desktop/backend nimbus"
-./scripts/01_test_models.sh
-./scripts/02_test_engine.sh
-./scripts/05_test_all.sh
-```
+- downloads
+- generated Zarr stores
+- logs
+- caches
+- port-forward runtime files
 
-## CLI modes
+## Documentation
 
-Direct mode (single-process usage):
-
-```bash
-nimbuschain-fetch --mode direct ...
-```
-
-Service mode (recommended with separated stack):
-
-```bash
-nimbuschain-fetch --mode service --service-url http://127.0.0.1:8000 ...
-```
+- `docs/ARCHITECTURE.md`: runtime architecture and repository map
+- `docs/RUNBOOK.md`: how to run, verify, and troubleshoot
+- `docs/API_REFERENCE.md`: API endpoints and filters
+- `docs/ZARR.md`: conversion scope, output model, and resolution policy

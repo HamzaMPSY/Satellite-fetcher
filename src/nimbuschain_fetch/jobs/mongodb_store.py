@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from nimbuschain_fetch.jobs.store import JobListFilters
+from nimbuschain_fetch.jobs.store import ArtifactListFilters, JobListFilters
 
 try:
     from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -32,6 +32,7 @@ class MongoJobStore:
         self._jobs = self._db.jobs
         self._events = self._db.job_events
         self._results = self._db.job_results
+        self._artifacts = self._db.artifacts
         self._counters = self._db.counters
         self._wait_until_ready(timeout_seconds=60)
         self._init_schema()
@@ -56,13 +57,24 @@ class MongoJobStore:
         self._jobs.create_index([("job_id", ASCENDING)], unique=True)
         self._jobs.create_index([("state", ASCENDING)])
         self._jobs.create_index([("provider", ASCENDING)])
+        self._jobs.create_index([("collection", ASCENDING)])
+        self._jobs.create_index([("product_type", ASCENDING)])
         self._jobs.create_index([("created_at", DESCENDING)])
+        self._jobs.create_index([("updated_at", DESCENDING)])
+        self._jobs.create_index([("provider", ASCENDING), ("state", ASCENDING), ("created_at", DESCENDING)])
+        self._jobs.create_index([("provider", ASCENDING), ("created_at", DESCENDING)])
 
         self._events.create_index([("event_id", ASCENDING)], unique=True)
         self._events.create_index([("job_id", ASCENDING), ("event_id", ASCENDING)])
         self._events.create_index([("timestamp", DESCENDING)])
 
         self._results.create_index([("job_id", ASCENDING)], unique=True)
+        self._artifacts.create_index([("artifact_id", ASCENDING)], unique=True)
+        self._artifacts.create_index([("artifact_uri", ASCENDING)], unique=True)
+        self._artifacts.create_index([("artifact_type", ASCENDING), ("updated_at", DESCENDING)])
+        self._artifacts.create_index([("provider", ASCENDING), ("updated_at", DESCENDING)])
+        self._artifacts.create_index([("collection", ASCENDING), ("updated_at", DESCENDING)])
+        self._artifacts.create_index([("scene_id", ASCENDING), ("updated_at", DESCENDING)])
 
     @staticmethod
     def _utc_now() -> str:
@@ -76,6 +88,9 @@ class MongoJobStore:
         doc.pop("_id", None)
         if "errors" not in doc:
             doc["errors"] = []
+        request = dict(doc.get("request") or {})
+        doc["product_type"] = doc.get("product_type") or request.get("product_type")
+        doc["tile_id"] = doc.get("tile_id") or request.get("tile_id")
         return doc
 
     def _next_event_id(self) -> int:
@@ -102,6 +117,8 @@ class MongoJobStore:
                 "job_type": job_type,
                 "provider": provider,
                 "collection": collection,
+                "product_type": request_payload.get("product_type"),
+                "tile_id": request_payload.get("tile_id"),
                 "request": request_payload,
                 "state": "queued",
                 "progress": 0.0,
@@ -129,8 +146,24 @@ class MongoJobStore:
         query: dict[str, Any] = {}
         if filters.state:
             query["state"] = filters.state
+        if filters.states:
+            query["state"] = {"$in": list(filters.states)}
         if filters.provider:
             query["provider"] = filters.provider
+        if filters.collection:
+            query["collection"] = filters.collection
+        if filters.product_type:
+            query.setdefault("$and", [])
+            query["$and"].append(
+                {
+                    "$or": [
+                        {"product_type": filters.product_type},
+                        {"request.product_type": filters.product_type},
+                    ]
+                }
+            )
+        if filters.job_id_query:
+            query["job_id"] = {"$regex": filters.job_id_query, "$options": "i"}
 
         created_range: dict[str, Any] = {}
         if filters.date_from:
@@ -140,14 +173,24 @@ class MongoJobStore:
         if created_range:
             query["created_at"] = created_range
 
+        updated_range: dict[str, Any] = {}
+        if filters.updated_from:
+            updated_range["$gte"] = filters.updated_from.isoformat()
+        if filters.updated_to:
+            updated_range["$lte"] = filters.updated_to.isoformat()
+        if updated_range:
+            query["updated_at"] = updated_range
+
         page = max(1, filters.page)
         page_size = max(1, min(200, filters.page_size))
         offset = (page - 1) * page_size
+        sort_field = filters.sort_by if filters.sort_by in {"created_at", "updated_at", "started_at", "finished_at"} else "updated_at"
+        sort_dir = DESCENDING if filters.sort_desc else ASCENDING
 
         total = self._jobs.count_documents(query)
         rows = (
             self._jobs.find(query)
-            .sort("created_at", DESCENDING)
+            .sort(sort_field, sort_dir)
             .skip(offset)
             .limit(page_size)
         )
@@ -215,6 +258,101 @@ class MongoJobStore:
         if not row:
             return None
         return row.get("result")
+
+    def upsert_artifact(self, artifact_payload: dict[str, Any]) -> dict[str, Any]:
+        now = self._utc_now()
+        payload = {
+            "artifact_id": artifact_payload["artifact_id"],
+            "artifact_type": artifact_payload["artifact_type"],
+            "artifact_uri": artifact_payload["artifact_uri"],
+            "provider": artifact_payload.get("provider"),
+            "collection": artifact_payload.get("collection"),
+            "scene_id": artifact_payload.get("scene_id"),
+            "source_uri": artifact_payload.get("source_uri"),
+            "created_by_job_id": artifact_payload.get("created_by_job_id"),
+            "source_job_id": artifact_payload.get("source_job_id"),
+            "data_family": artifact_payload.get("data_family"),
+            "band_names": list(artifact_payload.get("band_names", [])),
+            "dimensions": list(artifact_payload.get("dimensions", [])),
+            "shape": list(artifact_payload.get("shape", [])),
+            "size_bytes": artifact_payload.get("size_bytes"),
+            "metadata": dict(artifact_payload.get("metadata", {})),
+        }
+        existing = self._artifacts.find_one({"artifact_uri": payload["artifact_uri"]}, {"created_at": 1})
+        created_at = str(existing.get("created_at")) if existing else now
+        self._artifacts.update_one(
+            {"artifact_uri": payload["artifact_uri"]},
+            {
+                "$set": {
+                    **payload,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "created_at": created_at,
+                },
+            },
+            upsert=True,
+        )
+        row = self._artifacts.find_one({"artifact_uri": payload["artifact_uri"]})
+        return self._normalize_artifact(row)
+
+    @staticmethod
+    def _normalize_artifact(doc: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not doc:
+            return None
+        doc = dict(doc)
+        doc.pop("_id", None)
+        doc.setdefault("band_names", [])
+        doc.setdefault("dimensions", [])
+        doc.setdefault("shape", [])
+        doc.setdefault("metadata", {})
+        return doc
+
+    def list_artifacts(self, filters: ArtifactListFilters) -> tuple[list[dict[str, Any]], int]:
+        query: dict[str, Any] = {}
+        if filters.artifact_type:
+            query["artifact_type"] = filters.artifact_type
+        if filters.provider:
+            query["provider"] = filters.provider
+        if filters.collection:
+            query["collection"] = filters.collection
+        if filters.scene_id:
+            query["scene_id"] = filters.scene_id
+        if filters.job_id:
+            query["$or"] = [
+                {"created_by_job_id": filters.job_id},
+                {"source_job_id": filters.job_id},
+            ]
+        if filters.uri_query:
+            regex_query = {"$regex": filters.uri_query, "$options": "i"}
+            query["$and"] = query.get("$and", [])
+            query["$and"].append(
+                {
+                    "$or": [
+                        {"artifact_uri": regex_query},
+                        {"source_uri": regex_query},
+                    ]
+                }
+            )
+        updated_range: dict[str, Any] = {}
+        if filters.date_from:
+            updated_range["$gte"] = filters.date_from.isoformat()
+        if filters.date_to:
+            updated_range["$lte"] = filters.date_to.isoformat()
+        if updated_range:
+            query["updated_at"] = updated_range
+
+        page = max(1, filters.page)
+        page_size = max(1, min(200, filters.page_size))
+        offset = (page - 1) * page_size
+        total = self._artifacts.count_documents(query)
+        rows = (
+            self._artifacts.find(query)
+            .sort("updated_at", DESCENDING)
+            .skip(offset)
+            .limit(page_size)
+        )
+        return [self._normalize_artifact(row) for row in rows if row], int(total)
 
     def requeue_incomplete_jobs(self) -> list[str]:
         rows = list(

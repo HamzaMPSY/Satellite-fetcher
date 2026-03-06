@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nimbus-config
+  namespace: nimbuschain
+data:
+  NIMBUS_DB_BACKEND: "mongodb"
+  NIMBUS_MONGODB_URI: "mongodb://nimbus-mongodb:27017"
+  NIMBUS_MONGODB_DB: "nimbuschain_fetch"
+  NIMBUS_DATA_DIR: "/data/downloads"
+  NIMBUS_MAX_JOBS: "4"
+  NIMBUS_LOG_LEVEL: "INFO"
+  NIMBUS_LOG_JSON: "true"
+  NIMBUS_ENABLE_METRICS: "true"
+  NIMBUS_CORS_ORIGINS: "http://localhost:8501"
+  NIMBUS_MAX_REQUEST_MB: "10"
+  NIMBUS_PROVIDER_LIMITS: "copernicus=2,usgs=4"
+  NIMBUS_QUEUE_POLL_SECONDS: "1.0"
+  NIMBUS_STALE_JOB_SECONDS: "900"
+  NIMBUS_COPERNICUS_BASE_URL: "https://catalogue.dataspace.copernicus.eu"
+  NIMBUS_COPERNICUS_TOKEN_URL: "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+  NIMBUS_COPERNICUS_DOWNLOAD_URL: "https://zipper.dataspace.copernicus.eu"
+  NIMBUS_USGS_SERVICE_URL: "https://m2m.cr.usgs.gov/api/api/json/stable/"
+  NIMBUS_SERVICE_URL: "http://nimbus-api:8000"

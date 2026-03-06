@@ -12,7 +12,7 @@ services:
       - .env
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Containerfile
     depends_on:
       - mongodb
     command: ["uvicorn", "nimbuschain_fetch_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -51,7 +51,7 @@ services:
       - .env
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Containerfile
     depends_on:
       - mongodb
     command: ["nimbuschain-worker"]
@@ -101,6 +101,17 @@ services:
       NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
     volumes:
       - ./src:/app/src
+      - ./data:/data
+
+  nimbus-zarr:
+    build:
+      context: .
+      dockerfile: zarr-service/Containerfile
+    ports:
+      - "${NIMBUS_ZARR_PORT:-8010}:8010"
+    environment:
+      NIMBUS_DATA_DIR: /data/downloads
+    volumes:
       - ./data:/data
 
 volumes:

@@ -84,18 +84,39 @@ def get_job_result(
 @router.get("/jobs", response_model=JobListResponse)
 def list_jobs(
     state: str | None = None,
+    state_in: str | None = None,
     provider: str | None = None,
+    collection: str | None = None,
+    product_type: str | None = None,
+    job_id_query: str | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    updated_from: datetime | None = None,
+    updated_to: datetime | None = None,
+    sort_by: str = "updated_at",
+    sort_desc: bool = True,
     page: int = 1,
     page_size: int = 20,
     fetcher: NimbusFetcher = Depends(get_fetcher),
 ) -> JobListResponse:
+    states = tuple(
+        item.strip()
+        for item in (state_in or "").split(",")
+        if item and item.strip()
+    )
     return fetcher.list_jobs(
         state=state,
+        states=states,
         provider=provider,
+        collection=collection,
+        product_type=product_type,
+        job_id_query=job_id_query,
         date_from=date_from,
         date_to=date_to,
+        updated_from=updated_from,
+        updated_to=updated_to,
+        sort_by=sort_by,
+        sort_desc=sort_desc,
         page=page,
         page_size=page_size,
     )

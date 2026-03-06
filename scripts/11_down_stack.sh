@@ -13,3 +13,4 @@ fi
 "${COMPOSE_CMD[@]}" -f podman-compose.yml down --remove-orphans
 
 echo "Stack stopped."
+

@@ -149,6 +149,10 @@ class JobStatusResponse(BaseModel):
     progress: float = Field(default=0, ge=0, le=100)
     bytes_downloaded: int = 0
     bytes_total: int = 0
+    product_type: str | None = None
+    tile_id: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     duration_seconds: float | None = None
@@ -167,6 +171,65 @@ class JobResultResponse(BaseModel):
 
 class JobListResponse(BaseModel):
     items: list[JobStatusResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+class ArtifactType(str, Enum):
+    zarr = "zarr"
+
+
+class ArtifactUpsertRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_type: ArtifactType
+    artifact_uri: str = Field(min_length=1)
+    provider: ProviderName | None = None
+    collection: str | None = None
+    scene_id: str | None = None
+    source_uri: str | None = None
+    created_by_job_id: str | None = None
+    source_job_id: str | None = None
+    data_family: str | None = None
+    band_names: list[str] = Field(default_factory=list)
+    dimensions: list[str] = Field(default_factory=list)
+    shape: list[int] = Field(default_factory=list)
+    size_bytes: int | None = Field(default=None, ge=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("collection")
+    @classmethod
+    def _validate_collection_optional(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not COLLECTION_RE.match(value):
+            raise ValueError("Invalid collection format.")
+        return value
+
+
+class ArtifactRecord(BaseModel):
+    artifact_id: str
+    artifact_type: ArtifactType
+    artifact_uri: str
+    provider: ProviderName | None = None
+    collection: str | None = None
+    scene_id: str | None = None
+    source_uri: str | None = None
+    created_by_job_id: str | None = None
+    source_job_id: str | None = None
+    data_family: str | None = None
+    band_names: list[str] = Field(default_factory=list)
+    dimensions: list[str] = Field(default_factory=list)
+    shape: list[int] = Field(default_factory=list)
+    size_bytes: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ArtifactListResponse(BaseModel):
+    items: list[ArtifactRecord]
     total: int
     page: int
     page_size: int

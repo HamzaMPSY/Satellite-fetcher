@@ -2,19 +2,40 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OVERLAY_DIR="${PROJECT_ROOT}/k8s-minikube"
+API_IMAGE="${API_IMAGE:-ghcr.io/nimbuschain/nimbus-api:latest}"
+UI_IMAGE="${UI_IMAGE:-ghcr.io/nimbuschain/nimbus-ui:latest}"
 
 if ! command -v kubectl >/dev/null 2>&1; then
   echo "ERROR: kubectl is not installed." >&2
   exit 1
 fi
 
-if ! kubectl config current-context >/dev/null 2>&1; then
-  echo "ERROR: kubectl has no current context (start minikube first)." >&2
+if ! command -v minikube >/dev/null 2>&1; then
+  echo "ERROR: minikube is not installed." >&2
   exit 1
 fi
 
-kubectl apply -k "${OVERLAY_DIR}"
+cd "${PROJECT_ROOT}"
 
-echo "Applied Kubernetes minikube overlay from ${OVERLAY_DIR}"
-echo "Next: kubectl -n nimbuschain get pods"
+if ! minikube status >/dev/null 2>&1; then
+  echo "ERROR: minikube cluster is not running." >&2
+  echo "Start it first with ./scripts/32_k8s_bootstrap_minikube.sh" >&2
+  exit 1
+fi
+
+if command -v podman >/dev/null 2>&1 && podman image exists "${API_IMAGE}" && podman image exists "${UI_IMAGE}"; then
+  TMP_DIR="$(mktemp -d)"
+  trap 'rm -rf "${TMP_DIR}"' EXIT
+  podman save -o "${TMP_DIR}/nimbus-api.tar" "${API_IMAGE}"
+  podman save -o "${TMP_DIR}/nimbus-ui.tar" "${UI_IMAGE}"
+  minikube image load "${TMP_DIR}/nimbus-api.tar"
+  minikube image load "${TMP_DIR}/nimbus-ui.tar"
+fi
+
+kubectl apply -k k8s/overlays/minikube
+
+kubectl -n nimbuschain rollout status deploy/nimbus-api --timeout=180s || true
+kubectl -n nimbuschain rollout status deploy/nimbus-worker --timeout=180s || true
+kubectl -n nimbuschain rollout status deploy/nimbus-ui --timeout=180s || true
+
+echo "Kubernetes manifests applied."

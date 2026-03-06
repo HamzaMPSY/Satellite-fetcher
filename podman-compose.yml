@@ -103,5 +103,16 @@ services:
       - ./src:/app/src
       - ./data:/data
 
+  nimbus-zarr:
+    build:
+      context: .
+      dockerfile: zarr-service/Containerfile
+    ports:
+      - "${NIMBUS_ZARR_PORT:-8010}:8010"
+    environment:
+      NIMBUS_DATA_DIR: /data/downloads
+    volumes:
+      - ./data:/data
+
 volumes:
   mongodb_data:

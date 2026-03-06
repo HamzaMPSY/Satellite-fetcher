@@ -1,10 +1,38 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import requests
 from shapely.geometry import mapping
+
+try:
+    from nimbuschain_fetch.usgs_product_type import usgs_product_type_matches
+except ModuleNotFoundError:
+    import re
+
+    def _normalize_usgs_product_type_from_display_id(display_id: str) -> str:
+        parts = [part.strip().upper() for part in str(display_id or "").split("_") if part.strip()]
+        if len(parts) < 2:
+            return ""
+        platform = parts[0]
+        product_code = parts[1]
+        digits = re.findall(r"\d", platform)
+        if not digits or not product_code.startswith("L"):
+            return ""
+        return f"{digits[-1]}{product_code}"
+
+    def usgs_product_type_matches(display_id: str, product_type: str) -> bool:
+        requested = str(product_type or "").strip().upper()
+        if not requested:
+            return True
+        display = str(display_id or "").strip().upper()
+        if not display:
+            return False
+        if requested in display:
+            return True
+        return requested == _normalize_usgs_product_type_from_display_id(display)
 
 from nimbuschain_fetch_ui.aoi_utils import parse_aoi_text
 
@@ -189,7 +217,7 @@ def parse_usgs_scenes(payload: dict[str, Any], *, max_items: int, product_type: 
         if not isinstance(scene, dict):
             continue
         display_id = str(scene.get("displayId") or "")
-        if product_type and product_type not in display_id:
+        if not usgs_product_type_matches(display_id, product_type):
             continue
         temporal = scene.get("temporalCoverage", {}) if isinstance(scene.get("temporalCoverage"), dict) else {}
         filtered.append(
@@ -213,21 +241,52 @@ def _usgs_request(
     payload: dict[str, Any],
     auth_token: str | None = None,
 ) -> dict[str, Any]:
-    headers = {"Content-Type": "application/json"}
-    if auth_token:
-        headers["X-Auth-Token"] = auth_token
+    max_attempts = 4
+    url = f"{service_url.rstrip('/')}/{endpoint}"
+    for attempt in range(1, max_attempts + 1):
+        headers = {"Content-Type": "application/json"}
+        if auth_token:
+            headers["X-Auth-Token"] = auth_token
 
-    response = requests.post(
-        f"{service_url.rstrip('/')}/{endpoint}",
-        json=payload,
-        headers=headers,
-        timeout=60,
-    )
-    response.raise_for_status()
-    body = response.json()
-    if body.get("errorCode"):
-        raise RuntimeError(f"USGS API error {body['errorCode']}: {body.get('errorMessage')}")
-    return body
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"USGS request failed on {endpoint} after {max_attempts} attempts: {exc}"
+                ) from exc
+            time.sleep(min(8.0, 1.5 * attempt))
+            continue
+
+        if response.status_code in {429, 500, 502, 503, 504}:
+            if attempt < max_attempts:
+                time.sleep(min(10.0, 2.0 * attempt))
+                continue
+            body_text = (response.text or "").strip()[:500]
+            raise RuntimeError(
+                f"USGS HTTP {response.status_code} on {endpoint} after {max_attempts} attempts. "
+                f"Response: {body_text}"
+            )
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            body_text = (response.text or "").strip()[:500]
+            raise RuntimeError(
+                f"USGS HTTP {response.status_code} on {endpoint}. Response: {body_text}"
+            ) from exc
+
+        body = response.json()
+        if body.get("errorCode"):
+            raise RuntimeError(f"USGS API error {body['errorCode']}: {body.get('errorMessage')}")
+        return body
+
+    raise RuntimeError(f"USGS request failed on {endpoint}: retry budget exhausted")
 
 
 def _usgs_preview(
