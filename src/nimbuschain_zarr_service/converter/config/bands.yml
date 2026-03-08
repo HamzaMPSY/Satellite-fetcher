@@ -1,0 +1,76 @@
+sentinel2_l2a:
+  reference_band_order: ["B04", "red"]
+  subdir_filter: "IMG_DATA"
+  extensions: [".jp2", ".tif", ".tiff"]
+  bands:
+    - name: B01
+      patterns: ["_B01_60m\\.(jp2|tif)$", "_B01\\.(jp2|tif)$"]
+      categorical: false
+    - name: B02
+      patterns: ["_B02_10m\\.(jp2|tif)$", "_B02\\.(jp2|tif)$"]
+      categorical: false
+    - name: B03
+      patterns: ["_B03_10m\\.(jp2|tif)$", "_B03\\.(jp2|tif)$"]
+      categorical: false
+    - name: B04
+      patterns: ["_B04_10m\\.(jp2|tif)$", "_B04\\.(jp2|tif)$"]
+      categorical: false
+    - name: B05
+      patterns: ["_B05_20m\\.(jp2|tif)$", "_B05\\.(jp2|tif)$"]
+      categorical: false
+    - name: B06
+      patterns: ["_B06_20m\\.(jp2|tif)$", "_B06\\.(jp2|tif)$"]
+      categorical: false
+    - name: B07
+      patterns: ["_B07_20m\\.(jp2|tif)$", "_B07\\.(jp2|tif)$"]
+      categorical: false
+    - name: B08
+      patterns: ["_B08_10m\\.(jp2|tif)$", "_B08\\.(jp2|tif)$"]
+      categorical: false
+    - name: B8A
+      patterns: ["_B8A_20m\\.(jp2|tif)$", "_B8A\\.(jp2|tif)$"]
+      categorical: false
+    - name: B09
+      patterns: ["_B09_60m\\.(jp2|tif)$", "_B09\\.(jp2|tif)$"]
+      categorical: false
+    - name: B10
+      patterns: ["_B10_60m\\.(jp2|tif)$", "_B10\\.(jp2|tif)$"]
+      categorical: false
+    - name: B11
+      patterns: ["_B11_20m\\.(jp2|tif)$", "_B11\\.(jp2|tif)$"]
+      categorical: false
+    - name: B12
+      patterns: ["_B12_20m\\.(jp2|tif)$", "_B12\\.(jp2|tif)$"]
+      categorical: false
+
+landsat_l2:
+  reference_band_order: ["red", "B04", "B4"]
+  extensions: [".tif", ".tiff"]
+  bands:
+    - name: coastal
+      patterns: ["_SR_B1\\.(TIF|TIFF)$", "_B1\\.(TIF|TIFF)$"]
+      categorical: false
+    - name: blue
+      patterns: ["_SR_B2\\.(TIF|TIFF)$", "_B2\\.(TIF|TIFF)$"]
+      categorical: false
+    - name: green
+      patterns: ["_SR_B3\\.(TIF|TIFF)$", "_B3\\.(TIF|TIFF)$"]
+      categorical: false
+    - name: red
+      patterns: ["_SR_B4\\.(TIF|TIFF)$", "_B4\\.(TIF|TIFF)$"]
+      categorical: false
+    - name: nir
+      patterns: ["_SR_B5\\.(TIF|TIFF)$", "_B5\\.(TIF|TIFF)$"]
+      categorical: false
+    - name: swir1
+      patterns: ["_SR_B6\\.(TIF|TIFF)$", "_B6\\.(TIF|TIFF)$"]
+      categorical: false
+    - name: swir2
+      patterns: ["_SR_B7\\.(TIF|TIFF)$", "_B7\\.(TIF|TIFF)$"]
+      categorical: false
+    - name: thermal1
+      patterns: ["_ST_B10\\.(TIF|TIFF)$", "_B10\\.(TIF|TIFF)$"]
+      categorical: false
+    - name: thermal2
+      patterns: ["_ST_B11\\.(TIF|TIFF)$", "_B11\\.(TIF|TIFF)$"]
+      categorical: false

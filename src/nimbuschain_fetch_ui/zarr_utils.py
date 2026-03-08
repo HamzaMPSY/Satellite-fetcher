@@ -1,0 +1,343 @@
+import json
+import re
+import datetime as dt
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+
+from nimbuschain_fetch_ui.constants import DOWNLOADS_DIR, ZARR_STORES_DIR
+from nimbuschain_fetch_ui.jobs_helpers import _api_request
+
+
+def _looks_like_scene_name(name: str) -> bool:
+    upper_name = str(name or "").upper()
+    if not upper_name:
+        return False
+    if upper_name.endswith(".SAFE") or upper_name.endswith(".SAFE.ZIP"):
+        return True
+    if upper_name.startswith(("S1", "S2")) and "_" in upper_name:
+        return True
+    if upper_name.startswith(("LC08_", "LC09_", "LE07_", "LT05_", "LT04_", "LM05_")):
+        return True
+    return False
+
+
+def _manifest_source_candidates(limit: int = 200) -> List[str]:
+    if not DOWNLOADS_DIR.exists():
+        return []
+
+    candidates: Dict[str, float] = {}
+    for manifest_path in DOWNLOADS_DIR.rglob("manifest.json"):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        for raw_path_value in list(payload.get("paths", [])):
+            try:
+                raw_path = Path(str(raw_path_value))
+                if not raw_path.exists():
+                    continue
+                if raw_path.is_dir():
+                    candidates[str(raw_path)] = raw_path.stat().st_mtime
+                elif raw_path.is_file():
+                    candidates[str(raw_path)] = raw_path.stat().st_mtime
+            except OSError:
+                continue
+
+        parent_dir = manifest_path.parent
+        try:
+            for child in parent_dir.iterdir():
+                if _looks_like_scene_name(child.name):
+                    candidates[str(child)] = child.stat().st_mtime
+        except OSError:
+            continue
+
+    return [
+        item[0]
+        for item in sorted(candidates.items(), key=lambda pair: pair[1], reverse=True)[: max(1, limit)]
+    ]
+
+
+def recent_source_candidates(limit: int = 200) -> List[str]:
+    if not DOWNLOADS_DIR.exists():
+        return []
+
+    def _is_supported_raw_file(path: Path) -> bool:
+        lower_name = path.name.lower()
+        if lower_name.endswith(".safe.zip"):
+            return True
+        return path.suffix.lower() in {".zip", ".tar", ".gz", ".tgz", ".nc", ".tif", ".tiff"}
+
+    def _is_supported_raw_dir(path: Path) -> bool:
+        lower_name = path.name.lower()
+        if lower_name.endswith(".safe") or lower_name.endswith(".zarr"):
+            return lower_name.endswith(".safe")
+        if _looks_like_scene_name(path.name):
+            return True
+        try:
+            children = list(path.iterdir())
+        except OSError:
+            return False
+        if any(child.is_file() and child.name.lower() == "manifest.safe" for child in children):
+            return True
+        if any(child.is_file() and child.name.upper().endswith("_MTL.TXT") for child in children):
+            return True
+        if any(child.is_file() and child.suffix.lower() == ".nc" for child in children):
+            return True
+        tif_count = sum(
+            1 for child in children if child.is_file() and child.suffix.lower() in {".tif", ".tiff", ".jp2"}
+        )
+        return tif_count >= 3
+
+    candidates: Dict[str, float] = {}
+    for path in DOWNLOADS_DIR.rglob("*"):
+        try:
+            if path.is_dir():
+                if _is_supported_raw_dir(path):
+                    candidates[str(path)] = path.stat().st_mtime
+            elif path.is_file() and _is_supported_raw_file(path):
+                candidates[str(path)] = path.stat().st_mtime
+        except OSError:
+            continue
+
+    for manifest_candidate in _manifest_source_candidates(limit=max(limit, 200)):
+        try:
+            manifest_path = Path(manifest_candidate)
+            if manifest_path.exists():
+                candidates[str(manifest_path)] = manifest_path.stat().st_mtime
+        except OSError:
+            continue
+
+    return [
+        item[0]
+        for item in sorted(candidates.items(), key=lambda pair: pair[1], reverse=True)[: max(1, limit)]
+    ]
+
+
+def container_to_host_path_hint(path_value: str) -> str:
+    if not path_value:
+        return ""
+    if path_value.startswith("/data/"):
+        return "." + path_value
+    if path_value == "/data":
+        return "./data"
+    return ""
+
+
+def available_zarr_stores(limit: int = 120) -> List[Dict[str, Any]]:
+    if not ZARR_STORES_DIR.exists():
+        return []
+    stores: List[Dict[str, Any]] = []
+    for path in ZARR_STORES_DIR.rglob("*.zarr"):
+        if not path.is_dir():
+            continue
+        try:
+            stat = path.stat()
+            stores.append(
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "mtime": stat.st_mtime,
+                    "host_hint": container_to_host_path_hint(str(path)),
+                    "entries": sorted(
+                        [child.name for child in path.iterdir() if child.is_dir() or child.is_file()]
+                    )[:12],
+                }
+            )
+        except OSError:
+            continue
+    stores.sort(key=lambda item: item["mtime"], reverse=True)
+    return stores[: max(1, limit)]
+
+
+def list_artifacts(
+    api_url: str,
+    api_key: str,
+    *,
+    artifact_type: Optional[str] = None,
+    provider: Optional[str] = None,
+    collection: Optional[str] = None,
+    scene_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    uri_query: Optional[str] = None,
+    include_local: bool = False,
+    page: int = 1,
+    page_size: int = 100,
+) -> Tuple[List[Dict[str, Any]], int]:
+    params: Dict[str, Any] = {
+        "page": page,
+        "page_size": page_size,
+        "include_local": str(include_local).lower(),
+    }
+    if artifact_type:
+        params["artifact_type"] = artifact_type
+    if provider:
+        params["provider"] = provider
+    if collection:
+        params["collection"] = collection
+    if scene_id:
+        params["scene_id"] = scene_id
+    if job_id:
+        params["job_id"] = job_id
+    if uri_query:
+        params["uri_query"] = uri_query
+    try:
+        response = _api_request("GET", api_url, "/v1/artifacts", api_key=api_key, params=params, timeout=30)
+        if not response.ok:
+            return [], 0
+        body = response.json()
+        return list(body.get("items", [])), int(body.get("total", 0) or 0)
+    except Exception:
+        return [], 0
+
+
+def _path_size_bytes(path_value: str) -> Optional[int]:
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.exists():
+        return None
+    try:
+        if path.is_file():
+            return int(path.stat().st_size)
+        total = 0
+        file_count = 0
+        for child in path.rglob("*"):
+            if not child.is_file():
+                continue
+            total += int(child.stat().st_size)
+            file_count += 1
+            if file_count > 5000:
+                return None
+        return total
+    except OSError:
+        return None
+
+
+def register_zarr_artifact(
+    api_url: str,
+    api_key: str,
+    *,
+    convert_response: Dict[str, Any],
+    raw_uri: str,
+    provider: str,
+    collection: str,
+    scene_id: str,
+) -> bool:
+    zarr_uri = str(convert_response.get("zarr_uri", "")).strip()
+    if not zarr_uri:
+        return False
+    summary = convert_response.get("normalization_summary", {}) or {}
+    zarr_summary = summary.get("zarr_summary", {}) or {}
+    metadata = {
+        "normalization_summary": summary,
+        "registered_via": "streamlit_ui",
+    }
+    payload = {
+        "artifact_type": "zarr",
+        "artifact_uri": zarr_uri,
+        "provider": provider,
+        "collection": collection,
+        "scene_id": scene_id,
+        "source_uri": raw_uri,
+        "created_by_job_id": str(convert_response.get("job_id", "")).strip() or None,
+        "data_family": convert_response.get("data_family"),
+        "band_names": list(convert_response.get("band_names") or zarr_summary.get("band_names") or []),
+        "dimensions": list(convert_response.get("dimensions") or zarr_summary.get("dimensions") or []),
+        "shape": list(zarr_summary.get("shape") or []),
+        "size_bytes": _path_size_bytes(zarr_uri),
+        "metadata": metadata,
+    }
+    try:
+        response = _api_request("POST", api_url, "/v1/artifacts", api_key=api_key, payload=payload, timeout=30)
+        return bool(response.ok)
+    except Exception:
+        return False
+
+
+def human_size(size_bytes: Any) -> str:
+    try:
+        value = int(size_bytes)
+    except Exception:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(value)
+    unit = units[0]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            break
+        size /= 1024.0
+    return f"{size:.1f} {unit}"
+
+
+def guess_scene_id(raw_uri: str) -> str:
+    name = Path(raw_uri).name
+    for suffix in (".SAFE.zip", ".SAFE", ".tar.gz", ".tgz", ".tar", ".zip", ".nc", ".tif", ".tiff"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(raw_uri).stem
+
+
+def guess_zarr_provider(raw_uri: str) -> str:
+    lower_name = str(raw_uri or "").lower()
+    if any(token in lower_name for token in ("landsat", "lc08", "lc09", "le07", "lt05")):
+        return "usgs"
+    return "copernicus"
+
+
+def guess_zarr_collection(provider_api: str, scene_id: str) -> str:
+    scene_upper = str(scene_id or "").upper()
+    if provider_api == "usgs":
+        if "_L1" in scene_upper:
+            return "landsat_ot_c2_l1"
+        return "landsat_ot_c2_l2"
+    if scene_upper.startswith("S1"):
+        return "SENTINEL-1"
+    return "SENTINEL-2"
+
+
+def default_zarr_output(scene_id: str) -> str:
+    safe_scene = re.sub(r"[^A-Za-z0-9._-]+", "_", (scene_id or "scene")).strip("._-")
+    if not safe_scene:
+        safe_scene = "scene"
+    return f"/data/downloads/zarr/{safe_scene}.zarr"
+
+
+def _http_session() -> requests.Session:
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def list_artifacts_with_local(
+    api_url: str,
+    api_key: str,
+    *,
+    artifact_type: Optional[str] = None,
+    provider: Optional[str] = None,
+    collection: Optional[str] = None,
+    scene_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    uri_query: Optional[str] = None,
+    include_local: bool = False,
+    page: int = 1,
+    page_size: int = 100,
+) -> Tuple[List[Dict[str, Any]], int]:
+    return list_artifacts(
+        api_url,
+        api_key,
+        artifact_type=artifact_type,
+        provider=provider,
+        collection=collection,
+        scene_id=scene_id,
+        job_id=job_id,
+        uri_query=uri_query,
+        include_local=include_local,
+        page=page,
+        page_size=page_size,
+    )

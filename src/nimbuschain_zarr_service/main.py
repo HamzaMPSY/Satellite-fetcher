@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from nimbuschain_zarr_service.schema import default_zarr_model
+
+# New architecture imports
+from nimbuschain_zarr_service.converter import (
+    ConfigLoader,
+    CubeBuilder,
+    LandsatReader,
+    Sentinel2Reader,
+    ZarrWriter,
+)
+from nimbuschain_zarr_service.converter.config import CollectionConfig
 
 
 APP_VERSION = "0.1.0"
@@ -95,61 +106,66 @@ def schema() -> dict[str, object]:
 
 @app.post("/convert", response_model=ConvertResponse)
 def convert(payload: ConvertRequest) -> ConvertResponse:
-    from nimbuschain_zarr_service.core import (
-        ConversionDependencyError,
-        ConversionError,
-        summarize_dataset,
-        write_dataset_to_zarr,
-    )
-    from nimbuschain_zarr_service.copernicus import build_copernicus_dataset
-    from nimbuschain_zarr_service.landsat import (
-        LandsatDependencyError,
-        LandsatNormalizationError,
-        build_landsat_dataset,
+    # Map incoming collection/provider to config key
+    config_path = Path(__file__).resolve().parent / "converter" / "config" / "bands.yml"
+    loader = ConfigLoader(config_path)
+    collections = loader.load()
+
+    def _select_collection_key(provider: str, collection: str) -> str:
+        norm = collection.strip().lower()
+        if provider == "copernicus":
+            if norm.startswith("sentinel-2") or norm.startswith("s2"):
+                return "sentinel2_l2a"
+        if provider == "usgs":
+            if norm.endswith("_l2") or "_c2_l2" in norm:
+                return "landsat_l2"
+        return ""
+
+    cfg_key = _select_collection_key(payload.provider, payload.collection)
+    collection_cfg: CollectionConfig | None = collections.get(cfg_key)
+    if collection_cfg is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported provider/collection for this converter. "
+                "Ensure bands.yml has a matching config and provider is copernicus/usgs."
+            ),
+        )
+
+    reader = (
+        Sentinel2Reader(collection_cfg, prefetch=True)
+        if payload.provider == "copernicus"
+        else LandsatReader(collection_cfg, prefetch=True)
     )
 
     try:
-        if payload.provider == "usgs":
-            normalized_collection = payload.collection.strip().lower()
-            if normalized_collection not in USGS_ALLOWED_COLLECTIONS:
-                raise ConversionError(
-                    "Unsupported USGS collection for this project. "
-                    f"Expected one of: {', '.join(sorted(USGS_ALLOWED_COLLECTIONS))}."
-                )
-            dataset, summary = build_landsat_dataset(
-                raw_uri=payload.raw_uri,
-                provider=payload.provider,
-                collection=normalized_collection,
-                scene_id=payload.scene_id,
-            )
-        elif payload.provider == "copernicus":
-            normalized_collection = payload.collection.strip().upper()
-            if not any(normalized_collection.startswith(prefix) for prefix in COPERNICUS_ALLOWED_PREFIXES):
-                raise ConversionError(
-                    "Unsupported Copernicus collection for this project. "
-                    "Only SENTINEL-1 and SENTINEL-2 are supported."
-                )
-            dataset, summary = build_copernicus_dataset(
-                raw_uri=payload.raw_uri,
-                provider=payload.provider,
-                collection=normalized_collection,
-                scene_id=payload.scene_id,
-            )
-        else:
-            raise ConversionError(
-                "Unsupported conversion request. Expected a USGS Landsat or Copernicus product."
-            )
-        written_uri = write_dataset_to_zarr(dataset, payload.output_uri)
-    except (LandsatNormalizationError, ConversionError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except (LandsatDependencyError, ConversionDependencyError) as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        dataset = reader.read(payload.raw_uri)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Normalization failed: {exc}") from exc
 
-    dataset_summary = summarize_dataset(
-        dataset,
-        data_family=str(summary.get("data_family", "unknown")),
-        zarr_uri=written_uri,
-    )
+    # Optionally stack/appends could be added; here we write a single dataset
+    writer = ZarrWriter()
+    try:
+        writer.write(dataset, payload.output_uri, mode="w")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Zarr write failed: {exc}") from exc
+
+    # Build response summary
+    bands = dataset["bands"]
+    summary = {
+        "provider": payload.provider,
+        "collection": payload.collection,
+        "scene_id": payload.scene_id,
+        "product_id": dataset.attrs.get("product_id", payload.scene_id),
+        "data_family": dataset.attrs.get("data_family", "unknown"),
+        "original_path": dataset.attrs.get("original_path", payload.raw_uri),
+        "band_order": [str(b) for b in bands.coords["band"].values.tolist()],
+        "grid": {
+            "height": int(bands.sizes.get("y", 0)),
+            "width": int(bands.sizes.get("x", 0)),
+            "crs": str(bands.rio.crs) if hasattr(bands, "rio") else None,
+        },
+    }
 
     return ConvertResponse(
         job_id=payload.job_id,
@@ -161,11 +177,11 @@ def convert(payload: ConvertRequest) -> ConvertResponse:
             "Raw product converted into an x/y band time Zarr dataset and written successfully."
         ),
         accepted_at=datetime.now(timezone.utc).isoformat(),
-        zarr_uri=written_uri,
+        zarr_uri=payload.output_uri,
         data_family=str(summary.get("data_family", "unknown")),
-        band_names=list(dataset_summary["band_names"]),
-        dimensions=list(dataset_summary["dimensions"]),
-        normalization_summary={**summary, "zarr_summary": dataset_summary},
+        band_names=[str(b) for b in bands.coords["band"].values.tolist()],
+        dimensions=list(bands.dims),
+        normalization_summary=summary,
     )
 
 
