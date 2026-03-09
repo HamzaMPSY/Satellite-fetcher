@@ -20,6 +20,7 @@ class CollectionConfig:
     reference_band_order: list[str]
     subdir_filter: str | None = None
     extensions: set[str] | None = None
+    product_types: list[str] | None = None
 
 
 class ConfigLoader:
@@ -49,6 +50,7 @@ class ConfigLoader:
                 reference_band_order=list(value.get("reference_band_order", [])),
                 subdir_filter=value.get("subdir_filter"),
                 extensions=set(value.get("extensions", [])) or None,
+                product_types=list(value.get("product_types", [])) or None,
             )
         return collections
 

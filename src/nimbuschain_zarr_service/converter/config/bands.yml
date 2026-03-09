@@ -1,4 +1,5 @@
 sentinel2_l2a:
+  product_types: ["S2MSI2A"]
   reference_band_order: ["B04", "red"]
   subdir_filter: "IMG_DATA"
   extensions: [".jp2", ".tif", ".tiff"]
@@ -44,6 +45,7 @@ sentinel2_l2a:
       categorical: false
 
 landsat_l2:
+  product_types: ["LANDSAT_5_C2_L2", "LANDSAT_7_C2_L2", "LANDSAT_8_C2_L2", "LANDSAT_9_C2_L2"]
   reference_band_order: ["red", "B04", "B4"]
   extensions: [".tif", ".tiff"]
   bands:

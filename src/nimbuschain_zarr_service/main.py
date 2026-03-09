@@ -22,8 +22,51 @@ from nimbuschain_zarr_service.converter.config import CollectionConfig
 
 APP_VERSION = "0.1.0"
 DEFAULT_PORT = 8010
-COPERNICUS_ALLOWED_PREFIXES = ("SENTINEL-1", "SENTINEL-2")
-USGS_ALLOWED_COLLECTIONS = {"landsat_ot_c2_l1", "landsat_ot_c2_l2"}
+CONFIG_PATH = Path(__file__).resolve().parent / "converter" / "config" / "bands.yml"
+
+
+def _health_capabilities() -> dict[str, object]:
+    """Derive supported providers/collections/product-types strictly from bands.yml keys.
+
+    - Provider is inferred from the collection key prefix only (no hardcoded products).
+      * keys starting with "sentinel" -> copernicus
+      * keys starting with "landsat"  -> usgs
+      * otherwise grouped under "unknown"
+    - Product types are left empty lists unless the YAML encodes them (not present today).
+    """
+    loader = ConfigLoader(CONFIG_PATH)
+    collections = loader.load()
+
+    supported_collections: dict[str, list[str]] = {"copernicus": [], "usgs": [], "unknown": []}
+    supported_product_types: dict[str, list[str]] = {}
+    families: set[str] = set()
+
+    for key, collection_cfg in collections.items():
+        lower = key.lower()
+        if lower.startswith("sentinel"):
+            supported_collections["copernicus"].append(key)
+            families.add("optical")
+        elif lower.startswith("landsat"):
+            supported_collections["usgs"].append(key)
+            families.add("optical")
+        else:
+            supported_collections["unknown"].append(key)
+            families.add("unknown")
+
+        # Product types are read from bands.yml; default to empty if not provided.
+        supported_product_types[key] = collection_cfg.product_types or []
+
+    supported_collections = {k: v for k, v in supported_collections.items() if v}
+
+    if not families:
+        families.add("unknown")
+
+    return {
+        "conversion_ready": bool(collections),
+        "supported_families": sorted(families) if families else ["unknown"],
+        "supported_collections": supported_collections,
+        "supported_product_types": supported_product_types,
+    }
 
 
 class ConvertRequest(BaseModel):
@@ -75,23 +118,16 @@ def root() -> dict[str, str]:
 
 @app.get("/health")
 def health() -> dict[str, object]:
+    caps = _health_capabilities()
+    status = "ok"
+    if not caps.get("conversion_ready") or not caps.get("supported_collections"):
+        status = "degraded"
     return {
         "service": "zarr-converter-service",
-        "status": "ok",
+        "status": status,
         "version": APP_VERSION,
-        "conversion_ready": True,
-        "supported_families": ["optical", "sar"],
-        "supported_collections": {
-            "copernicus": list(COPERNICUS_ALLOWED_PREFIXES),
-            "usgs": sorted(USGS_ALLOWED_COLLECTIONS),
-        },
-        "supported_product_types": {
-            "SENTINEL-1": ["RAW", "GRD", "SLC", "IW_SLC__1S"],
-            "SENTINEL-2": ["S2MSI1C", "S2MSI2A"],
-            "landsat_ot_c2_l1": ["L1TP", "L1GT", "L1GS"],
-            "landsat_ot_c2_l2": ["L2SP", "L2SR"],
-        },
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        **caps,
     }
 
 
