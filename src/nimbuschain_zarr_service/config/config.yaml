@@ -1,0 +1,76 @@
+resolution_policy:
+  collections:
+    SENTINEL-2:
+      strategy: finest_native_grid
+      reference_band: red
+      target_pixel_size_meters: 10.0
+    SENTINEL-1:
+      strategy: native_reference_grid
+      reference_band: first_available_polarization
+      target_pixel_size_meters:
+    landsat_ot_c2_l1:
+      strategy: finest_native_grid
+      reference_band: red
+      target_pixel_size_meters: 30.0
+    landsat_ot_c2_l2:
+      strategy: finest_native_grid
+      reference_band: red
+      target_pixel_size_meters: 30.0
+
+copernicus:
+  SENTINEL-2:
+    S2MSI1C:
+      scene_tokens: [MSIL1C]
+      file_extension: .SAFE
+      ext: jp2
+      subdir_filter: IMG_DATA
+      bands_map:
+        empty: [B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B10, B11, B12]
+      categorical_bands: []
+    S2MSI2A:
+      scene_tokens: [MSIL2A]
+      file_extension: .SAFE
+      ext: jp2
+      subdir_filter: IMG_DATA
+      bands_map:
+        R10m: [B02, B03, B04, B08]
+        R20m: [B01, B05, B06, B07, B8A, B11, B12, SCL]
+        R60m: [B09, B10]
+      categorical_bands: [SCL]
+  SENTINEL-1:
+    RAW:
+      scene_tokens: [RAW]
+      measurement_exts: [tif, tiff, dat]
+      polarizations: [VV, VH, HH, HV]
+    GRD:
+      scene_tokens: [GRD]
+      measurement_exts: [tif, tiff]
+      polarizations: [VV, VH, HH, HV]
+    SLC:
+      scene_tokens: [SLC]
+      measurement_exts: [tif, tiff]
+      polarizations: [VV, VH, HH, HV]
+    IW_SLC__1S:
+      scene_tokens: [SLC]
+      mode_tokens: [IW]
+      measurement_exts: [tif, tiff]
+      polarizations: [VV, VH, HH, HV]
+
+usgs:
+  landsat_ot_c2_l1:
+    L1TP:
+      ext: TIF
+      band_codes: [B1, B2, B3, B4, B5, B6, B7, B10, B11]
+    L1GT:
+      ext: TIF
+      band_codes: [B1, B2, B3, B4, B5, B6, B7, B10, B11]
+    L1GS:
+      ext: TIF
+      band_codes: [B1, B2, B3, B4, B5, B6, B7, B10, B11]
+  landsat_ot_c2_l2:
+    L2SP:
+      ext: TIF
+      band_codes: [B1, B2, B3, B4, B5, B6, B7, B10]
+    L2SR:
+      ext: TIF
+      band_codes: [B1, B2, B3, B4, B5, B6, B7]

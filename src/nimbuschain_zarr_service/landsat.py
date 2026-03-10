@@ -5,11 +5,17 @@ from pathlib import Path
 from typing import Any
 import re
 
+from nimbuschain_zarr_service.config_loader import (
+    get_landsat_product_spec,
+    target_pixel_size_for,
+    supported_product_types,
+)
 from nimbuschain_zarr_service.core import (
     ConversionDependencyError,
     ConversionError,
     build_standard_dataset,
     load_aligned_raster_stack,
+    stream_raster_stack_to_zarr,
     prepare_source,
 )
 from nimbuschain_zarr_service.schema import CORE_BANDS
@@ -37,50 +43,21 @@ LANDSAT_CANONICAL_BANDS = (
 LANDSAT_OPTIONAL_BANDS = tuple(
     band for band in LANDSAT_CANONICAL_BANDS if band not in CORE_BANDS
 )
-_BAND_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
-    "coastal": (
-        re.compile(r"_SR_B1\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B1\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
-    "blue": (
-        re.compile(r"_SR_B2\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B2\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
-    "green": (
-        re.compile(r"_SR_B3\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B3\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
-    "red": (
-        re.compile(r"_SR_B4\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B4\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
-    "nir": (
-        re.compile(r"_SR_B5\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B5\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
-    "swir1": (
-        re.compile(r"_SR_B6\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B6\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
-    "swir2": (
-        re.compile(r"_SR_B7\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B7\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
-    "thermal1": (
-        re.compile(r"_ST_B10\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B10\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
-    "thermal2": (
-        re.compile(r"_ST_B11\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(r"_B11\.(?:TIF|TIFF)$", re.IGNORECASE),
-    ),
+_LANDSAT_CANONICAL_BY_CODE = {
+    "B1": "coastal",
+    "B2": "blue",
+    "B3": "green",
+    "B4": "red",
+    "B5": "nir",
+    "B6": "swir1",
+    "B7": "swir2",
+    "B10": "thermal1",
+    "B11": "thermal2",
 }
 _MTL_NAME_RE = re.compile(r"_MTL\.txt$", re.IGNORECASE)
 _MTL_KV_RE = re.compile(r"^\s*([A-Z0-9_]+)\s=\s(.+?)\s*$")
 _LANDSAT_PRODUCT_TYPE_RE = re.compile(r"_((?:L1|L2)[A-Z0-9]{2})_", re.IGNORECASE)
 _LANDSAT_SPACECRAFT_RE = re.compile(r"^L[A-Z]?0?([0-9]{2})_")
-_LANDSAT_L1_ALLOWED = {"L1TP", "L1GT", "L1GS"}
-_LANDSAT_L2_ALLOWED = {"L2SP", "L2SR"}
 
 
 def build_landsat_dataset(
@@ -89,18 +66,12 @@ def build_landsat_dataset(
     provider: str,
     collection: str,
     scene_id: str,
+    product_type: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     extracted = prepare_source(raw_uri, label="landsat")
     try:
         files = _discover_files(extracted.root)
         mtl_values = _parse_mtl_file(files.get("mtl"))
-        band_paths = _select_band_paths(files["tifs"])
-        ordered_bands = [band for band in LANDSAT_CANONICAL_BANDS if band in band_paths]
-        stack = load_aligned_raster_stack(
-            band_paths,
-            ordered_bands=ordered_bands,
-            reference_band="red",
-        )
         normalized_scene_id = str(
             mtl_values.get("LANDSAT_SCENE_ID")
             or mtl_values.get("LANDSAT_PRODUCT_ID")
@@ -110,10 +81,23 @@ def build_landsat_dataset(
             mtl_values.get("LANDSAT_PRODUCT_ID")
             or normalized_scene_id
         )
-        product_type = _landsat_product_type(product_id)
-        _validate_landsat_collection_product_type(collection=collection, product_type=product_type)
+        resolved_product_type = _landsat_product_type(product_id, requested=product_type)
+        _validate_landsat_collection_product_type(collection=collection, product_type=resolved_product_type)
+        band_paths = _select_band_paths(
+            files["tifs"],
+            collection=collection,
+            product_type=resolved_product_type,
+        )
+        ordered_bands = [band for band in LANDSAT_CANONICAL_BANDS if band in band_paths]
+        target_pixel_size = target_pixel_size_for(provider, collection)
+        stack = load_aligned_raster_stack(
+            band_paths,
+            ordered_bands=ordered_bands,
+            reference_band="red",
+            target_pixel_size=target_pixel_size,
+        )
         satellite_code = _landsat_satellite_code(product_id)
-        product_type_short = _landsat_product_type_short(satellite_code, product_type)
+        product_type_short = _landsat_product_type_short(satellite_code, resolved_product_type)
         product_level = _landsat_product_level(collection=collection, product_id=product_id)
         acquisition = _build_acquisition_datetime(mtl_values)
         dataset = build_standard_dataset(
@@ -125,7 +109,7 @@ def build_landsat_dataset(
                 "collection": collection,
                 "scene_id": normalized_scene_id,
                 "product_id": product_id,
-                "product_type": product_type,
+                "product_type": resolved_product_type,
                 "product_type_short": product_type_short,
                 "satellite": satellite_code,
                 "product_level": product_level,
@@ -142,7 +126,7 @@ def build_landsat_dataset(
             "collection": collection,
             "scene_id": normalized_scene_id,
             "product_id": product_id,
-            "product_type": product_type,
+            "product_type": resolved_product_type,
             "product_type_short": product_type_short,
             "satellite": satellite_code,
             "product_level": product_level,
@@ -155,6 +139,7 @@ def build_landsat_dataset(
                 band for band in LANDSAT_OPTIONAL_BANDS if band in band_paths
             ],
             "normalized_band_order": stack["band_names"],
+            "resolution_policy_meters": target_pixel_size,
             "band_sources": {
                 band: (
                     str(path.relative_to(extracted.root))
@@ -202,14 +187,138 @@ def normalize_landsat_source(
     provider: str,
     collection: str,
     scene_id: str,
+    product_type: str | None = None,
 ) -> dict[str, Any]:
     _, summary = build_landsat_dataset(
         raw_uri=raw_uri,
         provider=provider,
         collection=collection,
         scene_id=scene_id,
+        product_type=product_type,
     )
     return summary
+
+
+def convert_landsat_to_zarr(
+    *,
+    raw_uri: str,
+    provider: str,
+    collection: str,
+    scene_id: str,
+    output_uri: str,
+    product_type: str | None = None,
+) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    extracted = prepare_source(raw_uri, label="landsat")
+    try:
+        files = _discover_files(extracted.root)
+        mtl_values = _parse_mtl_file(files.get("mtl"))
+        normalized_scene_id = str(
+            mtl_values.get("LANDSAT_SCENE_ID")
+            or mtl_values.get("LANDSAT_PRODUCT_ID")
+            or scene_id
+        )
+        product_id = str(
+            mtl_values.get("LANDSAT_PRODUCT_ID")
+            or normalized_scene_id
+        )
+        resolved_product_type = _landsat_product_type(product_id, requested=product_type)
+        _validate_landsat_collection_product_type(collection=collection, product_type=resolved_product_type)
+        band_paths = _select_band_paths(
+            files["tifs"],
+            collection=collection,
+            product_type=resolved_product_type,
+        )
+        ordered_bands = [band for band in LANDSAT_CANONICAL_BANDS if band in band_paths]
+        satellite_code = _landsat_satellite_code(product_id)
+        product_type_short = _landsat_product_type_short(satellite_code, resolved_product_type)
+        product_level = _landsat_product_level(collection=collection, product_id=product_id)
+        acquisition = _build_acquisition_datetime(mtl_values)
+        target_pixel_size = target_pixel_size_for(provider, collection)
+        metadata = {
+            "provider": provider,
+            "collection": collection,
+            "scene_id": normalized_scene_id,
+            "product_id": product_id,
+            "product_type": resolved_product_type,
+            "product_type_short": product_type_short,
+            "satellite": satellite_code,
+            "product_level": product_level,
+            "data_family": "optical",
+            "source_uri": str(extracted.raw_path),
+        }
+        written_uri, dataset_summary = stream_raster_stack_to_zarr(
+            band_paths=band_paths,
+            ordered_bands=ordered_bands,
+            output_uri=output_uri,
+            metadata=metadata,
+            acquisition_datetime=acquisition,
+            reference_band="red",
+            target_pixel_size=target_pixel_size,
+        )
+        grid = {
+            "height": int(dataset_summary["shape"][2]),
+            "width": int(dataset_summary["shape"][3]),
+            "dtype": str(dataset_summary.get("dtype") or "unknown"),
+            "crs": dataset_summary.get("crs"),
+            "transform": dataset_summary.get("transform"),
+            "pixel_size": dataset_summary.get("pixel_size"),
+            "reference_band": "red",
+        }
+        summary = {
+            "provider": provider,
+            "collection": collection,
+            "scene_id": normalized_scene_id,
+            "product_id": product_id,
+            "product_type": resolved_product_type,
+            "product_type_short": product_type_short,
+            "satellite": satellite_code,
+            "product_level": product_level,
+            "data_family": "optical",
+            "source_kind": extracted.source_kind,
+            "raw_path": str(extracted.raw_path),
+            "canonical_bands": list(LANDSAT_CANONICAL_BANDS),
+            "required_core_bands": list(CORE_BANDS),
+            "optional_bands_present": [
+                band for band in LANDSAT_OPTIONAL_BANDS if band in band_paths
+            ],
+            "normalized_band_order": list(dataset_summary["band_names"]),
+            "resolution_policy_meters": target_pixel_size,
+            "band_sources": {
+                band: (
+                    str(path.relative_to(extracted.root))
+                    if extracted.cleanup is not None
+                    else str(path)
+                )
+                for band, path in band_paths.items()
+            },
+            "band_resampling": {},
+            "band_native_pixel_size": {},
+            "acquisition_datetime": acquisition,
+            "grid": grid,
+            "validation": {
+                "same_grid": True,
+                "missing_optional_bands": [
+                    band for band in LANDSAT_OPTIONAL_BANDS if band not in band_paths
+                ],
+            },
+        }
+        # Extract per-band metadata from the consolidated store attrs written by the streaming path.
+        band_metadata = dataset_summary.get("band_metadata")
+        if isinstance(band_metadata, dict):
+            summary["band_resampling"] = {
+                band: band_metadata.get(band, {}).get("resampled_to_reference")
+                for band in dataset_summary["band_names"]
+            }
+            summary["band_native_pixel_size"] = {
+                band: band_metadata.get(band, {}).get("source_pixel_size")
+                for band in dataset_summary["band_names"]
+            }
+        if normalized_scene_id != scene_id:
+            summary["requested_scene_id"] = scene_id
+        return written_uri, "optical", summary, dataset_summary
+    finally:
+        if extracted.cleanup is not None:
+            extracted.cleanup.cleanup()
 
 
 def _discover_files(root: Path) -> dict[str, Any]:
@@ -229,10 +338,24 @@ def _discover_files(root: Path) -> dict[str, Any]:
     return {"tifs": tifs, "mtl": mtl}
 
 
-def _select_band_paths(tifs: list[Path]) -> dict[str, Path]:
+def _select_band_paths(
+    tifs: list[Path],
+    *,
+    collection: str,
+    product_type: str,
+) -> dict[str, Path]:
+    spec = get_landsat_product_spec(collection, product_type)
+    if not spec:
+        raise LandsatNormalizationError(
+            f"Unsupported Landsat collection/product type: {collection} / {product_type}"
+        )
+
     band_paths: dict[str, Path] = {}
-    for canonical_band, patterns in _BAND_PATTERNS.items():
-        for pattern in patterns:
+    for band_code in list(spec.get("band_codes") or []):
+        canonical_band = _LANDSAT_CANONICAL_BY_CODE.get(str(band_code))
+        if not canonical_band:
+            continue
+        for pattern in _landsat_code_patterns(str(band_code)):
             match = next((path for path in tifs if pattern.search(path.name)), None)
             if match is not None:
                 band_paths[canonical_band] = match
@@ -245,6 +368,15 @@ def _select_band_paths(tifs: list[Path]) -> dict[str, Path]:
             + ", ".join(missing_core)
         )
     return band_paths
+
+
+def _landsat_code_patterns(code: str) -> tuple[re.Pattern[str], ...]:
+    escaped = re.escape(code)
+    return (
+        re.compile(rf"_SR_{escaped}\.(?:TIF|TIFF)$", re.IGNORECASE),
+        re.compile(rf"_ST_{escaped}\.(?:TIF|TIFF)$", re.IGNORECASE),
+        re.compile(rf"_{escaped}\.(?:TIF|TIFF)$", re.IGNORECASE),
+    )
 
 
 def _parse_mtl_file(mtl_path: Path | None) -> dict[str, str]:
@@ -274,7 +406,10 @@ def _build_acquisition_datetime(values: dict[str, str]) -> str | None:
     return parsed.replace(tzinfo=timezone.utc).isoformat()
 
 
-def _landsat_product_type(product_id: str) -> str:
+def _landsat_product_type(product_id: str, *, requested: str | None = None) -> str:
+    requested_upper = str(requested or "").strip().upper()
+    if requested_upper:
+        return requested_upper
     match = _LANDSAT_PRODUCT_TYPE_RE.search(str(product_id))
     if match:
         return match.group(1).upper()
@@ -317,21 +452,9 @@ def _validate_landsat_collection_product_type(*, collection: str, product_type: 
             "Unable to infer Landsat product type from product id. "
             f"Expected one of L1TP/L1GT/L1GS/L2SP/L2SR."
         )
-    collection_lower = str(collection).lower()
-    if collection_lower.endswith("_l1"):
-        if ptype not in _LANDSAT_L1_ALLOWED:
-            raise LandsatNormalizationError(
-                "Invalid Landsat Level-1 product type for collection landsat_ot_c2_l1. "
-                f"Expected one of: {', '.join(sorted(_LANDSAT_L1_ALLOWED))}. Got: {ptype}."
-            )
-        return
-    if collection_lower.endswith("_l2"):
-        if ptype not in _LANDSAT_L2_ALLOWED:
-            raise LandsatNormalizationError(
-                "Invalid Landsat Level-2 product type for collection landsat_ot_c2_l2. "
-                f"Expected one of: {', '.join(sorted(_LANDSAT_L2_ALLOWED))}. Got: {ptype}."
-            )
-        return
-    raise LandsatNormalizationError(
-        "Unsupported Landsat collection. Expected landsat_ot_c2_l1 or landsat_ot_c2_l2."
-    )
+    allowed = supported_product_types().get(str(collection).lower()) or supported_product_types().get(str(collection)) or []
+    if ptype not in allowed:
+        raise LandsatNormalizationError(
+            f"Invalid Landsat product type for collection {collection}. "
+            f"Expected one of: {', '.join(sorted(allowed))}. Got: {ptype}."
+        )

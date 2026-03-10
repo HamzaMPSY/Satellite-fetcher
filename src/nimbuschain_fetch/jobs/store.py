@@ -12,6 +12,7 @@ class JobListFilters:
     provider: str | None = None
     collection: str | None = None
     product_type: str | None = None
+    worker_id: str | None = None
     job_id_query: str | None = None
     date_from: datetime | None = None
     date_to: datetime | None = None
@@ -93,4 +94,10 @@ class JobStore(Protocol):
         ...
 
     def requeue_stale_running_jobs(self, stale_after_seconds: int) -> list[str]:
+        ...
+
+    def upsert_worker_heartbeat(self, worker_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+    def list_workers(self) -> list[dict[str, Any]]:
         ...

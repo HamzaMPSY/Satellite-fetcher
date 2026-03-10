@@ -51,17 +51,32 @@ def _discover_local_zarr_artifacts(data_dir: Path) -> list[dict[str, Any]]:
             continue
 
         root_meta: dict[str, Any] = {}
+        attributes: dict[str, Any] = {}
+        imagery: dict[str, Any] = {}
         zarr_json_path = store_path / "zarr.json"
         if zarr_json_path.exists():
             try:
                 root_meta = json.loads(zarr_json_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 root_meta = {}
-
-        attributes = root_meta.get("attributes", {}) if isinstance(root_meta, dict) else {}
-        consolidated = root_meta.get("consolidated_metadata", {}) if isinstance(root_meta, dict) else {}
-        nodes = consolidated.get("metadata", {}) if isinstance(consolidated, dict) else {}
-        imagery = nodes.get("imagery", {}) if isinstance(nodes, dict) else {}
+            attributes = root_meta.get("attributes", {}) if isinstance(root_meta, dict) else {}
+            consolidated = root_meta.get("consolidated_metadata", {}) if isinstance(root_meta, dict) else {}
+            nodes = consolidated.get("metadata", {}) if isinstance(consolidated, dict) else {}
+            imagery = nodes.get("imagery", {}) if isinstance(nodes, dict) else {}
+        else:
+            zattrs_path = store_path / ".zattrs"
+            zmetadata_path = store_path / ".zmetadata"
+            if zattrs_path.exists():
+                try:
+                    attributes = json.loads(zattrs_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    attributes = {}
+            if zmetadata_path.exists():
+                try:
+                    zmetadata = json.loads(zmetadata_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    zmetadata = {}
+                imagery = ((zmetadata.get("metadata") or {}).get("imagery/.zarray") or {})
         items.append(
             {
                 "artifact_id": _artifact_id_for_uri(str(store_path)),
@@ -75,12 +90,12 @@ def _discover_local_zarr_artifacts(data_dir: Path) -> list[dict[str, Any]]:
                 "source_job_id": None,
                 "data_family": attributes.get("data_family"),
                 "band_names": list(attributes.get("band_names", [])),
-                "dimensions": list(imagery.get("dimension_names", [])),
+                "dimensions": list(imagery.get("dimension_names", []) or ["time", "band", "y", "x"]),
                 "shape": list(imagery.get("shape", [])),
                 "size_bytes": None,
                 "metadata": {
                     "discovered_local": True,
-                    "zarr_format": root_meta.get("zarr_format"),
+                    "zarr_format": root_meta.get("zarr_format", 2),
                     "crs": attributes.get("crs"),
                     "transform": attributes.get("transform"),
                 },

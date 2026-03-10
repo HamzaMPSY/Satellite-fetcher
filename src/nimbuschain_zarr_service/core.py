@@ -107,10 +107,12 @@ def load_aligned_raster_stack(
     ordered_bands: list[str],
     reference_band: str | None = None,
     categorical_bands: set[str] | None = None,
+    target_pixel_size: float | None = None,
 ) -> dict[str, Any]:
     try:
         import rasterio
         from rasterio.enums import Resampling
+        from rasterio.transform import array_bounds, from_origin
         from rasterio.warp import reproject
     except ImportError as exc:
         raise ConversionDependencyError(
@@ -132,7 +134,17 @@ def load_aligned_raster_stack(
         ref_width = ref_src.width
         ref_crs = ref_src.crs.to_string() if ref_src.crs else None
         ref_transform = ref_src.transform
-        ref_pixel_size = [float(ref_transform.a), float(abs(ref_transform.e))]
+        native_ref_pixel_size = [float(ref_transform.a), float(abs(ref_transform.e))]
+
+        if target_pixel_size is not None:
+            left, bottom, right, top = array_bounds(ref_height, ref_width, ref_transform)
+            resolution = float(target_pixel_size)
+            ref_width = max(1, int(np.ceil((right - left) / resolution)))
+            ref_height = max(1, int(np.ceil((top - bottom) / resolution)))
+            ref_transform = from_origin(left, top, resolution, resolution)
+            ref_pixel_size = [resolution, resolution]
+        else:
+            ref_pixel_size = native_ref_pixel_size
 
         arrays: list[np.ndarray] = []
         available_bands: list[str] = []
@@ -184,7 +196,9 @@ def load_aligned_raster_stack(
                     "source_crs": src_crs,
                     "source_transform": list(src_transform)[:6],
                     "source_pixel_size": src_pixel_size,
+                    "reference_native_pixel_size": native_ref_pixel_size,
                     "reference_pixel_size": ref_pixel_size,
+                    "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
                     "resampled_to_reference": bool(resampled),
                 }
 
@@ -198,6 +212,104 @@ def load_aligned_raster_stack(
         "height": ref_height,
         "width": ref_width,
         "dtype": str(stacked.dtype),
+        "crs": ref_crs,
+        "transform": list(ref_transform)[:6],
+        "pixel_size": ref_pixel_size,
+        "reference_band": ref_name,
+        "band_metadata": band_metadata,
+    }
+
+
+def inspect_aligned_raster_stack(
+    band_paths: dict[str, Path],
+    *,
+    ordered_bands: list[str],
+    reference_band: str | None = None,
+    categorical_bands: set[str] | None = None,
+    target_pixel_size: float | None = None,
+) -> dict[str, Any]:
+    try:
+        import rasterio
+        from rasterio.transform import array_bounds, from_origin
+    except ImportError as exc:
+        raise ConversionDependencyError(
+            "Raster support is not available in the zarr-service runtime "
+            f"({exc}). Ensure rasterio and its system libraries are installed."
+        ) from exc
+
+    categorical_bands = categorical_bands or set()
+
+    if not ordered_bands:
+        raise ConversionError("No bands were selected for raster conversion.")
+
+    ref_name = reference_band if reference_band in band_paths else ordered_bands[0]
+    if ref_name not in band_paths:
+        raise ConversionError(f"Reference band '{ref_name}' is not available.")
+
+    with rasterio.open(band_paths[ref_name]) as ref_src:
+        ref_height = ref_src.height
+        ref_width = ref_src.width
+        ref_crs = ref_src.crs.to_string() if ref_src.crs else None
+        ref_transform = ref_src.transform
+        native_ref_pixel_size = [float(ref_transform.a), float(abs(ref_transform.e))]
+
+        if target_pixel_size is not None:
+            left, bottom, right, top = array_bounds(ref_height, ref_width, ref_transform)
+            resolution = float(target_pixel_size)
+            ref_width = max(1, int(np.ceil((right - left) / resolution)))
+            ref_height = max(1, int(np.ceil((top - bottom) / resolution)))
+            ref_transform = from_origin(left, top, resolution, resolution)
+            ref_pixel_size = [resolution, resolution]
+        else:
+            ref_pixel_size = native_ref_pixel_size
+
+    band_metadata: dict[str, dict[str, Any]] = {}
+    available_bands: list[str] = []
+    dtype_candidates: list[np.dtype[Any]] = []
+    for band_name in ordered_bands:
+        band_path = band_paths.get(band_name)
+        if band_path is None:
+            continue
+        with rasterio.open(band_path) as src:
+            if src.count != 1:
+                raise ConversionError(
+                    f"Band {band_name} is expected to be single-band, got {src.count}."
+                )
+            src_crs = src.crs.to_string() if src.crs else None
+            src_transform = src.transform
+            src_pixel_size = [float(src_transform.a), float(abs(src_transform.e))]
+            resampled = not (
+                src.height == ref_height
+                and src.width == ref_width
+                and src_crs == ref_crs
+                and tuple(src.transform) == tuple(ref_transform)
+            )
+            band_metadata[band_name] = {
+                "path": str(band_path),
+                "dtype": str(src.dtypes[0]),
+                "source_height": int(src.height),
+                "source_width": int(src.width),
+                "source_crs": src_crs,
+                "source_transform": list(src_transform)[:6],
+                "source_pixel_size": src_pixel_size,
+                "reference_native_pixel_size": native_ref_pixel_size,
+                "reference_pixel_size": ref_pixel_size,
+                "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
+                "resampled_to_reference": bool(resampled),
+                "categorical": bool(band_name in categorical_bands),
+            }
+            dtype_candidates.append(np.dtype(src.dtypes[0]))
+            available_bands.append(band_name)
+
+    if not available_bands:
+        raise ConversionError("No valid raster bands were discovered for streaming conversion.")
+
+    common_dtype = np.result_type(*dtype_candidates)
+    return {
+        "band_names": available_bands,
+        "height": ref_height,
+        "width": ref_width,
+        "dtype": str(common_dtype),
         "crs": ref_crs,
         "transform": list(ref_transform)[:6],
         "pixel_size": ref_pixel_size,
@@ -284,6 +396,129 @@ def write_dataset_to_zarr(dataset: xr.Dataset, output_uri: str) -> str:
     return str(output_path)
 
 
+def stream_raster_stack_to_zarr(
+    *,
+    band_paths: dict[str, Path],
+    ordered_bands: list[str],
+    output_uri: str,
+    metadata: dict[str, Any],
+    acquisition_datetime: str | None,
+    reference_band: str | None = None,
+    categorical_bands: set[str] | None = None,
+    target_pixel_size: float | None = None,
+) -> tuple[str, dict[str, Any]]:
+    try:
+        import rasterio
+        from rasterio.enums import Resampling
+        from rasterio.transform import Affine
+        from rasterio.vrt import WarpedVRT
+        from rasterio.windows import Window
+        import zarr
+        from numcodecs import Blosc
+    except ImportError as exc:
+        raise ConversionDependencyError(
+            "Streaming raster-to-zarr conversion dependencies are unavailable "
+            f"({exc}). Ensure rasterio, zarr, and numcodecs are installed."
+        ) from exc
+
+    stack = inspect_aligned_raster_stack(
+        band_paths,
+        ordered_bands=ordered_bands,
+        reference_band=reference_band,
+        categorical_bands=categorical_bands,
+        target_pixel_size=target_pixel_size,
+    )
+    band_names = list(stack["band_names"])
+    height = int(stack["height"])
+    width = int(stack["width"])
+    transform = stack["transform"]
+    affine_transform = Affine(*transform)
+    crs = stack["crs"]
+    band_metadata = dict(stack["band_metadata"])
+    chunk_spec = ChunkShape()
+    chunks = (
+        min(chunk_spec.time, 1),
+        min(chunk_spec.band, len(band_names)),
+        min(chunk_spec.y, height),
+        min(chunk_spec.x, width),
+    )
+    output_path = resolve_output_path(output_uri)
+    if output_path.exists() and output_path.is_file():
+        raise ConversionError(f"Output path is a file, expected a directory: {output_path}")
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    group_attrs = dict(metadata)
+    group_attrs["band_names"] = band_names
+    group_attrs["zarr_format_version"] = ZARR_FORMAT_VERSION
+    root = zarr.open_group(output_path, mode="w", zarr_format=2)
+    root.attrs.update(group_attrs)
+
+    compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
+    imagery = root.create_array(
+        "imagery",
+        shape=(1, len(band_names), height, width),
+        chunks=chunks,
+        dtype=np.dtype(stack["dtype"]),
+        compressor=compressor,
+    )
+    root.create_array("band", data=np.asarray(band_names, dtype=f"<U{max(len(v) for v in band_names)}"))
+    timestamp = _coerce_timestamp(acquisition_datetime)
+    root.create_array("time", data=np.asarray([timestamp.isoformat()], dtype="<U32"))
+    x_coords, y_coords = _derive_spatial_coords(transform, width=width, height=height)
+    if x_coords is not None and y_coords is not None:
+        root.create_array("x", data=x_coords, chunks=(min(chunk_spec.x, width),))
+        root.create_array("y", data=y_coords, chunks=(min(chunk_spec.y, height),))
+
+    for band_index, band_name in enumerate(band_names):
+        band_path = Path(band_paths[band_name])
+        band_info = band_metadata[band_name]
+        with rasterio.open(band_path) as src:
+            read_handle: Any = src
+            vrt: Any = None
+            if band_info["resampled_to_reference"]:
+                resampling = (
+                    Resampling.nearest if band_info.get("categorical") else Resampling.bilinear
+                )
+                vrt = WarpedVRT(
+                    src,
+                    crs=crs,
+                    transform=affine_transform,
+                    width=width,
+                    height=height,
+                    resampling=resampling,
+                )
+                read_handle = vrt
+            try:
+                for y0 in range(0, height, chunks[2]):
+                    block_h = min(chunks[2], height - y0)
+                    for x0 in range(0, width, chunks[3]):
+                        block_w = min(chunks[3], width - x0)
+                        window = Window(x0, y0, block_w, block_h)
+                        block = read_handle.read(1, window=window)
+                        imagery[0, band_index, y0 : y0 + block_h, x0 : x0 + block_w] = block
+            finally:
+                if vrt is not None:
+                    vrt.close()
+
+    zarr.consolidate_metadata(output_path)
+    dataset_summary = {
+        "data_family": str(metadata.get("data_family", "unknown")),
+        "zarr_uri": str(output_path),
+        "dimensions": ["time", "band", "y", "x"],
+        "shape": [1, len(band_names), height, width],
+        "band_names": band_names,
+        "time_values": [timestamp.isoformat()],
+        "dtype": str(np.dtype(stack["dtype"])),
+        "crs": crs,
+        "transform": transform,
+        "pixel_size": stack["pixel_size"],
+        "band_metadata": band_metadata,
+    }
+    return str(output_path), dataset_summary
+
+
 def resolve_output_path(output_uri: str) -> Path:
     if output_uri.startswith("file://"):
         parsed = urlparse(output_uri)
@@ -311,6 +546,7 @@ def summarize_dataset(dataset: "xr.Dataset", *, data_family: str, zarr_uri: str)
         "time_values": [str(item) for item in imagery.coords["time"].values.tolist()],
         "crs": dataset.attrs.get("crs"),
         "transform": dataset.attrs.get("transform"),
+        "pixel_size": dataset.attrs.get("reference_pixel_size"),
     }
 
 

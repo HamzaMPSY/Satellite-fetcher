@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
+import socket
 import time
 import uuid
 from collections.abc import Callable
@@ -75,7 +77,11 @@ class NimbusFetcher:
             else None
         )
         self._poller_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
         self._worker_id = uuid.uuid4().hex
+        self._worker_hostname = socket.gethostname()
+        self._worker_pid = os.getpid()
+        self._worker_started_at = datetime.now(timezone.utc).isoformat()
         self._cancel_check_cache: dict[str, tuple[float, bool]] = {}
         self._started = False
 
@@ -87,6 +93,11 @@ class NimbusFetcher:
             self.store.requeue_incomplete_jobs()
             await self._executor.start()
             await self._enqueue_queued_jobs()
+            self._publish_worker_heartbeat()
+            self._heartbeat_task = asyncio.create_task(
+                self._worker_heartbeat_loop(),
+                name="nimbus-worker-heartbeat",
+            )
             self._poller_task = asyncio.create_task(
                 self._monitor_queued_jobs_loop(),
                 name="nimbus-queue-poller",
@@ -103,6 +114,13 @@ class NimbusFetcher:
             except asyncio.CancelledError:
                 pass
             self._poller_task = None
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
         if self._executor is not None:
             await self._executor.stop()
         self._started = False
@@ -271,6 +289,11 @@ class NimbusFetcher:
             await self._enqueue_queued_jobs()
             await anyio.sleep(float(self.settings.nimbus_queue_poll_seconds))
 
+    async def _worker_heartbeat_loop(self) -> None:
+        while True:
+            self._publish_worker_heartbeat()
+            await anyio.sleep(float(self.settings.nimbus_worker_heartbeat_seconds))
+
     async def _enqueue_queued_jobs(self) -> None:
         if self._executor is None:
             return
@@ -279,6 +302,102 @@ class NimbusFetcher:
         )
         for row in queued:
             await self._executor.submit(str(row["job_id"]))
+
+    def get_worker_status(self) -> dict[str, Any]:
+        workers = list(self.store.list_workers())
+        now = datetime.now(timezone.utc)
+        stale_after = max(5, int(self.settings.nimbus_worker_stale_seconds))
+        alive_workers: list[dict[str, Any]] = []
+        stale_workers: list[dict[str, Any]] = []
+
+        running_rows, running_total = self.store.list_jobs(
+            JobListFilters(
+                states=(JobState.running.value, JobState.cancel_requested.value),
+                page=1,
+                page_size=max(1000, self.settings.nimbus_max_jobs * 20),
+            )
+        )
+        queued_rows, queued_total = self.store.list_jobs(
+            JobListFilters(
+                state=JobState.queued.value,
+                page=1,
+                page_size=1,
+            )
+        )
+        _ = queued_rows
+
+        running_by_worker: dict[str, int] = {}
+        cancel_requested_by_worker: dict[str, int] = {}
+        for row in running_rows:
+            worker_id = str(row.get("worker_id") or "").strip()
+            if not worker_id:
+                continue
+            state = str(row.get("state") or "").strip().lower()
+            if state == JobState.cancel_requested.value:
+                cancel_requested_by_worker[worker_id] = cancel_requested_by_worker.get(worker_id, 0) + 1
+            else:
+                running_by_worker[worker_id] = running_by_worker.get(worker_id, 0) + 1
+
+        worker_payloads: list[dict[str, Any]] = []
+        capacity_total = 0
+        capacity_used = 0
+
+        for worker in workers:
+            last_seen = self._parse_iso(worker.get("last_seen_at"))
+            age_seconds = None
+            is_alive = False
+            if last_seen is not None:
+                age_seconds = max(0.0, (now - last_seen).total_seconds())
+                is_alive = age_seconds <= stale_after
+            worker_id = str(worker.get("worker_id") or "")
+            running_count = int(running_by_worker.get(worker_id, worker.get("active_running_jobs", 0) or 0))
+            cancel_requested_count = int(
+                cancel_requested_by_worker.get(
+                    worker_id,
+                    worker.get("active_cancel_requested_jobs", 0) or 0,
+                )
+            )
+            max_concurrent = max(1, int(worker.get("max_concurrent_jobs", 1) or 1))
+            worker_capacity_used = running_count + cancel_requested_count
+            capacity_total += max_concurrent
+            capacity_used += min(max_concurrent, worker_capacity_used)
+            item = {
+                **worker,
+                "status": "alive" if is_alive else "stale",
+                "age_seconds": age_seconds,
+                "active_running_jobs": running_count,
+                "active_cancel_requested_jobs": cancel_requested_count,
+                "available_slots": max(0, max_concurrent - worker_capacity_used),
+            }
+            worker_payloads.append(item)
+            if is_alive:
+                alive_workers.append(item)
+            else:
+                stale_workers.append(item)
+
+        capacity_available = max(0, capacity_total - capacity_used)
+        can_accept_work = bool(alive_workers) and capacity_available > 0
+        ready = bool(alive_workers)
+        status = "ready" if ready else "not_ready"
+        if ready and not can_accept_work:
+            status = "saturated"
+
+        return {
+            "status": status,
+            "ready": ready,
+            "timestamp": now.isoformat(),
+            "worker_stale_seconds": stale_after,
+            "workers_alive": len(alive_workers),
+            "workers_stale": len(stale_workers),
+            "workers_total": len(worker_payloads),
+            "queued_jobs": int(queued_total),
+            "running_jobs": int(running_total),
+            "capacity_total": capacity_total,
+            "capacity_used": capacity_used,
+            "capacity_available": capacity_available,
+            "can_accept_work": can_accept_work,
+            "workers": worker_payloads,
+        }
 
     def _is_job_cancel_requested(self, job_id: str) -> bool:
         now = time.monotonic()
@@ -611,3 +730,53 @@ class NimbusFetcher:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _publish_worker_heartbeat(self) -> dict[str, Any] | None:
+        if not self._execution_enabled:
+            return None
+        running_rows, running_total = self.store.list_jobs(
+            JobListFilters(
+                states=(JobState.running.value,),
+                worker_id=self._worker_id,
+                page=1,
+                page_size=max(1, self.settings.nimbus_max_jobs * 2),
+            )
+        )
+        cancel_rows, cancel_total = self.store.list_jobs(
+            JobListFilters(
+                states=(JobState.cancel_requested.value,),
+                worker_id=self._worker_id,
+                page=1,
+                page_size=max(1, self.settings.nimbus_max_jobs * 2),
+            )
+        )
+        queued_rows, queued_total = self.store.list_jobs(
+            JobListFilters(
+                state=JobState.queued.value,
+                page=1,
+                page_size=1,
+            )
+        )
+        _ = running_rows, cancel_rows, queued_rows
+        return self.store.upsert_worker_heartbeat(
+            self._worker_id,
+            {
+                "runtime_role": self._runtime_role,
+                "execution_enabled": self._execution_enabled,
+                "max_concurrent_jobs": self.settings.nimbus_max_jobs,
+                "queue_poll_seconds": self.settings.nimbus_queue_poll_seconds,
+                "heartbeat_interval_seconds": self.settings.nimbus_worker_heartbeat_seconds,
+                "provider_limits": self.settings.provider_limits_map,
+                "hostname": self._worker_hostname,
+                "pid": self._worker_pid,
+                "active_running_jobs": running_total,
+                "active_cancel_requested_jobs": cancel_total,
+                "queue_backlog": queued_total,
+                "started_at": self._worker_started_at,
+                "last_seen_at": self._now_iso(),
+                "metadata": {
+                    "runtime_role": self._runtime_role,
+                    "executor_present": self._executor is not None,
+                },
+            },
+        )

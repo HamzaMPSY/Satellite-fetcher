@@ -33,6 +33,7 @@ class MongoJobStore:
         self._events = self._db.job_events
         self._results = self._db.job_results
         self._artifacts = self._db.artifacts
+        self._workers = self._db.workers
         self._counters = self._db.counters
         self._wait_until_ready(timeout_seconds=60)
         self._init_schema()
@@ -75,6 +76,8 @@ class MongoJobStore:
         self._artifacts.create_index([("provider", ASCENDING), ("updated_at", DESCENDING)])
         self._artifacts.create_index([("collection", ASCENDING), ("updated_at", DESCENDING)])
         self._artifacts.create_index([("scene_id", ASCENDING), ("updated_at", DESCENDING)])
+        self._workers.create_index([("worker_id", ASCENDING)], unique=True)
+        self._workers.create_index([("last_seen_at", DESCENDING)])
 
     @staticmethod
     def _utc_now() -> str:
@@ -91,6 +94,23 @@ class MongoJobStore:
         request = dict(doc.get("request") or {})
         doc["product_type"] = doc.get("product_type") or request.get("product_type")
         doc["tile_id"] = doc.get("tile_id") or request.get("tile_id")
+        return doc
+
+    @staticmethod
+    def _normalize_worker(doc: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not doc:
+            return None
+        doc = dict(doc)
+        doc.pop("_id", None)
+        doc["execution_enabled"] = bool(doc.get("execution_enabled", False))
+        doc["max_concurrent_jobs"] = int(doc.get("max_concurrent_jobs", 0) or 0)
+        doc["queue_poll_seconds"] = float(doc.get("queue_poll_seconds", 0.0) or 0.0)
+        doc["heartbeat_interval_seconds"] = float(doc.get("heartbeat_interval_seconds", 0.0) or 0.0)
+        doc["active_running_jobs"] = int(doc.get("active_running_jobs", 0) or 0)
+        doc["active_cancel_requested_jobs"] = int(doc.get("active_cancel_requested_jobs", 0) or 0)
+        doc["queue_backlog"] = int(doc.get("queue_backlog", 0) or 0)
+        doc["provider_limits"] = dict(doc.get("provider_limits") or {})
+        doc["metadata"] = dict(doc.get("metadata") or {})
         return doc
 
     def _next_event_id(self) -> int:
@@ -162,6 +182,8 @@ class MongoJobStore:
                     ]
                 }
             )
+        if filters.worker_id:
+            query["worker_id"] = filters.worker_id
         if filters.job_id_query:
             query["job_id"] = {"$regex": filters.job_id_query, "$options": "i"}
 
@@ -422,3 +444,37 @@ class MongoJobStore:
                 {"reason": "stale_running_timeout"},
             )
         return job_ids
+
+    def upsert_worker_heartbeat(self, worker_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self._utc_now()
+        document = {
+            "worker_id": worker_id,
+            "runtime_role": str(payload.get("runtime_role") or "worker"),
+            "execution_enabled": bool(payload.get("execution_enabled", True)),
+            "max_concurrent_jobs": max(1, int(payload.get("max_concurrent_jobs", 1) or 1)),
+            "queue_poll_seconds": float(payload.get("queue_poll_seconds", 1.0) or 1.0),
+            "heartbeat_interval_seconds": float(payload.get("heartbeat_interval_seconds", 5.0) or 5.0),
+            "provider_limits": dict(payload.get("provider_limits") or {}),
+            "hostname": payload.get("hostname"),
+            "pid": payload.get("pid"),
+            "active_running_jobs": max(0, int(payload.get("active_running_jobs", 0) or 0)),
+            "active_cancel_requested_jobs": max(0, int(payload.get("active_cancel_requested_jobs", 0) or 0)),
+            "queue_backlog": max(0, int(payload.get("queue_backlog", 0) or 0)),
+            "metadata": dict(payload.get("metadata") or {}),
+            "started_at": str(payload.get("started_at") or now),
+            "last_seen_at": str(payload.get("last_seen_at") or now),
+            "updated_at": now,
+        }
+        self._workers.update_one(
+            {"worker_id": worker_id},
+            {
+                "$set": document,
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+        return self._normalize_worker(self._workers.find_one({"worker_id": worker_id})) or {}
+
+    def list_workers(self) -> list[dict[str, Any]]:
+        rows = self._workers.find({}).sort("last_seen_at", DESCENDING)
+        return [self._normalize_worker(row) for row in rows if row]

@@ -138,8 +138,8 @@ def default_zarr_model() -> dict[str, Any]:
     }
     payload["resolution_policy"] = {
         "optical": (
-            "Use the finest native grid available in the product as the reference grid. "
-            "Coarser bands are reprojected to that grid."
+            "Use the finest native grid available for each supported optical collection. "
+            "Coarser bands are reprojected to that collection-specific target grid."
         ),
         "sentinel-2": {
             "reference_band": "red",
@@ -151,7 +151,7 @@ def default_zarr_model() -> dict[str, Any]:
         },
         "sentinel-1": {
             "reference_band": "first_available_polarization",
-            "target_pixel_size_meters": "native",
+            "target_pixel_size_meters": None,
         },
     }
     payload["data_families"] = {

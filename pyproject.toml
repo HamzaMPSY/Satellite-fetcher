@@ -45,7 +45,8 @@ zarr-service = [
   "xarray>=2024.10.0",
   "rasterio>=1.4.0",
   "h5netcdf>=1.4.0",
-  "h5py>=3.11.0"
+  "h5py>=3.11.0",
+  "pyyaml>=6.0.2"
 ]
 
 [project.scripts]

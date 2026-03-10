@@ -106,10 +106,34 @@ class SQLiteJobStore:
                 ON artifacts(collection, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_scene_updated
                 ON artifacts(scene_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS workers (
+                    worker_id TEXT PRIMARY KEY,
+                    runtime_role TEXT NOT NULL,
+                    execution_enabled INTEGER NOT NULL,
+                    max_concurrent_jobs INTEGER NOT NULL,
+                    queue_poll_seconds REAL NOT NULL,
+                    heartbeat_interval_seconds REAL NOT NULL,
+                    provider_limits_json TEXT NOT NULL,
+                    hostname TEXT,
+                    pid INTEGER,
+                    active_running_jobs INTEGER NOT NULL,
+                    active_cancel_requested_jobs INTEGER NOT NULL,
+                    queue_backlog INTEGER NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_workers_last_seen
+                ON workers(last_seen_at DESC);
                 """
             )
             self._ensure_column("jobs", "product_type", "TEXT")
             self._ensure_column("jobs", "tile_id", "TEXT")
+            self._ensure_column("jobs", "worker_id", "TEXT")
             self._conn.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
@@ -135,6 +159,7 @@ class SQLiteJobStore:
             "collection": row["collection"],
             "product_type": (row["product_type"] if "product_type" in row.keys() else None) or request.get("product_type"),
             "tile_id": (row["tile_id"] if "tile_id" in row.keys() else None) or request.get("tile_id"),
+            "worker_id": (row["worker_id"] if "worker_id" in row.keys() else None),
             "request": request,
             "state": row["state"],
             "progress": float(row["progress"]),
@@ -238,6 +263,9 @@ class SQLiteJobStore:
         if filters.product_type:
             where.append("COALESCE(product_type, json_extract(request_json, '$.product_type')) = ?")
             params.append(filters.product_type)
+        if filters.worker_id:
+            where.append("worker_id = ?")
+            params.append(filters.worker_id)
         if filters.job_id_query:
             where.append("job_id LIKE ?")
             params.append(f"%{filters.job_id_query}%")
@@ -543,16 +571,18 @@ class SQLiteJobStore:
         return job_ids
 
     def claim_job_for_execution(self, job_id: str, worker_id: str) -> bool:
-        _ = worker_id
         now = self._utc_now()
         with self._lock:
             cursor = self._conn.execute(
                 """
                 UPDATE jobs
-                SET state = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+                SET state = 'running',
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?,
+                    worker_id = ?
                 WHERE job_id = ? AND state = 'queued'
                 """,
-                (now, now, job_id),
+                (now, now, worker_id, job_id),
             )
             claimed = cursor.rowcount > 0
             if claimed:
@@ -598,3 +628,95 @@ class SQLiteJobStore:
                 )
             self._conn.commit()
         return job_ids
+
+    @staticmethod
+    def _row_to_worker(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "worker_id": row["worker_id"],
+            "runtime_role": row["runtime_role"],
+            "execution_enabled": bool(int(row["execution_enabled"])),
+            "max_concurrent_jobs": int(row["max_concurrent_jobs"]),
+            "queue_poll_seconds": float(row["queue_poll_seconds"]),
+            "heartbeat_interval_seconds": float(row["heartbeat_interval_seconds"]),
+            "provider_limits": json.loads(row["provider_limits_json"]),
+            "hostname": row["hostname"],
+            "pid": row["pid"],
+            "active_running_jobs": int(row["active_running_jobs"]),
+            "active_cancel_requested_jobs": int(row["active_cancel_requested_jobs"]),
+            "queue_backlog": int(row["queue_backlog"]),
+            "metadata": json.loads(row["metadata_json"]),
+            "started_at": row["started_at"],
+            "last_seen_at": row["last_seen_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_worker_heartbeat(self, worker_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self._utc_now()
+        record = {
+            "worker_id": worker_id,
+            "runtime_role": str(payload.get("runtime_role") or "worker"),
+            "execution_enabled": 1 if bool(payload.get("execution_enabled", True)) else 0,
+            "max_concurrent_jobs": max(1, int(payload.get("max_concurrent_jobs", 1) or 1)),
+            "queue_poll_seconds": float(payload.get("queue_poll_seconds", 1.0) or 1.0),
+            "heartbeat_interval_seconds": float(payload.get("heartbeat_interval_seconds", 5.0) or 5.0),
+            "provider_limits_json": json.dumps(payload.get("provider_limits") or {}),
+            "hostname": payload.get("hostname"),
+            "pid": payload.get("pid"),
+            "active_running_jobs": max(0, int(payload.get("active_running_jobs", 0) or 0)),
+            "active_cancel_requested_jobs": max(0, int(payload.get("active_cancel_requested_jobs", 0) or 0)),
+            "queue_backlog": max(0, int(payload.get("queue_backlog", 0) or 0)),
+            "metadata_json": json.dumps(payload.get("metadata") or {}),
+            "started_at": str(payload.get("started_at") or now),
+            "last_seen_at": str(payload.get("last_seen_at") or now),
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO workers(
+                    worker_id, runtime_role, execution_enabled, max_concurrent_jobs,
+                    queue_poll_seconds, heartbeat_interval_seconds, provider_limits_json,
+                    hostname, pid, active_running_jobs, active_cancel_requested_jobs,
+                    queue_backlog, metadata_json, started_at, last_seen_at, created_at, updated_at
+                ) VALUES (
+                    :worker_id, :runtime_role, :execution_enabled, :max_concurrent_jobs,
+                    :queue_poll_seconds, :heartbeat_interval_seconds, :provider_limits_json,
+                    :hostname, :pid, :active_running_jobs, :active_cancel_requested_jobs,
+                    :queue_backlog, :metadata_json, :started_at, :last_seen_at, :created_at, :updated_at
+                )
+                ON CONFLICT(worker_id) DO UPDATE SET
+                    runtime_role = excluded.runtime_role,
+                    execution_enabled = excluded.execution_enabled,
+                    max_concurrent_jobs = excluded.max_concurrent_jobs,
+                    queue_poll_seconds = excluded.queue_poll_seconds,
+                    heartbeat_interval_seconds = excluded.heartbeat_interval_seconds,
+                    provider_limits_json = excluded.provider_limits_json,
+                    hostname = excluded.hostname,
+                    pid = excluded.pid,
+                    active_running_jobs = excluded.active_running_jobs,
+                    active_cancel_requested_jobs = excluded.active_cancel_requested_jobs,
+                    queue_backlog = excluded.queue_backlog,
+                    metadata_json = excluded.metadata_json,
+                    started_at = COALESCE(workers.started_at, excluded.started_at),
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = excluded.updated_at
+                """,
+                record,
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError(f"Failed to upsert worker heartbeat for '{worker_id}'.")
+        return self._row_to_worker(row)
+
+    def list_workers(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM workers ORDER BY last_seen_at DESC"
+            ).fetchall()
+        return [self._row_to_worker(row) for row in rows]

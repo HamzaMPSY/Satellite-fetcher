@@ -41,6 +41,18 @@ class Settings(BaseSettings):
         ge=30,
         le=86400,
     )
+    nimbus_worker_heartbeat_seconds: float = Field(
+        default=5.0,
+        alias="NIMBUS_WORKER_HEARTBEAT_SECONDS",
+        ge=1.0,
+        le=300.0,
+    )
+    nimbus_worker_stale_seconds: int = Field(
+        default=20,
+        alias="NIMBUS_WORKER_STALE_SECONDS",
+        ge=5,
+        le=3600,
+    )
     nimbus_log_level: str = Field(default="INFO", alias="NIMBUS_LOG_LEVEL")
     nimbus_log_json: bool = Field(default=False, alias="NIMBUS_LOG_JSON")
     nimbus_enable_metrics: bool = Field(default=True, alias="NIMBUS_ENABLE_METRICS")

@@ -20,6 +20,7 @@ services:
       - "8000:8000"
     environment:
       NIMBUS_RUNTIME_ROLE: api
+      PYTHONPATH: /app/src
       NIMBUS_DB_BACKEND: ${NIMBUS_DB_BACKEND:-mongodb}
       NIMBUS_DB_PATH: /data/nimbus.db
       NIMBUS_MONGODB_URI: ${NIMBUS_MONGODB_URI_INTERNAL:-mongodb://mongodb:27017}
@@ -45,6 +46,7 @@ services:
       NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
     volumes:
       - ./data:/data
+      - ./src:/app/src
 
   nimbus-worker:
     env_file:
@@ -57,6 +59,7 @@ services:
     command: ["nimbuschain-worker"]
     environment:
       NIMBUS_RUNTIME_ROLE: worker
+      PYTHONPATH: /app/src
       NIMBUS_DB_BACKEND: ${NIMBUS_DB_BACKEND:-mongodb}
       NIMBUS_DB_PATH: /data/nimbus.db
       NIMBUS_MONGODB_URI: ${NIMBUS_MONGODB_URI_INTERNAL:-mongodb://mongodb:27017}
@@ -78,6 +81,7 @@ services:
       NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
     volumes:
       - ./data:/data
+      - ./src:/app/src
 
   nimbus-ui:
     build:
@@ -111,7 +115,9 @@ services:
       - "${NIMBUS_ZARR_PORT:-8010}:8010"
     environment:
       NIMBUS_DATA_DIR: /data/downloads
+      PYTHONPATH: /app/src
     volumes:
+      - ./src:/app/src
       - ./data:/data
 
 volumes:
