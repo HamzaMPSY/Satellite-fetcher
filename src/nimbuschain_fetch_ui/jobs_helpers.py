@@ -341,3 +341,24 @@ def _merge_job_rows(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         key=lambda row: (_status_reference_time(row) or dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)).timestamp(),
         reverse=True,
     )
+
+
+def _upsert_known_jobs(job_ids: List[str], *, active_job_ids: List[str] | None = None) -> None:
+    """Keep track of known/active job IDs in streamlit session state.
+
+    This mirrors the app.py usage; it stores unique IDs and optionally marks them as active.
+    """
+
+    if "known_job_ids" not in st.session_state:
+        st.session_state["known_job_ids"] = []
+    if "active_job_ids" not in st.session_state:
+        st.session_state["active_job_ids"] = []
+
+    known = set(map(str, st.session_state.get("known_job_ids", [])))
+    known.update({str(j) for j in job_ids if str(j)})
+    st.session_state["known_job_ids"] = sorted(known)
+
+    if active_job_ids:
+        active = set(map(str, st.session_state.get("active_job_ids", [])))
+        active.update({str(j) for j in active_job_ids if str(j)})
+        st.session_state["active_job_ids"] = sorted(active)

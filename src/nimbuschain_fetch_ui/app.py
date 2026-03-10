@@ -111,6 +111,7 @@ from nimbuschain_fetch_ui.jobs_helpers import (
     _job_matches_scope_filters,
     _filter_jobs_by_scope,
     _merge_job_rows,
+    _upsert_known_jobs,
 )
 from nimbuschain_fetch_ui.preview_local import preview_products_local
 from nimbuschain_fetch_ui.styling import CUSTOM_CSS
@@ -123,6 +124,7 @@ from nimbuschain_fetch_ui.data_loaders import (
 from nimbuschain_fetch_ui.downloads import (
     reset_downloads,
     count_downloaded_products,
+    _build_download_command,
     parse_download_logs,
     _auto_parallel_strategy,
     _build_download_command,
@@ -411,6 +413,27 @@ def init_state():
 
 def _ss(key, default=None):
     return st.session_state.get(key, default)
+
+
+
+# ------------------------- USGS helpers -------------------------
+
+def _resolve_usgs_product_type(selected_product_type: str, selected_satellite: str = "Any") -> str:
+    """Map UI-selected USGS product and optional satellite (08/09) to fetch API product type.
+
+    UI exposes:
+      - product options from constants.PRODUCT_TYPES["landsat_ot_c2_l1"] or ["landsat_ot_c2_l2"]
+      - satellite dropdown: Any / 08 / 09
+
+    The fetch service expects product types like L1TP / L2SP; satellite specificity isn’t required
+    for product type, so we just return the selected product type, validated against allowed sets.
+    """
+
+    allowed = set((PRODUCT_TYPES.get("landsat_ot_c2_l1") or []) + (PRODUCT_TYPES.get("landsat_ot_c2_l2") or []))
+    if selected_product_type in allowed:
+        return selected_product_type
+    # fallback to a sensible default
+    return "L2SP"
 
 
 
@@ -1231,10 +1254,12 @@ def main():
                 st.error("Define AOI or select tiles first.")
             else:
                 try:
+                    payload_provider = PROVIDER_CLI_MAP.get(provider, provider.lower())
+
                     if provider == "Copernicus" and len(selected_tiles_for_cmd) > 1:
                         jobs = [
-                            _build_job_payload(
-                                provider_label=provider,
+                            build_job_payload_runtime(
+                                provider=payload_provider,
                                 collection=collection,
                                 product_type=str(effective_product_type),
                                 start_date=st.session_state["start_date"],
@@ -1258,15 +1283,14 @@ def main():
                         else:
                             st.error(f"{response.status_code}: {response.text}")
                     else:
-                        tile_id = selected_tiles_for_cmd[0] if (provider == "Copernicus" and len(selected_tiles_for_cmd) == 1) else None
-                        payload = _build_job_payload(
-                            provider_label=provider,
+                        payload = build_job_payload_runtime(
+                            provider=payload_provider,
                             collection=collection,
                             product_type=str(effective_product_type),
                             start_date=st.session_state["start_date"],
                             end_date=st.session_state["end_date"],
                             aoi_wkt=aoi_text_for_download,
-                            tile_id=tile_id,
+                            tile_id=None if not (provider == "Copernicus" and len(selected_tiles_for_cmd) == 1) else selected_tiles_for_cmd[0],
                         )
                         response = _api_request(
                             "POST",

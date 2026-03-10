@@ -1,0 +1,88 @@
+# Example configuration for TheConverter
+
+S2:
+  L2A:
+    product_type: S2MSIL2A
+    file_extension: .SAFE
+    ext: jp2
+    subdir_filter: IMG_DATA
+    bands_map:
+      R10m:
+        - B02
+        - B03
+        - B04
+        - B08
+      R20m:
+        - B05
+        - B06
+        - B07
+        - B8A
+        - B11
+        - B12
+      R60m:
+        - B01
+        - B09
+    categorical_bands:
+      - SCL
+
+  L1C:
+    product_type: S2MSIL1C
+    file_extension: .SAFE
+    ext: jp2
+    subdir_filter: IMG_DATA
+    bands_map:
+      empty:
+        - B01
+        - B02
+        - B03
+        - B04
+        - B05
+        - B06
+        - B07
+        - B08
+        - B8A
+        - B09
+        - B11
+        - B12
+    categorical_bands: []
+
+LS:
+  L1TP:
+    product_type: L1TP
+    file_extension: _T1
+    ext: TIF
+    subdir_filter: empty
+    bands_map:
+      empty:
+        - B1
+        - B2
+        - B3
+        - B4
+        - B5
+        - B6
+        - B7
+        - B10
+        - B11
+    categorical_bands: []
+
+  L2SP:
+    product_type: L2SP
+    file_extension: _T1
+    ext: TIF
+    subdir_filter: empty
+    bands_map:
+      empty:
+        - B1
+        - B2
+        - B3
+        - B4
+        - B5
+        - B6
+        - B7
+        - B10
+        - B11
+      # Add QA bands if desired (mark as categorical if you include them)
+      # QA:
+      #   - QA_PIXEL
+      #   - QA_RADSAT
+    categorical_bands: []

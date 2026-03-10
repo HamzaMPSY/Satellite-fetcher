@@ -54,6 +54,7 @@ zarr-service = [
 nimbuschain-fetch = "nimbuschain_fetch.cli:main"
 nimbuschain-worker = "nimbuschain_fetch.worker:main"
 nimbuschain-zarr-service = "nimbuschain_zarr_service.main:run"
+converter = "nimbuschain_zarr_service.converter.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service"]
