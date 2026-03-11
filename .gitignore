@@ -15,6 +15,7 @@ app_debug.log
 .k8s-port-forward/
 _leaflet_comp/
 src/nimbuschain_fetch_ui/_leaflet_comp/
+**/.st-tree.cache
 
 *.db
 *.sqlite

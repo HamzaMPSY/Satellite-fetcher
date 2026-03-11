@@ -304,9 +304,10 @@ class NimbusFetcher:
             await self._executor.submit(str(row["job_id"]))
 
     def get_worker_status(self) -> dict[str, Any]:
+        stale_after = max(5, int(self.settings.nimbus_worker_stale_seconds))
+        pruned_workers = int(self.store.prune_stale_workers(stale_after))
         workers = list(self.store.list_workers())
         now = datetime.now(timezone.utc)
-        stale_after = max(5, int(self.settings.nimbus_worker_stale_seconds))
         alive_workers: list[dict[str, Any]] = []
         stale_workers: list[dict[str, Any]] = []
 
@@ -314,22 +315,30 @@ class NimbusFetcher:
             JobListFilters(
                 states=(JobState.running.value, JobState.cancel_requested.value),
                 page=1,
-                page_size=max(1000, self.settings.nimbus_max_jobs * 20),
+                page_size=max(1000, self.settings.nimbus_max_jobs * 200),
             )
         )
         queued_rows, queued_total = self.store.list_jobs(
             JobListFilters(
                 state=JobState.queued.value,
                 page=1,
-                page_size=1,
+                page_size=max(1000, self.settings.nimbus_max_jobs * 200),
             )
         )
-        _ = queued_rows
+        running_by_provider: dict[str, int] = {}
+        queued_by_provider: dict[str, int] = {}
+        configured_provider_limits = {
+            str(name).strip().lower(): max(1, int(limit))
+            for name, limit in self.settings.provider_limits_map.items()
+        }
 
         running_by_worker: dict[str, int] = {}
         cancel_requested_by_worker: dict[str, int] = {}
         for row in running_rows:
             worker_id = str(row.get("worker_id") or "").strip()
+            provider_name = str(row.get("provider") or "").strip().lower()
+            if provider_name:
+                running_by_provider[provider_name] = running_by_provider.get(provider_name, 0) + 1
             if not worker_id:
                 continue
             state = str(row.get("state") or "").strip().lower()
@@ -337,10 +346,15 @@ class NimbusFetcher:
                 cancel_requested_by_worker[worker_id] = cancel_requested_by_worker.get(worker_id, 0) + 1
             else:
                 running_by_worker[worker_id] = running_by_worker.get(worker_id, 0) + 1
+        for row in queued_rows:
+            provider_name = str(row.get("provider") or "").strip().lower()
+            if provider_name:
+                queued_by_provider[provider_name] = queued_by_provider.get(provider_name, 0) + 1
 
         worker_payloads: list[dict[str, Any]] = []
         capacity_total = 0
         capacity_used = 0
+        provider_capacity_total: dict[str, int] = {}
 
         for worker in workers:
             last_seen = self._parse_iso(worker.get("last_seen_at"))
@@ -372,6 +386,18 @@ class NimbusFetcher:
             worker_payloads.append(item)
             if is_alive:
                 alive_workers.append(item)
+                provider_limits = dict(item.get("provider_limits") or {})
+                provider_names = set(configured_provider_limits) | set(
+                    str(name).strip().lower() for name in provider_limits.keys() if str(name).strip()
+                )
+                for provider_name in provider_names:
+                    limit = provider_limits.get(
+                        provider_name,
+                        configured_provider_limits.get(provider_name, 1),
+                    )
+                    provider_capacity_total[provider_name] = (
+                        provider_capacity_total.get(provider_name, 0) + max(1, int(limit or 1))
+                    )
             else:
                 stale_workers.append(item)
 
@@ -382,11 +408,40 @@ class NimbusFetcher:
         if ready and not can_accept_work:
             status = "saturated"
 
+        provider_names = (
+            set(configured_provider_limits)
+            | set(running_by_provider)
+            | set(queued_by_provider)
+            | set(provider_capacity_total)
+        )
+        provider_capacity: dict[str, dict[str, int | bool]] = {}
+        for provider_name in sorted(provider_names):
+            total_limit = max(
+                0,
+                int(
+                    provider_capacity_total.get(
+                        provider_name,
+                        configured_provider_limits.get(provider_name, 0),
+                    )
+                ),
+            )
+            running_count = int(running_by_provider.get(provider_name, 0))
+            queued_count = int(queued_by_provider.get(provider_name, 0))
+            available = max(0, total_limit - running_count)
+            provider_capacity[provider_name] = {
+                "limit_total": total_limit,
+                "running": running_count,
+                "queued": queued_count,
+                "available": available,
+                "blocked_by_limit": queued_count > 0 and available <= 0,
+            }
+
         return {
             "status": status,
             "ready": ready,
             "timestamp": now.isoformat(),
             "worker_stale_seconds": stale_after,
+            "workers_pruned": pruned_workers,
             "workers_alive": len(alive_workers),
             "workers_stale": len(stale_workers),
             "workers_total": len(worker_payloads),
@@ -396,6 +451,7 @@ class NimbusFetcher:
             "capacity_used": capacity_used,
             "capacity_available": capacity_available,
             "can_accept_work": can_accept_work,
+            "provider_capacity": provider_capacity,
             "workers": worker_payloads,
         }
 

@@ -1,10 +1,14 @@
 # Zarr Conversion
 
-## Purpose
+## 1. Purpose
 
-The Zarr service converts raw downloaded scenes into a normalized array store for downstream analytics and masking.
+The Zarr service converts raw downloaded scenes into a normalized array store suitable for:
+- downstream analytics
+- spectral and temporal stacking
+- artifact indexing
+- later cloud/water masking workflows
 
-Output layout:
+The output layout is:
 
 ```text
 time, band, y, x
@@ -16,7 +20,7 @@ Default output location:
 /data/downloads/zarr/<scene>.zarr
 ```
 
-## Supported inputs
+## 2. Supported inputs
 
 ### Copernicus
 - `SENTINEL-1`: `RAW`, `GRD`, `SLC`, `IW_SLC__1S`
@@ -25,36 +29,89 @@ Default output location:
 ### USGS
 - `landsat_ot_c2_l1`: `L1TP`, `L1GT`, `L1GS`
 - `landsat_ot_c2_l2`: `L2SP`, `L2SR`
-- satellites: Landsat 8 and Landsat 9
+- supported satellites: Landsat 8 and Landsat 9
 
-## Resolution policy
+## 3. Resolution policy
 
-The converter does not downsample to the coarsest grid.
+The converter uses the best target grid per sensor family, not a fake one-size-fits-all grid.
 
 ### Sentinel-2
 - target grid: `10 m`
-- 20 m and 60 m bands are resampled to 10 m
+- native `20 m` and `60 m` bands are reprojected to `10 m`
 
 ### Landsat 8/9
 - target grid: `30 m`
-- thermal bands are aligned to the 30 m grid
+- thermal bands are aligned to the `30 m` grid
+- Level-1 `B8` panchromatic is preserved as a band, but it does **not** force the whole cube to `15 m`
+- the converter does not upsample Landsat to `10 m`
 
 ### Sentinel-1
-- target grid: source raster measurement grid
-- no fake optical-style 10 m upsampling is introduced
+- target grid: native measurement/reference raster grid
+- no optical-style forced `10 m` normalization
 
-## Canonical output intent
+## 4. Band preservation policy
 
-The service writes a Zarr store that is usable later for:
+### Sentinel-2 canonical bands
 
-- spectral analytics
-- temporal stacking
-- cloud/water masking
-- artifact indexing in the orchestrator
+The converter preserves the useful spectral bands of the product instead of collapsing everything into RGB/NIR/SWIR only.
 
-## Main endpoint
+Expected canonical set:
+- `coastal`
+- `blue`
+- `green`
+- `red`
+- `rededge1`
+- `rededge2`
+- `rededge3`
+- `nir`
+- `nir_narrow`
+- `water_vapor`
+- `cirrus`
+- `swir1`
+- `swir2`
+- `scene_classification` when `SCL` is available in `S2MSI2A`
+
+### Landsat 8/9 canonical bands
+
+#### Level 1
+- `coastal`
+- `blue`
+- `green`
+- `red`
+- `pan`
+- `nir`
+- `cirrus`
+- `swir1`
+- `swir2`
+- `thermal1`
+- `thermal2`
+
+#### Level 2
+Bands depend on the product family actually present in the source. Typical `L2SP` output keeps:
+- `coastal`
+- `blue`
+- `green`
+- `red`
+- `nir`
+- `swir1`
+- `swir2`
+- `thermal1`
+
+## 5. Runtime API
+
+### `GET /health`
+Basic health for the Zarr service.
+
+### `GET /readiness`
+Strict readiness, including a write-path smoke test.
+
+### `GET /schema`
+Returns:
+- Zarr model metadata
+- converter configuration actually loaded by the service
 
 ### `POST /convert`
+Convert one local raw scene/archive into Zarr.
 
 Minimal payload:
 
@@ -65,6 +122,7 @@ Minimal payload:
   "trace_id": "trace-1",
   "provider": "usgs",
   "collection": "landsat_ot_c2_l2",
+  "product_type": "L2SP",
   "scene_id": "LC08_L2SP_...",
   "raw_uri": "/data/downloads/<job>/<scene>",
   "raw_format": "directory",
@@ -72,16 +130,23 @@ Minimal payload:
 }
 ```
 
-## Service health
+## 6. Implementation notes
 
-```bash
-curl -s http://127.0.0.1:8010/health | python3 -m json.tool
-```
+Important modules:
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/service.py`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/core.py`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/copernicus.py`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/landsat.py`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/config/config.yaml`
 
-## Artifact registration
+Design choice:
+- Landsat conversion uses a streaming write path to avoid building an oversized in-memory cube.
+- Copernicus conversion keeps a sensor-aware normalization model and supports a stream-to-Zarr path as well.
 
-After a successful conversion, the UI or orchestrator can register the Zarr store through:
+## 7. Operational rule
 
-```text
-POST /v1/artifacts
-```
+A Zarr store is considered current when:
+- it was produced by the current converter flow
+- it is either registered as an artifact or locally discovered and matches the current schema expectations
+
+Legacy local stores may still exist on disk. The UI hides them by default unless explicitly requested.

@@ -4,12 +4,18 @@ import datetime as dt
 import tarfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
 
 from nimbuschain_fetch_ui.constants import DOWNLOADS_DIR, ZARR_STORES_DIR
 from nimbuschain_fetch_ui.jobs_helpers import _api_request
+
+
+def _is_remote_uri(path_value: str | Path) -> bool:
+    parsed = urlparse(str(path_value or "").strip())
+    return bool(parsed.scheme and parsed.scheme.lower() not in {"", "file"})
 
 
 def _container_to_host_path(path_value: str) -> Path:
@@ -37,6 +43,8 @@ def _candidate_runtime_path(path_value: str | Path) -> tuple[str, Optional[Path]
     raw_value = str(path_value or "").strip()
     if not raw_value:
         return "", None
+    if _is_remote_uri(raw_value):
+        return raw_value, None
     if raw_value.startswith("/data/") or raw_value == "/data":
         host_hint = _container_to_host_path(raw_value)
         return raw_value, host_hint
@@ -45,6 +53,8 @@ def _candidate_runtime_path(path_value: str | Path) -> tuple[str, Optional[Path]
 
 
 def _path_exists_in_runtime(path_value: str | Path) -> bool:
+    if _is_remote_uri(path_value):
+        return True
     runtime_value, host_path = _candidate_runtime_path(path_value)
     if runtime_value.startswith("/data/"):
         host_hint = _container_to_host_path(runtime_value)
@@ -83,6 +93,9 @@ def _manifest_source_candidates(limit: int = 200) -> List[str]:
             try:
                 runtime_value, host_path = _candidate_runtime_path(str(raw_path_value))
                 if not runtime_value:
+                    continue
+                if _is_remote_uri(runtime_value):
+                    candidates[runtime_value] = manifest_path.stat().st_mtime
                     continue
                 stat_path = host_path or _container_to_host_path(runtime_value)
                 if not stat_path.exists():
@@ -174,6 +187,8 @@ def recent_source_candidates(limit: int = 200) -> List[str]:
 def container_to_host_path_hint(path_value: str) -> str:
     if not path_value:
         return ""
+    if _is_remote_uri(path_value):
+        return ""
     if path_value.startswith("/data/") or path_value == "/data":
         return str(_container_to_host_path(path_value))
     return ""
@@ -248,6 +263,8 @@ def list_artifacts(
 
 def _path_size_bytes(path_value: str) -> Optional[int]:
     if not path_value:
+        return None
+    if _is_remote_uri(path_value):
         return None
     path = _container_to_host_path(path_value) if str(path_value).startswith("/data/") else Path(path_value)
     if not path.exists():
@@ -366,11 +383,12 @@ def human_size(size_bytes: Any) -> str:
 
 
 def guess_scene_id(raw_uri: str) -> str:
-    name = Path(raw_uri).name
+    parsed = urlparse(str(raw_uri or "").strip())
+    name = Path(parsed.path).name if parsed.scheme else Path(raw_uri).name
     for suffix in (".SAFE.zip", ".SAFE", ".tar.gz", ".tgz", ".tar", ".zip", ".nc", ".tif", ".tiff"):
         if name.endswith(suffix):
             return name[: -len(suffix)]
-    return Path(raw_uri).stem
+    return Path(name).stem
 
 
 def guess_zarr_provider(raw_uri: str) -> str:
@@ -434,6 +452,16 @@ def guess_raw_source_format(raw_uri: str) -> str:
         return "tar"
     if lower.endswith(".nc"):
         return "netcdf"
+    if _is_remote_uri(raw_uri):
+        parsed = urlparse(str(raw_uri or ""))
+        remote_name = Path(parsed.path).name.lower()
+        if remote_name.endswith(".zip"):
+            return "zip"
+        if remote_name.endswith(".tar") or remote_name.endswith(".tar.gz") or remote_name.endswith(".tgz"):
+            return "tar"
+        if remote_name.endswith(".nc"):
+            return "netcdf"
+        return "directory"
     if raw_uri:
         path = Path(raw_uri)
         if path.exists() and path.is_dir():

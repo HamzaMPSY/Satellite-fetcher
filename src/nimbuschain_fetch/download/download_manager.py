@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import re
 from pathlib import Path
 from time import monotonic
@@ -29,8 +31,10 @@ class DownloadManager:
         initial_delay: float = 1.5,
         backoff_factor: float = 1.7,
         connect_timeout: float = 20,
-        read_timeout: float = 120,
+        read_timeout: float | None = None,
         chunk_size: int = 1024 * 1024,
+        enable_resume: bool = True,
+        min_resume_size: int = 1024 * 1024,
         progress_callback: ProgressCallback | None = None,
         cancel_checker: CancelChecker | None = None,
     ):
@@ -39,8 +43,10 @@ class DownloadManager:
         self.initial_delay = max(0.2, float(initial_delay))
         self.backoff_factor = max(1.0, float(backoff_factor))
         self.connect_timeout = max(1.0, float(connect_timeout))
-        self.read_timeout = max(1.0, float(read_timeout))
+        self.read_timeout = None if read_timeout is None else max(1.0, float(read_timeout))
         self.chunk_size = max(64 * 1024, int(chunk_size))
+        self.enable_resume = bool(enable_resume)
+        self.min_resume_size = max(0, int(min_resume_size))
         self.progress_callback = progress_callback
         self.cancel_checker = cancel_checker
 
@@ -67,7 +73,14 @@ class DownloadManager:
             connect=self.connect_timeout,
             sock_read=self.read_timeout,
         )
-        connector = aiohttp.TCPConnector(limit=max(10, self.max_concurrent * 4), limit_per_host=8)
+        connector = aiohttp.TCPConnector(
+            limit=max(10, self.max_concurrent * 4),
+            limit_per_host=max(2, self.max_concurrent),
+            enable_cleanup_closed=True,
+            use_dns_cache=True,
+            ttl_dns_cache=300,
+            keepalive_timeout=300,
+        )
         semaphore = asyncio.Semaphore(self.max_concurrent)
 
         headers = dict(product_ids.get("headers", {}))
@@ -134,6 +147,17 @@ class DownloadManager:
                     )
             except DownloadCancelled:
                 raise
+            except _RetryableHttpError as exc:
+                last_error = exc
+                if exc.status == 401 and refresh_token_callback is not None:
+                    new_token = refresh_token_callback()
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    continue
+                if attempt < self.max_retries:
+                    await asyncio.sleep(max(delay, exc.retry_after or 0.0))
+                    delay = min(delay * self.backoff_factor, 120.0)
+                    continue
+                break
             except aiohttp.ClientResponseError as exc:
                 last_error = exc
                 status = exc.status
@@ -143,14 +167,14 @@ class DownloadManager:
                     continue
                 if status in {429, 500, 502, 503, 504} and attempt < self.max_retries:
                     await asyncio.sleep(delay)
-                    delay *= self.backoff_factor
+                    delay = min(delay * self.backoff_factor, 120.0)
                     continue
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     await asyncio.sleep(delay)
-                    delay *= self.backoff_factor
+                    delay = min(delay * self.backoff_factor, 120.0)
                     continue
                 break
 
@@ -167,19 +191,55 @@ class DownloadManager:
         output_dir: Path,
         headers: dict,
     ) -> Path:
-        async with session.get(url, headers=headers) as response:
+        requested_name = Path(str(file_name or "").strip()).name or "download"
+        initial_path = output_dir / requested_name
+        initial_resume_position = self._get_resume_position(initial_path)
+
+        request_headers = dict(headers)
+        if initial_resume_position > 0:
+            request_headers["Range"] = f"bytes={initial_resume_position}-"
+
+        async with session.get(url, headers=request_headers) as response:
+            if response.status == 401:
+                raise _RetryableHttpError(401)
+            if response.status == 429:
+                raise _RetryableHttpError(429, retry_after=self._retry_after_seconds(response))
+            if response.status in {500, 502, 503, 504}:
+                raise _RetryableHttpError(response.status, retry_after=self._retry_after_seconds(response))
+            if response.status == 416:
+                if self.progress_callback and initial_resume_position > 0:
+                    self.progress_callback(requested_name, initial_resume_position, initial_resume_position, initial_resume_position)
+                    self.progress_callback(requested_name, 0, initial_resume_position, initial_resume_position)
+                return initial_path
+
             response.raise_for_status()
-            resolved_name = self._resolve_output_name(file_name, response)
+            resolved_name = self._resolve_output_name(requested_name, response)
             file_path = output_dir / resolved_name
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            total: int | None = None
-            content_length = response.headers.get("Content-Length")
-            if content_length and content_length.isdigit():
-                total = int(content_length)
 
-            downloaded = 0
+            resume_position = initial_resume_position
+            if file_path != initial_path:
+                if initial_path.exists() and not file_path.exists():
+                    initial_path.replace(file_path)
+                resume_position = self._get_resume_position(file_path)
+
+            if response.status == 206 and resume_position <= 0:
+                resume_position = self._extract_resume_position(response)
+
+            file_mode = "wb"
+            if response.status == 206 and resume_position > 0:
+                file_mode = "ab"
+            elif response.status == 200 and resume_position > 0 and file_path.exists():
+                file_path.unlink()
+                resume_position = 0
+
+            total = self._resolve_total_size(response, resume_position)
+            downloaded = resume_position
+            if self.progress_callback and resume_position > 0:
+                self.progress_callback(resolved_name, resume_position, downloaded, total)
+
             started = monotonic()
-            with file_path.open("wb") as handle:
+            with file_path.open(file_mode) as handle:
                 async for chunk in response.content.iter_chunked(self.chunk_size):
                     if self.cancel_checker and self.cancel_checker():
                         raise DownloadCancelled("Download cancelled while streaming file.")
@@ -190,13 +250,68 @@ class DownloadManager:
                     if self.progress_callback:
                         self.progress_callback(resolved_name, len(chunk), downloaded, total)
 
+            if total is not None and file_path.exists():
+                final_size = file_path.stat().st_size
+                if final_size != total:
+                    raise _RetryableHttpError(503)
+
             elapsed = max(0.001, monotonic() - started)
             if self.progress_callback:
-                # Final heartbeat event with speed information inferred by caller.
                 self.progress_callback(resolved_name, 0, downloaded, total)
 
             _ = elapsed
             return file_path
+
+    def _get_resume_position(self, file_path: Path) -> int:
+        if not self.enable_resume or not file_path.exists():
+            return 0
+        file_size = file_path.stat().st_size
+        if file_size < self.min_resume_size:
+            try:
+                file_path.unlink()
+            except FileNotFoundError:
+                pass
+            return 0
+        return file_size
+
+    @staticmethod
+    def _extract_resume_position(response: aiohttp.ClientResponse) -> int:
+        content_range = response.headers.get("Content-Range", "").strip()
+        match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range)
+        if not match:
+            return 0
+        return int(match.group(1))
+
+    def _resolve_total_size(self, response: aiohttp.ClientResponse, resume_position: int) -> int | None:
+        content_range = response.headers.get("Content-Range", "").strip()
+        match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range)
+        if match and match.group(3).isdigit():
+            return int(match.group(3))
+
+        content_length = response.headers.get("Content-Length")
+        if content_length and content_length.isdigit():
+            value = int(content_length)
+            if response.status == 206:
+                return resume_position + value
+            return value
+        return None
+
+    @staticmethod
+    def _retry_after_seconds(response: aiohttp.ClientResponse) -> float | None:
+        raw_value = response.headers.get("Retry-After")
+        if not raw_value:
+            return None
+        raw_value = raw_value.strip()
+        if raw_value.isdigit():
+            return min(float(raw_value), 300.0)
+        try:
+            target = parsedate_to_datetime(raw_value)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            delta = (target - datetime.now(timezone.utc)).total_seconds()
+            return min(max(delta, 0.0), 300.0)
+        except (TypeError, ValueError, IndexError):
+            return None
 
     @staticmethod
     def _is_generic_fallback_name(file_name: str) -> bool:
@@ -250,3 +365,10 @@ class DownloadManager:
             return path_name
 
         return requested
+
+
+class _RetryableHttpError(Exception):
+    def __init__(self, status: int, retry_after: float | None = None):
+        self.status = int(status)
+        self.retry_after = retry_after
+        super().__init__(f"Retryable HTTP {self.status}")

@@ -478,3 +478,10 @@ class MongoJobStore:
     def list_workers(self) -> list[dict[str, Any]]:
         rows = self._workers.find({}).sort("last_seen_at", DESCENDING)
         return [self._normalize_worker(row) for row in rows if row]
+
+    def prune_stale_workers(self, stale_after_seconds: int) -> int:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=max(1, int(stale_after_seconds)))
+        ).isoformat()
+        result = self._workers.delete_many({"last_seen_at": {"$lt": cutoff}})
+        return int(result.deleted_count or 0)

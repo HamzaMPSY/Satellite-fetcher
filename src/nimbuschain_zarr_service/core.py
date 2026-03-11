@@ -12,6 +12,11 @@ import zipfile
 
 import numpy as np
 
+from nimbuschain_zarr_service.oci_storage import (
+    OCIStorageError,
+    OCIStore,
+    is_oci_uri,
+)
 from nimbuschain_zarr_service.schema import ChunkShape, ZARR_FORMAT_VERSION
 
 
@@ -23,12 +28,30 @@ class ConversionDependencyError(RuntimeError):
     """Raised when a required runtime dependency is missing."""
 
 
+class CleanupBundle:
+    """Composable cleanup handler for staged and extracted temporary sources."""
+
+    def __init__(self, *entries: TemporaryDirectory[str]) -> None:
+        self._entries: list[TemporaryDirectory[str]] = list(entries)
+
+    def add(self, entry: TemporaryDirectory[str]) -> None:
+        self._entries.append(entry)
+
+    def cleanup(self) -> None:
+        while self._entries:
+            entry = self._entries.pop()
+            try:
+                entry.cleanup()
+            except Exception:
+                continue
+
+
 @dataclass(frozen=True)
 class PreparedSource:
     root: Path
     source_kind: str
     raw_path: Path
-    cleanup: TemporaryDirectory[str] | None = None
+    cleanup: CleanupBundle | TemporaryDirectory[str] | None = None
 
 
 def resolve_local_path(raw_uri: str) -> Path:
@@ -56,14 +79,30 @@ def resolve_local_path(raw_uri: str) -> Path:
 
 
 def prepare_source(raw_uri: str, *, label: str) -> PreparedSource:
-    raw_path = resolve_local_path(raw_uri)
+    cleanup_bundle: CleanupBundle | None = None
+    if _is_remote_uri(raw_uri):
+        raw_path, cleanup_bundle = _stage_remote_source(raw_uri, label=label)
+    else:
+        raw_path = resolve_local_path(raw_uri)
     if not raw_path.exists():
         raise ConversionError(f"{label} source not found: {raw_path}")
 
     if raw_path.is_dir():
-        return PreparedSource(root=raw_path, source_kind="directory", raw_path=raw_path)
+        return PreparedSource(
+            root=raw_path,
+            source_kind="directory",
+            raw_path=raw_path,
+            cleanup=cleanup_bundle,
+        )
 
     if raw_path.is_file() and raw_path.suffix.lower() == ".nc":
+        if cleanup_bundle is not None:
+            return PreparedSource(
+                root=raw_path.parent,
+                source_kind="netcdf",
+                raw_path=raw_path,
+                cleanup=cleanup_bundle,
+            )
         tmp_dir = TemporaryDirectory(prefix=f"nimbus_{label}_")
         copied = Path(tmp_dir.name) / raw_path.name
         shutil.copy2(raw_path, copied)
@@ -71,29 +110,33 @@ def prepare_source(raw_uri: str, *, label: str) -> PreparedSource:
             root=Path(tmp_dir.name),
             source_kind="netcdf",
             raw_path=raw_path,
-            cleanup=tmp_dir,
+            cleanup=CleanupBundle(tmp_dir),
         )
 
     if zipfile.is_zipfile(raw_path):
         tmp_dir = TemporaryDirectory(prefix=f"nimbus_{label}_")
         with zipfile.ZipFile(raw_path) as archive:
             archive.extractall(tmp_dir.name)
+        cleanup = cleanup_bundle or CleanupBundle()
+        cleanup.add(tmp_dir)
         return PreparedSource(
             root=Path(tmp_dir.name),
             source_kind="zip",
             raw_path=raw_path,
-            cleanup=tmp_dir,
+            cleanup=cleanup,
         )
 
     if tarfile.is_tarfile(raw_path):
         tmp_dir = TemporaryDirectory(prefix=f"nimbus_{label}_")
         with tarfile.open(raw_path) as archive:
             archive.extractall(tmp_dir.name)
+        cleanup = cleanup_bundle or CleanupBundle()
+        cleanup.add(tmp_dir)
         return PreparedSource(
             root=Path(tmp_dir.name),
             source_kind="tar",
             raw_path=raw_path,
-            cleanup=tmp_dir,
+            cleanup=cleanup,
         )
 
     raise ConversionError(
@@ -111,6 +154,7 @@ def load_aligned_raster_stack(
 ) -> dict[str, Any]:
     try:
         import rasterio
+        from rasterio.errors import RasterioIOError
         from rasterio.enums import Resampling
         from rasterio.transform import array_bounds, from_origin
         from rasterio.warp import reproject
@@ -129,7 +173,14 @@ def load_aligned_raster_stack(
     if ref_name not in band_paths:
         raise ConversionError(f"Reference band '{ref_name}' is not available.")
 
-    with rasterio.open(band_paths[ref_name]) as ref_src:
+    try:
+        ref_ctx = rasterio.open(band_paths[ref_name])
+    except RasterioIOError as exc:
+        raise ConversionError(
+            f"Reference raster for band '{ref_name}' is not readable by rasterio: {band_paths[ref_name]}"
+        ) from exc
+
+    with ref_ctx as ref_src:
         ref_height = ref_src.height
         ref_width = ref_src.width
         ref_crs = ref_src.crs.to_string() if ref_src.crs else None
@@ -154,7 +205,14 @@ def load_aligned_raster_stack(
             if band_path is None:
                 continue
 
-            with rasterio.open(band_path) as src:
+            try:
+                src_ctx = rasterio.open(band_path)
+            except RasterioIOError as exc:
+                raise ConversionError(
+                    f"Raster band '{band_name}' is not readable by rasterio: {band_path}"
+                ) from exc
+
+            with src_ctx as src:
                 if src.count != 1:
                     raise ConversionError(
                         f"Band {band_name} is expected to be single-band, got {src.count}."
@@ -370,12 +428,7 @@ def build_standard_dataset(
 
 
 def write_dataset_to_zarr(dataset: xr.Dataset, output_uri: str) -> str:
-    output_path = resolve_output_path(output_uri)
-    if output_path.exists() and output_path.is_file():
-        raise ConversionError(f"Output path is a file, expected a directory: {output_path}")
-    if output_path.exists():
-        shutil.rmtree(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_store, public_uri = _prepare_output_store(output_uri)
 
     imagery = dataset["imagery"]
     chunk_spec = ChunkShape()
@@ -387,13 +440,13 @@ def write_dataset_to_zarr(dataset: xr.Dataset, output_uri: str) -> str:
     )
     encoding = {"imagery": {"chunks": chunks}}
     dataset.to_zarr(
-        str(output_path),
+        output_store,
         mode="w",
         consolidated=True,
         encoding=encoding,
         zarr_format=2,
     )
-    return str(output_path)
+    return public_uri
 
 
 def stream_raster_stack_to_zarr(
@@ -442,17 +495,12 @@ def stream_raster_stack_to_zarr(
         min(chunk_spec.y, height),
         min(chunk_spec.x, width),
     )
-    output_path = resolve_output_path(output_uri)
-    if output_path.exists() and output_path.is_file():
-        raise ConversionError(f"Output path is a file, expected a directory: {output_path}")
-    if output_path.exists():
-        shutil.rmtree(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_store, public_uri = _prepare_output_store(output_uri)
 
     group_attrs = dict(metadata)
     group_attrs["band_names"] = band_names
     group_attrs["zarr_format_version"] = ZARR_FORMAT_VERSION
-    root = zarr.open_group(output_path, mode="w", zarr_format=2)
+    root = zarr.open_group(output_store, mode="w", zarr_format=2)
     root.attrs.update(group_attrs)
 
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
@@ -502,10 +550,10 @@ def stream_raster_stack_to_zarr(
                 if vrt is not None:
                     vrt.close()
 
-    zarr.consolidate_metadata(output_path)
+    zarr.consolidate_metadata(output_store)
     dataset_summary = {
         "data_family": str(metadata.get("data_family", "unknown")),
-        "zarr_uri": str(output_path),
+        "zarr_uri": public_uri,
         "dimensions": ["time", "band", "y", "x"],
         "shape": [1, len(band_names), height, width],
         "band_names": band_names,
@@ -516,7 +564,7 @@ def stream_raster_stack_to_zarr(
         "pixel_size": stack["pixel_size"],
         "band_metadata": band_metadata,
     }
-    return str(output_path), dataset_summary
+    return public_uri, dataset_summary
 
 
 def resolve_output_path(output_uri: str) -> Path:
@@ -528,7 +576,7 @@ def resolve_output_path(output_uri: str) -> Path:
     parsed = urlparse(output_uri)
     if parsed.scheme:
         raise ConversionError(
-            "Only local output paths are supported by the Zarr converter in v1."
+            "Only local file paths can be resolved with resolve_output_path()."
         )
     candidate = Path(output_uri).expanduser().resolve()
     mapped = _fallback_mounted_data_output(candidate)
@@ -603,3 +651,56 @@ def _fallback_mounted_data_output(candidate: Path) -> Path | None:
                 return Path("/data")
             return Path("/data").joinpath(*suffix)
     return None
+
+
+def _is_remote_uri(uri: str) -> bool:
+    parsed = urlparse(str(uri or "").strip())
+    return bool(parsed.scheme and parsed.scheme.lower() not in {"", "file"})
+
+
+def _stage_remote_source(raw_uri: str, *, label: str) -> tuple[Path, CleanupBundle]:
+    if is_oci_uri(raw_uri):
+        return _stage_oci_source(raw_uri, label=label)
+    raise ConversionError(f"Unsupported remote source URI: {raw_uri}")
+
+
+def _stage_oci_source(raw_uri: str, *, label: str) -> tuple[Path, CleanupBundle]:
+    try:
+        store, parsed = OCIStore.from_uri(raw_uri)
+    except OCIStorageError as exc:
+        raise ConversionDependencyError(str(exc)) from exc
+
+    staging_dir = TemporaryDirectory(prefix=f"nimbus_{label}_oci_")
+    cleanup = CleanupBundle(staging_dir)
+    staging_root = Path(staging_dir.name)
+
+    if store.is_file(parsed.path):
+        local_path = staging_root / Path(parsed.path).name
+        store.download_file(parsed.path, local_path)
+        return local_path, cleanup
+
+    if store.is_dir(parsed.path):
+        dest_name = Path(parsed.path.rstrip("/")).name or "source"
+        local_root = staging_root / dest_name
+        store.download_tree(parsed.path, local_root)
+        return local_root, cleanup
+
+    raise ConversionError(f"OCI source not found: {raw_uri}")
+
+
+def _prepare_output_store(output_uri: str) -> tuple[Any, str]:
+    if is_oci_uri(output_uri):
+        try:
+            store, parsed = OCIStore.from_uri(output_uri)
+        except OCIStorageError as exc:
+            raise ConversionDependencyError(str(exc)) from exc
+        store.delete(parsed.path, recursive=True)
+        return store.get_mapper(parsed.path, create=True), output_uri
+
+    output_path = resolve_output_path(output_uri)
+    if output_path.exists() and output_path.is_file():
+        raise ConversionError(f"Output path is a file, expected a directory: {output_path}")
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path, str(output_path)

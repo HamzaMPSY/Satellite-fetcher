@@ -8,6 +8,7 @@ ZARR_FORMAT_VERSION = 1
 CORE_BANDS = ("blue", "green", "red", "nir")
 OPTICAL_EXTENDED_BANDS = (
     "coastal",
+    "pan",
     "rededge1",
     "rededge2",
     "rededge3",
@@ -18,12 +19,14 @@ OPTICAL_EXTENDED_BANDS = (
     "swir2",
     "thermal1",
     "thermal2",
+    "scene_classification",
 )
 CANONICAL_BANDS = (
     "coastal",
     "blue",
     "green",
     "red",
+    "pan",
     "rededge1",
     "rededge2",
     "rededge3",
@@ -35,6 +38,7 @@ CANONICAL_BANDS = (
     "swir2",
     "thermal1",
     "thermal2",
+    "scene_classification",
 )
 DIMENSIONS = ("time", "band", "y", "x")
 REQUIRED_METADATA_FIELDS = (
@@ -97,6 +101,7 @@ def default_zarr_model() -> dict[str, Any]:
         notes=(
             "Both Copernicus and Landsat inputs must be normalized to canonical bands before writing.",
             "Mask services read and write within the same Zarr store.",
+            "Raw products and Zarr outputs may be stored on the local filesystem or on OCI object storage.",
             "This schema is the baseline for v1 and may evolve under explicit format_version changes.",
         ),
     )
@@ -122,13 +127,16 @@ def default_zarr_model() -> dict[str, Any]:
             "cirrus",
             "swir1",
             "swir2",
+            "scene_classification",
         ],
         "landsat-8-9": [
             "coastal",
             "blue",
             "green",
             "red",
+            "pan",
             "nir",
+            "cirrus",
             "swir1",
             "swir2",
             "thermal1",
@@ -138,8 +146,9 @@ def default_zarr_model() -> dict[str, Any]:
     }
     payload["resolution_policy"] = {
         "optical": (
-            "Use the finest native grid available for each supported optical collection. "
-            "Coarser bands are reprojected to that collection-specific target grid."
+            "Use a collection-specific target grid that preserves the intended multispectral geometry. "
+            "Sentinel-2 is normalized to 10 m. Landsat is normalized to 30 m even when Level-1 includes "
+            "the 15 m panchromatic band B8. Coarser bands are reprojected to that collection-specific target grid."
         ),
         "sentinel-2": {
             "reference_band": "red",
@@ -153,6 +162,17 @@ def default_zarr_model() -> dict[str, Any]:
             "reference_band": "first_available_polarization",
             "target_pixel_size_meters": None,
         },
+    }
+    payload["sentinel1_runtime_notes"] = {
+        "standard_products": "GRD, SLC, and IW_SLC__1S are handled as raster Sentinel-1 products.",
+        "raw_products": (
+            "RAW products are decoded in sample space through an optional Sentinel-1 Level-0 decoder. "
+            "Their x/y axes are acquisition sample coordinates, not georeferenced map coordinates."
+        ),
+        "snap": (
+            "SNAP support is optional at runtime and is exposed via the service health/schema endpoints. "
+            "It is intended for Sentinel-1 preprocessing flows but is not required for the Python RAW decoder path."
+        ),
     }
     payload["data_families"] = {
         "optical": {

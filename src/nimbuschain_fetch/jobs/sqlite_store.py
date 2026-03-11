@@ -720,3 +720,15 @@ class SQLiteJobStore:
                 "SELECT * FROM workers ORDER BY last_seen_at DESC"
             ).fetchall()
         return [self._row_to_worker(row) for row in rows]
+
+    def prune_stale_workers(self, stale_after_seconds: int) -> int:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=max(1, int(stale_after_seconds)))
+        ).isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM workers WHERE last_seen_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount or 0)

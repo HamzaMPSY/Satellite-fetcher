@@ -101,3 +101,6 @@ class JobStore(Protocol):
 
     def list_workers(self) -> list[dict[str, Any]]:
         ...
+
+    def prune_stale_workers(self, stale_after_seconds: int) -> int:
+        ...

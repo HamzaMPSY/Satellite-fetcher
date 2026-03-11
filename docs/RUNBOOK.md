@@ -1,36 +1,54 @@
 # Runbook
 
-## Prerequisites
+## 1. Prerequisites
 
+Required:
 - Python 3.11
-- Podman + podman-compose
-- optional: Minikube + kubectl for Kubernetes
+- Podman + `podman-compose` or Podman Compose plugin
 
-## Local Podman workflow
+Optional:
+- Docker-compatible compose
+- Minikube + `kubectl`
 
-### 1. Configure environment
+## 2. First local setup
 
 ```bash
+cd "/Users/mehdidinari/Desktop/backend nimbus"
 cp .env.example .env
 ```
 
-Fill credentials and adjust ports only if needed.
+Do not commit `.env`.
 
-### 2. Start
+At minimum, configure provider credentials before testing downloads.
+
+## 3. Start locally with Podman
 
 ```bash
 ./scripts/10_up_stack.sh
 ```
 
-### 3. Verify
+The script:
+- starts the Podman machine on macOS when available
+- launches the compose stack
+- waits briefly for API, UI and Zarr health endpoints
+
+## 4. Local URLs
+
+- UI: [http://127.0.0.1:8501](http://127.0.0.1:8501)
+- API docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- API health: [http://127.0.0.1:8000/v1/health](http://127.0.0.1:8000/v1/health)
+- API readiness: [http://127.0.0.1:8000/v1/readiness](http://127.0.0.1:8000/v1/readiness)
+- Worker status: [http://127.0.0.1:8000/v1/worker/status](http://127.0.0.1:8000/v1/worker/status)
+- Zarr health: [http://127.0.0.1:8010/health](http://127.0.0.1:8010/health)
+- Zarr readiness: [http://127.0.0.1:8010/readiness](http://127.0.0.1:8010/readiness)
+
+## 5. Stop locally
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/health | python3 -m json.tool
-curl -s http://127.0.0.1:8010/health | python3 -m json.tool
-podman ps
+./scripts/11_down_stack.sh
 ```
 
-### 4. Logs
+## 6. Inspect logs
 
 ```bash
 podman logs -f backendnimbus_nimbus-api_1
@@ -39,75 +57,92 @@ podman logs -f backendnimbus_nimbus-ui_1
 podman logs -f backendnimbus_nimbus-zarr_1
 ```
 
-### 5. Stop
-
-```bash
-./scripts/11_down_stack.sh
-```
-
-## Smoke test
+## 7. Smoke checks
 
 ### API
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/health | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/readiness | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/worker/status | python3 -m json.tool
 ```
-
-### UI
-Open `http://127.0.0.1:8501`
 
 ### Zarr service
 
 ```bash
 curl -s http://127.0.0.1:8010/health | python3 -m json.tool
+curl -s http://127.0.0.1:8010/readiness | python3 -m json.tool
+curl -s http://127.0.0.1:8010/schema | python3 -m json.tool
 ```
 
-## Kubernetes with Minikube
+### UI
 
-### 1. Bootstrap cluster
+Open the UI and verify:
+- map loads
+- provider selector works
+- status blocks show API, readiness, worker and Zarr state
+- recent jobs panel renders without browser refresh loops
+
+## 8. Troubleshooting
+
+### Podman is not reachable on macOS
+
+```bash
+podman machine start
+podman system connection list
+```
+
+### UI shows no jobs or stale jobs
+
+Check:
+- API health/readiness
+- worker status
+- worker logs
+- browser hard refresh
+
+### UI Zarr tab does not show raw sources
+
+Check:
+- files really exist under `data/downloads/`
+- `manifest.json` exists for downloaded jobs when applicable
+- `./data:/data` volume is mounted in the UI container
+
+### Zarr conversion fails
+
+Check:
+- raw source path exists in `/data/downloads`
+- collection and product type match the source
+- Zarr `/readiness` endpoint is `ready`
+- converter logs for missing bands or unsupported inputs
+
+### Port conflict
+
+```bash
+lsof -nP -iTCP:8501 -sTCP:LISTEN
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+lsof -nP -iTCP:8010 -sTCP:LISTEN
+```
+
+## 9. Kubernetes / Minikube
 
 ```bash
 ./scripts/32_k8s_bootstrap_minikube.sh
-```
-
-### 2. Apply manifests
-
-```bash
 ./scripts/33_k8s_apply_minikube.sh
-```
-
-### 3. Expose API and UI locally
-
-```bash
 ./scripts/35_k8s_expose_local.sh
 ```
 
-### 4. Stop local exposure
+Stop local exposure:
 
 ```bash
 ./scripts/36_k8s_unexpose_local.sh
 ```
 
-## Common issues
+## 10. Onboarding checklist for a new developer
 
-### UI shows no live updates
-- verify API health
-- verify worker logs
-- hard refresh the browser
-
-### Zarr tab does not show raw sources
-- confirm files exist under `data/downloads`
-- check that the download job wrote `manifest.json`
-- verify UI container has `/data` mounted
-
-### Podman machine is down on macOS
-
-```bash
-podman machine start
-```
-
-### Port 8501 already used
-
-```bash
-lsof -nP -iTCP:8501 -sTCP:LISTEN
-```
+1. Read `/Users/mehdidinari/Desktop/backend nimbus/README.md`
+2. Read `/Users/mehdidinari/Desktop/backend nimbus/docs/ARCHITECTURE.md`
+3. Launch the Podman stack
+4. Verify all health and readiness endpoints
+5. Open the UI and submit one small job
+6. Inspect one finished job through the API and UI
+7. Review `/Users/mehdidinari/Desktop/backend nimbus/docs/ZARR.md` before touching conversion logic

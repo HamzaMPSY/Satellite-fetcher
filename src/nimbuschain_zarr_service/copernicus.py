@@ -18,6 +18,13 @@ from nimbuschain_zarr_service.core import (
     build_standard_dataset,
     load_aligned_raster_stack,
     prepare_source,
+    stream_raster_stack_to_zarr,
+    summarize_dataset,
+    write_dataset_to_zarr,
+)
+from nimbuschain_zarr_service.sentinel1_raw import (
+    build_sentinel1_raw_dataset,
+    convert_sentinel1_raw_to_zarr,
 )
 
 
@@ -28,6 +35,7 @@ _S1_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "hv": (re.compile(r"(?:^|[_-])hv(?:[_\.-]|$)", re.IGNORECASE),),
 }
 _S2_CANONICAL_BY_CODE = {
+    "SCL": "scene_classification",
     "B01": "coastal",
     "B02": "blue",
     "B03": "green",
@@ -57,6 +65,7 @@ _S2_CANONICAL_BANDS = (
     "cirrus",
     "swir1",
     "swir2",
+    "scene_classification",
 )
 
 
@@ -96,6 +105,64 @@ def build_copernicus_dataset(
         summary["source_kind"] = extracted.source_kind
         summary["raw_path"] = str(extracted.raw_path)
         return dataset, summary
+    finally:
+        if extracted.cleanup is not None:
+            extracted.cleanup.cleanup()
+
+
+def convert_copernicus_to_zarr(
+    *,
+    raw_uri: str,
+    provider: str,
+    collection: str,
+    scene_id: str,
+    output_uri: str,
+    product_type: str | None = None,
+) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    extracted = prepare_source(raw_uri, label="copernicus")
+    try:
+        resolved_scene_id = _resolve_scene_id(extracted, scene_id)
+        data_family = _detect_family(extracted, collection=collection, scene_id=resolved_scene_id)
+        if data_family == "optical":
+            return _convert_sentinel2_to_zarr(
+                extracted,
+                provider=provider,
+                collection=collection,
+                scene_id=resolved_scene_id,
+                output_uri=output_uri,
+                product_type=product_type,
+                requested_scene_id=scene_id,
+            )
+        s1_product_type = _s1_product_type(resolved_scene_id, requested=product_type)
+        if s1_product_type == "RAW":
+            written_uri, summary, dataset_summary = convert_sentinel1_raw_to_zarr(
+                root=extracted.root,
+                provider=provider,
+                collection=collection,
+                scene_id=resolved_scene_id,
+                output_uri=output_uri,
+            )
+            summary["scene_id"] = resolved_scene_id
+            summary["source_kind"] = extracted.source_kind
+            summary["raw_path"] = str(extracted.raw_path)
+            if scene_id != resolved_scene_id:
+                summary["requested_scene_id"] = scene_id
+            return written_uri, "sar", summary, dataset_summary
+
+        dataset, summary = _build_sentinel1_dataset(
+            extracted,
+            provider=provider,
+            collection=collection,
+            scene_id=resolved_scene_id,
+            product_type=product_type,
+        )
+        written_uri = write_dataset_to_zarr(dataset, output_uri)
+        dataset_summary = summarize_dataset(
+            dataset,
+            data_family=str(summary.get("data_family", "unknown")),
+            zarr_uri=written_uri,
+        )
+        return written_uri, str(summary.get("data_family", "unknown")), summary, dataset_summary
     finally:
         if extracted.cleanup is not None:
             extracted.cleanup.cleanup()
@@ -163,7 +230,7 @@ def _build_sentinel2_dataset(
             "Missing required Sentinel-2 optical bands: " + ", ".join(missing)
         )
 
-    ordered_bands = [band for band in _S2_CANONICAL_BANDS if band in band_paths]
+    ordered_bands = _ordered_s2_bands(s2_spec, band_paths)
     target_pixel_size = target_pixel_size_for(provider, collection)
     stack = load_aligned_raster_stack(
         band_paths,
@@ -230,6 +297,129 @@ def _build_sentinel2_dataset(
     return dataset, summary
 
 
+def _convert_sentinel2_to_zarr(
+    extracted: PreparedSource,
+    *,
+    provider: str,
+    collection: str,
+    scene_id: str,
+    output_uri: str,
+    product_type: str | None = None,
+    requested_scene_id: str | None = None,
+) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    raster_files = [
+        path
+        for path in extracted.root.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".jp2", ".tif", ".tiff"}
+        and "img_data" in str(path.parent).lower()
+    ]
+    if not raster_files:
+        raster_files = [
+            path
+            for path in extracted.root.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".jp2", ".tif", ".tiff"}
+        ]
+    if not raster_files:
+        raise ConversionError("No Sentinel-2 raster files were found in the SAFE product.")
+
+    s2_product_type = _s2_product_type(scene_id, requested=product_type)
+    s2_spec = get_copernicus_product_spec("SENTINEL-2", s2_product_type)
+    if not s2_spec:
+        raise ConversionError(
+            "Unsupported Sentinel-2 productType for this project. "
+            f"Expected one of: {', '.join(sorted(supported_product_types().get('SENTINEL-2', [])))}. "
+            f"Got: {s2_product_type}."
+        )
+
+    band_paths = _discover_s2_band_paths(
+        raster_files,
+        product_type=s2_product_type,
+        ext=str(s2_spec.get("ext", "jp2")),
+    )
+    missing = [band for band in _S2_REQUIRED_BANDS if band not in band_paths]
+    if missing:
+        raise ConversionError(
+            "Missing required Sentinel-2 optical bands: " + ", ".join(missing)
+        )
+
+    ordered_bands = _ordered_s2_bands(s2_spec, band_paths)
+    categorical_bands = {
+        _S2_CANONICAL_BY_CODE[code]
+        for code in list(s2_spec.get("categorical_bands") or [])
+        if code in _S2_CANONICAL_BY_CODE
+    }
+    acquisition = _extract_timestamp_from_scene_id(scene_id, prefix="S2")
+    target_pixel_size = target_pixel_size_for(provider, collection)
+    metadata = {
+        "provider": provider,
+        "collection": collection,
+        "scene_id": scene_id,
+        "product_id": scene_id,
+        "product_type": s2_product_type,
+        "product_level": _s2_product_level(scene_id),
+        "data_family": "optical",
+        "source_uri": str(extracted.raw_path),
+    }
+    written_uri, dataset_summary = stream_raster_stack_to_zarr(
+        band_paths=band_paths,
+        ordered_bands=ordered_bands,
+        output_uri=output_uri,
+        metadata=metadata,
+        acquisition_datetime=acquisition,
+        reference_band="red",
+        categorical_bands=categorical_bands,
+        target_pixel_size=target_pixel_size,
+    )
+    band_metadata = dict(dataset_summary.get("band_metadata") or {})
+    grid = {
+        "height": int(dataset_summary["shape"][2]),
+        "width": int(dataset_summary["shape"][3]),
+        "dtype": str(dataset_summary.get("dtype") or "unknown"),
+        "crs": dataset_summary.get("crs"),
+        "transform": dataset_summary.get("transform"),
+        "pixel_size": dataset_summary.get("pixel_size"),
+        "reference_band": "red",
+    }
+    summary = {
+        "provider": provider,
+        "collection": collection,
+        "scene_id": scene_id,
+        "product_id": scene_id,
+        "product_type": s2_product_type,
+        "product_level": _s2_product_level(scene_id),
+        "data_family": "optical",
+        "source_kind": extracted.source_kind,
+        "raw_path": str(extracted.raw_path),
+        "canonical_bands": list(_S2_CANONICAL_BANDS),
+        "required_core_bands": list(_S2_REQUIRED_BANDS),
+        "optional_bands_present": [band for band in _S2_CANONICAL_BANDS if band in band_paths and band not in _S2_REQUIRED_BANDS],
+        "normalized_band_order": list(dataset_summary["band_names"]),
+        "resolution_policy_meters": target_pixel_size,
+        "band_sources": {
+            band: str(path.relative_to(extracted.root)) for band, path in band_paths.items()
+        },
+        "band_resampling": {
+            band: band_metadata.get(band, {}).get("resampled_to_reference")
+            for band in dataset_summary["band_names"]
+        },
+        "band_native_pixel_size": {
+            band: band_metadata.get(band, {}).get("source_pixel_size")
+            for band in dataset_summary["band_names"]
+        },
+        "acquisition_datetime": acquisition,
+        "grid": grid,
+        "validation": {
+            "same_grid": True,
+            "missing_optional_bands": [
+                band for band in _S2_CANONICAL_BANDS if band not in band_paths and band not in _S2_REQUIRED_BANDS
+            ],
+        },
+    }
+    if requested_scene_id and requested_scene_id != scene_id:
+        summary["requested_scene_id"] = requested_scene_id
+    return written_uri, "optical", summary, dataset_summary
+
+
 def _build_sentinel1_dataset(
     extracted: PreparedSource,
     *,
@@ -239,6 +429,14 @@ def _build_sentinel1_dataset(
     product_type: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     s1_product_type = _s1_product_type(scene_id, requested=product_type)
+    if s1_product_type == "RAW":
+        dataset, summary = build_sentinel1_raw_dataset(
+            root=extracted.root,
+            provider=provider,
+            collection=collection,
+            scene_id=scene_id,
+        )
+        return dataset, summary
     s1_spec = get_copernicus_product_spec("SENTINEL-1", s1_product_type)
     if not s1_spec:
         raise ConversionError(
@@ -451,6 +649,11 @@ def _discover_s2_band_paths(
             if canonical in band_paths:
                 continue
     return band_paths
+
+
+def _ordered_s2_bands(spec: dict[str, Any], band_paths: dict[str, Path]) -> list[str]:
+    _ = spec
+    return [band for band in _S2_CANONICAL_BANDS if band in band_paths]
 
 
 def _s2_storage_suffix(bucket: str) -> str:

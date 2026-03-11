@@ -17,6 +17,9 @@ from nimbuschain_zarr_service.config_loader import (
     supported_collections,
     supported_product_types,
 )
+from nimbuschain_zarr_service.oci_storage import oci_support_status
+from nimbuschain_zarr_service.sentinel1_raw import raw_support_status
+from nimbuschain_zarr_service.snap_runtime import snap_support_status
 from nimbuschain_zarr_service.schema import default_zarr_model
 from nimbuschain_zarr_service.service import ZarrConversionService
 
@@ -81,6 +84,8 @@ def health() -> JSONResponse:
         "config": _check_config(),
         "dependencies": _check_dependencies(),
         "storage": _check_storage(),
+        "remote_storage": _check_remote_storage(),
+        "sentinel1": _check_sentinel1_support(),
         "service": _check_service(),
     }
     critical_failures = [
@@ -110,6 +115,8 @@ def readiness() -> JSONResponse:
         "config": _check_config(),
         "dependencies": _check_dependencies(),
         "storage": _check_storage(),
+        "remote_storage": _check_remote_storage(),
+        "sentinel1": _check_sentinel1_support(),
         "service": _check_service(),
         "smoke_zarr_write": _check_smoke_zarr_write(),
     }
@@ -141,6 +148,9 @@ def schema() -> dict[str, object]:
         "status": "ok",
         "zarr_model": default_zarr_model(),
         "converter_config": load_converter_config(),
+        "runtime_capabilities": {
+            "sentinel1": _check_sentinel1_support(),
+        },
     }
 
 
@@ -233,6 +243,30 @@ def _check_dependencies() -> dict[str, object]:
         "critical": True,
         "required_modules": list(_REQUIRED_MODULES),
         "missing_modules": missing,
+        }
+
+
+def _check_remote_storage() -> dict[str, object]:
+    status = oci_support_status()
+    return {
+        "ok": True,
+        "critical": False,
+        "oci_available": bool(status.get("available")),
+        "config_path": status.get("config_path"),
+        "profile": status.get("profile"),
+        "namespace": status.get("namespace"),
+    }
+
+
+def _check_sentinel1_support() -> dict[str, object]:
+    raw_status = raw_support_status()
+    snap_status = snap_support_status()
+    return {
+        "ok": True,
+        "critical": False,
+        "raw_decoder_available": bool(raw_status.get("available")),
+        "raw_decoder": raw_status,
+        "snap": snap_status,
     }
 
 

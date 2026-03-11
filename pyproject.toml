@@ -40,13 +40,17 @@ ui = [
   "pyproj>=3.7.0"
 ]
 zarr-service = [
+  "fsspec>=2024.9.0",
   "zarr>=2.18.0",
   "numcodecs>=0.13.0",
   "xarray>=2024.10.0",
   "rasterio>=1.4.0",
   "h5netcdf>=1.4.0",
   "h5py>=3.11.0",
-  "pyyaml>=6.0.2"
+  "pyyaml>=6.0.2",
+  "oci>=2.132.0",
+  "ocifs>=0.1.2",
+  "sentinel1decoder>=2.0.0"
 ]
 
 [project.scripts]
@@ -60,6 +64,10 @@ packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbu
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+  "integration: end-to-end or service-level integration coverage",
+  "slow: long-running tests that may require network, credentials, or large I/O",
+]
 
 [tool.ruff]
 line-length = 100
