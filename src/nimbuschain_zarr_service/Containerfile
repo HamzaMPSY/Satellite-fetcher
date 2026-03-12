@@ -5,15 +5,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# System deps (single layer) + non-root user
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libexpat1 && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --create-home --uid 10001 appuser
 
-RUN useradd --create-home --uid 10001 appuser
-
+# Copy project metadata first to improve cache reuse on code changes
 COPY pyproject.toml README.md /app/
-COPY src /app/src
 
+# Copy sources with target ownership
+COPY --chown=10001:10001 src /app/src
+
+# Install Python dependencies (zarr-service extra)
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir ".[zarr-service]"
 

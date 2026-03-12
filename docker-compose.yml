@@ -106,7 +106,7 @@ services:
   nimbus-zarr:
     build:
       context: .
-      dockerfile: zarr-service/Containerfile
+      dockerfile: src/nimbuschain_zarr_service/Containerfile
     ports:
       - "${NIMBUS_ZARR_PORT:-8010}:8010"
     environment:
