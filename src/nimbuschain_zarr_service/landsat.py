@@ -6,19 +6,20 @@ from typing import Any
 import re
 
 from nimbuschain_zarr_service.config_loader import (
-    get_landsat_product_spec,
-    target_pixel_size_for,
     supported_product_types,
+    target_pixel_size_for,
 )
 from nimbuschain_zarr_service.core import (
     ConversionDependencyError,
     ConversionError,
+    PreparedSource,
+    TargetGrid,
+    attach_layer_array,
     build_standard_dataset,
     load_aligned_raster_stack,
-    stream_raster_stack_to_zarr,
     prepare_source,
+    stream_raster_product_to_zarr,
 )
-from nimbuschain_zarr_service.schema import CORE_BANDS
 
 
 class LandsatNormalizationError(ConversionError):
@@ -29,39 +30,45 @@ class LandsatDependencyError(ConversionDependencyError):
     """Raised when a runtime dependency required for Landsat conversion is missing."""
 
 
-LANDSAT_CANONICAL_BANDS = (
-    "coastal",
-    "blue",
-    "green",
-    "red",
-    "pan",
-    "nir",
-    "cirrus",
-    "swir1",
-    "swir2",
-    "thermal1",
-    "thermal2",
-)
-LANDSAT_OPTIONAL_BANDS = tuple(
-    band for band in LANDSAT_CANONICAL_BANDS if band not in CORE_BANDS
-)
-_LANDSAT_CANONICAL_BY_CODE = {
-    "B1": "coastal",
-    "B2": "blue",
-    "B3": "green",
-    "B4": "red",
-    "B8": "pan",
-    "B5": "nir",
-    "B9": "cirrus",
-    "B6": "swir1",
-    "B7": "swir2",
-    "B10": "thermal1",
-    "B11": "thermal2",
-}
 _MTL_NAME_RE = re.compile(r"_MTL\.txt$", re.IGNORECASE)
 _MTL_KV_RE = re.compile(r"^\s*([A-Z0-9_]+)\s=\s(.+?)\s*$")
 _LANDSAT_PRODUCT_TYPE_RE = re.compile(r"_((?:L1|L2)[A-Z0-9]{2})_", re.IGNORECASE)
 _LANDSAT_SPACECRAFT_RE = re.compile(r"^L[A-Z]?0?([0-9]{2})_")
+
+_L1_IMAGERY_LAYERS = tuple(f"B{index}" for index in range(1, 12))
+_L2_REFLECTANCE_LAYERS = tuple(f"SR_B{index}" for index in range(1, 8))
+_L2_THERMAL_LAYERS = ("ST_B10",)
+_L2_IMAGERY_LAYERS = _L2_REFLECTANCE_LAYERS + _L2_THERMAL_LAYERS
+_L2SR_IMAGERY_LAYERS = _L2_REFLECTANCE_LAYERS
+_LANDSAT_ANCILLARY_PRIORITY = {
+    "QA_PIXEL": 0,
+    "QA_RADSAT": 1,
+    "SR_QA_AEROSOL": 2,
+    "QA_AEROSOL": 3,
+    "ST_QA": 4,
+    "SAA": 5,
+    "SZA": 6,
+    "VAA": 7,
+    "VZA": 8,
+    "ST_CDIST": 9,
+    "ST_DRAD": 10,
+    "ST_URAD": 11,
+    "ST_TRAD": 12,
+    "ST_ATRAN": 13,
+    "ST_EMIS": 14,
+    "ST_EMSD": 15,
+}
+_LANDSAT_KNOWN_LAYER_TOKENS = tuple(
+    sorted(
+        {
+            *_L1_IMAGERY_LAYERS,
+            *_L2_IMAGERY_LAYERS,
+            *_LANDSAT_ANCILLARY_PRIORITY,
+        },
+        key=len,
+        reverse=True,
+    )
+)
 
 
 def build_landsat_dataset(
@@ -81,32 +88,52 @@ def build_landsat_dataset(
             or mtl_values.get("LANDSAT_PRODUCT_ID")
             or scene_id
         )
-        product_id = str(
-            mtl_values.get("LANDSAT_PRODUCT_ID")
-            or normalized_scene_id
-        )
+        product_id = str(mtl_values.get("LANDSAT_PRODUCT_ID") or normalized_scene_id)
         resolved_product_type = _landsat_product_type(product_id, requested=product_type)
-        _validate_landsat_collection_product_type(collection=collection, product_type=resolved_product_type)
-        band_paths = _select_band_paths(
+        _validate_landsat_collection_product_type(
+            collection=collection,
+            product_type=resolved_product_type,
+        )
+        imagery_paths, ancillary_paths = _discover_landsat_layers(
             files["tifs"],
             collection=collection,
             product_type=resolved_product_type,
         )
-        ordered_bands = [band for band in LANDSAT_CANONICAL_BANDS if band in band_paths]
+        ordered_imagery = _ordered_landsat_imagery_layers(
+            collection=collection,
+            product_type=resolved_product_type,
+            imagery_paths=imagery_paths,
+        )
+        if not ordered_imagery:
+            raise LandsatNormalizationError(
+                "No Landsat imagery layers were detected in the extracted source."
+            )
+
+        reference_band = _landsat_reference_band(
+            collection=collection,
+            product_type=resolved_product_type,
+            available=ordered_imagery,
+        )
         target_pixel_size = target_pixel_size_for(provider, collection)
-        stack = load_aligned_raster_stack(
-            band_paths,
-            ordered_bands=ordered_bands,
-            reference_band="red",
+        imagery_stack = load_aligned_raster_stack(
+            imagery_paths,
+            ordered_bands=ordered_imagery,
+            reference_band=reference_band,
             target_pixel_size=target_pixel_size,
         )
-        satellite_code = _landsat_satellite_code(product_id)
-        product_type_short = _landsat_product_type_short(satellite_code, resolved_product_type)
-        product_level = _landsat_product_level(collection=collection, product_id=product_id)
         acquisition = _build_acquisition_datetime(mtl_values)
+        satellite_code = _landsat_satellite_code(product_id)
+        product_type_short = _landsat_product_type_short(
+            satellite_code,
+            resolved_product_type,
+        )
+        product_level = _landsat_product_level(
+            collection=collection,
+            product_id=product_id,
+        )
         dataset = build_standard_dataset(
-            arrays=stack["arrays"],
-            band_names=stack["band_names"],
+            arrays=imagery_stack["arrays"],
+            band_names=imagery_stack["band_names"],
             acquisition_datetime=acquisition,
             metadata={
                 "provider": provider,
@@ -118,65 +145,69 @@ def build_landsat_dataset(
                 "satellite": satellite_code,
                 "product_level": product_level,
                 "data_family": "optical",
-                "crs": stack["crs"],
-                "transform": stack["transform"],
-                "reference_band": stack["reference_band"],
-                "reference_pixel_size": stack["pixel_size"],
-                "band_metadata": stack["band_metadata"],
+                "crs": imagery_stack["crs"],
+                "transform": imagery_stack["transform"],
+                "reference_band": imagery_stack["reference_band"],
+                "reference_pixel_size": imagery_stack["pixel_size"],
+                "band_metadata": imagery_stack["band_metadata"],
             },
         )
-        summary = {
-            "provider": provider,
-            "collection": collection,
-            "scene_id": normalized_scene_id,
-            "product_id": product_id,
-            "product_type": resolved_product_type,
-            "product_type_short": product_type_short,
-            "satellite": satellite_code,
-            "product_level": product_level,
-            "data_family": "optical",
-            "source_kind": extracted.source_kind,
-            "raw_path": str(extracted.raw_path),
-            "canonical_bands": list(LANDSAT_CANONICAL_BANDS),
-            "required_core_bands": list(CORE_BANDS),
-            "optional_bands_present": [
-                band for band in LANDSAT_OPTIONAL_BANDS if band in band_paths
-            ],
-            "normalized_band_order": stack["band_names"],
-            "resolution_policy_meters": target_pixel_size,
-            "band_sources": {
-                band: (
-                    str(path.relative_to(extracted.root))
-                    if extracted.cleanup is not None
-                    else str(path)
-                )
-                for band, path in band_paths.items()
+        ancillary_metadata: dict[str, Any] = {}
+        ordered_ancillary = _ordered_landsat_ancillary_layers(ancillary_paths)
+        if ordered_ancillary:
+            target_grid = TargetGrid(
+                height=int(imagery_stack["height"]),
+                width=int(imagery_stack["width"]),
+                crs=imagery_stack["crs"],
+                transform=imagery_stack["transform"],
+                pixel_size=imagery_stack["pixel_size"],
+                reference_band=imagery_stack["reference_band"],
+            )
+            ancillary_stack = load_aligned_raster_stack(
+                ancillary_paths,
+                ordered_bands=ordered_ancillary,
+                reference_band=ordered_ancillary[0],
+                target_pixel_size=target_pixel_size,
+                target_grid=target_grid,
+            )
+            dataset = attach_layer_array(
+                dataset,
+                arrays=ancillary_stack["arrays"],
+                layer_names=ancillary_stack["band_names"],
+                acquisition_datetime=acquisition,
+                variable_name="ancillary",
+                coord_name="ancillary_layer",
+            )
+            ancillary_metadata = ancillary_stack["band_metadata"]
+
+        summary = _summarize_landsat_product(
+            provider=provider,
+            collection=collection,
+            scene_id=normalized_scene_id,
+            product_id=product_id,
+            product_type=resolved_product_type,
+            product_type_short=product_type_short,
+            satellite_code=satellite_code,
+            product_level=product_level,
+            acquisition=acquisition,
+            extracted=extracted,
+            imagery_paths=imagery_paths,
+            imagery_band_names=imagery_stack["band_names"],
+            imagery_metadata=imagery_stack["band_metadata"],
+            grid={
+                "height": imagery_stack["height"],
+                "width": imagery_stack["width"],
+                "dtype": imagery_stack["dtype"],
+                "crs": imagery_stack["crs"],
+                "transform": imagery_stack["transform"],
+                "pixel_size": imagery_stack["pixel_size"],
+                "reference_band": imagery_stack["reference_band"],
             },
-            "band_resampling": {
-                band: stack["band_metadata"][band]["resampled_to_reference"]
-                for band in stack["band_names"]
-            },
-            "band_native_pixel_size": {
-                band: stack["band_metadata"][band]["source_pixel_size"]
-                for band in stack["band_names"]
-            },
-            "acquisition_datetime": acquisition,
-            "grid": {
-                "height": stack["height"],
-                "width": stack["width"],
-                "dtype": stack["dtype"],
-                "crs": stack["crs"],
-                "transform": stack["transform"],
-                "pixel_size": stack["pixel_size"],
-                "reference_band": stack["reference_band"],
-            },
-            "validation": {
-                "same_grid": True,
-                "missing_optional_bands": [
-                    band for band in LANDSAT_OPTIONAL_BANDS if band not in band_paths
-                ],
-            },
-        }
+            target_pixel_size=target_pixel_size,
+            ancillary_paths=ancillary_paths,
+            ancillary_layer_names=ordered_ancillary,
+            ancillary_metadata=ancillary_metadata,
+        )
         if normalized_scene_id != scene_id:
             summary["requested_scene_id"] = scene_id
         return dataset, summary
@@ -221,23 +252,43 @@ def convert_landsat_to_zarr(
             or mtl_values.get("LANDSAT_PRODUCT_ID")
             or scene_id
         )
-        product_id = str(
-            mtl_values.get("LANDSAT_PRODUCT_ID")
-            or normalized_scene_id
-        )
+        product_id = str(mtl_values.get("LANDSAT_PRODUCT_ID") or normalized_scene_id)
         resolved_product_type = _landsat_product_type(product_id, requested=product_type)
-        _validate_landsat_collection_product_type(collection=collection, product_type=resolved_product_type)
-        band_paths = _select_band_paths(
+        _validate_landsat_collection_product_type(
+            collection=collection,
+            product_type=resolved_product_type,
+        )
+        imagery_paths, ancillary_paths = _discover_landsat_layers(
             files["tifs"],
             collection=collection,
             product_type=resolved_product_type,
         )
-        ordered_bands = [band for band in LANDSAT_CANONICAL_BANDS if band in band_paths]
-        satellite_code = _landsat_satellite_code(product_id)
-        product_type_short = _landsat_product_type_short(satellite_code, resolved_product_type)
-        product_level = _landsat_product_level(collection=collection, product_id=product_id)
-        acquisition = _build_acquisition_datetime(mtl_values)
+        ordered_imagery = _ordered_landsat_imagery_layers(
+            collection=collection,
+            product_type=resolved_product_type,
+            imagery_paths=imagery_paths,
+        )
+        if not ordered_imagery:
+            raise LandsatNormalizationError(
+                "No Landsat imagery layers were detected in the extracted source."
+            )
+        ordered_ancillary = _ordered_landsat_ancillary_layers(ancillary_paths)
         target_pixel_size = target_pixel_size_for(provider, collection)
+        reference_band = _landsat_reference_band(
+            collection=collection,
+            product_type=resolved_product_type,
+            available=ordered_imagery,
+        )
+        acquisition = _build_acquisition_datetime(mtl_values)
+        satellite_code = _landsat_satellite_code(product_id)
+        product_type_short = _landsat_product_type_short(
+            satellite_code,
+            resolved_product_type,
+        )
+        product_level = _landsat_product_level(
+            collection=collection,
+            product_id=product_id,
+        )
         metadata = {
             "provider": provider,
             "collection": collection,
@@ -250,73 +301,45 @@ def convert_landsat_to_zarr(
             "data_family": "optical",
             "source_uri": str(extracted.raw_path),
         }
-        written_uri, dataset_summary = stream_raster_stack_to_zarr(
-            band_paths=band_paths,
-            ordered_bands=ordered_bands,
+        written_uri, dataset_summary = stream_raster_product_to_zarr(
+            imagery_band_paths=imagery_paths,
+            imagery_layer_names=ordered_imagery,
             output_uri=output_uri,
             metadata=metadata,
             acquisition_datetime=acquisition,
-            reference_band="red",
+            reference_band=reference_band,
             target_pixel_size=target_pixel_size,
+            ancillary_band_paths=ancillary_paths,
+            ancillary_layer_names=ordered_ancillary,
         )
-        grid = {
-            "height": int(dataset_summary["shape"][2]),
-            "width": int(dataset_summary["shape"][3]),
-            "dtype": str(dataset_summary.get("dtype") or "unknown"),
-            "crs": dataset_summary.get("crs"),
-            "transform": dataset_summary.get("transform"),
-            "pixel_size": dataset_summary.get("pixel_size"),
-            "reference_band": "red",
-        }
-        summary = {
-            "provider": provider,
-            "collection": collection,
-            "scene_id": normalized_scene_id,
-            "product_id": product_id,
-            "product_type": resolved_product_type,
-            "product_type_short": product_type_short,
-            "satellite": satellite_code,
-            "product_level": product_level,
-            "data_family": "optical",
-            "source_kind": extracted.source_kind,
-            "raw_path": str(extracted.raw_path),
-            "canonical_bands": list(LANDSAT_CANONICAL_BANDS),
-            "required_core_bands": list(CORE_BANDS),
-            "optional_bands_present": [
-                band for band in LANDSAT_OPTIONAL_BANDS if band in band_paths
-            ],
-            "normalized_band_order": list(dataset_summary["band_names"]),
-            "resolution_policy_meters": target_pixel_size,
-            "band_sources": {
-                band: (
-                    str(path.relative_to(extracted.root))
-                    if extracted.cleanup is not None
-                    else str(path)
-                )
-                for band, path in band_paths.items()
+        summary = _summarize_landsat_product(
+            provider=provider,
+            collection=collection,
+            scene_id=normalized_scene_id,
+            product_id=product_id,
+            product_type=resolved_product_type,
+            product_type_short=product_type_short,
+            satellite_code=satellite_code,
+            product_level=product_level,
+            acquisition=acquisition,
+            extracted=extracted,
+            imagery_paths=imagery_paths,
+            imagery_band_names=list(dataset_summary["band_names"]),
+            imagery_metadata=dict(dataset_summary.get("band_metadata") or {}),
+            grid={
+                "height": int(dataset_summary["shape"][2]),
+                "width": int(dataset_summary["shape"][3]),
+                "dtype": str(dataset_summary.get("dtype") or "unknown"),
+                "crs": dataset_summary.get("crs"),
+                "transform": dataset_summary.get("transform"),
+                "pixel_size": dataset_summary.get("pixel_size"),
+                "reference_band": reference_band,
             },
-            "band_resampling": {},
-            "band_native_pixel_size": {},
-            "acquisition_datetime": acquisition,
-            "grid": grid,
-            "validation": {
-                "same_grid": True,
-                "missing_optional_bands": [
-                    band for band in LANDSAT_OPTIONAL_BANDS if band not in band_paths
-                ],
-            },
-        }
-        # Extract per-band metadata from the consolidated store attrs written by the streaming path.
-        band_metadata = dataset_summary.get("band_metadata")
-        if isinstance(band_metadata, dict):
-            summary["band_resampling"] = {
-                band: band_metadata.get(band, {}).get("resampled_to_reference")
-                for band in dataset_summary["band_names"]
-            }
-            summary["band_native_pixel_size"] = {
-                band: band_metadata.get(band, {}).get("source_pixel_size")
-                for band in dataset_summary["band_names"]
-            }
+            target_pixel_size=target_pixel_size,
+            ancillary_paths=ancillary_paths,
+            ancillary_layer_names=list(dataset_summary.get("ancillary_layer_names") or []),
+            ancillary_metadata=dict(dataset_summary.get("ancillary_metadata") or {}),
+        )
         if normalized_scene_id != scene_id:
             summary["requested_scene_id"] = scene_id
         return written_uri, "optical", summary, dataset_summary
@@ -336,51 +359,100 @@ def _discover_files(root: Path) -> dict[str, Any]:
             "No GeoTIFF bands were found in the Landsat source after extraction."
         )
     mtl = next(
-        (path for path in root.rglob("*") if path.is_file() and _MTL_NAME_RE.search(path.name)),
+        (
+            path
+            for path in root.rglob("*")
+            if path.is_file() and _MTL_NAME_RE.search(path.name)
+        ),
         None,
     )
     return {"tifs": tifs, "mtl": mtl}
 
 
-def _select_band_paths(
+def _discover_landsat_layers(
     tifs: list[Path],
     *,
     collection: str,
     product_type: str,
-) -> dict[str, Path]:
-    spec = get_landsat_product_spec(collection, product_type)
-    if not spec:
-        raise LandsatNormalizationError(
-            f"Unsupported Landsat collection/product type: {collection} / {product_type}"
-        )
-
-    band_paths: dict[str, Path] = {}
-    for band_code in list(spec.get("band_codes") or []):
-        canonical_band = _LANDSAT_CANONICAL_BY_CODE.get(str(band_code))
-        if not canonical_band:
+) -> tuple[dict[str, Path], dict[str, Path]]:
+    imagery_expected = _landsat_expected_imagery_layers(collection, product_type)
+    imagery_paths: dict[str, Path] = {}
+    ancillary_paths: dict[str, Path] = {}
+    for path in sorted(tifs):
+        layer_name = _landsat_layer_name(path)
+        if not layer_name:
             continue
-        for pattern in _landsat_code_patterns(str(band_code)):
-            match = next((path for path in tifs if pattern.search(path.name)), None)
-            if match is not None:
-                band_paths[canonical_band] = match
-                break
+        if layer_name in imagery_expected:
+            imagery_paths[layer_name] = path
+        else:
+            ancillary_paths[layer_name] = path
 
-    missing_core = [band for band in CORE_BANDS if band not in band_paths]
-    if missing_core:
+    missing_imagery = [layer for layer in imagery_expected if layer not in imagery_paths]
+    if missing_imagery:
         raise LandsatNormalizationError(
-            "Missing required Landsat reflective bands for normalization: "
-            + ", ".join(missing_core)
+            "Missing expected Landsat imagery layers for "
+            f"{collection}/{product_type}: {', '.join(missing_imagery)}"
         )
-    return band_paths
+    return imagery_paths, ancillary_paths
 
 
-def _landsat_code_patterns(code: str) -> tuple[re.Pattern[str], ...]:
-    escaped = re.escape(code)
-    return (
-        re.compile(rf"_SR_{escaped}\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(rf"_ST_{escaped}\.(?:TIF|TIFF)$", re.IGNORECASE),
-        re.compile(rf"_{escaped}\.(?:TIF|TIFF)$", re.IGNORECASE),
+def _landsat_expected_imagery_layers(collection: str, product_type: str) -> tuple[str, ...]:
+    collection_lower = str(collection).lower()
+    product_upper = str(product_type).upper()
+    if collection_lower.endswith("_l1"):
+        return _L1_IMAGERY_LAYERS
+    if product_upper == "L2SR":
+        return _L2SR_IMAGERY_LAYERS
+    return _L2_IMAGERY_LAYERS
+
+
+def _ordered_landsat_imagery_layers(
+    *,
+    collection: str,
+    product_type: str,
+    imagery_paths: dict[str, Path],
+) -> list[str]:
+    expected = _landsat_expected_imagery_layers(collection, product_type)
+    return [layer for layer in expected if layer in imagery_paths]
+
+
+def _ordered_landsat_ancillary_layers(ancillary_paths: dict[str, Path]) -> list[str]:
+    return sorted(
+        ancillary_paths,
+        key=lambda value: (_LANDSAT_ANCILLARY_PRIORITY.get(value, 100), value),
     )
+
+
+def _landsat_layer_name(path: Path) -> str | None:
+    stem = path.stem.upper()
+    for token in _LANDSAT_KNOWN_LAYER_TOKENS:
+        if re.search(rf"(?:^|_){re.escape(token)}(?:_|$)", stem):
+            return token
+
+    tokens = [token for token in re.split(r"[^A-Z0-9]+", stem) if token]
+    for index, token in enumerate(tokens):
+        if token.startswith("QA") or token in {"SAA", "SZA", "VAA", "VZA"} or token.startswith("ST"):
+            return "_".join(tokens[index:])
+    if len(tokens) >= 2:
+        return "_".join(tokens[-2:])
+    if tokens:
+        return tokens[-1]
+    return None
+
+
+def _landsat_reference_band(
+    *,
+    collection: str,
+    product_type: str,
+    available: list[str],
+) -> str:
+    preferred = ("SR_B4", "B4", "SR_B3", "B3", "SR_B2", "B2")
+    for candidate in preferred:
+        if candidate in available:
+            return candidate
+    if not available:
+        raise LandsatNormalizationError("No Landsat imagery layers are available.")
+    return available[0]
 
 
 def _parse_mtl_file(mtl_path: Path | None) -> dict[str, str]:
@@ -400,7 +472,6 @@ def _build_acquisition_datetime(values: dict[str, str]) -> str | None:
     date_value = values.get("DATE_ACQUIRED")
     if not date_value:
         return None
-
     time_value = values.get("SCENE_CENTER_TIME", "00:00:00Z").strip('"').rstrip("Z")
     time_main = time_value.split(".")[0]
     try:
@@ -454,11 +525,82 @@ def _validate_landsat_collection_product_type(*, collection: str, product_type: 
     if ptype == "UNKNOWN":
         raise LandsatNormalizationError(
             "Unable to infer Landsat product type from product id. "
-            f"Expected one of L1TP/L1GT/L1GS/L2SP/L2SR."
+            "Expected one of L1TP/L1GT/L1GS/L2SP/L2SR."
         )
-    allowed = supported_product_types().get(str(collection).lower()) or supported_product_types().get(str(collection)) or []
+    allowed = (
+        supported_product_types().get(str(collection).lower())
+        or supported_product_types().get(str(collection))
+        or []
+    )
     if ptype not in allowed:
         raise LandsatNormalizationError(
             f"Invalid Landsat product type for collection {collection}. "
             f"Expected one of: {', '.join(sorted(allowed))}. Got: {ptype}."
         )
+
+
+def _summarize_landsat_product(
+    *,
+    provider: str,
+    collection: str,
+    scene_id: str,
+    product_id: str,
+    product_type: str,
+    product_type_short: str,
+    satellite_code: str,
+    product_level: str,
+    acquisition: str | None,
+    extracted: PreparedSource,
+    imagery_paths: dict[str, Path],
+    imagery_band_names: list[str],
+    imagery_metadata: dict[str, Any],
+    grid: dict[str, Any],
+    target_pixel_size: float | None,
+    ancillary_paths: dict[str, Path],
+    ancillary_layer_names: list[str],
+    ancillary_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "collection": collection,
+        "scene_id": scene_id,
+        "product_id": product_id,
+        "product_type": product_type,
+        "product_type_short": product_type_short,
+        "satellite": satellite_code,
+        "product_level": product_level,
+        "data_family": "optical",
+        "source_kind": extracted.source_kind,
+        "raw_path": str(extracted.raw_path),
+        "normalized_band_order": imagery_band_names,
+        "resolution_policy_meters": target_pixel_size,
+        "band_sources": {
+            band: str(path.relative_to(extracted.root)) for band, path in imagery_paths.items()
+        },
+        "band_resampling": {
+            band: imagery_metadata.get(band, {}).get("resampled_to_reference")
+            for band in imagery_band_names
+        },
+        "band_native_pixel_size": {
+            band: imagery_metadata.get(band, {}).get("source_pixel_size")
+            for band in imagery_band_names
+        },
+        "ancillary_layer_names": ancillary_layer_names,
+        "ancillary_sources": {
+            layer: str(path.relative_to(extracted.root)) for layer, path in ancillary_paths.items()
+        },
+        "ancillary_resampling": {
+            layer: ancillary_metadata.get(layer, {}).get("resampled_to_reference")
+            for layer in ancillary_layer_names
+        },
+        "ancillary_native_pixel_size": {
+            layer: ancillary_metadata.get(layer, {}).get("source_pixel_size")
+            for layer in ancillary_layer_names
+        },
+        "acquisition_datetime": acquisition,
+        "grid": grid,
+        "validation": {
+            "imagery_layer_count": len(imagery_band_names),
+            "ancillary_layer_count": len(ancillary_layer_names),
+        },
+    }

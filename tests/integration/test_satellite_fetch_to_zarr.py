@@ -29,54 +29,56 @@ FINAL_JOB_STATES = {
     JobState.failed.value,
     JobState.cancelled.value,
 }
-SENTINEL2_SPECTRAL_BANDS = {
-    "coastal",
-    "blue",
-    "green",
-    "red",
-    "rededge1",
-    "rededge2",
-    "rededge3",
-    "nir",
-    "nir_narrow",
-    "water_vapor",
-    "cirrus",
-    "swir1",
-    "swir2",
+SENTINEL2_L1C_BANDS = {
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
+    "B06",
+    "B07",
+    "B08",
+    "B8A",
+    "B09",
+    "B10",
+    "B11",
+    "B12",
 }
-LANDSAT_L1_BANDS = {
-    "coastal",
-    "blue",
-    "green",
-    "red",
-    "pan",
-    "nir",
-    "cirrus",
-    "swir1",
-    "swir2",
-    "thermal1",
-    "thermal2",
+SENTINEL2_L2A_BANDS = {
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
+    "B06",
+    "B07",
+    "B08",
+    "B8A",
+    "B09",
+    "B11",
+    "B12",
 }
+LANDSAT_L1_BANDS = {f"B{index}" for index in range(1, 12)}
 LANDSAT_L2SP_BANDS = {
-    "coastal",
-    "blue",
-    "green",
-    "red",
-    "nir",
-    "swir1",
-    "swir2",
-    "thermal1",
+    "SR_B1",
+    "SR_B2",
+    "SR_B3",
+    "SR_B4",
+    "SR_B5",
+    "SR_B6",
+    "SR_B7",
+    "ST_B10",
 }
 LANDSAT_L2SR_BANDS = {
-    "coastal",
-    "blue",
-    "green",
-    "red",
-    "nir",
-    "swir1",
-    "swir2",
+    "SR_B1",
+    "SR_B2",
+    "SR_B3",
+    "SR_B4",
+    "SR_B5",
+    "SR_B6",
+    "SR_B7",
 }
-SENTINEL1_ALLOWED_BANDS = {"vv", "vh", "hh", "hv"}
+SENTINEL1_ALLOWED_BANDS = {"VV", "VH", "HH", "HV"}
 
 
 @dataclass(frozen=True)
@@ -376,8 +378,10 @@ def _expected_band_subset(case: PipelineCase) -> set[str]:
     product_type = case.effective_product_type.upper()
     if case.key == "sentinel1":
         return set()
-    if case.key in {"sentinel2_toa", "sentinel2_boa"}:
-        return set(SENTINEL2_SPECTRAL_BANDS)
+    if case.key == "sentinel2_toa":
+        return set(SENTINEL2_L1C_BANDS)
+    if case.key == "sentinel2_boa":
+        return set(SENTINEL2_L2A_BANDS)
     if case.key == "landsat_l1":
         return set(LANDSAT_L1_BANDS)
     if product_type == "L2SR":
@@ -417,11 +421,17 @@ def _assert_conversion_outputs(
         assert band_names.issubset(SENTINEL1_ALLOWED_BANDS), (
             f"{case.key}: unexpected Sentinel-1 polarizations {sorted(band_names - SENTINEL1_ALLOWED_BANDS)}"
         )
+        assert len(band_names) == len(set(dataset_summary["band_names"])), (
+            f"{case.key}: duplicate Sentinel-1 polarization entries were written"
+        )
     else:
         missing = sorted(expected_subset - band_names)
         assert not missing, (
             f"{case.key}: converted Zarr is missing expected bands {missing}. "
             f"Got {sorted(band_names)}"
+        )
+        assert len(band_names) == len(expected_subset), (
+            f"{case.key}: expected exactly {len(expected_subset)} imagery layers, got {len(band_names)}"
         )
 
     pixel_size = dataset_summary.get("pixel_size") or normalization_summary.get("grid", {}).get("pixel_size")
@@ -438,6 +448,16 @@ def _assert_conversion_outputs(
     assert tuple(group["imagery"].shape) == tuple(dataset_summary["shape"]), (
         f"{case.key}: imagery shape mismatch between summary and Zarr store"
     )
+    ancillary_layer_names = list(dataset_summary.get("ancillary_layer_names") or [])
+    if ancillary_layer_names:
+        assert "ancillary" in keys, f"{case.key}: ancillary layers declared but ancillary array missing"
+        assert "ancillary_layer" in group, f"{case.key}: ancillary coordinate missing"
+        assert tuple(group["ancillary"].shape) == tuple(dataset_summary["ancillary_shape"]), (
+            f"{case.key}: ancillary shape mismatch between summary and Zarr store"
+        )
+        assert len(ancillary_layer_names) == int(group["ancillary"].shape[1]), (
+            f"{case.key}: ancillary layer count mismatch"
+        )
 
     assert normalization_summary["raw_path"], f"{case.key}: normalization summary missing raw_path"
     assert Path(resolve_local_path(raw.raw_uri)).exists(), (

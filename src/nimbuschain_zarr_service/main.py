@@ -55,6 +55,8 @@ class ConvertResponse(BaseModel):
     data_family: str | None = None
     band_names: list[str] | None = None
     dimensions: list[str] | None = None
+    ancillary_layer_names: list[str] | None = None
+    ancillary_dimensions: list[str] | None = None
     normalization_summary: dict[str, object] | None = None
 
 
@@ -195,6 +197,8 @@ def convert(payload: ConvertRequest) -> ConvertResponse:
         data_family=data_family,
         band_names=list(dataset_summary["band_names"]),
         dimensions=list(dataset_summary["dimensions"]),
+        ancillary_layer_names=list(dataset_summary.get("ancillary_layer_names") or []),
+        ancillary_dimensions=list(dataset_summary.get("ancillary_dimensions") or []),
         normalization_summary={**summary, "zarr_summary": dataset_summary},
     )
 

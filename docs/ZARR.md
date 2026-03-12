@@ -8,10 +8,10 @@ The Zarr service converts raw downloaded scenes into a normalized array store su
 - artifact indexing
 - later cloud/water masking workflows
 
-The output layout is:
+The core output layout is:
 
 ```text
-time, band, y, x
+imagery(time, band, y, x)
 ```
 
 Default output location:
@@ -38,64 +38,39 @@ The converter uses the best target grid per sensor family, not a fake one-size-f
 ### Sentinel-2
 - target grid: `10 m`
 - native `20 m` and `60 m` bands are reprojected to `10 m`
+- every native spectral raster layer found in the source product is preserved
 
 ### Landsat 8/9
 - target grid: `30 m`
-- thermal bands are aligned to the `30 m` grid
+- all native image bands are aligned to the `30 m` grid
 - Level-1 `B8` panchromatic is preserved as a band, but it does **not** force the whole cube to `15 m`
-- the converter does not upsample Landsat to `10 m`
+- ancillary layers such as QA and angle rasters are stored separately when present
 
 ### Sentinel-1
 - target grid: native measurement/reference raster grid
 - no optical-style forced `10 m` normalization
+- all detected rasterized polarizations are preserved on the `band` axis
+- ancillary radar rasters are stored separately when present
 
-## 4. Band preservation policy
+## 4. Layer preservation policy
 
-### Sentinel-2 canonical bands
+Detailed product-by-product reference:
+- `/Users/mehdidinari/Desktop/backend nimbus/docs/PRODUCT_BANDS.md`
 
-The converter preserves the useful spectral bands of the product instead of collapsing everything into RGB/NIR/SWIR only.
+The converter no longer maps imagery to a reduced RGB/NIR/SWIR subset.
 
-Expected canonical set:
-- `coastal`
-- `blue`
-- `green`
-- `red`
-- `rededge1`
-- `rededge2`
-- `rededge3`
-- `nir`
-- `nir_narrow`
-- `water_vapor`
-- `cirrus`
-- `swir1`
-- `swir2`
-- `scene_classification` when `SCL` is available in `S2MSI2A`
+Rules:
+- preserve every native physical imagery raster layer found in the source product
+- preserve exact source layer names on the `band` coordinate
+- preserve QA, mask, classification, cloud, snow, aerosol, angle, thermal-support, or radar-support rasters in `ancillary(time, ancillary_layer, y, x)` when present
+- keep `imagery` and `ancillary` separate instead of flattening everything into one array
 
-### Landsat 8/9 canonical bands
-
-#### Level 1
-- `coastal`
-- `blue`
-- `green`
-- `red`
-- `pan`
-- `nir`
-- `cirrus`
-- `swir1`
-- `swir2`
-- `thermal1`
-- `thermal2`
-
-#### Level 2
-Bands depend on the product family actually present in the source. Typical `L2SP` output keeps:
-- `coastal`
-- `blue`
-- `green`
-- `red`
-- `nir`
-- `swir1`
-- `swir2`
-- `thermal1`
+Typical examples:
+- Sentinel-2 L1C imagery layers: `B01` through `B12` plus `B8A`
+- Sentinel-2 L2A imagery layers: `B01` through `B12` plus `B8A`, excluding `B10`
+- Landsat L1 imagery layers: `B1` through `B11`
+- Landsat L2 imagery layers: `SR_B1` through `SR_B7`, plus `ST_B10` when present
+- Sentinel-1 imagery layers: exact source polarization names such as `VV`, `VH`, `HH`, `HV`
 
 ## 5. Runtime API
 
@@ -136,12 +111,15 @@ Important modules:
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/service.py`
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/core.py`
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/copernicus.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/landsat.py`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/readers/landsat.py`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/readers/sentinel.py`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/writers/zarr.py`
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/config/config.yaml`
 
 Design choice:
 - Landsat conversion uses a streaming write path to avoid building an oversized in-memory cube.
-- Copernicus conversion keeps a sensor-aware normalization model and supports a stream-to-Zarr path as well.
+- Copernicus conversion preserves exact source imagery layer names and routes ancillary layers into separate arrays.
+- Sentinel-1 RAW produces a sample-space Zarr, not a georeferenced map-grid product.
 
 ## 7. Operational rule
 

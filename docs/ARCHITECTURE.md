@@ -64,8 +64,9 @@ Key code:
 
 Main role:
 - read local raw scenes or archives
-- normalize supported product families to a canonical band model
-- write `time, band, y, x` Zarr stores
+- preserve all native physical imagery layers from supported products using exact source layer names
+- route QA, masks, classification, cloud, snow, angle, aerosol, and other support rasters into ancillary arrays
+- write `imagery(time, band, y, x)` Zarr stores, plus `ancillary(time, ancillary_layer, y, x)` when needed
 - expose health, readiness and schema endpoints
 
 Key code:

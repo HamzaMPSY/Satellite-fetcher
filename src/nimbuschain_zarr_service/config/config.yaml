@@ -2,7 +2,7 @@ resolution_policy:
   collections:
     SENTINEL-2:
       strategy: collection_target_grid
-      reference_band: red
+      reference_band: B04
       target_pixel_size_meters: 10.0
     SENTINEL-1:
       strategy: native_reference_grid
@@ -10,11 +10,11 @@ resolution_policy:
       target_pixel_size_meters:
     landsat_ot_c2_l1:
       strategy: collection_target_grid
-      reference_band: red
+      reference_band: B4
       target_pixel_size_meters: 30.0
     landsat_ot_c2_l2:
       strategy: collection_target_grid
-      reference_band: red
+      reference_band: SR_B4
       target_pixel_size_meters: 30.0
 
 copernicus:
@@ -34,9 +34,13 @@ copernicus:
       subdir_filter: IMG_DATA
       bands_map:
         R10m: [B02, B03, B04, B08]
-        R20m: [B05, B06, B07, B8A, B11, B12, SCL]
-        R60m: [B01, B09, B10]
-      categorical_bands: [SCL]
+        R20m: [B05, B06, B07, B8A, B11, B12]
+        R60m: [B01, B09]
+      ancillary_bands:
+        R10m: [AOT]
+        R20m: [SCL, CLDPRB, SNWPRB]
+        R60m: [WVP]
+      categorical_bands: [SCL, CLDPRB, SNWPRB]
   SENTINEL-1:
     RAW:
       scene_tokens: [RAW]
@@ -70,7 +74,7 @@ usgs:
   landsat_ot_c2_l2:
     L2SP:
       ext: TIF
-      band_codes: [B1, B2, B3, B4, B5, B6, B7, B10]
+      band_codes: [SR_B1, SR_B2, SR_B3, SR_B4, SR_B5, SR_B6, SR_B7, ST_B10]
     L2SR:
       ext: TIF
-      band_codes: [B1, B2, B3, B4, B5, B6, B7]
+      band_codes: [SR_B1, SR_B2, SR_B3, SR_B4, SR_B5, SR_B6, SR_B7]

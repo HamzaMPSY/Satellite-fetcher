@@ -1769,7 +1769,7 @@ def main():
                     f"{_ss('zarr_service_url').rstrip('/')}/convert",
                     headers={"Content-Type": "application/json"},
                     json=payload,
-                    timeout=300,
+                    timeout=1800,
                 )
                 if response.ok:
                     body = response.json()

@@ -87,3 +87,4 @@ Ignored locally:
 - `/Users/mehdidinari/Desktop/backend nimbus/docs/RUNBOOK.md`
 - `/Users/mehdidinari/Desktop/backend nimbus/docs/API_REFERENCE.md`
 - `/Users/mehdidinari/Desktop/backend nimbus/docs/ZARR.md`
+- `/Users/mehdidinari/Desktop/backend nimbus/docs/PRODUCT_BANDS.md`

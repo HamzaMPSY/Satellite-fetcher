@@ -5,42 +5,8 @@ from typing import Any
 
 
 ZARR_FORMAT_VERSION = 1
-CORE_BANDS = ("blue", "green", "red", "nir")
-OPTICAL_EXTENDED_BANDS = (
-    "coastal",
-    "pan",
-    "rededge1",
-    "rededge2",
-    "rededge3",
-    "nir_narrow",
-    "water_vapor",
-    "cirrus",
-    "swir1",
-    "swir2",
-    "thermal1",
-    "thermal2",
-    "scene_classification",
-)
-CANONICAL_BANDS = (
-    "coastal",
-    "blue",
-    "green",
-    "red",
-    "pan",
-    "rededge1",
-    "rededge2",
-    "rededge3",
-    "nir",
-    "nir_narrow",
-    "water_vapor",
-    "cirrus",
-    "swir1",
-    "swir2",
-    "thermal1",
-    "thermal2",
-    "scene_classification",
-)
 DIMENSIONS = ("time", "band", "y", "x")
+ANCILLARY_DIMENSIONS = ("time", "ancillary_layer", "y", "x")
 REQUIRED_METADATA_FIELDS = (
     "provider",
     "collection",
@@ -74,7 +40,7 @@ class ZarrDataModelSpec:
     format_version: int
     layout: dict[str, str]
     dimensions: tuple[str, ...]
-    canonical_bands: tuple[str, ...]
+    ancillary_dimensions: tuple[str, ...]
     required_metadata_fields: tuple[str, ...]
     default_chunks: ChunkShape
     default_compression: CompressionSpec
@@ -87,62 +53,93 @@ def default_zarr_model() -> dict[str, Any]:
         format_version=ZARR_FORMAT_VERSION,
         layout={
             "imagery": "imagery",
+            "ancillary": "ancillary",
             "metadata": "metadata",
             "masks_root": "masks",
             "cloud_mask": "masks/cloud",
             "water_mask": "masks/water",
         },
         dimensions=DIMENSIONS,
-        canonical_bands=CANONICAL_BANDS,
+        ancillary_dimensions=ANCILLARY_DIMENSIONS,
         required_metadata_fields=REQUIRED_METADATA_FIELDS,
         default_chunks=ChunkShape(),
         default_compression=CompressionSpec(),
         single_scene_rule="A single-scene conversion writes time=1.",
         notes=(
-            "Both Copernicus and Landsat inputs must be normalized to canonical bands before writing.",
+            "Physical imagery layers are preserved with their exact source layer names on the band axis.",
+            "QA, mask, angle, aerosol, water vapour, cloud, snow, and other support rasters are written to the ancillary array.",
             "Mask services read and write within the same Zarr store.",
             "Raw products and Zarr outputs may be stored on the local filesystem or on OCI object storage.",
             "This schema is the baseline for v1 and may evolve under explicit format_version changes.",
         ),
     )
     payload = asdict(spec)
-    payload["required_conversion_bands"] = list(CORE_BANDS)
-    payload["optional_conversion_bands"] = list(OPTICAL_EXTENDED_BANDS)
-    payload["required_mask_bands"] = {
-        "omni_cloud_mask": ["red", "green", "nir"],
-        "omni_water_mask": ["red", "green", "blue", "nir"],
+    payload["layer_policy"] = {
+        "imagery": "Preserve every native physical imagery raster layer from the source product using exact source layer names.",
+        "ancillary": "Preserve every native QA, mask, classification, angle, aerosol, and other support raster layer in a separate ancillary array.",
     }
-    payload["sensor_band_sets"] = {
-        "sentinel-2": [
-            "coastal",
-            "blue",
-            "green",
-            "red",
-            "rededge1",
-            "rededge2",
-            "rededge3",
-            "nir",
-            "nir_narrow",
-            "water_vapor",
-            "cirrus",
-            "swir1",
-            "swir2",
-            "scene_classification",
+    payload["required_mask_bands"] = {
+        "omni_cloud_mask": [
+            "sensor-specific imagery layers required by the model input configuration"
         ],
-        "landsat-8-9": [
-            "coastal",
-            "blue",
-            "green",
-            "red",
-            "pan",
-            "nir",
-            "cirrus",
-            "swir1",
-            "swir2",
-            "thermal1",
-            "thermal2",
+        "omni_water_mask": [
+            "sensor-specific imagery layers required by the model input configuration"
         ],
-        "sentinel-1": ["vv", "vh", "hh", "hv"],
+    }
+    payload["imagery_layer_expectations"] = {
+        "sentinel-2-l1c": [
+            "B01",
+            "B02",
+            "B03",
+            "B04",
+            "B05",
+            "B06",
+            "B07",
+            "B08",
+            "B8A",
+            "B09",
+            "B10",
+            "B11",
+            "B12",
+        ],
+        "sentinel-2-l2a": [
+            "B01",
+            "B02",
+            "B03",
+            "B04",
+            "B05",
+            "B06",
+            "B07",
+            "B08",
+            "B8A",
+            "B09",
+            "B11",
+            "B12",
+        ],
+        "landsat-8-9-l1": [
+            "B1",
+            "B2",
+            "B3",
+            "B4",
+            "B5",
+            "B6",
+            "B7",
+            "B8",
+            "B9",
+            "B10",
+            "B11",
+        ],
+        "landsat-8-9-l2": [
+            "SR_B1",
+            "SR_B2",
+            "SR_B3",
+            "SR_B4",
+            "SR_B5",
+            "SR_B6",
+            "SR_B7",
+            "ST_B10",
+        ],
+        "sentinel-1": ["VV", "VH", "HH", "HV"],
     }
     payload["resolution_policy"] = {
         "optical": (
@@ -151,11 +148,11 @@ def default_zarr_model() -> dict[str, Any]:
             "the 15 m panchromatic band B8. Coarser bands are reprojected to that collection-specific target grid."
         ),
         "sentinel-2": {
-            "reference_band": "red",
+            "reference_band": "B04",
             "target_pixel_size_meters": 10,
         },
         "landsat-8-9": {
-            "reference_band": "red",
+            "reference_band": "B4 or SR_B4",
             "target_pixel_size_meters": 30,
         },
         "sentinel-1": {
@@ -178,13 +175,16 @@ def default_zarr_model() -> dict[str, Any]:
         "optical": {
             "dimensions": ["time", "band", "y", "x"],
             "notes": (
-                "Sentinel-2 and Landsat are normalized to a sensor-aware optical band model "
-                "that preserves all useful spectral bands instead of collapsing to RGB/NIR/SWIR only."
+                "Sentinel-2 and Landsat preserve all native imagery layers using exact source layer names. "
+                "Ancillary layers are stored in a separate array."
             ),
         },
         "sar": {
             "dimensions": ["time", "band", "y", "x"],
-            "notes": "Sentinel-1 polarizations are stored on the band axis (vv, vh, hh, hv).",
+            "notes": (
+                "Sentinel-1 polarizations are stored on the band axis using exact source polarization names "
+                "(VV, VH, HH, HV). Raster ancillary layers are stored separately when present."
+            ),
         },
         "swath": {
             "dimensions": ["time", "band", "y", "x"],

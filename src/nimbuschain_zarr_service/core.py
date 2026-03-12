@@ -54,6 +54,16 @@ class PreparedSource:
     cleanup: CleanupBundle | TemporaryDirectory[str] | None = None
 
 
+@dataclass(frozen=True)
+class TargetGrid:
+    height: int
+    width: int
+    crs: str | None
+    transform: list[float] | tuple[float, ...]
+    pixel_size: list[float] | tuple[float, ...] | None = None
+    reference_band: str | None = None
+
+
 def resolve_local_path(raw_uri: str) -> Path:
     if raw_uri.startswith("file://"):
         parsed = urlparse(raw_uri)
@@ -151,6 +161,7 @@ def load_aligned_raster_stack(
     reference_band: str | None = None,
     categorical_bands: set[str] | None = None,
     target_pixel_size: float | None = None,
+    target_grid: TargetGrid | None = None,
 ) -> dict[str, Any]:
     try:
         import rasterio
@@ -170,32 +181,44 @@ def load_aligned_raster_stack(
         raise ConversionError("No bands were selected for raster conversion.")
 
     ref_name = reference_band if reference_band in band_paths else ordered_bands[0]
-    if ref_name not in band_paths:
+    if ref_name not in band_paths and target_grid is None:
         raise ConversionError(f"Reference band '{ref_name}' is not available.")
 
-    try:
-        ref_ctx = rasterio.open(band_paths[ref_name])
-    except RasterioIOError as exc:
-        raise ConversionError(
-            f"Reference raster for band '{ref_name}' is not readable by rasterio: {band_paths[ref_name]}"
-        ) from exc
+    if target_grid is not None:
+        ref_height = int(target_grid.height)
+        ref_width = int(target_grid.width)
+        ref_crs = target_grid.crs
+        ref_transform = rasterio.Affine(*list(target_grid.transform)[:6])
+        ref_pixel_size = (
+            [float(v) for v in target_grid.pixel_size[:2]]
+            if target_grid.pixel_size is not None
+            else [float(ref_transform.a), float(abs(ref_transform.e))]
+        )
+        native_ref_pixel_size = ref_pixel_size
+    else:
+        try:
+            ref_ctx = rasterio.open(band_paths[ref_name])
+        except RasterioIOError as exc:
+            raise ConversionError(
+                f"Reference raster for band '{ref_name}' is not readable by rasterio: {band_paths[ref_name]}"
+            ) from exc
 
-    with ref_ctx as ref_src:
-        ref_height = ref_src.height
-        ref_width = ref_src.width
-        ref_crs = ref_src.crs.to_string() if ref_src.crs else None
-        ref_transform = ref_src.transform
-        native_ref_pixel_size = [float(ref_transform.a), float(abs(ref_transform.e))]
+        with ref_ctx as ref_src:
+            ref_height = ref_src.height
+            ref_width = ref_src.width
+            ref_crs = ref_src.crs.to_string() if ref_src.crs else None
+            ref_transform = ref_src.transform
+            native_ref_pixel_size = [float(ref_transform.a), float(abs(ref_transform.e))]
 
-        if target_pixel_size is not None:
-            left, bottom, right, top = array_bounds(ref_height, ref_width, ref_transform)
-            resolution = float(target_pixel_size)
-            ref_width = max(1, int(np.ceil((right - left) / resolution)))
-            ref_height = max(1, int(np.ceil((top - bottom) / resolution)))
-            ref_transform = from_origin(left, top, resolution, resolution)
-            ref_pixel_size = [resolution, resolution]
-        else:
-            ref_pixel_size = native_ref_pixel_size
+            if target_pixel_size is not None:
+                left, bottom, right, top = array_bounds(ref_height, ref_width, ref_transform)
+                resolution = float(target_pixel_size)
+                ref_width = max(1, int(np.ceil((right - left) / resolution)))
+                ref_height = max(1, int(np.ceil((top - bottom) / resolution)))
+                ref_transform = from_origin(left, top, resolution, resolution)
+                ref_pixel_size = [resolution, resolution]
+            else:
+                ref_pixel_size = native_ref_pixel_size
 
         arrays: list[np.ndarray] = []
         available_bands: list[str] = []
@@ -285,6 +308,7 @@ def inspect_aligned_raster_stack(
     reference_band: str | None = None,
     categorical_bands: set[str] | None = None,
     target_pixel_size: float | None = None,
+    target_grid: TargetGrid | None = None,
 ) -> dict[str, Any]:
     try:
         import rasterio
@@ -301,25 +325,37 @@ def inspect_aligned_raster_stack(
         raise ConversionError("No bands were selected for raster conversion.")
 
     ref_name = reference_band if reference_band in band_paths else ordered_bands[0]
-    if ref_name not in band_paths:
+    if ref_name not in band_paths and target_grid is None:
         raise ConversionError(f"Reference band '{ref_name}' is not available.")
 
-    with rasterio.open(band_paths[ref_name]) as ref_src:
-        ref_height = ref_src.height
-        ref_width = ref_src.width
-        ref_crs = ref_src.crs.to_string() if ref_src.crs else None
-        ref_transform = ref_src.transform
-        native_ref_pixel_size = [float(ref_transform.a), float(abs(ref_transform.e))]
+    if target_grid is not None:
+        ref_height = int(target_grid.height)
+        ref_width = int(target_grid.width)
+        ref_crs = target_grid.crs
+        ref_transform = rasterio.Affine(*list(target_grid.transform)[:6])
+        ref_pixel_size = (
+            [float(v) for v in target_grid.pixel_size[:2]]
+            if target_grid.pixel_size is not None
+            else [float(ref_transform.a), float(abs(ref_transform.e))]
+        )
+        native_ref_pixel_size = ref_pixel_size
+    else:
+        with rasterio.open(band_paths[ref_name]) as ref_src:
+            ref_height = ref_src.height
+            ref_width = ref_src.width
+            ref_crs = ref_src.crs.to_string() if ref_src.crs else None
+            ref_transform = ref_src.transform
+            native_ref_pixel_size = [float(ref_transform.a), float(abs(ref_transform.e))]
 
-        if target_pixel_size is not None:
-            left, bottom, right, top = array_bounds(ref_height, ref_width, ref_transform)
-            resolution = float(target_pixel_size)
-            ref_width = max(1, int(np.ceil((right - left) / resolution)))
-            ref_height = max(1, int(np.ceil((top - bottom) / resolution)))
-            ref_transform = from_origin(left, top, resolution, resolution)
-            ref_pixel_size = [resolution, resolution]
-        else:
-            ref_pixel_size = native_ref_pixel_size
+            if target_pixel_size is not None:
+                left, bottom, right, top = array_bounds(ref_height, ref_width, ref_transform)
+                resolution = float(target_pixel_size)
+                ref_width = max(1, int(np.ceil((right - left) / resolution)))
+                ref_height = max(1, int(np.ceil((top - bottom) / resolution)))
+                ref_transform = from_origin(left, top, resolution, resolution)
+                ref_pixel_size = [resolution, resolution]
+            else:
+                ref_pixel_size = native_ref_pixel_size
 
     band_metadata: dict[str, dict[str, Any]] = {}
     available_bands: list[str] = []
@@ -427,6 +463,55 @@ def build_standard_dataset(
     return dataset
 
 
+def attach_layer_array(
+    dataset: "xr.Dataset",
+    *,
+    arrays: "np.ndarray",
+    layer_names: list[str],
+    acquisition_datetime: str | None,
+    variable_name: str,
+    coord_name: str,
+) -> "xr.Dataset":
+    import numpy as np
+    import xarray as xr
+
+    if arrays.ndim != 3:
+        raise ConversionError(
+            f"Expected a 3D layer stack shaped (layer, y, x), got ndim={arrays.ndim}."
+        )
+
+    layer_count, height, width = arrays.shape
+    if layer_count != len(layer_names):
+        raise ConversionError(
+            f"Layer count mismatch for {variable_name}: arrays={layer_count}, names={len(layer_names)}."
+        )
+
+    imagery = dataset["imagery"]
+    if int(imagery.sizes["y"]) != height or int(imagery.sizes["x"]) != width:
+        raise ConversionError(
+            f"Spatial shape mismatch when attaching {variable_name}: expected "
+            f"({int(imagery.sizes['y'])}, {int(imagery.sizes['x'])}), got ({height}, {width})."
+        )
+
+    timestamp = _coerce_timestamp(acquisition_datetime)
+    coords: dict[str, Any] = {
+        "time": [np.datetime64(timestamp.replace(tzinfo=None))],
+        coord_name: layer_names,
+    }
+    if "x" in dataset.coords:
+        coords["x"] = dataset.coords["x"].values
+    if "y" in dataset.coords:
+        coords["y"] = dataset.coords["y"].values
+
+    dataset[variable_name] = xr.DataArray(
+        arrays[np.newaxis, ...],
+        dims=("time", coord_name, "y", "x"),
+        coords=coords,
+        name=variable_name,
+    )
+    return dataset
+
+
 def write_dataset_to_zarr(dataset: xr.Dataset, output_uri: str) -> str:
     output_store, public_uri = _prepare_output_store(output_uri)
 
@@ -459,6 +544,10 @@ def stream_raster_stack_to_zarr(
     reference_band: str | None = None,
     categorical_bands: set[str] | None = None,
     target_pixel_size: float | None = None,
+    target_grid: TargetGrid | None = None,
+    output_mode: str = "w",
+    array_name: str = "imagery",
+    coord_name: str = "band",
 ) -> tuple[str, dict[str, Any]]:
     try:
         import rasterio
@@ -480,6 +569,7 @@ def stream_raster_stack_to_zarr(
         reference_band=reference_band,
         categorical_bands=categorical_bands,
         target_pixel_size=target_pixel_size,
+        target_grid=target_grid,
     )
     band_names = list(stack["band_names"])
     height = int(stack["height"])
@@ -495,29 +585,44 @@ def stream_raster_stack_to_zarr(
         min(chunk_spec.y, height),
         min(chunk_spec.x, width),
     )
-    output_store, public_uri = _prepare_output_store(output_uri)
+    if output_mode == "w":
+        output_store, public_uri = _prepare_output_store(output_uri)
+        root = zarr.open_group(output_store, mode="w", zarr_format=2)
+    else:
+        output_store = _open_existing_output_store(output_uri)
+        public_uri = output_uri if is_oci_uri(output_uri) else str(resolve_output_path(output_uri))
+        root = zarr.open_group(output_store, mode="a", zarr_format=2)
 
     group_attrs = dict(metadata)
-    group_attrs["band_names"] = band_names
+    if coord_name == "band":
+        group_attrs["band_names"] = band_names
+    else:
+        group_attrs[f"{coord_name}_names"] = band_names
     group_attrs["zarr_format_version"] = ZARR_FORMAT_VERSION
-    root = zarr.open_group(output_store, mode="w", zarr_format=2)
     root.attrs.update(group_attrs)
 
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
     imagery = root.create_array(
-        "imagery",
+        array_name,
         shape=(1, len(band_names), height, width),
         chunks=chunks,
         dtype=np.dtype(stack["dtype"]),
         compressor=compressor,
     )
-    root.create_array("band", data=np.asarray(band_names, dtype=f"<U{max(len(v) for v in band_names)}"))
+    root.create_array(
+        coord_name,
+        data=np.asarray(band_names, dtype=f"<U{max(len(v) for v in band_names)}"),
+        overwrite=True,
+    )
     timestamp = _coerce_timestamp(acquisition_datetime)
-    root.create_array("time", data=np.asarray([timestamp.isoformat()], dtype="<U32"))
+    if "time" not in root:
+        root.create_array("time", data=np.asarray([timestamp.isoformat()], dtype="<U32"))
     x_coords, y_coords = _derive_spatial_coords(transform, width=width, height=height)
     if x_coords is not None and y_coords is not None:
-        root.create_array("x", data=x_coords, chunks=(min(chunk_spec.x, width),))
-        root.create_array("y", data=y_coords, chunks=(min(chunk_spec.y, height),))
+        if "x" not in root:
+            root.create_array("x", data=x_coords, chunks=(min(chunk_spec.x, width),))
+        if "y" not in root:
+            root.create_array("y", data=y_coords, chunks=(min(chunk_spec.y, height),))
 
     for band_index, band_name in enumerate(band_names):
         band_path = Path(band_paths[band_name])
@@ -554,9 +659,10 @@ def stream_raster_stack_to_zarr(
     dataset_summary = {
         "data_family": str(metadata.get("data_family", "unknown")),
         "zarr_uri": public_uri,
-        "dimensions": ["time", "band", "y", "x"],
+        "dimensions": ["time", coord_name, "y", "x"],
         "shape": [1, len(band_names), height, width],
         "band_names": band_names,
+        f"{coord_name}_names": band_names,
         "time_values": [timestamp.isoformat()],
         "dtype": str(np.dtype(stack["dtype"])),
         "crs": crs,
@@ -565,6 +671,71 @@ def stream_raster_stack_to_zarr(
         "band_metadata": band_metadata,
     }
     return public_uri, dataset_summary
+
+
+def stream_raster_product_to_zarr(
+    *,
+    imagery_band_paths: dict[str, Path],
+    imagery_layer_names: list[str],
+    output_uri: str,
+    metadata: dict[str, Any],
+    acquisition_datetime: str | None,
+    reference_band: str | None = None,
+    categorical_imagery_layers: set[str] | None = None,
+    target_pixel_size: float | None = None,
+    ancillary_band_paths: dict[str, Path] | None = None,
+    ancillary_layer_names: list[str] | None = None,
+    ancillary_categorical_layers: set[str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    written_uri, imagery_summary = stream_raster_stack_to_zarr(
+        band_paths=imagery_band_paths,
+        ordered_bands=imagery_layer_names,
+        output_uri=output_uri,
+        metadata=metadata,
+        acquisition_datetime=acquisition_datetime,
+        reference_band=reference_band,
+        categorical_bands=categorical_imagery_layers,
+        target_pixel_size=target_pixel_size,
+        output_mode="w",
+        array_name="imagery",
+        coord_name="band",
+    )
+    target_grid = TargetGrid(
+        height=int(imagery_summary["shape"][2]),
+        width=int(imagery_summary["shape"][3]),
+        crs=imagery_summary.get("crs"),
+        transform=list(imagery_summary.get("transform") or []),
+        pixel_size=list(imagery_summary.get("pixel_size") or []),
+        reference_band=reference_band,
+    )
+
+    product_summary = dict(imagery_summary)
+    product_summary["ancillary_layer_names"] = []
+    product_summary["ancillary_dimensions"] = ["time", "ancillary_layer", "y", "x"]
+    product_summary["ancillary_shape"] = [1, 0, int(imagery_summary["shape"][2]), int(imagery_summary["shape"][3])]
+    product_summary["ancillary_metadata"] = {}
+
+    if ancillary_band_paths and ancillary_layer_names:
+        _, ancillary_summary = stream_raster_stack_to_zarr(
+            band_paths=ancillary_band_paths,
+            ordered_bands=ancillary_layer_names,
+            output_uri=output_uri,
+            metadata=metadata,
+            acquisition_datetime=acquisition_datetime,
+            reference_band=ancillary_layer_names[0],
+            categorical_bands=ancillary_categorical_layers,
+            target_pixel_size=target_pixel_size,
+            target_grid=target_grid,
+            output_mode="a",
+            array_name="ancillary",
+            coord_name="ancillary_layer",
+        )
+        product_summary["ancillary_layer_names"] = list(ancillary_summary["band_names"])
+        product_summary["ancillary_dimensions"] = list(ancillary_summary["dimensions"])
+        product_summary["ancillary_shape"] = list(ancillary_summary["shape"])
+        product_summary["ancillary_metadata"] = dict(ancillary_summary.get("band_metadata") or {})
+
+    return written_uri, product_summary
 
 
 def resolve_output_path(output_uri: str) -> Path:
@@ -585,7 +756,7 @@ def resolve_output_path(output_uri: str) -> Path:
 
 def summarize_dataset(dataset: "xr.Dataset", *, data_family: str, zarr_uri: str) -> dict[str, Any]:
     imagery = dataset["imagery"]
-    return {
+    summary = {
         "data_family": data_family,
         "zarr_uri": zarr_uri,
         "dimensions": list(imagery.dims),
@@ -596,6 +767,14 @@ def summarize_dataset(dataset: "xr.Dataset", *, data_family: str, zarr_uri: str)
         "transform": dataset.attrs.get("transform"),
         "pixel_size": dataset.attrs.get("reference_pixel_size"),
     }
+    if "ancillary" in dataset:
+        ancillary = dataset["ancillary"]
+        summary["ancillary_dimensions"] = list(ancillary.dims)
+        summary["ancillary_shape"] = [int(size) for size in ancillary.shape]
+        summary["ancillary_layer_names"] = [
+            str(item) for item in ancillary.coords["ancillary_layer"].values.tolist()
+        ]
+    return summary
 
 
 def _derive_spatial_coords(
@@ -704,3 +883,19 @@ def _prepare_output_store(output_uri: str) -> tuple[Any, str]:
         shutil.rmtree(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path, str(output_path)
+
+
+def _open_existing_output_store(output_uri: str) -> Any:
+    if is_oci_uri(output_uri):
+        try:
+            store, parsed = OCIStore.from_uri(output_uri)
+        except OCIStorageError as exc:
+            raise ConversionDependencyError(str(exc)) from exc
+        if not store.exists(parsed.path):
+            raise ConversionError(f"Output store does not exist yet: {output_uri}")
+        return store.get_mapper(parsed.path, create=False)
+
+    output_path = resolve_output_path(output_uri)
+    if not output_path.exists():
+        raise ConversionError(f"Output store does not exist yet: {output_path}")
+    return output_path
