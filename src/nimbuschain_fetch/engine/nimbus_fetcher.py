@@ -559,6 +559,28 @@ class NimbusFetcher:
                 aggregate["last_time"] = now_mono
                 aggregate["last_bytes"] = int(aggregate["bytes_downloaded"])
 
+        def emit_retry(file_name: str, attempt: int, reason: str, retry_after: float | None) -> None:
+            row_now = self.store.get_job(job_id) or {}
+            retry_count = int(row_now.get("retry_count", 0) or 0) + 1
+            last_retry_at = self._now_iso()
+            self.store.update_job(
+                job_id,
+                retry_count=retry_count,
+                last_retry_at=last_retry_at,
+            )
+            self.store.append_event(
+                job_id,
+                "job.retrying",
+                {
+                    "file": file_name,
+                    "attempt": int(attempt),
+                    "reason": reason,
+                    "retry_after": retry_after,
+                    "retry_count": retry_count,
+                    "last_retry_at": last_retry_at,
+                },
+            )
+
         try:
             result = await anyio.to_thread.run_sync(
                 self._run_provider_job,
@@ -566,6 +588,7 @@ class NimbusFetcher:
                 request,
                 output_dir,
                 emit_progress,
+                emit_retry,
                 is_cancelled_now,
             )
 
@@ -641,6 +664,7 @@ class NimbusFetcher:
         request: JobCreateRequest,
         output_dir,
         progress_callback,
+        retry_callback,
         is_cancelled,
     ) -> dict[str, Any]:
         provider_name = self._provider_name(request.provider)
@@ -650,6 +674,7 @@ class NimbusFetcher:
             max_concurrent=provider_limit,
             progress_callback=progress_callback,
             cancel_checker=is_cancelled,
+            retry_callback=retry_callback,
         )
         provider = self._build_provider(provider_name, download_manager)
 
@@ -756,6 +781,8 @@ class NimbusFetcher:
             progress=float(row["progress"]),
             bytes_downloaded=int(row["bytes_downloaded"]),
             bytes_total=int(row["bytes_total"]),
+            retry_count=int(row.get("retry_count", 0) or 0),
+            last_retry_at=self._parse_iso(row.get("last_retry_at")),
             product_type=row.get("product_type"),
             tile_id=row.get("tile_id"),
             created_at=self._parse_iso(row.get("created_at")),

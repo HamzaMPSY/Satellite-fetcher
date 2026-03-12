@@ -149,6 +149,8 @@ class JobStatusResponse(BaseModel):
     progress: float = Field(default=0, ge=0, le=100)
     bytes_downloaded: int = 0
     bytes_total: int = 0
+    retry_count: int = 0
+    last_retry_at: datetime | None = None
     product_type: str | None = None
     tile_id: str | None = None
     created_at: datetime | None = None

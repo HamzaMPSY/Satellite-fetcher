@@ -144,6 +144,8 @@ class MongoJobStore:
                 "progress": 0.0,
                 "bytes_downloaded": 0,
                 "bytes_total": 0,
+                "retry_count": 0,
+                "last_retry_at": None,
                 "started_at": None,
                 "finished_at": None,
                 "errors": [],

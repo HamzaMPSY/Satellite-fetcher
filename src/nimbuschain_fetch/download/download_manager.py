@@ -18,6 +18,7 @@ class DownloadCancelled(Exception):
 
 ProgressCallback = Callable[[str, int, int, int | None], None]
 CancelChecker = Callable[[], bool]
+RetryCallback = Callable[[str, int, str, float | None], None]
 
 
 class DownloadManager:
@@ -37,6 +38,7 @@ class DownloadManager:
         min_resume_size: int = 1024 * 1024,
         progress_callback: ProgressCallback | None = None,
         cancel_checker: CancelChecker | None = None,
+        retry_callback: RetryCallback | None = None,
     ):
         self.max_concurrent = max(1, int(max_concurrent))
         self.max_retries = max(1, int(max_retries))
@@ -49,6 +51,7 @@ class DownloadManager:
         self.min_resume_size = max(0, int(min_resume_size))
         self.progress_callback = progress_callback
         self.cancel_checker = cancel_checker
+        self.retry_callback = retry_callback
 
     def download_products(self, product_ids: dict, output_dir: str = "downloads") -> list[str]:
         urls: list[str] = product_ids.get("urls", [])
@@ -149,6 +152,8 @@ class DownloadManager:
                 raise
             except _RetryableHttpError as exc:
                 last_error = exc
+                if self.retry_callback is not None:
+                    self.retry_callback(file_name, attempt, f"http_{exc.status}", exc.retry_after)
                 if exc.status == 401 and refresh_token_callback is not None:
                     new_token = refresh_token_callback()
                     headers["Authorization"] = f"Bearer {new_token}"
@@ -161,6 +166,8 @@ class DownloadManager:
             except aiohttp.ClientResponseError as exc:
                 last_error = exc
                 status = exc.status
+                if self.retry_callback is not None and (status in {401, 429, 500, 502, 503, 504}):
+                    self.retry_callback(file_name, attempt, f"http_{status}", None)
                 if status == 401 and refresh_token_callback is not None:
                     new_token = refresh_token_callback()
                     headers["Authorization"] = f"Bearer {new_token}"
@@ -172,6 +179,8 @@ class DownloadManager:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_error = exc
+                if self.retry_callback is not None:
+                    self.retry_callback(file_name, attempt, exc.__class__.__name__.lower(), None)
                 if attempt < self.max_retries:
                     await asyncio.sleep(delay)
                     delay = min(delay * self.backoff_factor, 120.0)

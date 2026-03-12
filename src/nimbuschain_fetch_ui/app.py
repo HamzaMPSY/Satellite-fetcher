@@ -52,6 +52,7 @@ from nimbuschain_fetch_ui.constants import (
     DEFAULT_ZARR_URL,
     RECENT_JOBS_WINDOW_HOURS,
     RECENT_JOB_CATEGORY_MINUTES,
+    PROVIDER_ISSUE_WINDOW_MINUTES,
     RECENT_JOBS_LIMIT,
     RECENT_JOBS_FETCH_LIMIT,
     JOB_MONITOR_REFRESH_EVERY,
@@ -610,7 +611,34 @@ def _render_job_cards(
         progress = float(item.get("progress", 0.0) or 0.0)
         duration = item.get("duration_seconds")
         errors = item.get("errors", []) or []
+        error_summary = None
+        if errors:
+            first_error = str(errors[0]).strip()
+            if "catalogue.dataspace.copernicus.eu" in first_error and "503" in first_error:
+                error_summary = "Copernicus catalogue is temporarily unavailable (HTTP 503). Retry later."
+            elif len(first_error) > 240:
+                error_summary = f"{first_error[:240]}..."
+            else:
+                error_summary = first_error
         with st.container(border=True):
+            state_label, state_fg, state_bg, state_icon = _job_state_style(state)
+            provider_issue = _job_provider_issue_badge(item)
+            badge_chunks = [
+                f"<span style='display:inline-flex;align-items:center;border-radius:999px;padding:4px 10px;"
+                f"font-size:.72rem;font-weight:700;color:{state_fg};background:{state_bg};text-transform:uppercase;'>{state_icon} {state_label}</span>"
+            ]
+            if provider_issue is not None:
+                issue_label, issue_fg, issue_bg, issue_icon = provider_issue
+                badge_chunks.append(
+                    f"<span style='display:inline-flex;align-items:center;border-radius:999px;padding:4px 10px;"
+                    f"font-size:.72rem;font-weight:700;color:{issue_fg};background:{issue_bg};text-transform:uppercase;'>{issue_icon} {issue_label}</span>"
+                )
+            st.markdown(
+                "<div style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;'>"
+                + "".join(badge_chunks)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
             h1, h2, h3, h4 = st.columns([3, 1, 1, 1])
             with h1:
                 st.markdown(f"**{job_id}**")
@@ -624,14 +652,23 @@ def _render_job_cards(
                 st.metric("Progress", f"{progress:.2f}%")
             with h4:
                 st.metric("Duration", f"{float(duration):.1f}s" if duration is not None else "-")
-            st.progress(max(0.0, min(1.0, progress / 100.0)))
+            _render_job_progress_bar(progress, state)
             st.caption(
                 f"{int(item.get('bytes_downloaded', 0) or 0)} / "
                 f"{int(item.get('bytes_total', 0) or 0)} bytes · "
                 f"Updated: {item.get('updated_at', '-')}"
             )
-            if errors:
-                st.error("\n".join(str(err) for err in errors[:5]))
+            queued_reason = _job_queued_reason(item)
+            if queued_reason:
+                st.caption(f"Why queued: {queued_reason}")
+            retry_details = _job_retry_details(item, provider_issue)
+            if retry_details:
+                st.caption(retry_details)
+            if error_summary:
+                st.error(error_summary)
+                with st.expander("Error details", expanded=False):
+                    for err in errors[:5]:
+                        st.code(str(err), language="text")
             if state == "succeeded":
                 result = result_cache.get(job_id, {})
                 paths = list(result.get("paths", [])) if isinstance(result, dict) else []
@@ -642,6 +679,188 @@ def _render_job_cards(
                             st.code(str(out_path), language="text")
                         if len(paths) > 25:
                             st.caption(f"Showing first 25 / {len(paths)} paths.")
+
+
+def _job_error_texts(
+    statuses: list[dict[str, Any]],
+    provider_api: str | None,
+    *,
+    window_minutes: int | None = None,
+) -> list[str]:
+    if not provider_api:
+        return []
+    texts: list[str] = []
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    for item in statuses:
+        if str(item.get("provider", "")).strip().lower() != provider_api:
+            continue
+        if window_minutes is not None:
+            ref = _status_reference_time(item)
+            if ref is None:
+                continue
+            if (now_utc - ref) > dt.timedelta(minutes=max(1, window_minutes)):
+                continue
+        for err in item.get("errors", []) or []:
+            text = str(err).strip()
+            if text:
+                texts.append(text.lower())
+    return texts
+
+
+def _job_state_style(state: str) -> tuple[str, str, str, str]:
+    normalized = str(state or "unknown").strip().lower()
+    if normalized == "running":
+        return ("running", "#67e8f9", "rgba(34,211,238,0.14)", "▶")
+    if normalized == "queued":
+        return ("queued", "#fbbf24", "rgba(251,191,36,0.16)", "⏳")
+    if normalized == "succeeded":
+        return ("succeeded", "#4ade80", "rgba(74,222,128,0.14)", "✓")
+    if normalized in {"failed", "cancelled"}:
+        fg = "#f87171" if normalized == "failed" else "#c084fc"
+        bg = "rgba(248,113,113,0.14)" if normalized == "failed" else "rgba(192,132,252,0.14)"
+        icon = "✕" if normalized == "failed" else "■"
+        return (normalized, fg, bg, icon)
+    return (normalized or "unknown", "#94a3b8", "rgba(148,163,184,0.14)", "•")
+
+
+def _job_progress_color(state: str) -> str:
+    normalized = str(state or "unknown").strip().lower()
+    if normalized == "running":
+        return "#22d3ee"
+    if normalized == "queued":
+        return "#fbbf24"
+    if normalized == "succeeded":
+        return "#4ade80"
+    if normalized == "failed":
+        return "#f87171"
+    if normalized == "cancelled":
+        return "#c084fc"
+    return "#64748b"
+
+
+def _render_job_progress_bar(progress: float, state: str) -> None:
+    width_pct = max(0.0, min(100.0, float(progress or 0.0)))
+    bar_color = _job_progress_color(state)
+    st.markdown(
+        f"""
+        <div style="height:8px;background:#1f2937;border-radius:999px;overflow:hidden;margin:6px 0 4px 0;">
+          <div style="height:100%;width:{width_pct:.2f}%;background:{bar_color};border-radius:999px;transition:width .2s ease;"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _job_queued_reason(item: dict[str, Any]) -> str | None:
+    if str(item.get("state", "")).strip().lower() != "queued":
+        return None
+
+    provider_api = str(item.get("provider", "")).strip().lower()
+    worker_snapshot = _ss("worker_status_snapshot")
+    if not isinstance(worker_snapshot, dict) or worker_snapshot.get("_error"):
+        return "worker status is unavailable."
+
+    workers_alive = int(worker_snapshot.get("workers_alive", 0) or 0)
+    capacity_available = int(worker_snapshot.get("capacity_available", 0) or 0)
+    queued_jobs = int(worker_snapshot.get("queued_jobs", 0) or 0)
+    running_jobs = int(worker_snapshot.get("running_jobs", 0) or 0)
+
+    if workers_alive <= 0:
+        return "no worker is alive."
+
+    provider_state = (worker_snapshot.get("provider_capacity") or {}).get(provider_api) or {}
+    if isinstance(provider_state, dict) and bool(provider_state.get("blocked_by_limit")):
+        running = int(provider_state.get("running", 0) or 0)
+        limit_total = int(provider_state.get("limit_total", 0) or 0)
+        queued = int(provider_state.get("queued", 0) or 0)
+        return f"{provider_api} provider throttle is reached ({running}/{limit_total} running, {queued} queued for this provider)."
+
+    if capacity_available <= 0:
+        return f"all worker slots are busy ({running_jobs} running, {queued_jobs} queued)."
+
+    return "waiting in the queue to be picked by an available worker."
+
+
+def _job_provider_issue_badge(item: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    provider_api = str(item.get("provider", "")).strip().lower()
+    if not provider_api:
+        return None
+
+    error_texts = [str(err).strip().lower() for err in (item.get("errors", []) or []) if str(err).strip()]
+    if any("503" in text or "service unavailable" in text or "temporarily unavailable" in text for text in error_texts):
+        return ("provider unavailable", "#f87171", "rgba(248,113,113,0.14)", "⚠")
+    if any("429" in text or "retry later" in text or "rate limit" in text or "too many requests" in text for text in error_texts):
+        return ("provider retrying", "#fbbf24", "rgba(251,191,36,0.16)", "↻")
+
+    worker_snapshot = _ss("worker_status_snapshot")
+    if isinstance(worker_snapshot, dict):
+        provider_state = (worker_snapshot.get("provider_capacity") or {}).get(provider_api) or {}
+        if bool(provider_state.get("blocked_by_limit")) and str(item.get("state", "")).strip().lower() == "queued":
+            return ("provider throttled", "#38bdf8", "rgba(56,189,248,0.16)", "⏸")
+    return None
+
+
+def _job_retry_details(
+    item: dict[str, Any],
+    provider_issue: tuple[str, str, str, str] | None,
+) -> str | None:
+    if provider_issue is None or provider_issue[0] != "provider retrying":
+        return None
+    retry_count = int(item.get("retry_count", 0) or 0)
+    last_retry_at = item.get("last_retry_at")
+    if retry_count <= 0 and not last_retry_at:
+        return None
+    parts: list[str] = []
+    if retry_count > 0:
+        parts.append(f"Retry count: {retry_count}")
+    if last_retry_at:
+        parts.append(f"Last retry: {last_retry_at}")
+    return " · ".join(parts)
+
+
+def _provider_runtime_badge(
+    provider_api: str | None,
+    statuses: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    if not provider_api:
+        return ("unknown", "Provider state unavailable.", "#64748b")
+
+    provider_label = provider_api.capitalize()
+    worker_snapshot = _ss("worker_status_snapshot")
+    provider_state = {}
+    if isinstance(worker_snapshot, dict):
+        provider_state = (worker_snapshot.get("provider_capacity") or {}).get(provider_api) or {}
+
+    error_texts = _job_error_texts(
+        statuses,
+        provider_api,
+        window_minutes=PROVIDER_ISSUE_WINDOW_MINUTES,
+    )
+    if any("503" in text or "service unavailable" in text or "temporarily unavailable" in text for text in error_texts):
+        return ("unavailable", f"{provider_label} is temporarily unavailable.", "#ef4444")
+    if any(
+        "429" in text or "retry later" in text or "rate limit" in text or "too many requests" in text
+        for text in error_texts
+    ):
+        return ("retrying", f"{provider_label} is retrying after transient provider errors.", "#f59e0b")
+    if isinstance(provider_state, dict) and bool(provider_state.get("blocked_by_limit")):
+        limit_total = int(provider_state.get("limit_total", 0) or 0)
+        running = int(provider_state.get("running", 0) or 0)
+        return ("throttled", f"{provider_label} is at provider limit ({running}/{limit_total}).", "#38bdf8")
+    return ("healthy", f"{provider_label} is healthy.", "#22c55e")
+
+
+def _render_provider_runtime_badge(provider_api: str | None, statuses: list[dict[str, Any]]) -> None:
+    state, detail, color = _provider_runtime_badge(provider_api, statuses)
+    st.markdown(
+        f"""
+        <div style="display:inline-flex;align-items:center;gap:8px;background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:999px;padding:6px 12px;margin:8px 0 2px 0;">
+          <span style="font-size:.72rem;font-weight:700;color:{color};text-transform:uppercase;">{state}</span>
+          <span style="font-size:.72rem;color:#cbd5e1;">{detail}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 
@@ -714,6 +933,7 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
         f"Summary is computed from the current filtered scope inside recent activity (last {RECENT_JOBS_WINDOW_HOURS}h) plus active jobs."
     )
     st.caption("Download panel shows recent activity plus active jobs. Full historical browsing stays in Results.")
+    _render_provider_runtime_badge(download_provider_api, scoped_statuses)
 
     filter_col1, filter_col2 = st.columns([2, 4])
     with filter_col1:
@@ -737,56 +957,54 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
             }[value],
         )
     with filter_col2:
-        adv1, adv2, adv3, adv4, adv5 = st.columns([1, 1, 1, 1, 0.8])
-        with adv1:
-            provider_scope = st.selectbox(
-                "Provider filter",
-                options=["all", "copernicus", "usgs"],
-                key="dl_job_provider_filter",
-                format_func=lambda value: {
-                    "all": "All providers",
-                    "copernicus": "Copernicus",
-                    "usgs": "USGS",
-                }[value],
+        active_filter_count = sum(
+            1
+            for value in (
+                str(_ss("dl_job_provider_filter", "all")) != "all",
+                bool(str(_ss("dl_job_collection_filter", "")).strip()),
+                bool(str(_ss("dl_job_product_filter", "")).strip()),
+                bool(str(_ss("dl_job_id_query", "")).strip()),
             )
-        with adv2:
-            collection_filter = st.text_input(
-                "Mission filter",
-                key="dl_job_collection_filter",
-                placeholder="e.g. SENTINEL-2",
-            ).strip()
-        with adv3:
-            product_filter = st.text_input(
-                "Product filter",
-                key="dl_job_product_filter",
-                placeholder="e.g. S2MSI2A / 8L1TP",
-            ).strip()
-        with adv4:
-            job_query = st.text_input(
-                "Job ID contains",
-                key="dl_job_id_query",
-                placeholder="job id fragment",
-            ).strip()
-        with adv5:
-            st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
-            refresh_jobs_clicked = st.button("Refresh", width="stretch", key="refresh_jobs_button")
-
-    tracked_statuses = _tracked_job_rows()
-    tracked_active_statuses = [
-        row for row in tracked_statuses if str(row.get("state", "")).lower() in ACTIVE_JOB_STATES
-    ]
-    tracked_recent_statuses = tracked_active_statuses or tracked_statuses[:6]
-    if tracked_recent_statuses:
-        st.markdown("---")
-        st.markdown("**Tracked jobs**")
-        st.caption(
-            "These jobs are pinned from your submissions in this session and stay visible even if you change provider, mission, or product in the form."
+            if value
         )
-        tracked_result_cache = _ensure_job_results_loaded(tracked_recent_statuses)
-        _render_job_cards(
-            tracked_recent_statuses,
-            result_cache=tracked_result_cache,
-        )
+        refresh_jobs_clicked = False
+        expander_label = "Advanced job filters"
+        if active_filter_count:
+            expander_label = f"Advanced job filters ({active_filter_count})"
+        with st.expander(expander_label, expanded=False):
+            adv1, adv2, adv3, adv4, adv5 = st.columns([1, 1, 1, 1, 0.8])
+            with adv1:
+                provider_scope = st.selectbox(
+                    "Provider filter",
+                    options=["all", "copernicus", "usgs"],
+                    key="dl_job_provider_filter",
+                    format_func=lambda value: {
+                        "all": "All providers",
+                        "copernicus": "Copernicus",
+                        "usgs": "USGS",
+                    }[value],
+                )
+            with adv2:
+                collection_filter = st.text_input(
+                    "Mission filter",
+                    key="dl_job_collection_filter",
+                    placeholder="e.g. SENTINEL-2",
+                ).strip()
+            with adv3:
+                product_filter = st.text_input(
+                    "Product filter",
+                    key="dl_job_product_filter",
+                    placeholder="e.g. S2MSI2A / 8L1TP",
+                ).strip()
+            with adv4:
+                job_query = st.text_input(
+                    "Job ID contains",
+                    key="dl_job_id_query",
+                    placeholder="job id fragment",
+                ).strip()
+            with adv5:
+                st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+                refresh_jobs_clicked = st.button("Refresh", width="stretch", key="refresh_jobs_button")
 
     base_visible_statuses = _filter_jobs_by_scope(
         statuses,
@@ -801,7 +1019,7 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
         recent_minutes=RECENT_JOB_CATEGORY_MINUTES,
         active_states=ACTIVE_JOB_STATES,
     )
-    st.caption("Changing the provider/mission/product form only affects new submissions. Existing jobs keep their original provider and product.")
+    st.caption("Changing provider, mission, or product in the form only affects new submissions.")
     visible_total = len(base_visible_statuses)
     if job_view == "recent":
         st.caption(f"Showing jobs updated in the last {RECENT_JOB_CATEGORY_MINUTES} minutes inside the recent activity window.")
@@ -1360,7 +1578,7 @@ def main():
         with pr2:
             refresh_preview = st.button("🔎 Refresh Preview", width="stretch", key="refresh_preview")
 
-        auto_preview = bool(preview_wkt) and not _ss("preview_fetched", False)
+        auto_preview = bool(preview_wkt) and not bool(_ss("preview_fetched", False))
         if refresh_preview or auto_preview:
             prev = preview_products_cached(
                 provider=provider,
@@ -1376,6 +1594,8 @@ def main():
             st.session_state["preview_total"] = int(prev.get("total", 0) or 0)
             st.session_state["preview_error"] = prev.get("error", "")
             st.session_state["preview_fetched"] = True
+        if preview_wkt:
+            st.caption("Preview refreshes automatically when AOI, dates, provider, or product change.")
 
         if _ss("preview_error"):
             st.warning(f"Preview: {_ss('preview_error')}")
@@ -1412,15 +1632,52 @@ def main():
             mode_text = "single job with tile filter"
         st.caption(f"Submit mode: {mode_text}")
 
-        d1, d2, d3, d4 = st.columns([2, 1, 1, 1])
+        stop_scope_provider = _provider_scope_value(
+            str(_ss("dl_job_provider_filter", "all")),
+            None,
+        )
+        stop_collection_query = str(_ss("dl_job_collection_filter", "")).strip()
+        stop_product_query = str(_ss("dl_job_product_filter", "")).strip()
+        stop_job_query = str(_ss("dl_job_id_query", "")).strip()
+        active_job_rows_for_stop, _ = _list_jobs(
+            _ss("api_url"),
+            _ss("api_key"),
+            state_in=",".join(sorted(ACTIVE_JOB_STATES)),
+            sort_by="updated_at",
+            sort_desc=True,
+            page=1,
+            page_size=200,
+        )
+        active_job_rows_for_stop = _filter_jobs_by_scope(
+            active_job_rows_for_stop,
+            provider=stop_scope_provider,
+            collection_query=stop_collection_query,
+            product_query=stop_product_query,
+            job_query=stop_job_query,
+        )
+        active_ids = [
+            str(item.get("job_id", "")).strip()
+            for item in active_job_rows_for_stop
+            if str(item.get("job_id", "")).strip()
+        ]
+        has_stoppable_jobs = bool(active_ids)
+
+        d1, d2 = st.columns([2, 1])
         with d1:
             start_clicked = st.button("🚀 Start Download", width="stretch", type="primary")
         with d2:
-            stop_clicked = st.button("⏹️ Stop", width="stretch")
-        with d3:
-            reset_clicked = st.button("🗑️ Reset", width="stretch")
-        with d4:
-            unlock_clicked = st.button("🔓 Unlock", width="stretch")
+            if has_stoppable_jobs:
+                stop_clicked = st.button(f"⏹️ Stop ({len(active_ids)})", width="stretch")
+            else:
+                stop_clicked = False
+                st.caption("No active jobs to stop.")
+        with st.expander("Advanced controls", expanded=False):
+            st.caption("Reset clears UI state only. Unlock releases the local tracker if it gets stuck.")
+            adv1, adv2 = st.columns(2)
+            with adv1:
+                reset_clicked = st.button("🗑️ Reset UI state", width="stretch")
+            with adv2:
+                unlock_clicked = st.button("🔓 Unlock tracker", width="stretch")
 
         download_provider_api = PROVIDER_CLI_MAP.get(provider)
         if bool(_ss("dl_auto_refresh", True)):
@@ -1529,32 +1786,6 @@ def main():
                             st.error(f"{response.status_code}: {response.text}")
                 except Exception as exc:
                     st.error(str(exc))
-
-        stop_scope_provider = _provider_scope_value(
-            str(_ss("dl_job_provider_filter", "all")),
-            None,
-        )
-        stop_collection_query = str(_ss("dl_job_collection_filter", "")).strip()
-        stop_product_query = str(_ss("dl_job_product_filter", "")).strip()
-        stop_job_query = str(_ss("dl_job_id_query", "")).strip()
-
-        active_job_rows_for_stop, _ = _list_jobs(
-            _ss("api_url"),
-            _ss("api_key"),
-            state_in=",".join(sorted(ACTIVE_JOB_STATES)),
-            sort_by="updated_at",
-            sort_desc=True,
-            page=1,
-            page_size=200,
-        )
-        active_job_rows_for_stop = _filter_jobs_by_scope(
-            active_job_rows_for_stop,
-            provider=stop_scope_provider,
-            collection_query=stop_collection_query,
-            product_query=stop_product_query,
-            job_query=stop_job_query,
-        )
-        active_ids = [str(item.get("job_id", "")).strip() for item in active_job_rows_for_stop if str(item.get("job_id", "")).strip()]
         if stop_clicked:
             cancelled = 0
             for job_id in active_ids:
@@ -1590,64 +1821,106 @@ def main():
             '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>🧱</span><span style="font-weight:600;font-size:.94rem;">Zarr Conversion</span></div>',
             unsafe_allow_html=True,
         )
-        zc1, zc2 = st.columns([3, 1])
-        with zc1:
-            st.session_state["zarr_service_url"] = st.text_input(
-                "Zarr service URL",
-                value=_ss("zarr_service_url", DEFAULT_ZARR_URL),
-                help="Example: http://nimbus-zarr:8010 (compose) or http://127.0.0.1:8010",
-            )
-        with zc2:
-            current_zarr_url = str(_ss("zarr_service_url", DEFAULT_ZARR_URL)).strip()
-            if (
-                _ss("last_zarr_status_url", "") != current_zarr_url
-                or _ss("zarr_health_snapshot") is None
-                or _ss("zarr_readiness_snapshot") is None
-            ):
-                _refresh_zarr_runtime_statuses()
-            if st.button("Refresh Zarr status", width="stretch"):
-                _refresh_zarr_runtime_statuses()
-        st.caption(f"Last checked: {_format_status_timestamp(_ss('zarr_status_checked_at'))}")
-        zstatus1, zstatus2 = st.columns(2)
-        with zstatus1:
-            _render_status_block("Zarr health", _ss("zarr_health_snapshot"), kind="service")
-        with zstatus2:
-            _render_status_block("Zarr readiness", _ss("zarr_readiness_snapshot"), kind="service")
+        current_zarr_url = str(_ss("zarr_service_url", DEFAULT_ZARR_URL)).strip()
+        if (
+            _ss("last_zarr_status_url", "") != current_zarr_url
+            or _ss("zarr_health_snapshot") is None
+            or _ss("zarr_readiness_snapshot") is None
+        ):
+            _refresh_zarr_runtime_statuses()
 
         zarr_schema = _zarr_service_schema(_ss("zarr_service_url", DEFAULT_ZARR_URL))
         resolution_policy_info = (zarr_schema.get("converter_config", {}) or {}).get("resolution_policy", {})
-        if resolution_policy_info:
-            collections_policy = dict(resolution_policy_info.get("collections") or {})
-            sentinel2_target = (collections_policy.get("SENTINEL-2") or {}).get("target_pixel_size_meters")
-            landsat_l1_target = (collections_policy.get("landsat_ot_c2_l1") or {}).get("target_pixel_size_meters")
-            landsat_l2_target = (collections_policy.get("landsat_ot_c2_l2") or {}).get("target_pixel_size_meters")
-            sentinel1_target = (collections_policy.get("SENTINEL-1") or {}).get("target_pixel_size_meters")
-            st.caption(
-                "Resolution policy: "
-                f"Sentinel-2 -> {sentinel2_target if sentinel2_target is not None else 'native'} m, "
-                f"Landsat L1 -> {landsat_l1_target if landsat_l1_target is not None else 'native'} m, "
-                f"Landsat L2 -> {landsat_l2_target if landsat_l2_target is not None else 'native'} m, "
-                f"Sentinel-1 -> {sentinel1_target if sentinel1_target is not None else 'native reference'}"
+        collections_policy = dict(resolution_policy_info.get("collections") or {})
+        sentinel2_target = (collections_policy.get("SENTINEL-2") or {}).get("target_pixel_size_meters")
+        landsat_l1_target = (collections_policy.get("landsat_ot_c2_l1") or {}).get("target_pixel_size_meters")
+        landsat_l2_target = (collections_policy.get("landsat_ot_c2_l2") or {}).get("target_pixel_size_meters")
+        sentinel1_target = (collections_policy.get("SENTINEL-1") or {}).get("target_pixel_size_meters")
+
+        summary1, summary2, summary3 = st.columns(3)
+        with summary1:
+            st.markdown(
+                "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
+                "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 1</div>"
+                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Pick a raw source</div>"
+                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Use a recent download, a local path, or an OCI URI.</div>"
+                "</div>",
+                unsafe_allow_html=True,
             )
-            st.caption(
-                "Landsat note: Level-1 keeps the 15 m panchromatic band B8, but the normalized multispectral Zarr grid stays at 30 m."
+        with summary2:
+            st.markdown(
+                "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
+                "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 2</div>"
+                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Confirm metadata</div>"
+                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Provider, collection, product type, and scene ID are editable before conversion.</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        with summary3:
+            st.markdown(
+                "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
+                "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 3</div>"
+                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Write Zarr output</div>"
+                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Use the mounted downloads volume or an OCI destination for the final store.</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        with st.expander("Service connection & diagnostics", expanded=False):
+            zc1, zc2 = st.columns([3, 1])
+            with zc1:
+                st.session_state["zarr_service_url"] = st.text_input(
+                    "Zarr service URL",
+                    value=_ss("zarr_service_url", DEFAULT_ZARR_URL),
+                    help="Example: http://nimbus-zarr:8010 (compose) or http://127.0.0.1:8010",
+                )
+            with zc2:
+                current_zarr_url = str(_ss("zarr_service_url", DEFAULT_ZARR_URL)).strip()
+                if st.button("Refresh Zarr status", width="stretch"):
+                    _refresh_zarr_runtime_statuses()
+            st.caption(f"Last checked: {_format_status_timestamp(_ss('zarr_status_checked_at'))}")
+            zstatus1, zstatus2 = st.columns(2)
+            with zstatus1:
+                _render_status_block("Zarr health", _ss("zarr_health_snapshot"), kind="service")
+            with zstatus2:
+                _render_status_block("Zarr readiness", _ss("zarr_readiness_snapshot"), kind="service")
+
+        if resolution_policy_info:
+            st.markdown(
+                "<div style='background:#0f172a;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:12px 14px;margin-top:10px;'>"
+                f"<div style='font-size:.8rem;color:#cbd5e1;'><b>Resolution policy</b> · Sentinel-2 → {sentinel2_target if sentinel2_target is not None else 'native'} m · "
+                f"Landsat L1 → {landsat_l1_target if landsat_l1_target is not None else 'native'} m · "
+                f"Landsat L2 → {landsat_l2_target if landsat_l2_target is not None else 'native'} m · "
+                f"Sentinel-1 → {sentinel1_target if sentinel1_target is not None else 'native reference'}</div>"
+                "<div style='font-size:.75rem;color:#94a3b8;margin-top:6px;'>Landsat Level-1 keeps the 15 m panchromatic band B8, but the normalized multispectral Zarr grid remains at 30 m.</div>"
+                "</div>",
+                unsafe_allow_html=True,
             )
 
         candidates = _recent_source_candidates()
+        st.markdown("---")
+        st.markdown("**Step 1. Source**")
         if not candidates:
-            st.info("No recent raw files or source folders found in downloads.")
-        selected_raw_uri = st.selectbox(
-            "Raw source",
-            options=candidates if candidates else [""],
-            index=0,
-            key="zarr_raw_uri",
-            help="Recent downloads and extracted source folders.",
-            format_func=lambda value: (
-                "-"
-                if not value
-                else f"{Path(str(value)).name}  |  {value}"
-            ),
-        )
+            st.info("No recent raw files or source folders were found in downloads. You can still paste a local path or an OCI URI below.")
+        source_col1, source_col2 = st.columns([3, 2])
+        with source_col1:
+            selected_raw_uri = st.selectbox(
+                "Recent raw source",
+                options=candidates if candidates else [""],
+                index=0,
+                key="zarr_raw_uri",
+                help="Recent downloads and extracted source folders.",
+                format_func=lambda value: (
+                    "-"
+                    if not value
+                    else f"{Path(str(value)).name}  |  {value}"
+                ),
+            )
+        with source_col2:
+            if candidates:
+                st.metric("Detected sources", len(candidates))
+            else:
+                st.metric("Detected sources", 0)
         last_selected_raw = str(_ss("zarr_last_selected_raw_uri", "")).strip()
         current_raw_value = str(_ss("zarr_raw_uri_value", "")).strip()
         if str(selected_raw_uri or "").strip() != last_selected_raw:
@@ -1666,6 +1939,8 @@ def main():
         default_collection = _guess_zarr_collection(default_provider, guessed_scene)
         default_product_type = _guess_zarr_product_type(default_provider, default_collection, guessed_scene)
         default_output = _default_zarr_output(guessed_scene)
+        source_kind = _guess_raw_source_format(raw_uri) if raw_uri else "-"
+        source_host_hint = _container_to_host_path_hint(raw_uri) if raw_uri else None
 
         last_raw = str(_ss("zarr_last_raw_uri", ""))
         if raw_uri and raw_uri != last_raw:
@@ -1677,10 +1952,22 @@ def main():
             st.session_state["zarr_output_uri"] = default_output
             st.session_state["zarr_last_auto_output"] = default_output
 
+        if raw_uri:
+            source_meta1, source_meta2, source_meta3 = st.columns(3)
+            with source_meta1:
+                st.metric("Source type", source_kind.upper() if source_kind else "-")
+            with source_meta2:
+                st.metric("Detected scene", guessed_scene or "-")
+            with source_meta3:
+                st.metric("Detected provider", default_provider or "-")
+            if source_host_hint and source_host_hint != raw_uri:
+                st.caption(f"Host path hint: {source_host_hint}")
+
         provider_options = list((zarr_schema.get("supported_collections", {}) or {}).keys()) or ["copernicus", "usgs"]
         provider_default = _ss("zarr_provider_api", default_provider)
         provider_index = provider_options.index(provider_default) if provider_default in provider_options else 0
 
+        st.markdown("**Step 2. Conversion target**")
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             provider_api = st.selectbox(
@@ -1719,13 +2006,6 @@ def main():
             st.session_state["zarr_output_uri"] = auto_output
             st.session_state["zarr_last_auto_output"] = auto_output
 
-        output_uri = st.text_input(
-            "Output Zarr path",
-            value=_default_zarr_output(scene_id),
-            key="zarr_output_uri",
-            help="Use /data/... for local output, or oci://bucket@namespace/path/to/store.zarr for remote output.",
-        )
-
         sentinel1_caps = ((zarr_schema.get("runtime_capabilities") or {}).get("sentinel1") or {})
         raw_decoder_available = bool(sentinel1_caps.get("raw_decoder_available"))
 
@@ -1739,12 +2019,28 @@ def main():
         elif provider_api == "copernicus" and collection_api == "SENTINEL-1" and product_type == "RAW":
             st.info("Sentinel-1 RAW decoder is available. Conversion will produce a non-georeferenced sample-space Zarr.")
 
+        st.markdown("**Step 3. Output**")
+        output_uri = st.text_input(
+            "Output Zarr path",
+            value=_default_zarr_output(scene_id),
+            key="zarr_output_uri",
+            help="Use /data/... for local output, or oci://bucket@namespace/path/to/store.zarr for remote output.",
+        )
+        output_meta1, output_meta2, output_meta3 = st.columns(3)
+        with output_meta1:
+            st.metric("Output kind", "OCI" if output_uri.strip().startswith("oci://") else "Local")
+        with output_meta2:
+            st.metric("Collection", collection_api or "-")
+        with output_meta3:
+            st.metric("Product type", product_type or "-")
+
         run_convert = st.button(
             "Run Zarr conversion",
             type="primary",
             width="stretch",
             disabled=(not raw_uri) or (zarr_conversion_blocker is not None),
         )
+        st.caption("The converter preserves native imagery layers and stores QA / ancillary layers separately when available.")
         if run_convert:
             scene_id_value = scene_id.strip() or guessed_scene or "scene"
             output_uri_value = output_uri.strip()
@@ -1797,117 +2093,117 @@ def main():
                 st.error(str(exc))
 
         st.markdown("---")
-        st.caption("Registered and discovered Zarr stores")
-        zaf1, zaf2, zaf3 = st.columns([2, 2, 3])
-        with zaf1:
-            zarr_provider_filter = st.selectbox(
-                "Artifact provider",
-                options=["", "copernicus", "usgs"],
-                key="zarr_artifact_provider",
-                format_func=lambda value: "All providers" if not value else value,
+        with st.expander("Stored Zarr stores", expanded=True):
+            zaf1, zaf2, zaf3 = st.columns([2, 2, 3])
+            with zaf1:
+                zarr_provider_filter = st.selectbox(
+                    "Artifact provider",
+                    options=["", "copernicus", "usgs"],
+                    key="zarr_artifact_provider",
+                    format_func=lambda value: "All providers" if not value else value,
+                )
+            with zaf2:
+                zarr_collection_filter = st.text_input(
+                    "Artifact mission",
+                    key="zarr_artifact_collection",
+                    placeholder="e.g. SENTINEL-2",
+                ).strip()
+            with zaf3:
+                zarr_artifact_query = st.text_input(
+                    "Artifact path / scene search",
+                    key="zarr_artifact_query",
+                    placeholder="scene id or path fragment",
+                ).strip()
+            show_legacy_zarr = st.checkbox(
+                "Show legacy/unregistered local Zarr stores",
+                value=bool(_ss("show_legacy_zarr", False)),
+                key="show_legacy_zarr",
+                help="Legacy stores are old local Zarr directories discovered on disk but not registered by the current converter flow.",
             )
-        with zaf2:
-            zarr_collection_filter = st.text_input(
-                "Artifact mission",
-                key="zarr_artifact_collection",
-                placeholder="e.g. SENTINEL-2",
-            ).strip()
-        with zaf3:
-            zarr_artifact_query = st.text_input(
-                "Artifact path / scene search",
-                key="zarr_artifact_query",
-                placeholder="scene id or path fragment",
-            ).strip()
-        show_legacy_zarr = st.checkbox(
-            "Show legacy/unregistered local Zarr stores",
-            value=bool(_ss("show_legacy_zarr", False)),
-            key="show_legacy_zarr",
-            help="Legacy stores are old local Zarr directories discovered on disk but not registered by the current converter flow.",
-        )
 
-        artifacts, artifacts_total = _list_artifacts(
-            _ss("api_url"),
-            _ss("api_key"),
-            artifact_type="zarr",
-            provider=zarr_provider_filter or None,
-            collection=zarr_collection_filter or None,
-            uri_query=zarr_artifact_query or None,
-            include_local=True,
-            page=1,
-            page_size=120,
-        )
-        visible_artifacts, hidden_legacy_count = _filter_visible_artifacts(
-            artifacts,
-            include_legacy=show_legacy_zarr,
-        )
-        if not visible_artifacts:
-            st.info("No .zarr store found in the registry or on local disk yet.")
-        else:
-            caption = f"Showing {len(visible_artifacts)} / {artifacts_total} Zarr stores."
-            if hidden_legacy_count:
-                caption += f" Hidden legacy stores: {hidden_legacy_count}."
-            st.caption(caption)
-            store_options = [str(item["artifact_uri"]) for item in visible_artifacts]
-            selected_store = st.selectbox(
-                "Stored Zarr directory",
-                options=store_options,
-                index=0,
-                key="zarr_selected_store",
-                format_func=lambda value: next(
-                    (
-                        f"[{str(item.get('_visibility_status', _artifact_visibility_status(item))).upper()}] "
-                        f"{Path(str(item['artifact_uri'])).name}  |  "
-                        f"{_container_to_host_path_hint(str(item['artifact_uri'])) or str(item['artifact_uri'])}"
-                        for item in visible_artifacts
-                        if str(item["artifact_uri"]) == value
+            artifacts, artifacts_total = _list_artifacts(
+                _ss("api_url"),
+                _ss("api_key"),
+                artifact_type="zarr",
+                provider=zarr_provider_filter or None,
+                collection=zarr_collection_filter or None,
+                uri_query=zarr_artifact_query or None,
+                include_local=True,
+                page=1,
+                page_size=120,
+            )
+            visible_artifacts, hidden_legacy_count = _filter_visible_artifacts(
+                artifacts,
+                include_legacy=show_legacy_zarr,
+            )
+            if not visible_artifacts:
+                st.info("No .zarr store found in the registry or on local disk yet.")
+            else:
+                caption = f"Showing {len(visible_artifacts)} / {artifacts_total} Zarr stores."
+                if hidden_legacy_count:
+                    caption += f" Hidden legacy stores: {hidden_legacy_count}."
+                st.caption(caption)
+                store_options = [str(item["artifact_uri"]) for item in visible_artifacts]
+                selected_store = st.selectbox(
+                    "Stored Zarr directory",
+                    options=store_options,
+                    index=0,
+                    key="zarr_selected_store",
+                    format_func=lambda value: next(
+                        (
+                            f"[{str(item.get('_visibility_status', _artifact_visibility_status(item))).upper()}] "
+                            f"{Path(str(item['artifact_uri'])).name}  |  "
+                            f"{_container_to_host_path_hint(str(item['artifact_uri'])) or str(item['artifact_uri'])}"
+                            for item in visible_artifacts
+                            if str(item["artifact_uri"]) == value
+                        ),
+                        value,
                     ),
-                    value,
-                ),
-            )
-            selected_store_meta = next(
-                (item for item in visible_artifacts if str(item["artifact_uri"]) == selected_store),
-                visible_artifacts[0],
-            )
-            selected_host_hint = _container_to_host_path_hint(str(selected_store_meta.get("artifact_uri", "")))
-            meta_cols = st.columns(4)
-            with meta_cols[0]:
-                st.metric("Provider", str(selected_store_meta.get("provider", "-") or "-"))
-            with meta_cols[1]:
-                st.metric("Collection", str(selected_store_meta.get("collection", "-") or "-"))
-            with meta_cols[2]:
-                st.metric("Bands", len(selected_store_meta.get("band_names") or []))
-            with meta_cols[3]:
-                st.metric("Size", _human_size(selected_store_meta.get("size_bytes")))
-            st.code(
-                "\n".join(
-                    [
-                        f"Scene: {selected_store_meta.get('scene_id', '-')}",
-                        f"Container path: {selected_store_meta.get('artifact_uri', '-')}",
-                        f"Host path: {selected_host_hint or '-'}",
-                        f"Visibility status: {selected_store_meta.get('_visibility_status', _artifact_visibility_status(selected_store_meta))}",
-                        f"Data family: {selected_store_meta.get('data_family', '-')}",
-                        f"Dimensions: {', '.join([str(v) for v in (selected_store_meta.get('dimensions') or [])]) or '-'}",
-                        f"Shape: {selected_store_meta.get('shape', []) or '-'}",
-                        f"Bands: {', '.join([str(v) for v in (selected_store_meta.get('band_names') or [])]) or '-'}",
-                        f"Source: {selected_store_meta.get('source_uri', '-')}",
-                        f"Updated: {selected_store_meta.get('updated_at', '-')}",
-                    ]
-                ),
-                language="text",
-            )
+                )
+                selected_store_meta = next(
+                    (item for item in visible_artifacts if str(item["artifact_uri"]) == selected_store),
+                    visible_artifacts[0],
+                )
+                selected_host_hint = _container_to_host_path_hint(str(selected_store_meta.get("artifact_uri", "")))
+                meta_cols = st.columns(4)
+                with meta_cols[0]:
+                    st.metric("Provider", str(selected_store_meta.get("provider", "-") or "-"))
+                with meta_cols[1]:
+                    st.metric("Collection", str(selected_store_meta.get("collection", "-") or "-"))
+                with meta_cols[2]:
+                    st.metric("Bands", len(selected_store_meta.get("band_names") or []))
+                with meta_cols[3]:
+                    st.metric("Size", _human_size(selected_store_meta.get("size_bytes")))
+                st.code(
+                    "\n".join(
+                        [
+                            f"Scene: {selected_store_meta.get('scene_id', '-')}",
+                            f"Container path: {selected_store_meta.get('artifact_uri', '-')}",
+                            f"Host path: {selected_host_hint or '-'}",
+                            f"Visibility status: {selected_store_meta.get('_visibility_status', _artifact_visibility_status(selected_store_meta))}",
+                            f"Data family: {selected_store_meta.get('data_family', '-')}",
+                            f"Dimensions: {', '.join([str(v) for v in (selected_store_meta.get('dimensions') or [])]) or '-'}",
+                            f"Shape: {selected_store_meta.get('shape', []) or '-'}",
+                            f"Bands: {', '.join([str(v) for v in (selected_store_meta.get('band_names') or [])]) or '-'}",
+                            f"Source: {selected_store_meta.get('source_uri', '-')}",
+                            f"Updated: {selected_store_meta.get('updated_at', '-')}",
+                        ]
+                    ),
+                    language="text",
+                )
 
-        st.markdown("---")
-        st.caption("Recent Zarr conversions (session)")
-        zarr_history = list(_ss("zarr_history", []))
-        if not zarr_history:
-            st.info("No conversion executed in this session yet.")
-        else:
-            for item in zarr_history[:20]:
-                with st.container(border=True):
-                    st.markdown(f"**{item.get('job_id', '-') }**")
-                    st.caption(f"{item.get('data_family', '-') } · {item.get('zarr_uri', '-')}")
-                    st.caption(f"Bands: {', '.join([str(b) for b in (item.get('band_names') or [])])}")
-                    st.code(json.dumps(item.get("normalization_summary", {}), indent=2), language="json")
+        with st.expander("Recent Zarr conversions (session)", expanded=False):
+            zarr_history = list(_ss("zarr_history", []))
+            if not zarr_history:
+                st.info("No conversion executed in this session yet.")
+            else:
+                for item in zarr_history[:20]:
+                    with st.container(border=True):
+                        st.markdown(f"**{item.get('job_id', '-') }**")
+                        st.caption(f"{item.get('data_family', '-') } · {item.get('zarr_uri', '-')}")
+                        st.caption(f"Bands: {', '.join([str(b) for b in (item.get('band_names') or [])])}")
+                        with st.expander("Normalization summary", expanded=False):
+                            st.code(json.dumps(item.get("normalization_summary", {}), indent=2), language="json")
 
     with tab_res:
         render_results_tab(api_url=_ss("api_url"), api_key=_ss("api_key"))

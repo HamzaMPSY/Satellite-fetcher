@@ -191,17 +191,32 @@ def _copernicus_preview(
         "$top": str(max(50, max_items * 3)),
         "$count": "true",
     }
-    products_response = requests.get(
-        f"{base_url.rstrip('/')}/odata/v1/Products",
-        params=params,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=60,
-    )
+    products_response = None
+    for attempt in range(1, 5):
+        products_response = requests.get(
+            f"{base_url.rstrip('/')}/odata/v1/Products",
+            params=params,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=60,
+        )
+        if products_response.status_code not in {429, 500, 502, 503, 504}:
+            break
+        if attempt < 4:
+            retry_after = products_response.headers.get("Retry-After")
+            try:
+                delay = max(0.0, float(retry_after)) if retry_after else min(10.0, 2.0 * attempt)
+            except Exception:
+                delay = min(10.0, 2.0 * attempt)
+            time.sleep(delay)
+    assert products_response is not None
     if not products_response.ok:
         return {
             "items": [],
             "total": 0,
-            "error": f"Copernicus preview search failed ({products_response.status_code}).",
+            "error": (
+                "Copernicus preview search is temporarily unavailable "
+                f"(HTTP {products_response.status_code}). Retry in a few seconds."
+            ),
         }
 
     payload = products_response.json()

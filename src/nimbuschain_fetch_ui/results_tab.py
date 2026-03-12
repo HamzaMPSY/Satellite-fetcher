@@ -200,13 +200,22 @@ def _render_files_section(downloads_dir: Path) -> None:
     selected_path = st.selectbox("Select a file", options=[row["path"] for row in rows], index=0)
     local_path = downloads_dir / selected_path
     if local_path.exists() and local_path.is_file():
-        st.download_button(
-            "⬇️ Download selected",
-            data=local_path.read_bytes(),
-            file_name=local_path.name,
-            mime="application/octet-stream",
-            width="stretch",
-        )
+        file_size_mb = local_path.stat().st_size / (1024 * 1024)
+        st.caption(f"Selected path: `{local_path}`")
+        if file_size_mb <= 50:
+            with local_path.open("rb") as handle:
+                st.download_button(
+                    "⬇️ Download selected",
+                    data=handle.read(),
+                    file_name=local_path.name,
+                    mime="application/octet-stream",
+                    width="stretch",
+                )
+        else:
+            st.info(
+                f"Browser download is disabled for large files ({file_size_mb:.1f} MB) to keep Streamlit responsive. "
+                "Use the local path above."
+            )
 
 
 def render_results_tab(*, api_url: str, api_key: str) -> None:

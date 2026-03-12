@@ -40,6 +40,8 @@ class SQLiteJobStore:
                     progress REAL NOT NULL,
                     bytes_downloaded INTEGER NOT NULL,
                     bytes_total INTEGER NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_retry_at TEXT,
                     started_at TEXT,
                     finished_at TEXT,
                     errors_json TEXT NOT NULL,
@@ -134,6 +136,8 @@ class SQLiteJobStore:
             self._ensure_column("jobs", "product_type", "TEXT")
             self._ensure_column("jobs", "tile_id", "TEXT")
             self._ensure_column("jobs", "worker_id", "TEXT")
+            self._ensure_column("jobs", "retry_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("jobs", "last_retry_at", "TEXT")
             self._conn.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
@@ -165,6 +169,8 @@ class SQLiteJobStore:
             "progress": float(row["progress"]),
             "bytes_downloaded": int(row["bytes_downloaded"]),
             "bytes_total": int(row["bytes_total"]),
+            "retry_count": int(row["retry_count"]) if "retry_count" in row.keys() and row["retry_count"] is not None else 0,
+            "last_retry_at": row["last_retry_at"] if "last_retry_at" in row.keys() else None,
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
             "errors": json.loads(row["errors_json"]),
@@ -188,9 +194,9 @@ class SQLiteJobStore:
                 """
                 INSERT INTO jobs(
                     job_id, job_type, provider, collection, product_type, tile_id, request_json, state,
-                    progress, bytes_downloaded, bytes_total, started_at, finished_at,
+                    progress, bytes_downloaded, bytes_total, retry_count, last_retry_at, started_at, finished_at,
                     errors_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -204,6 +210,8 @@ class SQLiteJobStore:
                     0.0,
                     0,
                     0,
+                    0,
+                    None,
                     None,
                     None,
                     "[]",

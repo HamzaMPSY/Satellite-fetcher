@@ -236,11 +236,6 @@ def load_aligned_raster_stack(
                 ) from exc
 
             with src_ctx as src:
-                if src.count != 1:
-                    raise ConversionError(
-                        f"Band {band_name} is expected to be single-band, got {src.count}."
-                    )
-
                 src_crs = src.crs.to_string() if src.crs else None
                 src_transform = src.transform
                 src_pixel_size = [float(src_transform.a), float(abs(src_transform.e))]
@@ -250,38 +245,46 @@ def load_aligned_raster_stack(
                     and src_crs == ref_crs
                     and tuple(src.transform) == tuple(ref_transform)
                 )
-                if not resampled:
-                    data = src.read(1)
-                else:
-                    data = np.empty((ref_height, ref_width), dtype=src.dtypes[0])
-                    resampling = (
-                        Resampling.nearest if band_name in categorical_bands else Resampling.bilinear
-                    )
-                    reproject(
-                        source=rasterio.band(src, 1),
-                        destination=data,
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        dst_transform=ref_transform,
-                        dst_crs=ref_src.crs,
-                        resampling=resampling,
-                    )
+                for expanded_name, source_band_index in _expand_raster_layer_names(band_name, src.count):
+                    if not resampled:
+                        data = src.read(source_band_index)
+                    else:
+                        data = np.empty(
+                            (ref_height, ref_width),
+                            dtype=src.dtypes[source_band_index - 1],
+                        )
+                        resampling = (
+                            Resampling.nearest if band_name in categorical_bands else Resampling.bilinear
+                        )
+                        reproject(
+                            source=rasterio.band(src, source_band_index),
+                            destination=data,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=ref_transform,
+                            dst_crs=ref_src.crs,
+                            resampling=resampling,
+                        )
 
-                arrays.append(data)
-                available_bands.append(band_name)
-                band_metadata[band_name] = {
-                    "path": str(band_path),
-                    "dtype": str(src.dtypes[0]),
-                    "source_height": int(src.height),
-                    "source_width": int(src.width),
-                    "source_crs": src_crs,
-                    "source_transform": list(src_transform)[:6],
-                    "source_pixel_size": src_pixel_size,
-                    "reference_native_pixel_size": native_ref_pixel_size,
-                    "reference_pixel_size": ref_pixel_size,
-                    "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
-                    "resampled_to_reference": bool(resampled),
-                }
+                    arrays.append(data)
+                    available_bands.append(expanded_name)
+                    band_metadata[expanded_name] = {
+                        "path": str(band_path),
+                        "source_layer": band_name,
+                        "source_band_index": int(source_band_index),
+                        "source_raster_band_count": int(src.count),
+                        "dtype": str(src.dtypes[source_band_index - 1]),
+                        "source_height": int(src.height),
+                        "source_width": int(src.width),
+                        "source_crs": src_crs,
+                        "source_transform": list(src_transform)[:6],
+                        "source_pixel_size": src_pixel_size,
+                        "reference_native_pixel_size": native_ref_pixel_size,
+                        "reference_pixel_size": ref_pixel_size,
+                        "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
+                        "resampled_to_reference": bool(resampled),
+                        "categorical": bool(band_name in categorical_bands),
+                    }
 
     if not arrays:
         raise ConversionError("No valid raster bands were loaded.")
@@ -365,10 +368,6 @@ def inspect_aligned_raster_stack(
         if band_path is None:
             continue
         with rasterio.open(band_path) as src:
-            if src.count != 1:
-                raise ConversionError(
-                    f"Band {band_name} is expected to be single-band, got {src.count}."
-                )
             src_crs = src.crs.to_string() if src.crs else None
             src_transform = src.transform
             src_pixel_size = [float(src_transform.a), float(abs(src_transform.e))]
@@ -378,22 +377,26 @@ def inspect_aligned_raster_stack(
                 and src_crs == ref_crs
                 and tuple(src.transform) == tuple(ref_transform)
             )
-            band_metadata[band_name] = {
-                "path": str(band_path),
-                "dtype": str(src.dtypes[0]),
-                "source_height": int(src.height),
-                "source_width": int(src.width),
-                "source_crs": src_crs,
-                "source_transform": list(src_transform)[:6],
-                "source_pixel_size": src_pixel_size,
-                "reference_native_pixel_size": native_ref_pixel_size,
-                "reference_pixel_size": ref_pixel_size,
-                "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
-                "resampled_to_reference": bool(resampled),
-                "categorical": bool(band_name in categorical_bands),
-            }
-            dtype_candidates.append(np.dtype(src.dtypes[0]))
-            available_bands.append(band_name)
+            for expanded_name, source_band_index in _expand_raster_layer_names(band_name, src.count):
+                band_metadata[expanded_name] = {
+                    "path": str(band_path),
+                    "source_layer": band_name,
+                    "source_band_index": int(source_band_index),
+                    "source_raster_band_count": int(src.count),
+                    "dtype": str(src.dtypes[source_band_index - 1]),
+                    "source_height": int(src.height),
+                    "source_width": int(src.width),
+                    "source_crs": src_crs,
+                    "source_transform": list(src_transform)[:6],
+                    "source_pixel_size": src_pixel_size,
+                    "reference_native_pixel_size": native_ref_pixel_size,
+                    "reference_pixel_size": ref_pixel_size,
+                    "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
+                    "resampled_to_reference": bool(resampled),
+                    "categorical": bool(band_name in categorical_bands),
+                }
+                dtype_candidates.append(np.dtype(src.dtypes[source_band_index - 1]))
+                available_bands.append(expanded_name)
 
     if not available_bands:
         raise ConversionError("No valid raster bands were discovered for streaming conversion.")
@@ -625,8 +628,9 @@ def stream_raster_stack_to_zarr(
             root.create_array("y", data=y_coords, chunks=(min(chunk_spec.y, height),))
 
     for band_index, band_name in enumerate(band_names):
-        band_path = Path(band_paths[band_name])
         band_info = band_metadata[band_name]
+        band_path = Path(str(band_info["path"]))
+        source_band_index = int(band_info.get("source_band_index") or 1)
         with rasterio.open(band_path) as src:
             read_handle: Any = src
             vrt: Any = None
@@ -649,7 +653,7 @@ def stream_raster_stack_to_zarr(
                     for x0 in range(0, width, chunks[3]):
                         block_w = min(chunks[3], width - x0)
                         window = Window(x0, y0, block_w, block_h)
-                        block = read_handle.read(1, window=window)
+                        block = read_handle.read(source_band_index, window=window)
                         imagery[0, band_index, y0 : y0 + block_h, x0 : x0 + block_w] = block
             finally:
                 if vrt is not None:
@@ -899,3 +903,14 @@ def _open_existing_output_store(output_uri: str) -> Any:
     if not output_path.exists():
         raise ConversionError(f"Output store does not exist yet: {output_path}")
     return output_path
+
+
+def _expand_raster_layer_names(layer_name: str, source_band_count: int) -> list[tuple[str, int]]:
+    if source_band_count <= 1:
+        return [(layer_name, 1)]
+    if layer_name.upper() == "TCI" and source_band_count == 3:
+        return [("TCI_R", 1), ("TCI_G", 2), ("TCI_B", 3)]
+    return [
+        (f"{layer_name}_{source_band_index}", source_band_index)
+        for source_band_index in range(1, source_band_count + 1)
+    ]

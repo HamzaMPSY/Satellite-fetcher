@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -26,6 +27,63 @@ class CopernicusProvider(ProviderBase):
 
         if not self.username or not self.password:
             raise ValueError("Copernicus credentials are missing in environment variables.")
+
+    def _retry_after_seconds(self, response: requests.Response) -> float | None:
+        raw_value = response.headers.get("Retry-After")
+        if not raw_value:
+            return None
+        try:
+            return max(0.0, float(raw_value))
+        except Exception:
+            return None
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        timeout: int = 60,
+        retries: int = 4,
+        allow_auth_refresh: bool = True,
+    ) -> requests.Response:
+        merged_headers = dict(headers or {})
+        last_error: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                response = self.session.request(
+                    method,
+                    url,
+                    headers=merged_headers,
+                    params=params,
+                    timeout=timeout,
+                )
+            except RequestException as exc:
+                last_error = exc
+                if attempt >= retries:
+                    raise
+                time.sleep(min(10.0, 1.5 * attempt))
+                continue
+
+            if response.status_code == 401 and allow_auth_refresh and attempt < retries:
+                self._access_token = None
+                merged_headers = dict(headers or {})
+                merged_headers.update(self._auth_header())
+                time.sleep(0.5)
+                continue
+
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < retries:
+                retry_after = self._retry_after_seconds(response)
+                time.sleep(retry_after if retry_after is not None else min(12.0, 2.0 * attempt))
+                continue
+
+            response.raise_for_status()
+            return response
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"Copernicus request failed: {method} {url}")
 
     def get_access_token(self) -> str:
         payload = {
@@ -110,8 +168,22 @@ class CopernicusProvider(ProviderBase):
         }
 
         url = f"{self.base_url}/odata/v1/Products"
-        response = self.session.get(url, params=params, headers=self._auth_header(), timeout=60)
-        response.raise_for_status()
+        try:
+            response = self._request(
+                "GET",
+                url,
+                params=params,
+                headers=self._auth_header(),
+                timeout=60,
+            )
+        except RequestException as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code == 503:
+                raise RuntimeError(
+                    "Copernicus catalogue search is temporarily unavailable (HTTP 503). "
+                    "Retry in a few seconds."
+                ) from exc
+            raise RuntimeError("Copernicus catalogue search failed.") from exc
         payload = response.json()
         values: list[dict[str, Any]] = payload.get("value", [])
         return [str(item.get("Id")) for item in values if item.get("Id")]
@@ -119,8 +191,7 @@ class CopernicusProvider(ProviderBase):
     def _fetch_product_name(self, product_id: str) -> str:
         try:
             url = f"{self.base_url}/odata/v1/Products({product_id})"
-            resp = self.session.get(url, headers=self._auth_header(), timeout=60)
-            resp.raise_for_status()
+            resp = self._request("GET", url, headers=self._auth_header(), timeout=60)
             name = resp.json().get("Name")
             if name:
                 return f"{name}.zip"
