@@ -82,7 +82,6 @@ services:
       dockerfile: ui/Containerfile
     depends_on:
       - nimbus-api
-      - nimbus-zarr
     restart: unless-stopped
     ports:
       - "${NIMBUS_UI_PORT:-8501}:8501"
@@ -90,7 +89,6 @@ services:
       PYTHONPATH: /app/src
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
       NIMBUS_SERVICE_URL: ${NIMBUS_SERVICE_URL:-http://nimbus-api:8000}
-      NIMBUS_ZARR_SERVICE_URL: ${NIMBUS_ZARR_SERVICE_URL:-http://nimbus-zarr:8010}
       NIMBUS_API_KEY: ${NIMBUS_API_KEY:-}
       NIMBUS_UI_DATA_DIR: /data/downloads
       NIMBUS_UI_JOB_REFRESH_EVERY: ${NIMBUS_UI_JOB_REFRESH_EVERY:-3s}

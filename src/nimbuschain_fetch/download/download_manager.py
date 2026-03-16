@@ -31,11 +31,14 @@ class DownloadManager:
         max_retries: int = 5,
         initial_delay: float = 1.5,
         backoff_factor: float = 1.7,
+        max_retry_delay: float = 120.0,
         connect_timeout: float = 20,
         read_timeout: float | None = None,
         chunk_size: int = 1024 * 1024,
         enable_resume: bool = True,
         min_resume_size: int = 1024 * 1024,
+        gateway_timeout_retries: int = 3,
+        gateway_timeout_floor_delay: float = 8.0,
         progress_callback: ProgressCallback | None = None,
         cancel_checker: CancelChecker | None = None,
         retry_callback: RetryCallback | None = None,
@@ -44,11 +47,14 @@ class DownloadManager:
         self.max_retries = max(1, int(max_retries))
         self.initial_delay = max(0.2, float(initial_delay))
         self.backoff_factor = max(1.0, float(backoff_factor))
+        self.max_retry_delay = max(self.initial_delay, float(max_retry_delay))
         self.connect_timeout = max(1.0, float(connect_timeout))
         self.read_timeout = None if read_timeout is None else max(1.0, float(read_timeout))
         self.chunk_size = max(64 * 1024, int(chunk_size))
         self.enable_resume = bool(enable_resume)
         self.min_resume_size = max(0, int(min_resume_size))
+        self.gateway_timeout_retries = max(0, int(gateway_timeout_retries))
+        self.gateway_timeout_floor_delay = max(1.0, float(gateway_timeout_floor_delay))
         self.progress_callback = progress_callback
         self.cancel_checker = cancel_checker
         self.retry_callback = retry_callback
@@ -91,7 +97,7 @@ class DownloadManager:
         file_names: list[str] = product_ids["file_names"]
         refresh_token_callback = product_ids.get("refresh_token_callback")
 
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=True) as session:
             tasks = [
                 self._download_with_retry(
                     session=session,
@@ -117,7 +123,15 @@ class DownloadManager:
             paths.append(str(result))
 
         if errors and not paths:
-            raise RuntimeError(f"All downloads failed ({len(errors)} errors).")
+            unique_messages: list[str] = []
+            for error in errors:
+                text = f"{error.__class__.__name__}: {error}".strip()
+                if text not in unique_messages:
+                    unique_messages.append(text)
+            detail = " | ".join(unique_messages[:3])
+            if len(unique_messages) > 3:
+                detail += f" | +{len(unique_messages) - 3} more"
+            raise RuntimeError(f"All downloads failed ({len(errors)} errors). Causes: {detail}")
 
         return paths
 
@@ -135,7 +149,9 @@ class DownloadManager:
         delay = self.initial_delay
         last_error: Exception | None = None
 
-        for attempt in range(1, self.max_retries + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             if self.cancel_checker and self.cancel_checker():
                 raise DownloadCancelled("Download batch cancelled.")
 
@@ -158,9 +174,16 @@ class DownloadManager:
                     new_token = refresh_token_callback()
                     headers["Authorization"] = f"Bearer {new_token}"
                     continue
-                if attempt < self.max_retries:
-                    await asyncio.sleep(max(delay, exc.retry_after or 0.0))
-                    delay = min(delay * self.backoff_factor, 120.0)
+                max_attempts = self._max_attempts_for_retryable_status(exc.status)
+                if attempt < max_attempts:
+                    wait_seconds = self._retry_delay_for_http_status(
+                        status=exc.status,
+                        attempt=attempt,
+                        current_delay=delay,
+                        retry_after=exc.retry_after,
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    delay = self._next_delay(delay, exc.status)
                     continue
                 break
             except aiohttp.ClientResponseError as exc:
@@ -172,9 +195,16 @@ class DownloadManager:
                     new_token = refresh_token_callback()
                     headers["Authorization"] = f"Bearer {new_token}"
                     continue
-                if status in {429, 500, 502, 503, 504} and attempt < self.max_retries:
-                    await asyncio.sleep(delay)
-                    delay = min(delay * self.backoff_factor, 120.0)
+                max_attempts = self._max_attempts_for_retryable_status(status)
+                if status in {429, 500, 502, 503, 504} and attempt < max_attempts:
+                    wait_seconds = self._retry_delay_for_http_status(
+                        status=status,
+                        attempt=attempt,
+                        current_delay=delay,
+                        retry_after=None,
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    delay = self._next_delay(delay, status)
                     continue
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
@@ -182,14 +212,47 @@ class DownloadManager:
                 if self.retry_callback is not None:
                     self.retry_callback(file_name, attempt, exc.__class__.__name__.lower(), None)
                 if attempt < self.max_retries:
-                    await asyncio.sleep(delay)
-                    delay = min(delay * self.backoff_factor, 120.0)
+                    await asyncio.sleep(min(delay, self.max_retry_delay))
+                    delay = self._next_delay(delay, None)
                     continue
                 break
 
         if last_error is None:
             raise RuntimeError(f"Unknown download failure for {file_name}")
         raise last_error
+
+    def _max_attempts_for_retryable_status(self, status: int) -> int:
+        if int(status) == 504:
+            return self.max_retries + self.gateway_timeout_retries
+        return self.max_retries
+
+    def _retry_delay_for_http_status(
+        self,
+        *,
+        status: int,
+        attempt: int,
+        current_delay: float,
+        retry_after: float | None,
+    ) -> float:
+        if retry_after is not None:
+            base_wait = max(0.0, float(retry_after))
+        else:
+            base_wait = float(current_delay)
+
+        if int(status) == 429:
+            return min(max(base_wait, 10.0), self.max_retry_delay)
+        if int(status) == 504:
+            # Copernicus download endpoints can take a while to become ready.
+            return min(max(base_wait, self.gateway_timeout_floor_delay), self.max_retry_delay)
+        if int(status) in {500, 502, 503}:
+            return min(max(base_wait, 4.0), self.max_retry_delay)
+        return min(max(base_wait, self.initial_delay), self.max_retry_delay)
+
+    def _next_delay(self, current_delay: float, status: int | None) -> float:
+        next_delay = float(current_delay) * self.backoff_factor
+        if status == 504:
+            next_delay = max(next_delay, self.gateway_timeout_floor_delay * self.backoff_factor)
+        return min(next_delay, self.max_retry_delay)
 
     async def _download_one(
         self,

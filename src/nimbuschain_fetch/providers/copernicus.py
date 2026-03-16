@@ -45,7 +45,7 @@ class CopernicusProvider(ProviderBase):
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
         timeout: int = 60,
-        retries: int = 4,
+        retries: int = 6,
         allow_auth_refresh: bool = True,
     ) -> requests.Response:
         merged_headers = dict(headers or {})
@@ -75,7 +75,7 @@ class CopernicusProvider(ProviderBase):
 
             if response.status_code in {429, 500, 502, 503, 504} and attempt < retries:
                 retry_after = self._retry_after_seconds(response)
-                time.sleep(retry_after if retry_after is not None else min(12.0, 2.0 * attempt))
+                time.sleep(self._backoff_delay(response.status_code, attempt, retry_after))
                 continue
 
             response.raise_for_status()
@@ -84,6 +84,20 @@ class CopernicusProvider(ProviderBase):
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"Copernicus request failed: {method} {url}")
+
+    @staticmethod
+    def _backoff_delay(status_code: int, attempt: int, retry_after: float | None) -> float:
+        if retry_after is not None:
+            base_wait = max(0.0, float(retry_after))
+        else:
+            base_wait = 0.0
+        if int(status_code) == 429:
+            return min(max(base_wait, 10.0), 300.0)
+        if int(status_code) == 504:
+            return min(max(base_wait, 8.0 * attempt), 180.0)
+        if int(status_code) in {500, 502, 503}:
+            return min(max(base_wait, 3.0 * attempt), 90.0)
+        return min(max(base_wait, 2.0 * attempt), 60.0)
 
     def get_access_token(self) -> str:
         payload = {
@@ -178,9 +192,9 @@ class CopernicusProvider(ProviderBase):
             )
         except RequestException as exc:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code == 503:
+            if status_code in {503, 504}:
                 raise RuntimeError(
-                    "Copernicus catalogue search is temporarily unavailable (HTTP 503). "
+                    f"Copernicus catalogue search is temporarily unavailable (HTTP {status_code}). "
                     "Retry in a few seconds."
                 ) from exc
             raise RuntimeError("Copernicus catalogue search failed.") from exc
@@ -191,7 +205,7 @@ class CopernicusProvider(ProviderBase):
     def _fetch_product_name(self, product_id: str) -> str:
         try:
             url = f"{self.base_url}/odata/v1/Products({product_id})"
-            resp = self._request("GET", url, headers=self._auth_header(), timeout=60)
+            resp = self._request("GET", url, headers=self._auth_header(), timeout=60, retries=6)
             name = resp.json().get("Name")
             if name:
                 return f"{name}.zip"

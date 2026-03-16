@@ -27,6 +27,19 @@ class JobState(str, Enum):
     cancelled = "cancelled"
 
 
+class PipelineState(str, Enum):
+    queued = "queued"
+    searching = "searching"
+    downloading = "downloading"
+    downloaded = "downloaded"
+    zarr_queued = "zarr_queued"
+    zarr_converting = "zarr_converting"
+    zarr_written = "zarr_written"
+    zarr_failed = "zarr_failed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
 class AOIInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -146,6 +159,13 @@ class JobEvent(BaseModel):
 class JobStatusResponse(BaseModel):
     job_id: str
     state: JobState
+    pipeline_state: PipelineState = PipelineState.queued
+    pipeline_step: str | None = None
+    pipeline_progress: float | None = Field(default=None, ge=0, le=100)
+    pipeline_metadata: dict[str, Any] = Field(default_factory=dict)
+    conversion_metadata: dict[str, Any] = Field(default_factory=dict)
+    raw_outputs: list[str] = Field(default_factory=list)
+    zarr_outputs: list[str] = Field(default_factory=list)
     progress: float = Field(default=0, ge=0, le=100)
     bytes_downloaded: int = 0
     bytes_total: int = 0
@@ -166,9 +186,22 @@ class JobStatusResponse(BaseModel):
 class JobResultResponse(BaseModel):
     job_id: str
     paths: list[str] = Field(default_factory=list)
+    raw_outputs: list[str] = Field(default_factory=list)
+    zarr_outputs: list[str] = Field(default_factory=list)
     checksums: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     manifest_entry: dict[str, Any] = Field(default_factory=dict)
+    pipeline_metadata: dict[str, Any] = Field(default_factory=dict)
+    conversion_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class JobConvertRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    raw_uri: str | None = None
+    output_uri: str | None = None
+    scene_id: str | None = None
+    product_type: str | None = None
 
 
 class JobListResponse(BaseModel):

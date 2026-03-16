@@ -8,6 +8,7 @@ import time
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
 
 import anyio
@@ -22,14 +23,17 @@ from nimbuschain_fetch.manifest import build_manifest_entry, checksums_for_paths
 from nimbuschain_fetch.models import (
     ArtifactListResponse,
     ArtifactRecord,
+    ArtifactType,
     ArtifactUpsertRequest,
     BatchJobCreateRequest,
     DownloadProductsRequest,
+    JobConvertRequest,
     JobCreateRequest,
     JobListResponse,
     JobResultResponse,
     JobState,
     JobStatusResponse,
+    PipelineState,
     ProviderName,
     SearchDownloadRequest,
 )
@@ -37,6 +41,7 @@ from nimbuschain_fetch.providers import CopernicusProvider, UsgsProvider
 from nimbuschain_fetch.security.paths import sanitize_output_dir
 from nimbuschain_fetch.jobs.store_factory import create_job_store
 from nimbuschain_fetch.settings import Settings, get_settings
+from nimbuschain_zarr_service.service import ZarrConversionService
 
 
 class JobNotFoundError(KeyError):
@@ -83,6 +88,7 @@ class NimbusFetcher:
         self._worker_pid = os.getpid()
         self._worker_started_at = datetime.now(timezone.utc).isoformat()
         self._cancel_check_cache: dict[str, tuple[float, bool]] = {}
+        self._zarr_converter: ZarrConversionService | None = None
         self._started = False
 
     async def start(self) -> None:
@@ -470,6 +476,313 @@ class NimbusFetcher:
         self._cancel_check_cache[job_id] = (now + 0.5, is_cancelled)
         return is_cancelled
 
+    def _converter(self) -> ZarrConversionService:
+        if self._zarr_converter is None:
+            self._zarr_converter = ZarrConversionService()
+        return self._zarr_converter
+
+    def _update_pipeline(
+        self,
+        job_id: str,
+        *,
+        pipeline_state: PipelineState,
+        pipeline_step: str,
+        pipeline_progress: float | None = None,
+        pipeline_metadata: dict[str, Any] | None = None,
+        conversion_metadata: dict[str, Any] | None = None,
+        raw_outputs: list[str] | None = None,
+        zarr_outputs: list[str] | None = None,
+        event_type: str | None = None,
+        event_payload: dict[str, Any] | None = None,
+    ) -> None:
+        fields: dict[str, Any] = {
+            "pipeline_state": pipeline_state.value,
+            "pipeline_step": pipeline_step,
+        }
+        if pipeline_progress is not None:
+            fields["pipeline_progress"] = max(0.0, min(100.0, float(pipeline_progress)))
+        if pipeline_metadata is not None:
+            fields["pipeline_metadata"] = pipeline_metadata
+        if conversion_metadata is not None:
+            fields["conversion_metadata"] = conversion_metadata
+        if raw_outputs is not None:
+            fields["raw_outputs"] = list(raw_outputs)
+        if zarr_outputs is not None:
+            fields["zarr_outputs"] = list(zarr_outputs)
+        self.store.update_job(job_id, **fields)
+        if event_type:
+            self.store.append_event(
+                job_id,
+                event_type,
+                {
+                    "pipeline_state": pipeline_state.value,
+                    "pipeline_step": pipeline_step,
+                    **(event_payload or {}),
+                },
+            )
+
+    @staticmethod
+    def _filter_manifest_paths(paths: list[str]) -> list[str]:
+        return [path for path in paths if Path(str(path)).name != "manifest.json"]
+
+    @staticmethod
+    def _scene_id_from_raw_uri(raw_uri: str) -> str:
+        name = Path(str(raw_uri)).name
+        for suffix in (".SAFE.zip", ".SAFE", ".tar.gz", ".tgz", ".tar", ".zip", ".nc", ".tif", ".tiff"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)]
+        return Path(name).stem or "scene"
+
+    def _default_zarr_output_uri(self, scene_id: str) -> str:
+        safe_scene = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (scene_id or "scene")).strip("._-")
+        if not safe_scene:
+            safe_scene = "scene"
+        return str(self.settings.nimbus_data_dir / "zarr" / f"{safe_scene}.zarr")
+
+    @staticmethod
+    def _normalize_collection_for_zarr(provider_name: str, collection: str) -> str:
+        return collection.strip().lower() if provider_name == "usgs" else collection.strip().upper()
+
+    @staticmethod
+    def _normalize_product_type_for_zarr(product_type: str | None) -> str | None:
+        if product_type is None:
+            return None
+        normalized = str(product_type).strip()
+        return normalized.upper() if normalized else None
+
+    def _register_zarr_artifact(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        collection: str,
+        scene_id: str,
+        raw_uri: str,
+        zarr_uri: str,
+        data_family: str,
+        conversion_summary: dict[str, Any],
+        dataset_summary: dict[str, Any],
+    ) -> None:
+        artifact_request = ArtifactUpsertRequest(
+            artifact_type=ArtifactType.zarr,
+            artifact_uri=zarr_uri,
+            provider=ProviderName(provider_name),
+            collection=collection,
+            scene_id=scene_id,
+            source_uri=raw_uri,
+            created_by_job_id=job_id,
+            source_job_id=job_id,
+            data_family=data_family,
+            band_names=list(dataset_summary.get("band_names") or []),
+            dimensions=list(dataset_summary.get("dimensions") or []),
+            shape=list(dataset_summary.get("shape") or []),
+            metadata={
+                "normalization_summary": conversion_summary,
+                "zarr_summary": dataset_summary,
+                "registered_via": "pipeline_job",
+            },
+        )
+        self.upsert_artifact(artifact_request)
+
+    def _convert_raw_outputs(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        collection: str,
+        product_type: str | None,
+        raw_outputs: list[str],
+        is_cancelled: Callable[[], bool],
+    ) -> tuple[list[str], dict[str, Any]]:
+        if not raw_outputs:
+            return [], {"status": "skipped", "reason": "no_raw_outputs"}
+
+        zarr_outputs: list[str] = []
+        conversions: list[dict[str, Any]] = []
+        total = max(1, len(raw_outputs))
+        self._update_pipeline(
+            job_id,
+            pipeline_state=PipelineState.zarr_queued,
+            pipeline_step="zarr_queued",
+            pipeline_progress=0.0,
+            raw_outputs=raw_outputs,
+            conversion_metadata={
+                "status": "queued",
+                "stage": "zarr_queued",
+                "current_index": 0,
+                "total": total,
+            },
+            event_type="job.zarr_queued",
+            event_payload={"raw_output_count": len(raw_outputs)},
+        )
+        for index, raw_uri in enumerate(raw_outputs, start=1):
+            if is_cancelled():
+                raise JobCancelledError("Job cancellation requested.")
+            scene_id = self._scene_id_from_raw_uri(raw_uri)
+            output_uri = self._default_zarr_output_uri(scene_id)
+            per_item_progress = ((index - 1) / total) * 100.0
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.zarr_converting,
+                pipeline_step="writing_chunks",
+                pipeline_progress=per_item_progress,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+                conversion_metadata={
+                    "status": "running",
+                    "stage": "writing_chunks",
+                    "current_raw_uri": raw_uri,
+                    "current_scene_id": scene_id,
+                    "current_output_uri": output_uri,
+                    "current_index": index,
+                    "total": total,
+                },
+                event_type="job.zarr_converting",
+                event_payload={
+                    "raw_uri": raw_uri,
+                    "scene_id": scene_id,
+                    "output_uri": output_uri,
+                    "index": index,
+                    "total": total,
+                    "stage": "writing_chunks",
+                },
+            )
+            written_uri, data_family, conversion_summary, dataset_summary = self._converter().convert(
+                provider=provider_name,
+                collection=self._normalize_collection_for_zarr(provider_name, collection),
+                scene_id=scene_id,
+                raw_uri=raw_uri,
+                output_uri=output_uri,
+                product_type=self._normalize_product_type_for_zarr(product_type),
+            )
+            zarr_outputs.append(written_uri)
+            conversions.append(
+                {
+                    "raw_uri": raw_uri,
+                    "scene_id": scene_id,
+                    "zarr_uri": written_uri,
+                    "data_family": data_family,
+                    "summary": conversion_summary,
+                    "dataset_summary": dataset_summary,
+                }
+            )
+            register_progress = min(
+                99.0,
+                ((index - 1) / total) * 100.0 + (100.0 / total) * 0.85,
+            )
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.zarr_converting,
+                pipeline_step="registering_artifact",
+                pipeline_progress=register_progress,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+                conversion_metadata={
+                    "status": "running",
+                    "stage": "registering_artifact",
+                    "current_raw_uri": raw_uri,
+                    "current_scene_id": scene_id,
+                    "current_output_uri": written_uri,
+                    "current_index": index,
+                    "total": total,
+                },
+                event_type="job.zarr_converting",
+                event_payload={
+                    "raw_uri": raw_uri,
+                    "scene_id": scene_id,
+                    "output_uri": written_uri,
+                    "index": index,
+                    "total": total,
+                    "stage": "registering_artifact",
+                },
+            )
+            self._register_zarr_artifact(
+                job_id=job_id,
+                provider_name=provider_name,
+                collection=collection,
+                scene_id=scene_id,
+                raw_uri=raw_uri,
+                zarr_uri=written_uri,
+                data_family=data_family,
+                conversion_summary=conversion_summary,
+                dataset_summary=dataset_summary,
+            )
+        return zarr_outputs, {
+            "status": "written",
+            "count": len(zarr_outputs),
+            "items": conversions,
+        }
+
+    def convert_existing_job(self, job_id: str, request: JobConvertRequest) -> JobStatusResponse:
+        row = self.store.get_job(job_id)
+        if not row:
+            raise JobNotFoundError(job_id)
+        state = str(row.get("state") or "")
+        if state in {JobState.queued.value, JobState.running.value, JobState.cancel_requested.value}:
+            raise ValueError("Manual conversion is only allowed when the job is not actively running.")
+
+        result = self.store.get_result(job_id) or {}
+        raw_outputs = list(row.get("raw_outputs") or result.get("raw_outputs") or self._filter_manifest_paths(list(result.get("paths") or [])))
+        selected_raw_uri = str(request.raw_uri or (raw_outputs[0] if raw_outputs else "")).strip()
+        if not selected_raw_uri:
+            raise ValueError("No raw output is attached to this job. Provide raw_uri explicitly.")
+        scene_id = str(request.scene_id or self._scene_id_from_raw_uri(selected_raw_uri)).strip()
+        provider_name = self._provider_name(row.get("provider"))
+        collection = str(row.get("collection") or "")
+        product_type = str(request.product_type or row.get("product_type") or "").strip() or None
+        output_uri = str(request.output_uri or self._default_zarr_output_uri(scene_id)).strip()
+
+        self.store.update_job(job_id, state=JobState.running.value, finished_at=None, errors=[])
+        zarr_outputs, conversion_metadata = self._convert_raw_outputs(
+            job_id=job_id,
+            provider_name=provider_name,
+            collection=collection,
+            product_type=product_type,
+            raw_outputs=[selected_raw_uri],
+            is_cancelled=lambda: self._is_job_cancel_requested(job_id),
+        )
+        pipeline_state = PipelineState.zarr_written
+        pipeline_metadata = {
+            **dict(row.get("pipeline_metadata") or {}),
+            "manual_conversion": True,
+            "raw_output_count": len(raw_outputs),
+            "zarr_output_count": len(zarr_outputs),
+        }
+        result_payload = {
+            "job_id": job_id,
+            "paths": list(result.get("paths") or []),
+            "raw_outputs": raw_outputs,
+            "zarr_outputs": zarr_outputs,
+            "checksums": dict(result.get("checksums") or {}),
+            "metadata": dict(result.get("metadata") or {}),
+            "manifest_entry": dict(result.get("manifest_entry") or {}),
+            "pipeline_metadata": pipeline_metadata,
+            "conversion_metadata": conversion_metadata,
+        }
+        self.store.set_result(job_id, result_payload)
+        self.store.update_job(
+            job_id,
+            state=JobState.succeeded.value,
+            finished_at=self._now_iso(),
+            pipeline_state=pipeline_state.value,
+            pipeline_step="zarr_written",
+            pipeline_progress=100.0,
+            pipeline_metadata=pipeline_metadata,
+            conversion_metadata=conversion_metadata,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+        )
+        self.store.append_event(
+            job_id,
+            "job.zarr_written",
+            {
+                "pipeline_state": pipeline_state.value,
+                "manual_conversion": True,
+                "zarr_outputs": zarr_outputs,
+            },
+        )
+        return self.get_job(job_id)
+
     async def _execute_job(self, job_id: str, is_cancelled: Callable[[], bool]) -> None:
         row = self.store.get_job(job_id)
         if not row:
@@ -501,6 +814,40 @@ class NimbusFetcher:
             getattr(request, "output_dir", None),
             fallback_name=job_id,
         )
+        provider_name = self._provider_name(request.provider)
+        base_pipeline_metadata: dict[str, Any] = {
+            "provider": provider_name,
+            "collection": request.collection,
+            "product_type": getattr(request, "product_type", None),
+            "output_dir": str(output_dir),
+            "job_type": request.job_type,
+        }
+        if isinstance(request, SearchDownloadRequest):
+            base_pipeline_metadata["tile_id"] = request.tile_id
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.searching,
+                pipeline_step="searching",
+                pipeline_progress=5.0,
+                pipeline_metadata={**base_pipeline_metadata, "products_found": 0},
+                event_type="job.searching",
+                event_payload={"provider": provider_name, "collection": request.collection},
+            )
+        else:
+            requested_ids = list(getattr(request, "product_ids", []) or [])
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.downloading,
+                pipeline_step="downloading",
+                pipeline_progress=5.0,
+                pipeline_metadata={
+                    **base_pipeline_metadata,
+                    "products_requested": len(requested_ids),
+                    "products_found": len(requested_ids),
+                },
+                event_type="job.downloading",
+                event_payload={"products_requested": len(requested_ids)},
+            )
 
         file_progress: dict[str, dict[str, int | None]] = {}
         aggregate = {
@@ -535,6 +882,7 @@ class NimbusFetcher:
                     99.0,
                     100.0 * int(aggregate["bytes_downloaded"]) / int(aggregate["bytes_total"]),
                 )
+            pipeline_progress = min(69.0, 5.0 + (progress_pct * 0.64))
 
             # Throttle DB writes and events.
             if now_mono - float(aggregate["last_emit"]) >= 0.25 or delta == 0:
@@ -543,6 +891,9 @@ class NimbusFetcher:
                     progress=progress_pct,
                     bytes_downloaded=int(aggregate["bytes_downloaded"]),
                     bytes_total=int(aggregate["bytes_total"]),
+                    pipeline_state=PipelineState.downloading.value,
+                    pipeline_step="downloading",
+                    pipeline_progress=pipeline_progress,
                 )
                 self.store.append_event(
                     job_id,
@@ -596,33 +947,89 @@ class NimbusFetcher:
                 self._mark_cancelled(job_id, "cancelled_after_download")
                 return
 
-            paths = result["paths"]
-            metadata = result["metadata"]
+            raw_outputs = self._filter_manifest_paths(list(result["paths"]))
+            metadata = dict(result["metadata"])
+            pipeline_metadata = {
+                **base_pipeline_metadata,
+                **metadata,
+                "products_found": int(metadata.get("products_found", len(raw_outputs)) or len(raw_outputs)),
+                "products_downloaded": int(metadata.get("products_downloaded", len(raw_outputs)) or len(raw_outputs)),
+                "raw_output_count": len(raw_outputs),
+            }
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.downloaded,
+                pipeline_step="downloaded",
+                pipeline_progress=70.0,
+                pipeline_metadata=pipeline_metadata,
+                raw_outputs=raw_outputs,
+                event_type="job.downloaded",
+                event_payload={"raw_outputs": raw_outputs, "raw_output_count": len(raw_outputs)},
+            )
 
-            checksums = checksums_for_paths(paths)
+            checksums = checksums_for_paths(raw_outputs)
             manifest_entry = build_manifest_entry(
                 job_id=job_id,
                 provider=str(row["provider"]),
                 collection=str(row["collection"]),
                 metadata=metadata,
-                paths=paths,
+                paths=raw_outputs,
                 checksums=checksums,
             )
             manifest_path = write_manifest(output_dir, manifest_entry)
-
-            all_paths = [*paths, str(manifest_path)]
+            raw_result_paths = [*raw_outputs, str(manifest_path)]
             checksums[str(manifest_path)] = checksums_for_paths([str(manifest_path)]).get(
                 str(manifest_path), ""
             )
+            base_result_payload = {
+                "job_id": job_id,
+                "paths": raw_result_paths,
+                "raw_outputs": raw_outputs,
+                "zarr_outputs": [],
+                "checksums": checksums,
+                "metadata": metadata,
+                "manifest_entry": manifest_entry,
+                "pipeline_metadata": pipeline_metadata,
+                "conversion_metadata": {},
+            }
+            self.store.set_result(job_id, base_result_payload)
+
+            zarr_outputs, conversion_metadata = self._convert_raw_outputs(
+                job_id=job_id,
+                provider_name=provider_name,
+                collection=request.collection,
+                product_type=getattr(request, "product_type", None),
+                raw_outputs=raw_outputs,
+                is_cancelled=is_cancelled_now,
+            )
+            final_paths = [*raw_result_paths, *zarr_outputs]
+            conversion_status = str(conversion_metadata.get("status") or "")
+            final_pipeline_state = (
+                PipelineState.zarr_written
+                if zarr_outputs or conversion_status == "written"
+                else PipelineState.downloaded
+            )
+            final_pipeline_step = (
+                "zarr_written" if final_pipeline_state == PipelineState.zarr_written else "downloaded"
+            )
+            final_pipeline_metadata = {
+                **pipeline_metadata,
+                "zarr_output_count": len(zarr_outputs),
+                "manual_conversion": False,
+            }
 
             self.store.set_result(
                 job_id,
                 {
                     "job_id": job_id,
-                    "paths": all_paths,
+                    "paths": final_paths,
+                    "raw_outputs": raw_outputs,
+                    "zarr_outputs": zarr_outputs,
                     "checksums": checksums,
                     "metadata": metadata,
                     "manifest_entry": manifest_entry,
+                    "pipeline_metadata": final_pipeline_metadata,
+                    "conversion_metadata": conversion_metadata,
                 },
             )
             self.store.update_job(
@@ -632,28 +1039,83 @@ class NimbusFetcher:
                 finished_at=self._now_iso(),
                 bytes_downloaded=int(aggregate["bytes_downloaded"]),
                 bytes_total=max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"])),
+                pipeline_state=final_pipeline_state.value,
+                pipeline_step=final_pipeline_step,
+                pipeline_progress=100.0,
+                pipeline_metadata=final_pipeline_metadata,
+                conversion_metadata=conversion_metadata,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
             )
+            if final_pipeline_state == PipelineState.zarr_written:
+                self.store.append_event(
+                    job_id,
+                    "job.zarr_written",
+                    {
+                        "pipeline_state": final_pipeline_state.value,
+                        "zarr_outputs": zarr_outputs,
+                    },
+                )
             self.store.append_event(
                 job_id,
                 "job.succeeded",
                 {
                     "status": JobState.succeeded.value,
-                    "paths": all_paths,
+                    "paths": final_paths,
+                    "pipeline_state": final_pipeline_state.value,
                 },
             )
         except (DownloadCancelled, JobCancelledError):
             self._mark_cancelled(job_id, "cancelled_during_download")
         except Exception as exc:
+            current_row = self.store.get_job(job_id) or row
+            existing_result = self.store.get_result(job_id) or {}
+            raw_outputs = list(existing_result.get("raw_outputs") or current_row.get("raw_outputs") or [])
+            current_pipeline_state = str(current_row.get("pipeline_state") or "")
+            is_zarr_failure = current_pipeline_state in {
+                PipelineState.zarr_queued.value,
+                PipelineState.zarr_converting.value,
+                PipelineState.downloaded.value,
+            }
+            pipeline_state = PipelineState.zarr_failed if is_zarr_failure and raw_outputs else PipelineState.failed
+            pipeline_step = "zarr_failed" if pipeline_state == PipelineState.zarr_failed else "failed"
+            conversion_metadata = dict(existing_result.get("conversion_metadata") or {})
+            if pipeline_state == PipelineState.zarr_failed:
+                conversion_metadata = {
+                    **conversion_metadata,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+                if existing_result:
+                    self.store.set_result(
+                        job_id,
+                        {
+                            **existing_result,
+                            "conversion_metadata": conversion_metadata,
+                            "raw_outputs": raw_outputs,
+                            "zarr_outputs": list(existing_result.get("zarr_outputs") or []),
+                        },
+                    )
             self.store.update_job(
                 job_id,
                 state=JobState.failed.value,
                 finished_at=self._now_iso(),
                 errors=[str(exc)],
+                pipeline_state=pipeline_state.value,
+                pipeline_step=pipeline_step,
+                pipeline_metadata=dict(existing_result.get("pipeline_metadata") or current_row.get("pipeline_metadata") or {}),
+                conversion_metadata=conversion_metadata,
+                raw_outputs=raw_outputs,
+                zarr_outputs=list(existing_result.get("zarr_outputs") or current_row.get("zarr_outputs") or []),
             )
             self.store.append_event(
                 job_id,
                 "job.failed",
-                {"status": JobState.failed.value, "error": str(exc)},
+                {
+                    "status": JobState.failed.value,
+                    "error": str(exc),
+                    "pipeline_state": pipeline_state.value,
+                },
             )
         finally:
             self._cancel_check_cache.pop(job_id, None)
@@ -670,17 +1132,48 @@ class NimbusFetcher:
         provider_name = self._provider_name(request.provider)
         provider_limit = self.settings.provider_limits_map.get(provider_name, 1)
 
-        download_manager = DownloadManager(
+        download_manager_kwargs: dict[str, Any] = dict(
             max_concurrent=provider_limit,
             progress_callback=progress_callback,
             cancel_checker=is_cancelled,
             retry_callback=retry_callback,
         )
+        if provider_name == "copernicus":
+            # Copernicus download endpoints can intermittently return 504 before
+            # the first byte. Use a longer retry window inspired by the legacy
+            # downloader behavior.
+            download_manager_kwargs.update(
+                max_retries=6,
+                initial_delay=3.0,
+                backoff_factor=2.0,
+                max_retry_delay=300.0,
+                gateway_timeout_retries=4,
+                gateway_timeout_floor_delay=10.0,
+            )
+
+        download_manager = DownloadManager(**download_manager_kwargs)
         provider = self._build_provider(provider_name, download_manager)
 
         if isinstance(request, SearchDownloadRequest):
             if is_cancelled():
                 raise JobCancelledError("cancelled")
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.searching,
+                pipeline_step="searching",
+                pipeline_progress=5.0,
+                pipeline_metadata={
+                    "provider": provider_name,
+                    "collection": request.collection,
+                    "product_type": request.product_type,
+                    "tile_id": request.tile_id,
+                    "products_found": 0,
+                    "output_dir": str(output_dir),
+                    "job_type": request.job_type,
+                },
+                event_type="job.searching",
+                event_payload={"provider": provider_name, "collection": request.collection},
+            )
             geom = parse_aoi(request.aoi.model_dump())
 
             product_ids = provider.search_products(
@@ -695,6 +1188,24 @@ class NimbusFetcher:
                 job_id,
                 "job.products_found",
                 {"count": len(product_ids)},
+            )
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.downloading,
+                pipeline_step="downloading",
+                pipeline_progress=10.0 if product_ids else 70.0,
+                pipeline_metadata={
+                    "provider": provider_name,
+                    "collection": request.collection,
+                    "product_type": request.product_type,
+                    "tile_id": request.tile_id,
+                    "products_found": len(product_ids),
+                    "products_requested": len(product_ids),
+                    "output_dir": str(output_dir),
+                    "job_type": request.job_type,
+                },
+                event_type="job.downloading",
+                event_payload={"products_found": len(product_ids)},
             )
             if is_cancelled():
                 raise JobCancelledError("cancelled")
@@ -730,6 +1241,22 @@ class NimbusFetcher:
         request = cast(DownloadProductsRequest, request)
         if hasattr(provider, "dataset"):
             setattr(provider, "dataset", request.collection)
+        self._update_pipeline(
+            job_id,
+            pipeline_state=PipelineState.downloading,
+            pipeline_step="downloading",
+            pipeline_progress=10.0,
+            pipeline_metadata={
+                "provider": provider_name,
+                "collection": request.collection,
+                "products_requested": len(request.product_ids),
+                "products_found": len(request.product_ids),
+                "output_dir": str(output_dir),
+                "job_type": request.job_type,
+            },
+            event_type="job.downloading",
+            event_payload={"products_requested": len(request.product_ids)},
+        )
         paths = provider.download_products(product_ids=request.product_ids, output_dir=str(output_dir))
         return {
             "paths": paths,
@@ -756,15 +1283,23 @@ class NimbusFetcher:
         return provider_cls(self.settings, download_manager)
 
     def _mark_cancelled(self, job_id: str, reason: str) -> None:
+        current_row = self.store.get_job(job_id) or {}
         self.store.update_job(
             job_id,
             state=JobState.cancelled.value,
             finished_at=self._now_iso(),
+            pipeline_state=PipelineState.cancelled.value,
+            pipeline_step="cancelled",
+            pipeline_progress=current_row.get("pipeline_progress"),
         )
         self.store.append_event(
             job_id,
             "job.cancelled",
-            {"status": JobState.cancelled.value, "reason": reason},
+            {
+                "status": JobState.cancelled.value,
+                "reason": reason,
+                "pipeline_state": PipelineState.cancelled.value,
+            },
         )
 
     def _to_status_response(self, row: dict[str, Any]) -> JobStatusResponse:
@@ -778,6 +1313,17 @@ class NimbusFetcher:
         return JobStatusResponse(
             job_id=row["job_id"],
             state=JobState(row["state"]),
+            pipeline_state=PipelineState(str(row.get("pipeline_state") or PipelineState.queued.value)),
+            pipeline_step=row.get("pipeline_step"),
+            pipeline_progress=(
+                float(row["pipeline_progress"])
+                if row.get("pipeline_progress") is not None
+                else None
+            ),
+            pipeline_metadata=dict(row.get("pipeline_metadata") or {}),
+            conversion_metadata=dict(row.get("conversion_metadata") or {}),
+            raw_outputs=list(row.get("raw_outputs") or []),
+            zarr_outputs=list(row.get("zarr_outputs") or []),
             progress=float(row["progress"]),
             bytes_downloaded=int(row["bytes_downloaded"]),
             bytes_total=int(row["bytes_total"]),

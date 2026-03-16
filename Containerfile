@@ -21,11 +21,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libexpat1 && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN useradd --create-home --uid 10001 appuser
 
+COPY pyproject.toml README.md /app/
+COPY src /app/src
 COPY --from=builder /dist/*.whl /tmp/
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir /tmp/*.whl && \
+    pip install --no-cache-dir ".[zarr-service]" && \
     rm -rf /tmp/*.whl
 
 USER appuser

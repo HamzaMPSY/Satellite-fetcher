@@ -2,18 +2,18 @@
 
 ## 1. System overview
 
-NimbusChain Fetch is split into four runtime components with explicit boundaries.
+NimbusChain Fetch is split into four runtime components with explicit boundaries, but the backend/orchestrator is the only public API surface.
 
 ```text
 Browser
   -> nimbus-ui (Streamlit)
        -> nimbus-api (FastAPI orchestration layer)
             -> MongoDB or SQLite store
-            -> nimbus-worker (download execution)
-            -> nimbus-zarr (raw scene -> Zarr conversion)
+            -> nimbus-worker (download + Zarr execution)
+            -> nimbus-zarr runtime/library (internal conversion code)
 ```
 
-The UI never executes downloads directly. It submits jobs to the API. The worker owns execution. The Zarr service owns normalization and writing of array stores.
+The UI never executes downloads directly. It submits pipeline jobs to the API. The worker owns execution from search to download to Zarr. The Zarr package is reused as worker-internal conversion logic, while the backend exposes converter health/schema endpoints for the UI.
 
 ## 2. Runtime responsibilities
 
@@ -40,6 +40,7 @@ Main role:
 - publish events and metrics
 - register artifacts and expose health/readiness status
 - expose worker capacity status
+- expose converter health/readiness/schema and manual conversion routes under `/v1`
 
 Key folders:
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_service/main.py`: FastAPI entrypoint
@@ -53,21 +54,22 @@ Main role:
 - poll the job store
 - claim queued jobs
 - execute provider-specific downloads
-- persist result paths and events
+- trigger Zarr conversion automatically after successful download
+- persist raw outputs, Zarr outputs, result paths and events under the same `job_id`
 - heartbeat execution capacity back to the store
 
 Key code:
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/worker.py`
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/providers/`
 
-### `nimbus-zarr`
+### `nimbus-zarr` runtime
 
 Main role:
 - read local raw scenes or archives
 - preserve all native physical imagery layers from supported products using exact source layer names
 - route QA, masks, classification, cloud, snow, angle, aerosol, and other support rasters into ancillary arrays
 - write `imagery(time, band, y, x)` Zarr stores, plus `ancillary(time, ancillary_layer, y, x)` when needed
-- expose health, readiness and schema endpoints
+- provide reusable conversion code used by the worker and by backend-owned manual conversion routes
 
 Key code:
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/main.py`
@@ -85,9 +87,11 @@ UI form
   -> POST /v1/jobs
   -> job store persists job as queued
   -> worker claims job
-  -> provider download executes
-  -> events + status updates emitted
-  -> result paths persisted
+  -> provider search/download executes
+  -> raw outputs persisted
+  -> worker runs Zarr conversion in-process
+  -> raw + zarr outputs persisted on the same job
+  -> events + pipeline status updates emitted
   -> UI reads jobs/events/results
 ```
 
@@ -95,11 +99,12 @@ UI form
 
 ```text
 raw scene folder/archive
-  -> POST /convert on nimbus-zarr
-  -> collection-specific normalization
+  -> POST /v1/jobs/{job_id}/convert on nimbus-api (manual path)
+  -> or automatic worker step after download success
+  -> collection-specific normalization via nimbuschain_zarr_service library
   -> sensor-aware target resolution selection
   -> Zarr write under /data/downloads/zarr
-  -> artifact registration through /v1/artifacts
+  -> artifact registration through /v1/artifacts under the same job lineage
 ```
 
 ## 4. Folder structure and intent
@@ -109,11 +114,11 @@ raw scene folder/archive
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/`
   Core domain logic, providers, worker logic, storage contracts.
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_service/`
-  Thin API layer over the engine and stores.
+  Public API layer over the engine, stores, and converter-facing routes.
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_ui/`
   Streamlit presentation layer and client-side orchestration.
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/`
-  Conversion logic and service API.
+  Conversion logic reused by the worker and converter routes.
 
 ### Infrastructure and operations
 
@@ -136,9 +141,9 @@ raw scene folder/archive
 
 Already good in the current project:
 - service split is clear and justified
-- UI, API, worker and converter boundaries are explicit
+- UI, API, worker and converter-library boundaries are explicit
 - API contracts are already stable enough for a real workflow
-- conversion concerns are separated from the downloader
+- conversion concerns are separated from provider download code
 - the project is runnable locally with a small number of commands
 
 ## 6. Main technical debt still intentionally accepted

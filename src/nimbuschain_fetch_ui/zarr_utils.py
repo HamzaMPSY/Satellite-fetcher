@@ -469,12 +469,18 @@ def guess_raw_source_format(raw_uri: str) -> str:
     return "directory"
 
 
-def zarr_service_schema(service_url: str) -> dict[str, Any]:
-    service_url = str(service_url or "").strip()
-    if not service_url:
+def zarr_service_schema(api_url: str, api_key: str = "") -> dict[str, Any]:
+    api_url = str(api_url or "").strip()
+    if not api_url:
         return {}
     try:
-        response = _http_session().get(f"{service_url.rstrip('/')}/schema", timeout=30)
+        response = _api_request(
+            "GET",
+            api_url,
+            "/v1/converter/schema",
+            api_key=api_key,
+            timeout=30,
+        )
         if response.ok:
             return response.json()
     except Exception:

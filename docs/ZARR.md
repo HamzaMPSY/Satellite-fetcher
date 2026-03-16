@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-The Zarr service converts raw downloaded scenes into a normalized array store suitable for:
+The converter runtime transforms raw downloaded scenes into a normalized array store suitable for:
 - downstream analytics
 - spectral and temporal stacking
 - artifact indexing
@@ -74,35 +74,43 @@ Typical examples:
 
 ## 5. Runtime API
 
-### `GET /health`
-Basic health for the Zarr service.
+The backend/orchestrator is the public API. The standalone Zarr FastAPI can remain available as an internal compatibility harness, but the UI and normal pipeline should use the backend endpoints below.
 
-### `GET /readiness`
-Strict readiness, including a write-path smoke test.
+### `GET /v1/converter/health`
+Basic converter health exposed by the backend.
 
-### `GET /schema`
+### `GET /v1/converter/readiness`
+Strict converter readiness, including a write-path smoke test.
+
+### `GET /v1/converter/schema`
 Returns:
 - Zarr model metadata
-- converter configuration actually loaded by the service
+- converter configuration actually loaded by the runtime
 
-### `POST /convert`
-Convert one local raw scene/archive into Zarr.
+### `POST /v1/jobs/{job_id}/convert`
+Run a manual conversion for raw outputs already attached to an existing pipeline job. The conversion remains attached to the same `job_id` and artifact lineage.
 
 Minimal payload:
 
 ```json
 {
-  "job_id": "job-1",
-  "pipeline_id": "pipe-1",
-  "trace_id": "trace-1",
-  "provider": "usgs",
-  "collection": "landsat_ot_c2_l2",
-  "product_type": "L2SP",
-  "scene_id": "LC08_L2SP_...",
   "raw_uri": "/data/downloads/<job>/<scene>",
-  "raw_format": "directory",
-  "output_uri": "/data/downloads/zarr/<scene>.zarr"
+  "output_uri": "/data/downloads/zarr/<scene>.zarr",
+  "scene_id": "LC08_L2SP_...",
+  "product_type": "L2SP"
 }
+```
+
+### Automatic conversion
+
+The default path is automatic:
+
+```text
+POST /v1/jobs
+  -> worker searches and downloads
+  -> worker detects raw outputs
+  -> worker invokes the converter library in-process
+  -> the same job transitions to pipeline_state=zarr_written
 ```
 
 ## 6. Implementation notes
@@ -115,6 +123,8 @@ Important modules:
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/readers/sentinel.py`
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/writers/zarr.py`
 - `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/config/config.yaml`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/engine/nimbus_fetcher.py`
+- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_service/api/converter.py`
 
 Design choice:
 - Landsat conversion uses a streaming write path to avoid building an oversized in-memory cube.

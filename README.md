@@ -4,14 +4,15 @@ NimbusChain Fetch is a multi-service satellite data platform composed of:
 
 - a FastAPI orchestrator for jobs, events, artifacts and health
 - a worker that executes Copernicus and USGS downloads
-- a Streamlit UI for AOI selection, job tracking and manual Zarr conversion
-- a dedicated Zarr conversion service for raw scene normalization
+- a Streamlit UI for AOI selection, pipeline tracking and manual Zarr conversion
+- an internal Zarr conversion runtime used by the worker and exposed through the backend API
 
 The repository is intentionally small in scope: it focuses on raw scene acquisition, operational monitoring, and conversion to a normalized `time, band, y, x` Zarr layout.
 
 ## Core capabilities
 
 - submit and track satellite download jobs
+- execute one pipeline job from search to download to Zarr conversion under a single `job_id`
 - preview products locally from Copernicus and USGS credentials already configured in the environment
 - persist job state, events, results and Zarr artifacts
 - convert downloaded scenes to Zarr with sensor-aware band preservation
@@ -22,9 +23,9 @@ The repository is intentionally small in scope: it focuses on raw scene acquisit
 
 ```text
 src/nimbuschain_fetch/            Core engine, providers, worker, stores
-src/nimbuschain_fetch_service/    FastAPI API layer
+src/nimbuschain_fetch_service/    FastAPI API layer and public converter endpoints
 src/nimbuschain_fetch_ui/         Streamlit frontend
-src/nimbuschain_zarr_service/     Zarr conversion service
+src/nimbuschain_zarr_service/     Internal Zarr conversion runtime/library
 
 Containerfile                     API/worker image
 ui/Containerfile                  UI image
@@ -51,7 +52,7 @@ Then open:
 
 - UI: [http://127.0.0.1:8501](http://127.0.0.1:8501)
 - API docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-- Zarr schema: [http://127.0.0.1:8010/schema](http://127.0.0.1:8010/schema)
+- Converter schema: [http://127.0.0.1:8000/v1/converter/schema](http://127.0.0.1:8000/v1/converter/schema)
 
 Stop the stack:
 
@@ -64,8 +65,8 @@ Stop the stack:
 - API health: [http://127.0.0.1:8000/v1/health](http://127.0.0.1:8000/v1/health)
 - API readiness: [http://127.0.0.1:8000/v1/readiness](http://127.0.0.1:8000/v1/readiness)
 - Worker status: [http://127.0.0.1:8000/v1/worker/status](http://127.0.0.1:8000/v1/worker/status)
-- Zarr health: [http://127.0.0.1:8010/health](http://127.0.0.1:8010/health)
-- Zarr readiness: [http://127.0.0.1:8010/readiness](http://127.0.0.1:8010/readiness)
+- Converter health: [http://127.0.0.1:8000/v1/converter/health](http://127.0.0.1:8000/v1/converter/health)
+- Converter readiness: [http://127.0.0.1:8000/v1/converter/readiness](http://127.0.0.1:8000/v1/converter/readiness)
 
 ## Data and git policy
 

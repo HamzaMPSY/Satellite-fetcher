@@ -67,12 +67,12 @@ curl -s http://127.0.0.1:8000/v1/readiness | python3 -m json.tool
 curl -s http://127.0.0.1:8000/v1/worker/status | python3 -m json.tool
 ```
 
-### Zarr service
+### Converter runtime (via backend public API)
 
 ```bash
-curl -s http://127.0.0.1:8010/health | python3 -m json.tool
-curl -s http://127.0.0.1:8010/readiness | python3 -m json.tool
-curl -s http://127.0.0.1:8010/schema | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/converter/health | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/converter/readiness | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/converter/schema | python3 -m json.tool
 ```
 
 ### UI

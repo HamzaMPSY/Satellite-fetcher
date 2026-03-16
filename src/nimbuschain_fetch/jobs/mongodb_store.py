@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -94,6 +95,17 @@ class MongoJobStore:
         request = dict(doc.get("request") or {})
         doc["product_type"] = doc.get("product_type") or request.get("product_type")
         doc["tile_id"] = doc.get("tile_id") or request.get("tile_id")
+        doc["pipeline_state"] = str(doc.get("pipeline_state") or "queued")
+        doc["pipeline_step"] = doc.get("pipeline_step")
+        doc["pipeline_progress"] = (
+            float(doc["pipeline_progress"])
+            if doc.get("pipeline_progress") is not None
+            else None
+        )
+        doc["pipeline_metadata"] = dict(doc.get("pipeline_metadata") or {})
+        doc["conversion_metadata"] = dict(doc.get("conversion_metadata") or {})
+        doc["raw_outputs"] = list(doc.get("raw_outputs") or [])
+        doc["zarr_outputs"] = list(doc.get("zarr_outputs") or [])
         return doc
 
     @staticmethod
@@ -141,6 +153,13 @@ class MongoJobStore:
                 "tile_id": request_payload.get("tile_id"),
                 "request": request_payload,
                 "state": "queued",
+                "pipeline_state": "queued",
+                "pipeline_step": "queued",
+                "pipeline_progress": 0.0,
+                "pipeline_metadata": {},
+                "conversion_metadata": {},
+                "raw_outputs": [],
+                "zarr_outputs": [],
                 "progress": 0.0,
                 "bytes_downloaded": 0,
                 "bytes_total": 0,
@@ -161,8 +180,20 @@ class MongoJobStore:
     def update_job(self, job_id: str, **fields: Any) -> None:
         if not fields:
             return
-        fields["updated_at"] = self._utc_now()
-        self._jobs.update_one({"job_id": job_id}, {"$set": fields})
+        normalized_fields: dict[str, Any] = {}
+        for key, value in fields.items():
+            if key == "errors":
+                normalized_fields[key] = list(value or [])
+            elif key in {"pipeline_metadata", "conversion_metadata"}:
+                normalized_fields[key] = dict(value or {})
+            elif key in {"raw_outputs", "zarr_outputs"}:
+                normalized_fields[key] = list(value or [])
+            elif key == "pipeline_progress" and value is not None:
+                normalized_fields[key] = float(value)
+            else:
+                normalized_fields[key] = value
+        normalized_fields["updated_at"] = self._utc_now()
+        self._jobs.update_one({"job_id": job_id}, {"$set": normalized_fields})
 
     def list_jobs(self, filters: JobListFilters) -> tuple[list[dict[str, Any]], int]:
         query: dict[str, Any] = {}
@@ -392,7 +423,15 @@ class MongoJobStore:
         now = self._utc_now()
         self._jobs.update_many(
             {"job_id": {"$in": job_ids}},
-            {"$set": {"state": "queued", "updated_at": now}},
+            {
+                "$set": {
+                    "state": "queued",
+                    "pipeline_state": "queued",
+                    "pipeline_step": "queued",
+                    "pipeline_progress": 0.0,
+                    "updated_at": now,
+                }
+            },
         )
         for jid in job_ids:
             self.append_event(
@@ -437,7 +476,15 @@ class MongoJobStore:
         now = self._utc_now()
         self._jobs.update_many(
             {"job_id": {"$in": job_ids}},
-            {"$set": {"state": "queued", "updated_at": now}},
+            {
+                "$set": {
+                    "state": "queued",
+                    "pipeline_state": "queued",
+                    "pipeline_step": "queued",
+                    "pipeline_progress": 0.0,
+                    "updated_at": now,
+                }
+            },
         )
         for jid in job_ids:
             self.append_event(

@@ -20,6 +20,7 @@ from nimbuschain_fetch_ui.constants import (
 )
 from nimbuschain_fetch_ui.downloads import count_downloaded_products
 from nimbuschain_fetch_ui.jobs_helpers import (
+    _api_request,
     _filter_recent_job_rows,
     _list_jobs,
     _recent_jobs_cutoff,
@@ -113,6 +114,8 @@ def _render_job_details(rows: list[dict[str, Any]]) -> None:
                     "collection": selected_job.get("collection"),
                     "product_type": selected_job.get("product_type"),
                     "state": selected_job.get("state"),
+                    "pipeline_state": selected_job.get("pipeline_state"),
+                    "pipeline_step": selected_job.get("pipeline_step"),
                     "progress": selected_job.get("progress"),
                     "bytes_downloaded": selected_job.get("bytes_downloaded"),
                     "bytes_total": selected_job.get("bytes_total"),
@@ -126,6 +129,95 @@ def _render_job_details(rows: list[dict[str, Any]]) -> None:
             ),
             language="json",
         )
+
+
+def _render_outputs_block(title: str, outputs: list[str], empty_message: str) -> None:
+    with st.container(border=True):
+        st.markdown(f"**{title}**")
+        if not outputs:
+            st.caption(empty_message)
+            return
+        st.caption(f"{len(outputs)} item(s)")
+        with st.expander(f"Show {title.lower()}", expanded=False):
+            for item in outputs:
+                st.code(str(item), language="text")
+
+
+def _render_pipeline_result_section(api_url: str, api_key: str, rows: list[dict[str, Any]]) -> None:
+    st.markdown("---")
+    st.markdown("**Pipeline outputs**")
+    selected_job_id = st.selectbox(
+        "Inspect pipeline job",
+        options=[str(row.get("job_id", "")) for row in rows],
+        format_func=lambda job_id: f"{job_id[:12]}...",
+        index=0,
+        key="results_pipeline_job",
+    )
+    selected_row = next((row for row in rows if str(row.get("job_id", "")) == selected_job_id), None)
+    if selected_row is None:
+        return
+
+    result_payload: dict[str, Any] = {}
+    try:
+        response = _api_request("GET", api_url, f"/v1/jobs/{selected_job_id}/result", api_key=api_key, timeout=60)
+        if response.ok:
+            result_payload = dict(response.json() or {})
+    except Exception:
+        result_payload = {}
+
+    raw_outputs = list(result_payload.get("raw_outputs") or selected_row.get("raw_outputs") or [])
+    zarr_outputs = list(result_payload.get("zarr_outputs") or selected_row.get("zarr_outputs") or [])
+    pipeline_metadata = dict(result_payload.get("pipeline_metadata") or selected_row.get("pipeline_metadata") or {})
+    conversion_metadata = dict(result_payload.get("conversion_metadata") or selected_row.get("conversion_metadata") or {})
+
+    top1, top2, top3, top4 = st.columns(4)
+    with top1:
+        st.metric("State", str(selected_row.get("state") or "-"))
+    with top2:
+        st.metric("Pipeline", str(selected_row.get("pipeline_state") or "-"))
+    with top3:
+        st.metric("Raw outputs", len(raw_outputs))
+    with top4:
+        st.metric("Zarr outputs", len(zarr_outputs))
+
+    meta1, meta2, meta3 = st.columns(3)
+    with meta1:
+        st.caption(
+            f"Provider: `{selected_row.get('provider', '-')}`  \n"
+            f"Mission: `{selected_row.get('collection', '-')}`"
+        )
+    with meta2:
+        st.caption(
+            f"Product: `{selected_row.get('product_type', '-')}`  \n"
+            f"Updated: `{_fmt_timestamp(selected_row.get('updated_at'))}`"
+        )
+    with meta3:
+        scene_hint = (
+            pipeline_metadata.get("scene_id")
+            or selected_row.get("scene_id")
+            or conversion_metadata.get("scene_id")
+            or "-"
+        )
+        st.caption(f"Scene: `{scene_hint}`")
+
+    out1, out2 = st.columns(2)
+    with out1:
+        _render_outputs_block("Raw outputs", raw_outputs, "No raw outputs were persisted for this job.")
+    with out2:
+        _render_outputs_block("Zarr outputs", zarr_outputs, "No Zarr outputs were written for this job.")
+
+    if pipeline_metadata or conversion_metadata:
+        with st.expander("Pipeline metadata", expanded=False):
+            st.code(
+                json.dumps(
+                    {
+                        "pipeline_metadata": pipeline_metadata,
+                        "conversion_metadata": conversion_metadata,
+                    },
+                    indent=2,
+                ),
+                language="json",
+            )
 
 
 def _render_files_section(downloads_dir: Path) -> None:
@@ -268,6 +360,7 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
     if jobs_rows:
         _render_job_summary_cards(jobs_rows)
         _render_jobs_table(jobs_rows)
+        _render_pipeline_result_section(api_url, api_key, jobs_rows)
         _render_job_details(jobs_rows)
     else:
         st.info("No jobs for selected filters.")

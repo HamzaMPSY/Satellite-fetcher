@@ -37,6 +37,13 @@ class SQLiteJobStore:
                     tile_id TEXT,
                     request_json TEXT NOT NULL,
                     state TEXT NOT NULL,
+                    pipeline_state TEXT NOT NULL DEFAULT 'queued',
+                    pipeline_step TEXT,
+                    pipeline_progress REAL,
+                    pipeline_metadata_json TEXT NOT NULL DEFAULT '{}',
+                    conversion_metadata_json TEXT NOT NULL DEFAULT '{}',
+                    raw_outputs_json TEXT NOT NULL DEFAULT '[]',
+                    zarr_outputs_json TEXT NOT NULL DEFAULT '[]',
                     progress REAL NOT NULL,
                     bytes_downloaded INTEGER NOT NULL,
                     bytes_total INTEGER NOT NULL,
@@ -138,6 +145,13 @@ class SQLiteJobStore:
             self._ensure_column("jobs", "worker_id", "TEXT")
             self._ensure_column("jobs", "retry_count", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column("jobs", "last_retry_at", "TEXT")
+            self._ensure_column("jobs", "pipeline_state", "TEXT NOT NULL DEFAULT 'queued'")
+            self._ensure_column("jobs", "pipeline_step", "TEXT")
+            self._ensure_column("jobs", "pipeline_progress", "REAL")
+            self._ensure_column("jobs", "pipeline_metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("jobs", "conversion_metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("jobs", "raw_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column("jobs", "zarr_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
             self._conn.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
@@ -166,6 +180,13 @@ class SQLiteJobStore:
             "worker_id": (row["worker_id"] if "worker_id" in row.keys() else None),
             "request": request,
             "state": row["state"],
+            "pipeline_state": row["pipeline_state"] if "pipeline_state" in row.keys() else "queued",
+            "pipeline_step": row["pipeline_step"] if "pipeline_step" in row.keys() else None,
+            "pipeline_progress": float(row["pipeline_progress"]) if "pipeline_progress" in row.keys() and row["pipeline_progress"] is not None else None,
+            "pipeline_metadata": json.loads(row["pipeline_metadata_json"]) if "pipeline_metadata_json" in row.keys() and row["pipeline_metadata_json"] else {},
+            "conversion_metadata": json.loads(row["conversion_metadata_json"]) if "conversion_metadata_json" in row.keys() and row["conversion_metadata_json"] else {},
+            "raw_outputs": json.loads(row["raw_outputs_json"]) if "raw_outputs_json" in row.keys() and row["raw_outputs_json"] else [],
+            "zarr_outputs": json.loads(row["zarr_outputs_json"]) if "zarr_outputs_json" in row.keys() and row["zarr_outputs_json"] else [],
             "progress": float(row["progress"]),
             "bytes_downloaded": int(row["bytes_downloaded"]),
             "bytes_total": int(row["bytes_total"]),
@@ -194,9 +215,11 @@ class SQLiteJobStore:
                 """
                 INSERT INTO jobs(
                     job_id, job_type, provider, collection, product_type, tile_id, request_json, state,
+                    pipeline_state, pipeline_step, pipeline_progress, pipeline_metadata_json,
+                    conversion_metadata_json, raw_outputs_json, zarr_outputs_json,
                     progress, bytes_downloaded, bytes_total, retry_count, last_retry_at, started_at, finished_at,
                     errors_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -207,6 +230,13 @@ class SQLiteJobStore:
                     tile_id,
                     json.dumps(request_payload),
                     "queued",
+                    "queued",
+                    "queued",
+                    0.0,
+                    "{}",
+                    "{}",
+                    "[]",
+                    "[]",
                     0.0,
                     0,
                     0,
@@ -240,6 +270,10 @@ class SQLiteJobStore:
                 normalized["errors_json"] = json.dumps(value)
             elif key == "request":
                 normalized["request_json"] = json.dumps(value)
+            elif key in {"pipeline_metadata", "conversion_metadata"}:
+                normalized[f"{key}_json"] = json.dumps(value or {})
+            elif key in {"raw_outputs", "zarr_outputs"}:
+                normalized[f"{key}_json"] = json.dumps(list(value or []))
             else:
                 normalized[key] = value
 

@@ -63,18 +63,20 @@ def refresh_api_runtime_statuses(*, api_url: str, api_key: str) -> dict[str, Any
     }
 
 
-def refresh_zarr_runtime_statuses(*, zarr_url: str) -> dict[str, Any]:
+def refresh_zarr_runtime_statuses(*, api_url: str, api_key: str) -> dict[str, Any]:
     return {
         "zarr_health_snapshot": fetch_status_json(
-            base_url=zarr_url,
-            path="/health",
+            base_url=api_url,
+            path="/v1/converter/health",
+            api_key=api_key,
         ),
         "zarr_readiness_snapshot": fetch_status_json(
-            base_url=zarr_url,
-            path="/readiness",
+            base_url=api_url,
+            path="/v1/converter/readiness",
+            api_key=api_key,
         ),
         "zarr_status_checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "last_zarr_status_url": zarr_url,
+        "last_zarr_status_url": api_url,
     }
 
 

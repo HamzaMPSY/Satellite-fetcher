@@ -49,7 +49,6 @@ from nimbuschain_fetch_ui.constants import (
     PID_PATH,
     DEFAULT_API_URL,
     DEFAULT_API_KEY,
-    DEFAULT_ZARR_URL,
     RECENT_JOBS_WINDOW_HOURS,
     RECENT_JOB_CATEGORY_MINUTES,
     PROVIDER_ISSUE_WINDOW_MINUTES,
@@ -138,7 +137,6 @@ from nimbuschain_fetch_ui.downloads import (
 from nimbuschain_fetch_ui.zarr_utils import (
     recent_source_candidates as _recent_source_candidates,
     available_zarr_stores as _available_zarr_stores,
-    register_zarr_artifact as _register_zarr_artifact,
     zarr_service_schema as _zarr_service_schema,
     guess_scene_id as _guess_scene_id,
     guess_zarr_provider as _guess_zarr_provider,
@@ -415,7 +413,6 @@ def init_state():
         "click_sel": True,
         "api_url": DEFAULT_API_URL,
         "api_key": DEFAULT_API_KEY,
-        "zarr_service_url": DEFAULT_ZARR_URL,
         "provider": "Copernicus",
         "satellite": "SENTINEL-2",
         "product": "S2MSI2A",
@@ -434,7 +431,6 @@ def init_state():
         "dl_job_collection_filter": "",
         "dl_job_product_filter": "",
         "dl_job_id_query": "",
-        "zarr_history": [],
         "zarr_selected_store": "",
         "zarr_artifact_query": "",
         "zarr_artifact_provider": "",
@@ -542,8 +538,76 @@ def _refresh_api_runtime_statuses() -> None:
 
 
 def _refresh_zarr_runtime_statuses() -> None:
-    zarr_url = str(_ss("zarr_service_url", DEFAULT_ZARR_URL)).strip()
-    st.session_state.update(_collect_zarr_runtime_statuses(zarr_url=zarr_url))
+    api_url = str(_ss("api_url", DEFAULT_API_URL)).strip()
+    api_key = str(_ss("api_key", DEFAULT_API_KEY)).strip()
+    st.session_state.update(_collect_zarr_runtime_statuses(api_url=api_url, api_key=api_key))
+
+
+def _raw_uri_candidates(raw_uri: str) -> set[str]:
+    normalized = str(raw_uri or "").strip()
+    candidates = {normalized}
+    if normalized.startswith("/data/"):
+        host_hint = _container_to_host_path_hint(normalized)
+        if host_hint:
+            candidates.add(str(host_hint).strip())
+    else:
+        host_hint = _container_to_host_path_hint(normalized)
+        if host_hint:
+            candidates.add(host_hint.strip())
+    basename = Path(normalized).name if normalized else ""
+    if basename:
+        candidates.add(basename)
+    return {item for item in candidates if item}
+
+
+def _find_pipeline_job_for_raw_uri(api_url: str, api_key: str, raw_uri: str) -> str | None:
+    target_candidates = _raw_uri_candidates(raw_uri)
+    if not target_candidates:
+        return None
+
+    candidate_rows: list[dict[str, Any]] = []
+    for page in range(1, 6):
+        rows, _total = _list_jobs(
+            api_url,
+            api_key,
+            updated_from=_recent_jobs_cutoff(24 * 30),
+            page=page,
+            page_size=200,
+        )
+        if not rows:
+            break
+        candidate_rows.extend(rows)
+        if len(rows) < 200:
+            break
+
+    for row in candidate_rows:
+        row_candidates = set()
+        for value in list(row.get("raw_outputs") or []):
+            row_candidates.update(_raw_uri_candidates(str(value)))
+        for value in list(row.get("paths") or []):
+            row_candidates.update(_raw_uri_candidates(str(value)))
+        if target_candidates & row_candidates:
+            return str(row.get("job_id") or "").strip() or None
+
+    for row in candidate_rows[:50]:
+        job_id = str(row.get("job_id") or "").strip()
+        if not job_id:
+            continue
+        try:
+            response = _api_request("GET", api_url, f"/v1/jobs/{job_id}/result", api_key=api_key, timeout=30)
+            if not response.ok:
+                continue
+            result_payload = response.json()
+        except Exception:
+            continue
+        result_candidates = set()
+        for value in list(result_payload.get("raw_outputs") or []):
+            result_candidates.update(_raw_uri_candidates(str(value)))
+        for value in list(result_payload.get("paths") or []):
+            result_candidates.update(_raw_uri_candidates(str(value)))
+        if target_candidates & result_candidates:
+            return job_id
+    return None
 
 
 def _tracked_job_rows() -> list[dict[str, Any]]:
@@ -608,13 +672,18 @@ def _render_job_cards(
     for item in statuses[:100]:
         job_id = str(item.get("job_id", "unknown"))
         state = str(item.get("state", "unknown"))
-        progress = float(item.get("progress", 0.0) or 0.0)
+        download_progress = float(item.get("progress", 0.0) or 0.0)
+        pipeline_state = _job_pipeline_state(item)
+        pipeline_progress = _job_pipeline_progress(item)
         duration = item.get("duration_seconds")
         errors = item.get("errors", []) or []
         error_summary = None
         if errors:
             first_error = str(errors[0]).strip()
-            if "catalogue.dataspace.copernicus.eu" in first_error and "503" in first_error:
+            error_text = first_error.lower()
+            if "504" in error_text:
+                error_summary = "Copernicus download endpoint timed out (HTTP 504) before the first byte. Retry later."
+            elif "catalogue.dataspace.copernicus.eu" in first_error and "503" in first_error:
                 error_summary = "Copernicus catalogue is temporarily unavailable (HTTP 503). Retry later."
             elif len(first_error) > 240:
                 error_summary = f"{first_error[:240]}..."
@@ -622,10 +691,13 @@ def _render_job_cards(
                 error_summary = first_error
         with st.container(border=True):
             state_label, state_fg, state_bg, state_icon = _job_state_style(state)
+            pipeline_label, pipeline_fg, pipeline_bg, pipeline_icon = _job_pipeline_style(item)
             provider_issue = _job_provider_issue_badge(item)
             badge_chunks = [
                 f"<span style='display:inline-flex;align-items:center;border-radius:999px;padding:4px 10px;"
-                f"font-size:.72rem;font-weight:700;color:{state_fg};background:{state_bg};text-transform:uppercase;'>{state_icon} {state_label}</span>"
+                f"font-size:.72rem;font-weight:700;color:{state_fg};background:{state_bg};text-transform:uppercase;'>{state_icon} {state_label}</span>",
+                f"<span style='display:inline-flex;align-items:center;border-radius:999px;padding:4px 10px;"
+                f"font-size:.72rem;font-weight:700;color:{pipeline_fg};background:{pipeline_bg};text-transform:uppercase;'>{pipeline_icon} {pipeline_label}</span>"
             ]
             if provider_issue is not None:
                 issue_label, issue_fg, issue_bg, issue_icon = provider_issue
@@ -649,14 +721,26 @@ def _render_job_cards(
             with h2:
                 st.metric("State", state)
             with h3:
-                st.metric("Progress", f"{progress:.2f}%")
+                st.metric("Pipeline", pipeline_label)
             with h4:
                 st.metric("Duration", f"{float(duration):.1f}s" if duration is not None else "-")
-            _render_job_progress_bar(progress, state)
+            _render_pipeline_timeline(item)
+            _render_job_progress_bar(pipeline_progress, _job_progress_visual_state(item))
             st.caption(
-                f"{int(item.get('bytes_downloaded', 0) or 0)} / "
-                f"{int(item.get('bytes_total', 0) or 0)} bytes · "
-                f"Updated: {item.get('updated_at', '-')}"
+                f"Pipeline progress: {pipeline_progress:.2f}%"
+                f" · Download progress: {download_progress:.2f}%"
+                f" · Updated: {item.get('updated_at', '-')}"
+            )
+            pipeline_summary = _job_pipeline_summary(item)
+            if pipeline_summary:
+                st.caption(pipeline_summary)
+            pipeline_substate = _job_pipeline_substate(item)
+            if pipeline_substate:
+                st.caption(pipeline_substate)
+            _render_job_pipeline_paths(item)
+            st.caption(
+                f"Downloaded bytes: {int(item.get('bytes_downloaded', 0) or 0)} / "
+                f"{int(item.get('bytes_total', 0) or 0)}"
             )
             queued_reason = _job_queued_reason(item)
             if queued_reason:
@@ -723,6 +807,201 @@ def _job_state_style(state: str) -> tuple[str, str, str, str]:
     return (normalized or "unknown", "#94a3b8", "rgba(148,163,184,0.14)", "•")
 
 
+def _job_pipeline_state(item: dict[str, Any]) -> str:
+    pipeline_state = str(item.get("pipeline_state", "") or "").strip().lower()
+    if pipeline_state:
+        return pipeline_state
+    state = str(item.get("state", "") or "").strip().lower()
+    if state == "succeeded" and list(item.get("zarr_outputs") or []):
+        return "zarr_written"
+    return state or "queued"
+
+
+def _job_pipeline_progress(item: dict[str, Any]) -> float:
+    if item.get("pipeline_progress") is not None:
+        return float(item.get("pipeline_progress", 0.0) or 0.0)
+    return float(item.get("progress", 0.0) or 0.0)
+
+
+def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
+    pipeline_state = _job_pipeline_state(item)
+    if pipeline_state == "searching":
+        return ("searching", "#93c5fd", "rgba(147,197,253,0.14)", "⌕")
+    if pipeline_state == "downloading":
+        return ("downloading", "#67e8f9", "rgba(34,211,238,0.14)", "↓")
+    if pipeline_state == "downloaded":
+        return ("download complete", "#86efac", "rgba(134,239,172,0.14)", "✓")
+    if pipeline_state == "zarr_queued":
+        return ("zarr queued", "#fbbf24", "rgba(251,191,36,0.16)", "⏳")
+    if pipeline_state == "zarr_converting":
+        return ("zarr converting", "#38bdf8", "rgba(56,189,248,0.16)", "⚙")
+    if pipeline_state == "zarr_written":
+        return ("zarr ready", "#4ade80", "rgba(74,222,128,0.14)", "⬢")
+    if pipeline_state == "zarr_failed":
+        return ("zarr failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
+    if pipeline_state == "cancelled":
+        return ("cancelled", "#c084fc", "rgba(192,132,252,0.14)", "■")
+    if pipeline_state == "failed":
+        return ("failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
+    return ("queued", "#fbbf24", "rgba(251,191,36,0.16)", "⏳")
+
+
+def _job_progress_visual_state(item: dict[str, Any]) -> str:
+    pipeline_state = _job_pipeline_state(item)
+    if pipeline_state in {"failed", "zarr_failed"}:
+        return "failed"
+    if pipeline_state == "cancelled":
+        return "cancelled"
+    if pipeline_state in {"queued", "zarr_queued"}:
+        return "queued"
+    if pipeline_state == "zarr_written":
+        return "succeeded"
+    return "running"
+
+
+def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
+    pipeline_state = _job_pipeline_state(item)
+    pipeline_step = str(item.get("pipeline_step", "") or "").strip().lower()
+    pipeline_meta = dict(item.get("pipeline_metadata") or {})
+    bytes_downloaded = int(item.get("bytes_downloaded", 0) or 0)
+    raw_count = len(item.get("raw_outputs") or []) or int(pipeline_meta.get("raw_output_count", 0) or 0)
+    zarr_count = len(item.get("zarr_outputs") or []) or int(pipeline_meta.get("zarr_output_count", 0) or 0)
+    products_found = int(pipeline_meta.get("products_found", 0) or 0)
+    suffix_parts: list[str] = []
+    if raw_count:
+        suffix_parts.append(f"raw outputs: {raw_count}")
+    if zarr_count:
+        suffix_parts.append(f"zarr outputs: {zarr_count}")
+    suffix = f" ({' · '.join(suffix_parts)})" if suffix_parts else ""
+    if pipeline_state == "searching":
+        return "Searching the provider catalogue for matching products."
+    if pipeline_state == "downloading":
+        if products_found > 0 and bytes_downloaded <= 0:
+            return f"Products were found. Waiting for the first download byte from the provider ({products_found} selected)."
+        return f"Raw product download is in progress{suffix}."
+    if pipeline_state == "downloaded":
+        return f"Download complete. Preparing Zarr conversion{suffix}."
+    if pipeline_state == "zarr_queued":
+        return f"Download complete. Zarr conversion is queued{suffix}."
+    if pipeline_state == "zarr_converting":
+        if pipeline_step == "registering_artifact":
+            return f"Download complete. Zarr data is written. Registering the store{suffix}."
+        return f"Download complete. Zarr conversion is running{suffix}."
+    if pipeline_state == "zarr_written":
+        return f"Download complete. Zarr output is ready{suffix}."
+    if pipeline_state == "zarr_failed":
+        return f"Download completed, but Zarr conversion failed{suffix}."
+    if pipeline_state == "failed":
+        if products_found > 0 and bytes_downloaded <= 0:
+            return f"Search succeeded ({products_found} products found), but the provider download failed before the first byte."
+        return "Pipeline failed before reaching a usable Zarr output."
+    if pipeline_state == "cancelled":
+        return "Pipeline was cancelled."
+    return None
+
+
+def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
+    pipeline_state = _job_pipeline_state(item)
+    pipeline_step = str(item.get("pipeline_step", "") or "").strip().lower()
+    conversion_meta = dict(item.get("conversion_metadata") or {})
+    current_index = int(conversion_meta.get("current_index", 0) or 0)
+    total = int(conversion_meta.get("total", 0) or 0)
+    item_suffix = f" ({current_index}/{total})" if current_index > 0 and total > 0 else ""
+    if pipeline_state == "zarr_queued":
+        return f"Waiting for the worker to start Zarr conversion{item_suffix}."
+    if pipeline_state == "zarr_converting":
+        if pipeline_step == "writing_chunks":
+            return f"Writing chunks into the Zarr store{item_suffix}."
+        if pipeline_step == "registering_artifact":
+            return f"Registering the Zarr artifact in the backend{item_suffix}."
+        return f"Zarr conversion is active{item_suffix}."
+    if pipeline_state == "downloaded":
+        return "Raw product is available locally. The backend is about to start the Zarr stage."
+    return None
+
+
+def _job_pipeline_paths(item: dict[str, Any]) -> tuple[str | None, str | None]:
+    conversion_meta = dict(item.get("conversion_metadata") or {})
+    raw_uri = str(conversion_meta.get("current_raw_uri") or "").strip()
+    if not raw_uri:
+        raw_outputs = list(item.get("raw_outputs") or [])
+        if raw_outputs:
+            raw_uri = str(raw_outputs[0]).strip()
+    zarr_uri = str(conversion_meta.get("current_output_uri") or "").strip()
+    if not zarr_uri:
+        zarr_outputs = list(item.get("zarr_outputs") or [])
+        if zarr_outputs:
+            zarr_uri = str(zarr_outputs[-1]).strip()
+    return (raw_uri or None, zarr_uri or None)
+
+
+def _render_job_pipeline_paths(item: dict[str, Any]) -> None:
+    raw_uri, zarr_uri = _job_pipeline_paths(item)
+    if not raw_uri and not zarr_uri:
+        return
+    lines: list[str] = []
+    if raw_uri:
+        lines.append(f"Source raw: {Path(raw_uri).name}")
+    if zarr_uri:
+        lines.append(f"Zarr target: {Path(zarr_uri).name}")
+    st.code("\n".join(lines), language="text")
+
+
+def _render_pipeline_timeline(item: dict[str, Any]) -> None:
+    pipeline_state = _job_pipeline_state(item)
+    state = str(item.get("state", "") or "").strip().lower()
+    steps = [
+        ("searching", "Search"),
+        ("downloading", "Download"),
+        ("downloaded", "Downloaded"),
+        ("zarr_queued", "Zarr queued"),
+        ("zarr_converting", "Convert"),
+        ("zarr_written", "Ready"),
+    ]
+    order = {key: idx for idx, (key, _label) in enumerate(steps)}
+    anchor_state = pipeline_state
+    if pipeline_state == "queued":
+        anchor_state = "searching"
+    elif pipeline_state == "failed":
+        anchor_state = "downloading"
+    elif pipeline_state == "zarr_failed":
+        anchor_state = "zarr_converting"
+    elif pipeline_state == "cancelled":
+        anchor_state = "downloading"
+    anchor_index = order.get(anchor_state, 0)
+    chips: list[str] = []
+    for idx, (key, label) in enumerate(steps):
+        if state == "succeeded" and pipeline_state == "zarr_written":
+            status_kind = "done" if idx <= anchor_index else "pending"
+        elif pipeline_state in {"failed", "zarr_failed"} and idx == anchor_index:
+            status_kind = "failed"
+        elif idx < anchor_index:
+            status_kind = "done"
+        elif idx == anchor_index:
+            status_kind = "current"
+        else:
+            status_kind = "pending"
+        if status_kind == "done":
+            fg, bg, border = "#4ade80", "rgba(74,222,128,0.12)", "rgba(74,222,128,0.28)"
+        elif status_kind == "current":
+            fg, bg, border = "#38bdf8", "rgba(56,189,248,0.12)", "rgba(56,189,248,0.32)"
+        elif status_kind == "failed":
+            fg, bg, border = "#f87171", "rgba(248,113,113,0.12)", "rgba(248,113,113,0.28)"
+        else:
+            fg, bg, border = "#94a3b8", "rgba(148,163,184,0.08)", "rgba(148,163,184,0.14)"
+        chips.append(
+            f"<span style='display:inline-flex;align-items:center;justify-content:center;"
+            f"padding:4px 10px;border-radius:999px;border:1px solid {border};"
+            f"background:{bg};color:{fg};font-size:.72rem;font-weight:600;'>{label}</span>"
+        )
+    st.markdown(
+        "<div style='display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 8px 0;'>"
+        + "".join(chips)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _job_progress_color(state: str) -> str:
     normalized = str(state or "unknown").strip().lower()
     if normalized == "running":
@@ -787,7 +1066,14 @@ def _job_provider_issue_badge(item: dict[str, Any]) -> tuple[str, str, str, str]
         return None
 
     error_texts = [str(err).strip().lower() for err in (item.get("errors", []) or []) if str(err).strip()]
-    if any("503" in text or "service unavailable" in text or "temporarily unavailable" in text for text in error_texts):
+    if any(
+        "503" in text
+        or "504" in text
+        or "service unavailable" in text
+        or "temporarily unavailable" in text
+        or "gateway timeout" in text
+        for text in error_texts
+    ):
         return ("provider unavailable", "#f87171", "rgba(248,113,113,0.14)", "⚠")
     if any("429" in text or "retry later" in text or "rate limit" in text or "too many requests" in text for text in error_texts):
         return ("provider retrying", "#fbbf24", "rgba(251,191,36,0.16)", "↻")
@@ -836,7 +1122,14 @@ def _provider_runtime_badge(
         provider_api,
         window_minutes=PROVIDER_ISSUE_WINDOW_MINUTES,
     )
-    if any("503" in text or "service unavailable" in text or "temporarily unavailable" in text for text in error_texts):
+    if any(
+        "503" in text
+        or "504" in text
+        or "service unavailable" in text
+        or "temporarily unavailable" in text
+        or "gateway timeout" in text
+        for text in error_texts
+    ):
         return ("unavailable", f"{provider_label} is temporarily unavailable.", "#ef4444")
     if any(
         "429" in text or "retry later" in text or "rate limit" in text or "too many requests" in text
@@ -1821,15 +2114,14 @@ def main():
             '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>🧱</span><span style="font-weight:600;font-size:.94rem;">Zarr Conversion</span></div>',
             unsafe_allow_html=True,
         )
-        current_zarr_url = str(_ss("zarr_service_url", DEFAULT_ZARR_URL)).strip()
         if (
-            _ss("last_zarr_status_url", "") != current_zarr_url
+            _ss("last_zarr_status_url", "") != str(_ss("api_url", DEFAULT_API_URL)).strip()
             or _ss("zarr_health_snapshot") is None
             or _ss("zarr_readiness_snapshot") is None
         ):
             _refresh_zarr_runtime_statuses()
 
-        zarr_schema = _zarr_service_schema(_ss("zarr_service_url", DEFAULT_ZARR_URL))
+        zarr_schema = _zarr_service_schema(_ss("api_url"), _ss("api_key"))
         resolution_policy_info = (zarr_schema.get("converter_config", {}) or {}).get("resolution_policy", {})
         collections_policy = dict(resolution_policy_info.get("collections") or {})
         sentinel2_target = (collections_policy.get("SENTINEL-2") or {}).get("target_pixel_size_meters")
@@ -1869,14 +2161,19 @@ def main():
         with st.expander("Service connection & diagnostics", expanded=False):
             zc1, zc2 = st.columns([3, 1])
             with zc1:
-                st.session_state["zarr_service_url"] = st.text_input(
-                    "Zarr service URL",
-                    value=_ss("zarr_service_url", DEFAULT_ZARR_URL),
-                    help="Example: http://nimbus-zarr:8010 (compose) or http://127.0.0.1:8010",
+                st.code(
+                    "\n".join(
+                        [
+                            f"Backend API: {_ss('api_url')}",
+                            f"Converter health: {_ss('api_url').rstrip('/')}/v1/converter/health",
+                            f"Converter readiness: {_ss('api_url').rstrip('/')}/v1/converter/readiness",
+                            f"Converter schema: {_ss('api_url').rstrip('/')}/v1/converter/schema",
+                        ]
+                    ),
+                    language="text",
                 )
             with zc2:
-                current_zarr_url = str(_ss("zarr_service_url", DEFAULT_ZARR_URL)).strip()
-                if st.button("Refresh Zarr status", width="stretch"):
+                if st.button("Refresh converter status", width="stretch"):
                     _refresh_zarr_runtime_statuses()
             st.caption(f"Last checked: {_format_status_timestamp(_ss('zarr_status_checked_at'))}")
             zstatus1, zstatus2 = st.columns(2)
@@ -2040,55 +2337,52 @@ def main():
             width="stretch",
             disabled=(not raw_uri) or (zarr_conversion_blocker is not None),
         )
-        st.caption("The converter preserves native imagery layers and stores QA / ancillary layers separately when available.")
+        st.caption("The converter preserves native imagery layers and stores QA / ancillary layers separately when available. Manual conversion is attached to an existing pipeline job, not created as a separate job.")
         if run_convert:
             scene_id_value = scene_id.strip() or guessed_scene or "scene"
             output_uri_value = output_uri.strip()
             if output_uri_value.startswith("/tmp/"):
                 output_uri_value = _default_zarr_output(scene_id_value)
                 st.info(f"Output path adjusted to mounted volume: {output_uri_value}")
-
-            payload = {
-                "job_id": f"zarr-{uuid.uuid4().hex[:12]}",
-                "pipeline_id": f"ui-zarr-{uuid.uuid4().hex[:8]}",
-                "trace_id": f"ui-zarr-{uuid.uuid4().hex[:8]}",
-                "provider": provider_api,
-                "collection": collection_api.strip(),
-                "product_type": product_type.strip() if product_type else None,
-                "scene_id": scene_id_value,
-                "raw_uri": raw_uri,
-                "raw_format": _guess_raw_source_format(raw_uri),
-                "output_uri": output_uri_value,
-            }
-            try:
-                response = _http_session().post(
-                    f"{_ss('zarr_service_url').rstrip('/')}/convert",
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=1800,
+            source_job_id = _find_pipeline_job_for_raw_uri(_ss("api_url"), _ss("api_key"), raw_uri)
+            if not source_job_id:
+                st.error(
+                    "No existing pipeline job was found for this raw source. "
+                    "Manual conversion must be attached to a downloaded job tracked by the backend."
                 )
-                if response.ok:
-                    body = response.json()
-                    history = list(_ss("zarr_history", []))
-                    history.insert(0, body)
-                    st.session_state["zarr_history"] = history[:50]
-                    _register_zarr_artifact(
+                source_job_id = ""
+            try:
+                if source_job_id:
+                    response = _api_request(
+                        "POST",
                         _ss("api_url"),
-                        _ss("api_key"),
-                        convert_response=body,
-                        raw_uri=raw_uri,
-                        provider=provider_api,
-                        collection=collection_api.strip(),
-                        scene_id=scene_id_value,
+                        f"/v1/jobs/{source_job_id}/convert",
+                        api_key=_ss("api_key"),
+                        payload={
+                            "raw_uri": raw_uri,
+                            "output_uri": output_uri_value,
+                            "scene_id": scene_id_value,
+                            "product_type": product_type.strip() if product_type else None,
+                        },
+                        timeout=1800,
                     )
-                    zarr_uri = str(body.get("zarr_uri", "-"))
-                    host_hint = _container_to_host_path_hint(zarr_uri)
-                    if host_hint:
-                        st.success(f"Zarr conversion completed: {zarr_uri} (host: {host_hint})")
+                    if response.ok:
+                        body = response.json()
+                        manual_job_id = str(body.get("job_id") or source_job_id)
+                        cache = dict(_ss("job_status_cache", {}))
+                        cache[manual_job_id] = body
+                        st.session_state["job_status_cache"] = cache
+                        st.session_state["job_result_cache"] = {
+                            key: value
+                            for key, value in dict(_ss("job_result_cache", {})).items()
+                            if key != manual_job_id
+                        }
+                        _upsert_known_jobs([manual_job_id])
+                        st.success(
+                            f"Zarr conversion completed and attached to pipeline job {manual_job_id}."
+                        )
                     else:
-                        st.success(f"Zarr conversion completed: {zarr_uri}")
-                else:
-                    st.error(f"{response.status_code}: {_response_error_message(response)}")
+                        st.error(f"{response.status_code}: {_response_error_message(response)}")
             except Exception as exc:
                 st.error(str(exc))
 
@@ -2192,18 +2486,32 @@ def main():
                     language="text",
                 )
 
-        with st.expander("Recent Zarr conversions (session)", expanded=False):
-            zarr_history = list(_ss("zarr_history", []))
-            if not zarr_history:
-                st.info("No conversion executed in this session yet.")
+        with st.expander("Recent pipeline conversions", expanded=False):
+            recent_rows, _ = _list_jobs(
+                _ss("api_url"),
+                _ss("api_key"),
+                updated_from=_recent_jobs_cutoff(RECENT_JOBS_WINDOW_HOURS),
+                page=1,
+                page_size=40,
+            )
+            converted_rows = [
+                row for row in recent_rows
+                if list(row.get("zarr_outputs") or [])
+                or str(row.get("pipeline_state") or "") in {"zarr_converting", "zarr_written", "zarr_failed"}
+            ]
+            if not converted_rows:
+                st.info("No recent pipeline conversions found.")
             else:
-                for item in zarr_history[:20]:
+                for item in converted_rows[:20]:
                     with st.container(border=True):
                         st.markdown(f"**{item.get('job_id', '-') }**")
-                        st.caption(f"{item.get('data_family', '-') } · {item.get('zarr_uri', '-')}")
-                        st.caption(f"Bands: {', '.join([str(b) for b in (item.get('band_names') or [])])}")
-                        with st.expander("Normalization summary", expanded=False):
-                            st.code(json.dumps(item.get("normalization_summary", {}), indent=2), language="json")
+                        st.caption(
+                            f"{item.get('provider', '-')}/{item.get('collection', '-')}"
+                            f" · pipeline state: {item.get('pipeline_state', '-')}"
+                        )
+                        if item.get("zarr_outputs"):
+                            for output_path in list(item.get("zarr_outputs") or [])[:5]:
+                                st.code(str(output_path), language="text")
 
     with tab_res:
         render_results_tab(api_url=_ss("api_url"), api_key=_ss("api_key"))
