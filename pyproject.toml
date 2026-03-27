@@ -16,6 +16,7 @@ dependencies = [
   "anyio>=4.4.0",
   "aiohttp>=3.10.0",
   "fastapi>=0.115.0",
+  "fastai>=2.7.18,<3",
   "fsspec>=2024.9.0",
   "h5netcdf>=1.4.0",
   "h5py>=3.11.0",
@@ -23,6 +24,8 @@ dependencies = [
   "numcodecs>=0.13.0",
   "oci>=2.132.0",
   "ocifs>=0.1.2",
+  "omnicloudmask[legacy]>=1.7.1",
+  "omniwatermask>=0.4.3",
   "pydantic>=2.9.0",
   "pydantic-settings>=2.4.0",
   "prometheus-client>=0.21.0",
@@ -58,7 +61,7 @@ nimbuschain-worker = "nimbuschain_fetch.worker:main"
 nimbuschain-zarr-service = "nimbuschain_zarr_service.main:run"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service"]
+packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service", "src/nimbuschain_mask_service"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

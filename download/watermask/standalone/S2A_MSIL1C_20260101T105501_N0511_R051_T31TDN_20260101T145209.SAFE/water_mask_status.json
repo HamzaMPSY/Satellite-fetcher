@@ -1,0 +1,18 @@
+{
+  "artifact_uri": null,
+  "input_bands": [
+    "B04",
+    "B03",
+    "B02",
+    "B08"
+  ],
+  "input_zarr_uri": "/private/var/folders/q2/957tc46136s5zm0v9xhbc4040000gn/T/pytest-of-mehdidinari/pytest-37/test_manual_omniwater_failure_0/out/callback.zarr",
+  "mask_path": null,
+  "output_zarr_uri": "/private/var/folders/q2/957tc46136s5zm0v9xhbc4040000gn/T/pytest-of-mehdidinari/pytest-37/test_manual_omniwater_failure_0/out/callback.zarr",
+  "reason": "simulated_omniwater_failure",
+  "status": "failed",
+  "status_path": "/Users/mehdidinari/Desktop/backend nimbus/download/watermask/standalone/S2A_MSIL1C_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE/water_mask_status.json",
+  "storage_mode": "in_place_zarr_enrichment",
+  "updated_at": "2026-03-25T10:47:58.294233+00:00",
+  "work_dir": "/Users/mehdidinari/Desktop/backend nimbus/download/watermask/standalone/S2A_MSIL1C_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
+}

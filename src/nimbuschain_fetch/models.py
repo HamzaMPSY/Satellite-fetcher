@@ -166,6 +166,7 @@ class JobStatusResponse(BaseModel):
     conversion_metadata: dict[str, Any] = Field(default_factory=dict)
     raw_outputs: list[str] = Field(default_factory=list)
     zarr_outputs: list[str] = Field(default_factory=list)
+    watermask_outputs: list[str] = Field(default_factory=list)
     progress: float = Field(default=0, ge=0, le=100)
     bytes_downloaded: int = 0
     bytes_total: int = 0
@@ -188,6 +189,7 @@ class JobResultResponse(BaseModel):
     paths: list[str] = Field(default_factory=list)
     raw_outputs: list[str] = Field(default_factory=list)
     zarr_outputs: list[str] = Field(default_factory=list)
+    watermask_outputs: list[str] = Field(default_factory=list)
     checksums: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     manifest_entry: dict[str, Any] = Field(default_factory=dict)
@@ -204,6 +206,24 @@ class JobConvertRequest(BaseModel):
     product_type: str | None = None
 
 
+class JobWaterMaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    zarr_uri: str | None = None
+    scene_id: str | None = None
+    product_type: str | None = None
+    fail_on_error: bool = False
+
+
+class JobWaterMaskResponse(BaseModel):
+    job_id: str
+    zarr_uri: str
+    masked_zarr_uri: str | None = None
+    water_mask: dict[str, Any] = Field(default_factory=dict)
+    watermask_outputs: list[str] = Field(default_factory=list)
+    job: JobStatusResponse
+
+
 class JobListResponse(BaseModel):
     items: list[JobStatusResponse]
     total: int
@@ -213,6 +233,8 @@ class JobListResponse(BaseModel):
 
 class ArtifactType(str, Enum):
     zarr = "zarr"
+    zarr_masked = "zarr_masked"
+    watermask = "watermask"
 
 
 class ArtifactUpsertRequest(BaseModel):

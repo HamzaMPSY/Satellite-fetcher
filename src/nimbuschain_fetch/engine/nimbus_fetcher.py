@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import os
 import socket
 import time
@@ -33,6 +34,8 @@ from nimbuschain_fetch.models import (
     JobResultResponse,
     JobState,
     JobStatusResponse,
+    JobWaterMaskRequest,
+    JobWaterMaskResponse,
     PipelineState,
     ProviderName,
     SearchDownloadRequest,
@@ -41,6 +44,7 @@ from nimbuschain_fetch.providers import CopernicusProvider, UsgsProvider
 from nimbuschain_fetch.security.paths import sanitize_output_dir
 from nimbuschain_fetch.jobs.store_factory import create_job_store
 from nimbuschain_fetch.settings import Settings, get_settings
+from nimbuschain_mask_service.service import MaskService
 from nimbuschain_zarr_service.service import ZarrConversionService
 
 
@@ -89,6 +93,7 @@ class NimbusFetcher:
         self._worker_started_at = datetime.now(timezone.utc).isoformat()
         self._cancel_check_cache: dict[str, tuple[float, bool]] = {}
         self._zarr_converter: ZarrConversionService | None = None
+        self._mask_service: MaskService | None = None
         self._started = False
 
     async def start(self) -> None:
@@ -159,13 +164,165 @@ class NimbusFetcher:
         row = self.store.get_job(job_id)
         if not row:
             raise JobNotFoundError(job_id)
+        row = self._normalize_historical_job_row(row)
+        row = self._normalize_backend_paths_in_job_row(row)
         return self._to_status_response(row)
 
     def get_result(self, job_id: str) -> JobResultResponse:
-        row = self.store.get_result(job_id)
+        job_row = self.store.get_job(job_id)
+        if not job_row:
+            raise JobNotFoundError(job_id)
+        job_row = self._normalize_historical_job_row(job_row)
+        job_row = self._normalize_backend_paths_in_job_row(job_row)
+        result = self.store.get_result(job_id) or {}
+        if not result and not any(
+            [
+                list(job_row.get("raw_outputs") or []),
+                list(job_row.get("zarr_outputs") or []),
+                list(job_row.get("watermask_outputs") or []),
+            ]
+        ):
+            raise JobNotFoundError(job_id)
+
+        result = self._normalize_backend_paths_in_result_payload(result)
+        normalized_result = {
+            "job_id": job_id,
+            "paths": list(result.get("paths") or []),
+            "raw_outputs": list(result.get("raw_outputs") or job_row.get("raw_outputs") or []),
+            "zarr_outputs": list(result.get("zarr_outputs") or job_row.get("zarr_outputs") or []),
+            "watermask_outputs": list(result.get("watermask_outputs") or job_row.get("watermask_outputs") or []),
+            "checksums": dict(result.get("checksums") or {}),
+            "metadata": dict(result.get("metadata") or {}),
+            "manifest_entry": dict(result.get("manifest_entry") or {}),
+            "pipeline_metadata": dict(result.get("pipeline_metadata") or job_row.get("pipeline_metadata") or {}),
+            "conversion_metadata": dict(result.get("conversion_metadata") or job_row.get("conversion_metadata") or {}),
+        }
+        return JobResultResponse.model_validate(normalized_result)
+
+    def apply_watermask_existing_job(self, job_id: str, request: JobWaterMaskRequest) -> JobWaterMaskResponse:
+        row = self.store.get_job(job_id)
         if not row:
             raise JobNotFoundError(job_id)
-        return JobResultResponse.model_validate(row)
+        row = self._normalize_backend_paths_in_job_row(row)
+        state = str(row.get("state") or "")
+        if state in {JobState.queued.value, JobState.running.value, JobState.cancel_requested.value}:
+            raise ValueError("Water mask is only allowed when the job is not actively running.")
+
+        result = self._normalize_backend_paths_in_result_payload(self.store.get_result(job_id) or {})
+        available_zarr_uris = self._job_related_zarr_uris(job_id=job_id, row=row, result=result)
+        if not available_zarr_uris:
+            raise ValueError("No Zarr output is attached to this job. Run the Zarr conversion first.")
+
+        selected_zarr_uri = self._normalize_backend_path(str(request.zarr_uri or available_zarr_uris[0]).strip())
+        if selected_zarr_uri not in available_zarr_uris:
+            raise ValueError("The requested Zarr URI is not attached to this job lineage.")
+
+        zarr_context = self._resolve_zarr_context(
+            job_id=job_id,
+            row=row,
+            result=result,
+            zarr_uri=selected_zarr_uri,
+            scene_id_override=request.scene_id,
+            product_type_override=request.product_type,
+        )
+        self.store.append_event(
+            job_id,
+            "job.water_masking",
+            {
+                "zarr_uri": selected_zarr_uri,
+                "scene_id": zarr_context["scene_id"],
+                "provider": zarr_context["provider"],
+                "collection": zarr_context["collection"],
+                "product_type": zarr_context["product_type"],
+            },
+        )
+        water_mask = self._masker().apply_omniwater_to_zarr(
+            job_id=job_id,
+            zarr_uri=selected_zarr_uri,
+            provider=zarr_context["provider"],
+            collection=zarr_context["collection"],
+            product_type=zarr_context["product_type"],
+            scene_id=zarr_context["scene_id"],
+            acquisition_datetime=zarr_context["acquisition_datetime"],
+            dataset_summary=zarr_context["dataset_summary"],
+            fail_on_error=bool(request.fail_on_error),
+            stage_callback=None,
+        )
+        watermask_outputs = self._collect_watermask_outputs(result=result, water_mask=water_mask)
+        conversion_metadata = dict(result.get("conversion_metadata") or row.get("conversion_metadata") or {})
+        conversion_metadata["water_mask"] = water_mask
+        conversion_metadata["water_mask_source_zarr_uri"] = selected_zarr_uri
+        conversion_metadata["water_mask_output_zarr_uri"] = str(water_mask.get("output_zarr_uri") or "").strip()
+
+        pipeline_metadata = dict(result.get("pipeline_metadata") or row.get("pipeline_metadata") or {})
+        pipeline_metadata["water_mask_last_run_at"] = self._now_iso()
+        pipeline_metadata["water_mask_source_zarr_uri"] = selected_zarr_uri
+        pipeline_metadata["water_mask_output_zarr_uri"] = str(water_mask.get("output_zarr_uri") or "").strip()
+
+        updated_result = {
+            "job_id": job_id,
+            "paths": self._merge_paths(list(result.get("paths") or []), watermask_outputs),
+            "raw_outputs": list(result.get("raw_outputs") or row.get("raw_outputs") or []),
+            "zarr_outputs": list(result.get("zarr_outputs") or row.get("zarr_outputs") or []),
+            "watermask_outputs": watermask_outputs,
+            "checksums": dict(result.get("checksums") or {}),
+            "metadata": dict(result.get("metadata") or {}),
+            "manifest_entry": dict(result.get("manifest_entry") or {}),
+            "pipeline_metadata": pipeline_metadata,
+            "conversion_metadata": conversion_metadata,
+        }
+        self.store.set_result(job_id, updated_result)
+        self.store.update_job(
+            job_id,
+            pipeline_metadata=pipeline_metadata,
+            conversion_metadata=conversion_metadata,
+            raw_outputs=updated_result["raw_outputs"],
+            zarr_outputs=updated_result["zarr_outputs"],
+            watermask_outputs=watermask_outputs,
+        )
+        if water_mask.get("status") == "written":
+            self._register_masked_zarr_artifact(
+                job_id=job_id,
+                provider_name=zarr_context["provider"],
+                collection=zarr_context["collection"],
+                scene_id=zarr_context["scene_id"],
+                source_zarr_uri=selected_zarr_uri,
+                water_mask=water_mask,
+                dataset_summary=zarr_context["dataset_summary"],
+            )
+            self._register_watermask_artifact(
+                job_id=job_id,
+                provider_name=zarr_context["provider"],
+                collection=zarr_context["collection"],
+                scene_id=zarr_context["scene_id"],
+                zarr_uri=selected_zarr_uri,
+                water_mask=water_mask,
+            )
+            self.store.append_event(
+                job_id,
+                "job.water_mask_written",
+                {
+                    "zarr_uri": selected_zarr_uri,
+                    "water_mask": water_mask,
+                },
+            )
+        else:
+            self.store.append_event(
+                job_id,
+                "job.water_mask_failed",
+                {
+                    "zarr_uri": selected_zarr_uri,
+                    "water_mask": water_mask,
+                },
+            )
+        return JobWaterMaskResponse(
+            job_id=job_id,
+            zarr_uri=selected_zarr_uri,
+            masked_zarr_uri=str(water_mask.get("output_zarr_uri") or "").strip() or None,
+            water_mask=water_mask,
+            watermask_outputs=watermask_outputs,
+            job=self.get_job(job_id),
+        )
 
     async def cancel_job(self, job_id: str) -> bool:
         row = self.store.get_job(job_id)
@@ -223,15 +380,17 @@ class NimbusFetcher:
             )
         )
         return JobListResponse(
-            items=[self._to_status_response(row) for row in rows],
+            items=[self._to_status_response(self._normalize_backend_paths_in_job_row(self._normalize_historical_job_row(row))) for row in rows],
             total=total,
             page=max(1, page),
             page_size=max(1, page_size),
         )
 
     def upsert_artifact(self, request: ArtifactUpsertRequest) -> ArtifactRecord:
+        normalized_artifact_uri = self._normalize_backend_path(request.artifact_uri)
+        normalized_source_uri = self._normalize_backend_path(request.source_uri) if request.source_uri else None
         artifact_id = hashlib.md5(
-            request.artifact_uri.encode("utf-8"),
+            normalized_artifact_uri.encode("utf-8"),
             usedforsecurity=False,
         ).hexdigest()
         row = self.store.upsert_artifact(
@@ -240,8 +399,11 @@ class NimbusFetcher:
                 "artifact_id": artifact_id,
                 "artifact_type": request.artifact_type.value,
                 "provider": request.provider.value if request.provider else None,
+                "artifact_uri": normalized_artifact_uri,
+                "source_uri": normalized_source_uri,
             }
         )
+        row = self._normalize_backend_paths_in_artifact_row(row)
         return ArtifactRecord.model_validate(row)
 
     def list_artifacts(
@@ -273,7 +435,7 @@ class NimbusFetcher:
             )
         )
         return ArtifactListResponse(
-            items=[ArtifactRecord.model_validate(row) for row in rows],
+            items=[ArtifactRecord.model_validate(self._normalize_backend_paths_in_artifact_row(row)) for row in rows],
             total=total,
             page=max(1, page),
             page_size=max(1, page_size),
@@ -540,6 +702,83 @@ class NimbusFetcher:
         return str(self.settings.nimbus_data_dir / "zarr" / f"{safe_scene}.zarr")
 
     @staticmethod
+    def _merge_paths(existing: list[str], additions: list[str]) -> list[str]:
+        merged: list[str] = []
+        for value in [*existing, *additions]:
+            item = str(value).strip()
+            if item and item not in merged:
+                merged.append(item)
+        return merged
+
+    def _normalize_backend_path(self, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if not normalized:
+            return normalized
+        root = str(self.settings.nimbus_data_dir).rstrip("/")
+        legacy_prefixes = (
+            "/data/downloads/",
+            "/download/",
+            "/downloads/",
+            "/app/download/",
+            "/app/downloads/",
+            "/app/data/downloads/",
+        )
+        if normalized in {
+            "/data/downloads",
+            "/download",
+            "/downloads",
+            "/app/download",
+            "/app/downloads",
+            "/app/data/downloads",
+        }:
+            return root
+        for legacy_prefix in legacy_prefixes:
+            if normalized.startswith(legacy_prefix):
+                suffix = normalized[len(legacy_prefix):]
+                return f"{root}/{suffix}" if suffix else root
+        return normalized
+
+    def _normalize_backend_paths_payload(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: self._normalize_backend_paths_payload(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._normalize_backend_paths_payload(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._normalize_backend_paths_payload(item) for item in value]
+        return self._normalize_backend_path(value)
+
+    def _normalize_backend_paths_in_job_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        normalized["request"] = dict(self._normalize_backend_paths_payload(dict(row.get("request") or {})))
+        normalized["pipeline_metadata"] = dict(self._normalize_backend_paths_payload(dict(row.get("pipeline_metadata") or {})))
+        normalized["conversion_metadata"] = dict(self._normalize_backend_paths_payload(dict(row.get("conversion_metadata") or {})))
+        normalized["raw_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(row.get("raw_outputs") or []))))
+        normalized["zarr_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(row.get("zarr_outputs") or []))))
+        normalized["watermask_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(row.get("watermask_outputs") or []))))
+        return normalized
+
+    def _normalize_backend_paths_in_result_payload(self, result: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(result or {})
+        normalized["paths"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("paths") or []))))
+        normalized["raw_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("raw_outputs") or []))))
+        normalized["zarr_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("zarr_outputs") or []))))
+        normalized["watermask_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("watermask_outputs") or []))))
+        normalized["metadata"] = dict(self._normalize_backend_paths_payload(dict(normalized.get("metadata") or {})))
+        normalized["manifest_entry"] = dict(self._normalize_backend_paths_payload(dict(normalized.get("manifest_entry") or {})))
+        normalized["pipeline_metadata"] = dict(self._normalize_backend_paths_payload(dict(normalized.get("pipeline_metadata") or {})))
+        normalized["conversion_metadata"] = dict(self._normalize_backend_paths_payload(dict(normalized.get("conversion_metadata") or {})))
+        return normalized
+
+    def _normalize_backend_paths_in_artifact_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        normalized["artifact_uri"] = self._normalize_backend_path(row.get("artifact_uri"))
+        normalized["source_uri"] = self._normalize_backend_path(row.get("source_uri"))
+        normalized["metadata"] = dict(self._normalize_backend_paths_payload(dict(row.get("metadata") or {})))
+        return normalized
+
+    @staticmethod
     def _normalize_collection_for_zarr(provider_name: str, collection: str) -> str:
         return collection.strip().lower() if provider_name == "usgs" else collection.strip().upper()
 
@@ -584,6 +823,283 @@ class NimbusFetcher:
         )
         self.upsert_artifact(artifact_request)
 
+    def _register_watermask_artifact(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        collection: str,
+        scene_id: str,
+        zarr_uri: str,
+        water_mask: dict[str, Any],
+    ) -> None:
+        artifact_uri = str(water_mask.get("artifact_uri") or "").strip()
+        if not artifact_uri:
+            return
+        artifact_request = ArtifactUpsertRequest(
+            artifact_type=ArtifactType.watermask,
+            artifact_uri=artifact_uri,
+            provider=ProviderName(provider_name),
+            collection=collection,
+            scene_id=scene_id,
+            source_uri=zarr_uri,
+            created_by_job_id=job_id,
+            source_job_id=job_id,
+            data_family="mask",
+            dimensions=["time", "y", "x"],
+            shape=list(water_mask.get("shape") or []),
+            metadata={
+                "water_mask": water_mask,
+                "registered_via": "manual_watermask",
+            },
+        )
+        self.upsert_artifact(artifact_request)
+
+    def _register_masked_zarr_artifact(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        collection: str,
+        scene_id: str,
+        source_zarr_uri: str,
+        water_mask: dict[str, Any],
+        dataset_summary: dict[str, Any],
+    ) -> None:
+        artifact_uri = str(water_mask.get("output_zarr_uri") or "").strip()
+        if not artifact_uri:
+            return
+        artifact_request = ArtifactUpsertRequest(
+            artifact_type=ArtifactType.zarr_masked,
+            artifact_uri=artifact_uri,
+            provider=ProviderName(provider_name),
+            collection=collection,
+            scene_id=scene_id,
+            source_uri=source_zarr_uri,
+            created_by_job_id=job_id,
+            source_job_id=job_id,
+            data_family="optical",
+            band_names=list(dataset_summary.get("band_names") or []),
+            dimensions=list(dataset_summary.get("dimensions") or []),
+            shape=list(dataset_summary.get("shape") or []),
+            metadata={
+                "water_mask": water_mask,
+                "registered_via": "manual_watermask",
+                "source_zarr_uri": source_zarr_uri,
+            },
+        )
+        self.upsert_artifact(artifact_request)
+
+    def _masker(self) -> MaskService:
+        if self._mask_service is None:
+            self._mask_service = MaskService()
+        return self._mask_service
+
+    def _job_related_zarr_uris(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+        result: dict[str, Any],
+    ) -> list[str]:
+        related: list[str] = []
+        for value in list(result.get("zarr_outputs") or row.get("zarr_outputs") or []):
+            uri = str(value).strip()
+            if uri and uri not in related:
+                related.append(uri)
+        for artifact_type in (ArtifactType.zarr.value, ArtifactType.zarr_masked.value):
+            artifacts = self.list_artifacts(
+                artifact_type=artifact_type,
+                provider=None,
+                collection=None,
+                scene_id=None,
+                job_id=job_id,
+                uri_query=None,
+                date_from=None,
+                date_to=None,
+                page=1,
+                page_size=500,
+            )
+            for item in artifacts.items:
+                uri = str(item.artifact_uri).strip()
+                if uri and uri not in related:
+                    related.append(uri)
+        return related
+
+    def _resolve_zarr_context(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+        result: dict[str, Any],
+        zarr_uri: str,
+        scene_id_override: str | None,
+        product_type_override: str | None,
+    ) -> dict[str, Any]:
+        conversion_metadata = dict(result.get("conversion_metadata") or row.get("conversion_metadata") or {})
+        items = list(conversion_metadata.get("items") or [])
+        matching_item = next(
+            (
+                item
+                for item in items
+                if str((item or {}).get("zarr_uri") or "").strip() == zarr_uri
+            ),
+            None,
+        )
+        dataset_summary = dict((matching_item or {}).get("dataset_summary") or {})
+        summary = dict((matching_item or {}).get("summary") or {})
+        grid_summary = dict(summary.get("grid") or {})
+        if not dataset_summary.get("crs") and grid_summary.get("crs"):
+            dataset_summary["crs"] = grid_summary.get("crs")
+        if not dataset_summary.get("transform") and grid_summary.get("transform"):
+            dataset_summary["transform"] = list(grid_summary.get("transform") or [])
+        if not dataset_summary.get("dtype") and grid_summary.get("dtype"):
+            dataset_summary["dtype"] = str(grid_summary.get("dtype") or "")
+        if not dataset_summary.get("shape") and grid_summary.get("height") and grid_summary.get("width"):
+            band_names = list(dataset_summary.get("band_names") or summary.get("normalized_band_order") or [])
+            dataset_summary["shape"] = [1, len(band_names), int(grid_summary["height"]), int(grid_summary["width"])]
+        if not dataset_summary.get("band_names") and summary.get("normalized_band_order"):
+            dataset_summary["band_names"] = [str(item) for item in list(summary.get("normalized_band_order") or [])]
+        if not dataset_summary.get("ancillary_layer_names") and summary.get("ancillary_layer_names"):
+            dataset_summary["ancillary_layer_names"] = [
+                str(item) for item in list(summary.get("ancillary_layer_names") or [])
+            ]
+        if not dataset_summary:
+            dataset_summary = self._inspect_zarr_dataset(zarr_uri)
+        provider_name = self._provider_name(row.get("provider"))
+        collection = str(row.get("collection") or summary.get("collection") or "").strip()
+        scene_id = (
+            str(scene_id_override or "").strip()
+            or str((matching_item or {}).get("scene_id") or "").strip()
+            or str(summary.get("scene_id") or "").strip()
+            or self._scene_id_from_raw_uri(zarr_uri)
+        )
+        product_type = (
+            str(product_type_override or "").strip()
+            or str(row.get("product_type") or "").strip()
+            or str(summary.get("product_type") or "").strip()
+            or None
+        )
+        acquisition_datetime = (
+            str(dataset_summary.get("acquisition_datetime") or "").strip()
+            or str(summary.get("acquisition_datetime") or "").strip()
+            or None
+        )
+        if not collection:
+            raise ValueError("Unable to infer collection for the selected Zarr output.")
+        if not dataset_summary:
+            raise ValueError("Unable to infer dataset summary for the selected Zarr output.")
+        return {
+            "provider": provider_name,
+            "collection": collection,
+            "scene_id": scene_id,
+            "product_type": product_type,
+            "acquisition_datetime": acquisition_datetime,
+            "dataset_summary": dataset_summary,
+        }
+
+    def _inspect_zarr_dataset(self, zarr_uri: str) -> dict[str, Any]:
+        try:
+            import zarr
+        except Exception as exc:
+            raise ValueError(f"Unable to inspect existing Zarr output because zarr is unavailable ({exc}).") from exc
+
+        from nimbuschain_zarr_service.core import _open_existing_output_store
+
+        root = zarr.open_group(_open_existing_output_store(zarr_uri), mode="r")
+        imagery = root.get("imagery")
+        if imagery is None:
+            raise ValueError("The selected Zarr output does not contain an imagery array.")
+        band_names = list(root.attrs.get("band_names") or [])
+        if not band_names and "band" in root:
+            band_names = [str(item) for item in root["band"][:].tolist()]
+        acquisition_datetime = None
+        if "time" in root and len(root["time"]) > 0:
+            raw_time = root["time"][0]
+            acquisition_datetime = str(raw_time.item() if hasattr(raw_time, "item") else raw_time)
+        attrs = dict(root.attrs)
+        transform = list(attrs.get("transform") or [])
+        if len(transform) < 6 and "x" in root and "y" in root:
+            derived_transform = self._derive_transform_from_xy(
+                x_values=root["x"][:].tolist(),
+                y_values=root["y"][:].tolist(),
+            )
+            if derived_transform:
+                transform = derived_transform
+        crs = attrs.get("crs")
+        if not crs:
+            crs = self._infer_crs_from_scene_metadata(
+                scene_id=str(attrs.get("scene_id") or ""),
+                source_uri=str(attrs.get("source_uri") or zarr_uri),
+            )
+        return {
+            "dimensions": ["time", "band", "y", "x"],
+            "shape": list(imagery.shape),
+            "band_names": [str(item) for item in band_names],
+            "ancillary_layer_names": list(root.attrs.get("ancillary_layer_names") or []),
+            "acquisition_datetime": acquisition_datetime,
+            "crs": crs,
+            "transform": transform,
+            "dtype": str(attrs.get("dtype") or imagery.dtype),
+        }
+
+    @staticmethod
+    def _derive_transform_from_xy(*, x_values: list[Any], y_values: list[Any]) -> list[float]:
+        if len(x_values) < 2 or len(y_values) < 2:
+            return []
+        try:
+            x0 = float(x_values[0])
+            x1 = float(x_values[1])
+            y0 = float(y_values[0])
+            y1 = float(y_values[1])
+        except (TypeError, ValueError):
+            return []
+        x_res = x1 - x0
+        y_res = y1 - y0
+        if x_res == 0.0 or y_res == 0.0:
+            return []
+        # Coordinates are pixel centers. Affine transform expects top-left corner.
+        return [
+            x_res,
+            0.0,
+            x0 - (x_res / 2.0),
+            0.0,
+            y_res,
+            y0 - (y_res / 2.0),
+        ]
+
+    @staticmethod
+    def _infer_crs_from_scene_metadata(*, scene_id: str, source_uri: str) -> str | None:
+        text = f"{scene_id} {source_uri}"
+        match = re.search(r"T(?P<zone>\d{2})(?P<band>[A-Z]{3})", text)
+        if not match:
+            return None
+        zone = int(match.group("zone"))
+        latitude_band = match.group("band")[0]
+        epsg_base = 326 if latitude_band >= "N" else 327
+        return f"EPSG:{epsg_base}{zone:02d}"
+
+    @staticmethod
+    def _collect_watermask_outputs(
+        *,
+        result: dict[str, Any],
+        water_mask: dict[str, Any],
+    ) -> list[str]:
+        outputs: list[str] = []
+        for value in list(result.get("watermask_outputs") or []):
+            item = str(value).strip()
+            if item and item not in outputs:
+                outputs.append(item)
+        for key in ("artifact_uri", "status_path"):
+            item = str(water_mask.get(key) or "").strip()
+            if item and item not in outputs:
+                outputs.append(item)
+        derived_zarr_uri = str(water_mask.get("output_zarr_uri") or "").strip()
+        if derived_zarr_uri and derived_zarr_uri != str(water_mask.get("input_zarr_uri") or "").strip():
+            if derived_zarr_uri not in outputs:
+                outputs.append(derived_zarr_uri)
+        return outputs
+
     def _convert_raw_outputs(
         self,
         *,
@@ -593,6 +1109,8 @@ class NimbusFetcher:
         product_type: str | None,
         raw_outputs: list[str],
         is_cancelled: Callable[[], bool],
+        scene_id_override: str | None = None,
+        output_uri_override: str | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         if not raw_outputs:
             return [], {"status": "skipped", "reason": "no_raw_outputs"}
@@ -618,8 +1136,16 @@ class NimbusFetcher:
         for index, raw_uri in enumerate(raw_outputs, start=1):
             if is_cancelled():
                 raise JobCancelledError("Job cancellation requested.")
-            scene_id = self._scene_id_from_raw_uri(raw_uri)
-            output_uri = self._default_zarr_output_uri(scene_id)
+            scene_id = (
+                str(scene_id_override or "").strip()
+                if index == 1 and scene_id_override
+                else self._scene_id_from_raw_uri(raw_uri)
+            )
+            output_uri = (
+                str(output_uri_override or "").strip()
+                if index == 1 and output_uri_override
+                else self._default_zarr_output_uri(scene_id)
+            )
             per_item_progress = ((index - 1) / total) * 100.0
             self._update_pipeline(
                 job_id,
@@ -740,6 +1266,8 @@ class NimbusFetcher:
             product_type=product_type,
             raw_outputs=[selected_raw_uri],
             is_cancelled=lambda: self._is_job_cancel_requested(job_id),
+            scene_id_override=scene_id,
+            output_uri_override=output_uri,
         )
         pipeline_state = PipelineState.zarr_written
         pipeline_metadata = {
@@ -1302,6 +1830,59 @@ class NimbusFetcher:
             },
         )
 
+    def _normalize_historical_job_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        state = str(row.get("state") or "")
+        pipeline_state = str(row.get("pipeline_state") or PipelineState.queued.value)
+        if pipeline_state != PipelineState.queued.value:
+            return row
+
+        updates: dict[str, Any] = {}
+        progress = float(row.get("progress") or 0.0)
+        raw_outputs = list(row.get("raw_outputs") or [])
+        zarr_outputs = list(row.get("zarr_outputs") or [])
+        conversion_metadata = dict(row.get("conversion_metadata") or {})
+
+        if state == JobState.succeeded.value:
+            if zarr_outputs or conversion_metadata.get("status") == "written":
+                updates = {
+                    "pipeline_state": PipelineState.zarr_written.value,
+                    "pipeline_step": "zarr_written",
+                    "pipeline_progress": 100.0,
+                }
+            else:
+                updates = {
+                    "pipeline_state": PipelineState.downloaded.value,
+                    "pipeline_step": "downloaded",
+                    "pipeline_progress": 100.0,
+                }
+        elif state == JobState.failed.value:
+            if raw_outputs and conversion_metadata:
+                updates = {
+                    "pipeline_state": PipelineState.zarr_failed.value,
+                    "pipeline_step": "zarr_failed",
+                    "pipeline_progress": max(float(row.get("pipeline_progress") or 0.0), max(progress, 72.0)),
+                }
+            else:
+                updates = {
+                    "pipeline_state": PipelineState.failed.value,
+                    "pipeline_step": "failed",
+                    "pipeline_progress": max(float(row.get("pipeline_progress") or 0.0), progress),
+                }
+        elif state == JobState.cancelled.value:
+            updates = {
+                "pipeline_state": PipelineState.cancelled.value,
+                "pipeline_step": "cancelled",
+                "pipeline_progress": float(row.get("pipeline_progress") or progress),
+            }
+
+        if not updates:
+            return row
+
+        self.store.update_job(row["job_id"], preserve_updated_at=True, **updates)
+        normalized = dict(row)
+        normalized.update(updates)
+        return normalized
+
     def _to_status_response(self, row: dict[str, Any]) -> JobStatusResponse:
         started_at = self._parse_iso(row.get("started_at"))
         finished_at = self._parse_iso(row.get("finished_at"))
@@ -1324,6 +1905,7 @@ class NimbusFetcher:
             conversion_metadata=dict(row.get("conversion_metadata") or {}),
             raw_outputs=list(row.get("raw_outputs") or []),
             zarr_outputs=list(row.get("zarr_outputs") or []),
+            watermask_outputs=list(row.get("watermask_outputs") or []),
             progress=float(row["progress"]),
             bytes_downloaded=int(row["bytes_downloaded"]),
             bytes_total=int(row["bytes_total"]),

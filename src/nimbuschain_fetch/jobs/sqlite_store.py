@@ -44,6 +44,7 @@ class SQLiteJobStore:
                     conversion_metadata_json TEXT NOT NULL DEFAULT '{}',
                     raw_outputs_json TEXT NOT NULL DEFAULT '[]',
                     zarr_outputs_json TEXT NOT NULL DEFAULT '[]',
+                    watermask_outputs_json TEXT NOT NULL DEFAULT '[]',
                     progress REAL NOT NULL,
                     bytes_downloaded INTEGER NOT NULL,
                     bytes_total INTEGER NOT NULL,
@@ -152,6 +153,7 @@ class SQLiteJobStore:
             self._ensure_column("jobs", "conversion_metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("jobs", "raw_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column("jobs", "zarr_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column("jobs", "watermask_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
             self._conn.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
@@ -187,6 +189,7 @@ class SQLiteJobStore:
             "conversion_metadata": json.loads(row["conversion_metadata_json"]) if "conversion_metadata_json" in row.keys() and row["conversion_metadata_json"] else {},
             "raw_outputs": json.loads(row["raw_outputs_json"]) if "raw_outputs_json" in row.keys() and row["raw_outputs_json"] else [],
             "zarr_outputs": json.loads(row["zarr_outputs_json"]) if "zarr_outputs_json" in row.keys() and row["zarr_outputs_json"] else [],
+            "watermask_outputs": json.loads(row["watermask_outputs_json"]) if "watermask_outputs_json" in row.keys() and row["watermask_outputs_json"] else [],
             "progress": float(row["progress"]),
             "bytes_downloaded": int(row["bytes_downloaded"]),
             "bytes_total": int(row["bytes_total"]),
@@ -216,10 +219,10 @@ class SQLiteJobStore:
                 INSERT INTO jobs(
                     job_id, job_type, provider, collection, product_type, tile_id, request_json, state,
                     pipeline_state, pipeline_step, pipeline_progress, pipeline_metadata_json,
-                    conversion_metadata_json, raw_outputs_json, zarr_outputs_json,
+                    conversion_metadata_json, raw_outputs_json, zarr_outputs_json, watermask_outputs_json,
                     progress, bytes_downloaded, bytes_total, retry_count, last_retry_at, started_at, finished_at,
                     errors_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -235,6 +238,7 @@ class SQLiteJobStore:
                     0.0,
                     "{}",
                     "{}",
+                    "[]",
                     "[]",
                     "[]",
                     0.0,
@@ -264,6 +268,7 @@ class SQLiteJobStore:
         if not fields:
             return
 
+        preserve_updated_at = bool(fields.pop("preserve_updated_at", False))
         normalized: dict[str, Any] = {}
         for key, value in fields.items():
             if key == "errors":
@@ -272,12 +277,13 @@ class SQLiteJobStore:
                 normalized["request_json"] = json.dumps(value)
             elif key in {"pipeline_metadata", "conversion_metadata"}:
                 normalized[f"{key}_json"] = json.dumps(value or {})
-            elif key in {"raw_outputs", "zarr_outputs"}:
+            elif key in {"raw_outputs", "zarr_outputs", "watermask_outputs"}:
                 normalized[f"{key}_json"] = json.dumps(list(value or []))
             else:
                 normalized[key] = value
 
-        normalized["updated_at"] = self._utc_now()
+        if not preserve_updated_at:
+            normalized["updated_at"] = self._utc_now()
         assignments = ", ".join(f"{key} = ?" for key in normalized)
         params = list(normalized.values()) + [job_id]
 
@@ -594,7 +600,11 @@ class SQLiteJobStore:
                 self._conn.execute(
                     """
                     UPDATE jobs
-                    SET state = 'queued', updated_at = ?
+                    SET state = 'queued',
+                        pipeline_step = 'resume_after_restart',
+                        worker_id = NULL,
+                        errors_json = '[]',
+                        updated_at = ?
                     WHERE state IN ('running', 'cancel_requested')
                     """,
                     (now,),
@@ -621,7 +631,8 @@ class SQLiteJobStore:
                 SET state = 'running',
                     started_at = COALESCE(started_at, ?),
                     updated_at = ?,
-                    worker_id = ?
+                    worker_id = ?,
+                    errors_json = '[]'
                 WHERE job_id = ? AND state = 'queued'
                 """,
                 (now, now, worker_id, job_id),
@@ -654,7 +665,11 @@ class SQLiteJobStore:
             self._conn.execute(
                 """
                 UPDATE jobs
-                SET state = 'queued', updated_at = ?
+                SET state = 'queued',
+                    pipeline_step = 'resume_after_restart',
+                    worker_id = NULL,
+                    errors_json = '[]',
+                    updated_at = ?
                 WHERE state IN ('running', 'cancel_requested')
                   AND updated_at < ?
                 """,

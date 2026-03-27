@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -90,6 +90,34 @@ class Settings(BaseSettings):
     )
     nimbus_usgs_username: str | None = Field(default=None, alias="NIMBUS_USGS_USERNAME")
     nimbus_usgs_token: str | None = Field(default=None, alias="NIMBUS_USGS_TOKEN")
+
+    @field_validator(
+        "nimbus_copernicus_base_url",
+        "nimbus_copernicus_token_url",
+        "nimbus_copernicus_download_url",
+        "nimbus_usgs_service_url",
+        mode="before",
+    )
+    @classmethod
+    def _strip_required_strings(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return str(value).strip()
+
+    @field_validator(
+        "nimbus_api_key",
+        "nimbus_copernicus_username",
+        "nimbus_copernicus_password",
+        "nimbus_usgs_username",
+        "nimbus_usgs_token",
+        mode="before",
+    )
+    @classmethod
+    def _strip_optional_strings(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        cleaned = str(value).strip()
+        return cleaned or None
 
     @property
     def cors_origins(self) -> list[str]:

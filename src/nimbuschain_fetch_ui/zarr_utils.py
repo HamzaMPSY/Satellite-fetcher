@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 import requests
 from requests.adapters import HTTPAdapter
 
-from nimbuschain_fetch_ui.constants import DOWNLOADS_DIR, ZARR_STORES_DIR
+from nimbuschain_fetch_ui.constants import DOWNLOADS_DIR, PROJECT_ROOT, ZARR_STORES_DIR
 from nimbuschain_fetch_ui.jobs_helpers import _api_request
 
 
@@ -20,10 +20,77 @@ def _is_remote_uri(path_value: str | Path) -> bool:
 
 def _container_to_host_path(path_value: str) -> Path:
     value = str(path_value or "").strip()
+    if value.startswith("/app/data/downloads/"):
+        suffix = Path(value).relative_to("/app/data/downloads")
+        return PROJECT_ROOT / "data" / "downloads" / suffix
+    if value == "/app/data/downloads":
+        return PROJECT_ROOT / "data" / "downloads"
+    if value.startswith("/app/data/"):
+        suffix = Path(value).relative_to("/app/data")
+        return PROJECT_ROOT / "data" / suffix
+    if value == "/app/data":
+        return PROJECT_ROOT / "data"
+    if value.startswith("/data/downloads/"):
+        suffix = Path(value).relative_to("/data/downloads")
+        return PROJECT_ROOT / "data" / "downloads" / suffix
+    if value == "/data/downloads":
+        return PROJECT_ROOT / "data" / "downloads"
     if value.startswith("/data/"):
-        return Path(".") / value.lstrip("/")
+        return PROJECT_ROOT / value.lstrip("/")
     if value == "/data":
-        return Path("./data")
+        return PROJECT_ROOT / "data"
+    if value.startswith("/app/download/"):
+        suffix = Path(value).relative_to("/app/download")
+        primary = PROJECT_ROOT / "data" / "downloads" / suffix
+        fallback = PROJECT_ROOT / "download" / suffix
+        if primary.exists() or not fallback.exists():
+            return primary
+        return fallback
+    if value == "/app/download":
+        primary = PROJECT_ROOT / "data" / "downloads"
+        fallback = PROJECT_ROOT / "download"
+        if primary.exists() or not fallback.exists():
+            return primary
+        return fallback
+    if value.startswith("/app/downloads/"):
+        suffix = Path(value).relative_to("/app/downloads")
+        primary = PROJECT_ROOT / "data" / "downloads" / suffix
+        fallback = PROJECT_ROOT / "downloads" / suffix
+        if primary.exists() or not fallback.exists():
+            return primary
+        return fallback
+    if value == "/app/downloads":
+        primary = PROJECT_ROOT / "data" / "downloads"
+        fallback = PROJECT_ROOT / "downloads"
+        if primary.exists() or not fallback.exists():
+            return primary
+        return fallback
+    if value.startswith("/download/"):
+        suffix = Path(value).relative_to("/download")
+        primary = PROJECT_ROOT / "data" / "downloads" / suffix
+        fallback = PROJECT_ROOT / "download" / suffix
+        if primary.exists() or not fallback.exists():
+            return primary
+        return fallback
+    if value == "/download":
+        primary = PROJECT_ROOT / "data" / "downloads"
+        fallback = PROJECT_ROOT / "download"
+        if primary.exists() or not fallback.exists():
+            return primary
+        return fallback
+    if value.startswith("/downloads/"):
+        suffix = Path(value).relative_to("/downloads")
+        primary = PROJECT_ROOT / "data" / "downloads" / suffix
+        fallback = PROJECT_ROOT / "downloads" / suffix
+        if primary.exists() or not fallback.exists():
+            return primary
+        return fallback
+    if value == "/downloads":
+        primary = PROJECT_ROOT / "data" / "downloads"
+        fallback = PROJECT_ROOT / "downloads"
+        if primary.exists() or not fallback.exists():
+            return primary
+        return fallback
     return Path(value)
 
 
@@ -45,7 +112,27 @@ def _candidate_runtime_path(path_value: str | Path) -> tuple[str, Optional[Path]
         return "", None
     if _is_remote_uri(raw_value):
         return raw_value, None
+    if raw_value.startswith("/app/data/") or raw_value == "/app/data":
+        host_hint = _container_to_host_path(raw_value)
+        if raw_value.startswith("/app/data/downloads/") or raw_value == "/app/data/downloads":
+            suffix = host_hint.relative_to(PROJECT_ROOT / "data" / "downloads")
+            return str(Path("/data/downloads") / suffix), host_hint
+        return raw_value, host_hint
     if raw_value.startswith("/data/") or raw_value == "/data":
+        host_hint = _container_to_host_path(raw_value)
+        return raw_value, host_hint
+    if raw_value.startswith("/app/download/") or raw_value == "/app/download":
+        host_hint = _container_to_host_path(raw_value)
+        suffix = host_hint.relative_to(PROJECT_ROOT / "data" / "downloads")
+        return str(Path("/data/downloads") / suffix), host_hint
+    if raw_value.startswith("/app/downloads/") or raw_value == "/app/downloads":
+        host_hint = _container_to_host_path(raw_value)
+        suffix = host_hint.relative_to(PROJECT_ROOT / "data" / "downloads")
+        return str(Path("/data/downloads") / suffix), host_hint
+    if raw_value.startswith("/download/") or raw_value == "/download":
+        host_hint = _container_to_host_path(raw_value)
+        return raw_value, host_hint
+    if raw_value.startswith("/downloads/") or raw_value == "/downloads":
         host_hint = _container_to_host_path(raw_value)
         return raw_value, host_hint
     host_path = Path(raw_value)
@@ -56,7 +143,7 @@ def _path_exists_in_runtime(path_value: str | Path) -> bool:
     if _is_remote_uri(path_value):
         return True
     runtime_value, host_path = _candidate_runtime_path(path_value)
-    if runtime_value.startswith("/data/"):
+    if runtime_value.startswith("/data/") or runtime_value.startswith("/download/") or runtime_value.startswith("/downloads/"):
         host_hint = _container_to_host_path(runtime_value)
         if host_hint.exists():
             return True
@@ -189,7 +276,21 @@ def container_to_host_path_hint(path_value: str) -> str:
         return ""
     if _is_remote_uri(path_value):
         return ""
-    if path_value.startswith("/data/") or path_value == "/data":
+    if (
+        path_value.startswith("/app/data/")
+        or path_value == "/app/data"
+        or path_value.startswith("/app/download/")
+        or path_value == "/app/download"
+        or path_value.startswith("/app/downloads/")
+        or path_value == "/app/downloads"
+        or
+        path_value.startswith("/data/")
+        or path_value == "/data"
+        or path_value.startswith("/download/")
+        or path_value == "/download"
+        or path_value.startswith("/downloads/")
+        or path_value == "/downloads"
+    ):
         return str(_container_to_host_path(path_value))
     return ""
 
@@ -266,7 +367,11 @@ def _path_size_bytes(path_value: str) -> Optional[int]:
         return None
     if _is_remote_uri(path_value):
         return None
-    path = _container_to_host_path(path_value) if str(path_value).startswith("/data/") else Path(path_value)
+    normalized = str(path_value)
+    if normalized.startswith(("/data/", "/download/", "/downloads/")):
+        path = _container_to_host_path(path_value)
+    else:
+        path = Path(path_value)
     if not path.exists():
         return None
     try:

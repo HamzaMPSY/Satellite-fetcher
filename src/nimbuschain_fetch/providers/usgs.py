@@ -52,6 +52,7 @@ class UsgsProvider(ProviderBase):
         self.api_key: str | None = None
         self.dataset: str | None = None
         self.scene_names: dict[str, str] = {}
+        self.permissions: set[str] = set()
 
         if not self.username or not self.token:
             raise ValueError("USGS credentials are missing in environment variables.")
@@ -61,7 +62,41 @@ class UsgsProvider(ProviderBase):
     def get_access_token(self) -> str:
         payload = {"username": self.username, "token": self.token}
         self.api_key = self._send_request("login-token", payload)
+        try:
+            self.permissions = self._fetch_permissions()
+        except Exception:
+            # Permissions are only used for better diagnostics; do not block login on this.
+            self.permissions = set()
         return self.api_key
+
+    def _fetch_permissions(self) -> set[str]:
+        payload = self._send_request("permissions", {})
+        if isinstance(payload, list):
+            return {str(item).strip().lower() for item in payload if str(item).strip()}
+        if isinstance(payload, dict):
+            items = payload.get("permissions") or payload.get("data") or payload.get("results") or []
+            if isinstance(items, list):
+                return {str(item).strip().lower() for item in items if str(item).strip()}
+        return set()
+
+    def _permission_hint(self) -> str | None:
+        if not self.permissions:
+            return None
+        if self._has_download_permission():
+            return None
+        return (
+            "USGS account is authenticated but lacks MACHINE download access. "
+            "Request MACHINE access on https://ers.cr.usgs.gov/profile/access and wait for approval. "
+            f"Current permissions: {sorted(self.permissions)}"
+        )
+
+    def _has_download_permission(self) -> bool:
+        perms = {str(item).strip().lower() for item in (self.permissions or set()) if str(item).strip()}
+        if not perms:
+            return False
+        if "download" in perms or "order" in perms:
+            return True
+        return any("download" in item or "order" in item or "machine" in item for item in perms)
 
     def _send_request(self, endpoint: str, data: dict[str, Any]) -> Any:
         url = f"{self.service_url}{endpoint}"
@@ -81,6 +116,12 @@ class UsgsProvider(ProviderBase):
                 time.sleep(min(8.0, 1.5 * attempt))
                 continue
 
+            if response.status_code in {401, 403} and endpoint != "login-token" and attempt < max_attempts:
+                # USGS can return an HTML 401/403 page when the token is stale or rejected by a protected endpoint.
+                self.get_access_token()
+                time.sleep(0.5)
+                continue
+
             if response.status_code in {429, 500, 502, 503, 504}:
                 if attempt < max_attempts:
                     time.sleep(min(10.0, 2.0 * attempt))
@@ -95,8 +136,13 @@ class UsgsProvider(ProviderBase):
                 response.raise_for_status()
             except requests.HTTPError as exc:
                 body = (response.text or "").strip()[:500]
+                permission_hint = ""
+                if response.status_code == 403 and endpoint in {"download-options", "download-request"}:
+                    hint = self._permission_hint()
+                    if hint:
+                        permission_hint = f" Hint: {hint}"
                 raise RuntimeError(
-                    f"USGS HTTP {response.status_code} on {endpoint}. Response: {body}"
+                    f"USGS HTTP {response.status_code} on {endpoint}. Response: {body}{permission_hint}"
                 ) from exc
 
             payload = response.json()
@@ -167,8 +213,11 @@ class UsgsProvider(ProviderBase):
             return []
         if not self.dataset:
             raise RuntimeError("USGS dataset is not set. Call search_products first.")
+        permission_hint = self._permission_hint()
+        if permission_hint:
+            raise RuntimeError(permission_hint)
 
-        options_payload = {"datasetName": self.dataset, "entityIds": ",".join(product_ids)}
+        options_payload = {"datasetName": self.dataset, "entityIds": list(product_ids)}
         options = self._send_request("download-options", options_payload)
 
         downloads: list[dict[str, Any]] = []

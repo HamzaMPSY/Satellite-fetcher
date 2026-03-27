@@ -25,6 +25,7 @@ from nimbuschain_fetch_ui.jobs_helpers import (
     _list_jobs,
     _recent_jobs_cutoff,
 )
+from nimbuschain_fetch_ui.zarr_utils import list_artifacts as _list_artifacts
 
 
 def _fmt_mb(value: Any) -> float:
@@ -143,7 +144,38 @@ def _render_outputs_block(title: str, outputs: list[str], empty_message: str) ->
                 st.code(str(item), language="text")
 
 
-def _render_pipeline_result_section(api_url: str, api_key: str, rows: list[dict[str, Any]]) -> None:
+def _render_masked_zarr_relations(masked_artifacts: list[dict[str, Any]]) -> None:
+    relation_rows: list[dict[str, str]] = []
+    for item in masked_artifacts:
+        masked_uri = str(item.get("artifact_uri") or "").strip()
+        source_uri = str(item.get("source_uri") or "").strip()
+        metadata = dict(item.get("metadata") or {})
+        if not source_uri:
+            source_uri = str(metadata.get("source_zarr_uri") or "").strip()
+        if not masked_uri:
+            continue
+        relation_rows.append(
+            {
+                "source_zarr": source_uri or "-",
+                "masked_zarr": masked_uri,
+            }
+        )
+    if not relation_rows:
+        st.caption("No source to masked Zarr lineage is recorded for this job.")
+        return
+    with st.container(border=True):
+        st.markdown("**Masked Zarr lineage**")
+        st.caption("Source Zarr -> derived masked Zarr")
+        st.dataframe(relation_rows, width="stretch", hide_index=True)
+
+
+def _render_pipeline_result_section(
+    api_url: str,
+    api_key: str,
+    rows: list[dict[str, Any]],
+    *,
+    artifact_type_filter: str | None = None,
+) -> None:
     st.markdown("---")
     st.markdown("**Pipeline outputs**")
     selected_job_id = st.selectbox(
@@ -167,10 +199,29 @@ def _render_pipeline_result_section(api_url: str, api_key: str, rows: list[dict[
 
     raw_outputs = list(result_payload.get("raw_outputs") or selected_row.get("raw_outputs") or [])
     zarr_outputs = list(result_payload.get("zarr_outputs") or selected_row.get("zarr_outputs") or [])
+    watermask_outputs = list(result_payload.get("watermask_outputs") or selected_row.get("watermask_outputs") or [])
     pipeline_metadata = dict(result_payload.get("pipeline_metadata") or selected_row.get("pipeline_metadata") or {})
     conversion_metadata = dict(result_payload.get("conversion_metadata") or selected_row.get("conversion_metadata") or {})
+    masked_artifacts, _masked_total = _list_artifacts(
+        api_url,
+        api_key,
+        artifact_type="zarr_masked",
+        job_id=selected_job_id,
+        page=1,
+        page_size=100,
+    )
+    masked_zarr_outputs = [str(item.get("artifact_uri") or "").strip() for item in masked_artifacts if str(item.get("artifact_uri") or "").strip()]
+    mask_aux_outputs = [
+        str(item) for item in watermask_outputs
+        if str(item).strip() and str(item).strip() not in masked_zarr_outputs
+    ]
 
-    top1, top2, top3, top4 = st.columns(4)
+    visible_raw_outputs = raw_outputs if artifact_type_filter in {None, "", "raw"} else []
+    visible_zarr_outputs = zarr_outputs if artifact_type_filter in {None, "", "zarr"} else []
+    visible_masked_zarr_outputs = masked_zarr_outputs if artifact_type_filter in {None, "", "zarr_masked"} else []
+    visible_mask_aux_outputs = mask_aux_outputs if artifact_type_filter in {None, "", "watermask"} else []
+
+    top1, top2, top3, top4, top5 = st.columns(5)
     with top1:
         st.metric("State", str(selected_row.get("state") or "-"))
     with top2:
@@ -179,6 +230,8 @@ def _render_pipeline_result_section(api_url: str, api_key: str, rows: list[dict[
         st.metric("Raw outputs", len(raw_outputs))
     with top4:
         st.metric("Zarr outputs", len(zarr_outputs))
+    with top5:
+        st.metric("Masked Zarr", len(masked_zarr_outputs))
 
     meta1, meta2, meta3 = st.columns(3)
     with meta1:
@@ -200,11 +253,19 @@ def _render_pipeline_result_section(api_url: str, api_key: str, rows: list[dict[
         )
         st.caption(f"Scene: `{scene_hint}`")
 
-    out1, out2 = st.columns(2)
+    out1, out2, out3 = st.columns(3)
     with out1:
-        _render_outputs_block("Raw outputs", raw_outputs, "No raw outputs were persisted for this job.")
+        _render_outputs_block("Raw outputs", visible_raw_outputs, "No raw outputs match the selected artifact filter for this job.")
     with out2:
-        _render_outputs_block("Zarr outputs", zarr_outputs, "No Zarr outputs were written for this job.")
+        _render_outputs_block("Zarr outputs", visible_zarr_outputs, "No Zarr outputs match the selected artifact filter for this job.")
+    with out3:
+        _render_outputs_block("Masked Zarr outputs", visible_masked_zarr_outputs, "No derived masked Zarr outputs match the selected artifact filter for this job.")
+
+    if artifact_type_filter in {None, "", "zarr_masked"}:
+        _render_masked_zarr_relations(masked_artifacts)
+
+    if mask_aux_outputs or artifact_type_filter == "watermask":
+        _render_outputs_block("Mask artifacts", visible_mask_aux_outputs, "No separate mask artifacts match the selected artifact filter for this job.")
 
     if pipeline_metadata or conversion_metadata:
         with st.expander("Pipeline metadata", expanded=False):
@@ -316,7 +377,7 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
         unsafe_allow_html=True,
     )
 
-    filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 1.4])
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1, 1, 1, 1.2])
     with filter_col1:
         state_filter = st.selectbox(
             "State",
@@ -326,6 +387,12 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
     with filter_col2:
         provider_filter = st.selectbox("Provider", ["", "copernicus", "usgs"], index=0)
     with filter_col3:
+        artifact_type_filter = st.selectbox(
+            "Artifact type",
+            ["", "raw", "zarr", "zarr_masked", "watermask"],
+            index=0,
+        )
+    with filter_col4:
         result_job_query = st.text_input("Job search", value="", placeholder="job id fragment")
 
     jobs_rows, jobs_total = _list_jobs(
@@ -360,7 +427,12 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
     if jobs_rows:
         _render_job_summary_cards(jobs_rows)
         _render_jobs_table(jobs_rows)
-        _render_pipeline_result_section(api_url, api_key, jobs_rows)
+        _render_pipeline_result_section(
+            api_url,
+            api_key,
+            jobs_rows,
+            artifact_type_filter=artifact_type_filter or None,
+        )
         _render_job_details(jobs_rows)
     else:
         st.info("No jobs for selected filters.")

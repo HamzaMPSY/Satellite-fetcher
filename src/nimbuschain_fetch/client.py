@@ -18,10 +18,13 @@ from nimbuschain_fetch.models import (
     BatchJobCreateRequest,
     BatchJobCreatedResponse,
     JobCreateRequest,
+    JobConvertRequest,
     JobEvent,
     JobListResponse,
     JobResultResponse,
     JobStatusResponse,
+    JobWaterMaskRequest,
+    JobWaterMaskResponse,
 )
 from nimbuschain_fetch.settings import get_settings
 
@@ -145,6 +148,36 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
         response.raise_for_status()
         return JobResultResponse.model_validate(response.json())
 
+    def convert_job_output(self, job_id: str, request: JobConvertRequest | dict[str, Any]) -> JobStatusResponse:
+        payload = JobConvertRequest.model_validate(request)
+        if self.mode == "direct":
+            assert self._portal and self._fetcher
+            return self._portal.call(self._fetcher.convert_existing_job, job_id, payload)
+
+        assert self._session is not None
+        response = self._session.post(
+            f"{self.service_url}/v1/jobs/{job_id}/convert",
+            json=payload.model_dump(mode="json"),
+            timeout=60,
+        )
+        response.raise_for_status()
+        return JobStatusResponse.model_validate(response.json())
+
+    def apply_watermask(self, job_id: str, request: JobWaterMaskRequest | dict[str, Any]) -> JobWaterMaskResponse:
+        payload = JobWaterMaskRequest.model_validate(request)
+        if self.mode == "direct":
+            assert self._portal and self._fetcher
+            return self._portal.call(self._fetcher.apply_watermask_existing_job, job_id, payload)
+
+        assert self._session is not None
+        response = self._session.post(
+            f"{self.service_url}/v1/jobs/{job_id}/water-mask",
+            json=payload.model_dump(mode="json"),
+            timeout=60,
+        )
+        response.raise_for_status()
+        return JobWaterMaskResponse.model_validate(response.json())
+
     def list_jobs(
         self,
         *,
@@ -170,21 +203,22 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
             parsed_from = datetime.fromisoformat(date_from) if date_from else None
             parsed_to = datetime.fromisoformat(date_to) if date_to else None
             return self._portal.call(
-                self._fetcher.list_jobs,
-                state=state,
-                states=tuple(item.strip() for item in (state_in or "").split(",") if item.strip()),
-                provider=provider,
-                collection=collection,
-                product_type=product_type,
-                job_id_query=job_id_query,
-                date_from=parsed_from,
-                date_to=parsed_to,
-                updated_from=datetime.fromisoformat(updated_from) if updated_from else None,
-                updated_to=datetime.fromisoformat(updated_to) if updated_to else None,
-                sort_by=sort_by,
-                sort_desc=sort_desc,
-                page=page,
-                page_size=page_size,
+                lambda: self._fetcher.list_jobs(
+                    state=state,
+                    states=tuple(item.strip() for item in (state_in or "").split(",") if item.strip()),
+                    provider=provider,
+                    collection=collection,
+                    product_type=product_type,
+                    job_id_query=job_id_query,
+                    date_from=parsed_from,
+                    date_to=parsed_to,
+                    updated_from=datetime.fromisoformat(updated_from) if updated_from else None,
+                    updated_to=datetime.fromisoformat(updated_to) if updated_to else None,
+                    sort_by=sort_by,
+                    sort_desc=sort_desc,
+                    page=page,
+                    page_size=page_size,
+                )
             )
 
         assert self._session is not None
@@ -242,17 +276,18 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
         if self.mode == "direct":
             assert self._portal and self._fetcher
             return self._portal.call(
-                self._fetcher.list_artifacts,
-                artifact_type=artifact_type,
-                provider=provider,
-                collection=collection,
-                scene_id=scene_id,
-                job_id=job_id,
-                uri_query=uri_query,
-                date_from=None,
-                date_to=None,
-                page=page,
-                page_size=page_size,
+                lambda: self._fetcher.list_artifacts(
+                    artifact_type=artifact_type,
+                    provider=provider,
+                    collection=collection,
+                    scene_id=scene_id,
+                    job_id=job_id,
+                    uri_query=uri_query,
+                    date_from=None,
+                    date_to=None,
+                    page=page,
+                    page_size=page_size,
+                )
             )
 
         assert self._session is not None

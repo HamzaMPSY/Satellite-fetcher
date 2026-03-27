@@ -4,6 +4,7 @@ import re
 import sys
 import math
 import json
+import html
 import time
 import tempfile
 import subprocess
@@ -12,6 +13,7 @@ import datetime as dt
 import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
+from urllib.parse import quote
 
 # Ensure repo src/ is on sys.path before importing package modules (helps when PYTHONPATH is missing)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22,6 +24,7 @@ if str(SRC_DIR) not in sys.path:
 import geopandas as gpd
 import shapely
 import streamlit as st
+import streamlit.components.v1 as components
 from dataclasses import dataclass
 from shapely.geometry import Polygon, box
 
@@ -197,6 +200,8 @@ logger.info("=" * 60)
 
 @st.cache_data(show_spinner="Previewing products for this AOI…", ttl=180)
 def preview_products_cached(
+    api_url: str,
+    api_key: str,
     provider: str,
     collection: str,
     product_type: str,
@@ -206,6 +211,46 @@ def preview_products_cached(
     max_items: int = 50,
     tile_ids: List[str] | None = None,
 ) -> Dict[str, Any]:
+    payload = {
+        "provider": provider,
+        "collection": collection,
+        "product_type": product_type,
+        "start_date": start_date,
+        "end_date": end_date,
+        "aoi_wkt": aoi_wkt,
+        "max_items": max_items,
+        "tile_ids": tile_ids or [],
+    }
+    try:
+        response = _api_request(
+            "POST",
+            api_url,
+            "/v1/preview",
+            api_key=api_key,
+            payload=payload,
+            timeout=90,
+        )
+        if response.ok:
+            body = response.json()
+            if isinstance(body, dict):
+                return {
+                    "items": list(body.get("items", [])),
+                    "total": int(body.get("total", 0) or 0),
+                    "error": str(body.get("error", "") or ""),
+                    "error_kind": str(body.get("error_kind", "") or ""),
+                    "error_detail": str(body.get("error_detail", "") or ""),
+                }
+        else:
+            return {
+                "items": [],
+                "total": 0,
+                "error": f"Preview service failed: {_response_error_message(response)}",
+                "error_kind": "technical",
+                "error_detail": f"Preview service failed: {_response_error_message(response)}",
+            }
+    except Exception:
+        pass
+
     return preview_products_local(
         provider=provider,
         collection=collection,
@@ -435,6 +480,11 @@ def init_state():
         "zarr_artifact_query": "",
         "zarr_artifact_provider": "",
         "zarr_artifact_collection": "",
+        "watermask_selected_store": "",
+        "watermask_artifact_query": "",
+        "watermask_artifact_provider": "",
+        "watermask_artifact_collection": "",
+        "show_legacy_watermask_zarr": False,
         "zarr_chunk_time": 1,
         "zarr_chunk_y": 512,
         "zarr_chunk_x": 512,
@@ -451,6 +501,8 @@ def init_state():
         "preview_items": [],
         "preview_total": 0,
         "preview_error": "",
+        "preview_error_kind": "",
+        "preview_error_detail": "",
         "preview_fetched": False,
         "fly_to": None,
         "use_file_browser_component": False,
@@ -608,6 +660,220 @@ def _find_pipeline_job_for_raw_uri(api_url: str, api_key: str, raw_uri: str) -> 
         if target_candidates & result_candidates:
             return job_id
     return None
+
+
+def _zarr_uri_candidates(zarr_uri: str) -> set[str]:
+    normalized = str(zarr_uri or "").strip()
+    candidates = {normalized}
+    host_hint = _container_to_host_path_hint(normalized)
+    if host_hint:
+        candidates.add(str(host_hint).strip())
+    basename = Path(normalized).name if normalized else ""
+    if basename:
+        candidates.add(basename)
+    return {item for item in candidates if item}
+
+
+def _find_pipeline_job_for_zarr_uri(
+    api_url: str,
+    api_key: str,
+    zarr_uri: str,
+    *,
+    artifacts: list[dict[str, Any]] | None = None,
+) -> str | None:
+    target_candidates = _zarr_uri_candidates(zarr_uri)
+    if not target_candidates:
+        return None
+
+    for item in artifacts or []:
+        artifact_uri = str(item.get("artifact_uri") or "").strip()
+        if artifact_uri and target_candidates & _zarr_uri_candidates(artifact_uri):
+            for field_name in ("created_by_job_id", "source_job_id"):
+                job_id = str(item.get(field_name) or "").strip()
+                if job_id:
+                    return job_id
+
+    candidate_rows: list[dict[str, Any]] = []
+    for page in range(1, 6):
+        rows, _total = _list_jobs(
+            api_url,
+            api_key,
+            updated_from=_recent_jobs_cutoff(24 * 30),
+            page=page,
+            page_size=200,
+        )
+        if not rows:
+            break
+        candidate_rows.extend(rows)
+        if len(rows) < 200:
+            break
+
+    for row in candidate_rows:
+        row_candidates = set()
+        for value in list(row.get("zarr_outputs") or []):
+            row_candidates.update(_zarr_uri_candidates(str(value)))
+        if target_candidates & row_candidates:
+            return str(row.get("job_id") or "").strip() or None
+
+    for row in candidate_rows[:50]:
+        job_id = str(row.get("job_id") or "").strip()
+        if not job_id:
+            continue
+        try:
+            response = _api_request("GET", api_url, f"/v1/jobs/{job_id}/result", api_key=api_key, timeout=30)
+            if not response.ok:
+                continue
+            result_payload = response.json()
+        except Exception:
+            continue
+        result_candidates = set()
+        for value in list(result_payload.get("zarr_outputs") or []):
+            result_candidates.update(_zarr_uri_candidates(str(value)))
+        if target_candidates & result_candidates:
+            return job_id
+    return None
+
+
+def _read_local_zarr_attributes(store_path: Path) -> dict[str, Any]:
+    zarr_json_path = store_path / "zarr.json"
+    if zarr_json_path.exists():
+        try:
+            payload = json.loads(zarr_json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if isinstance(payload, dict):
+            return dict(payload.get("attributes") or {})
+        return {}
+    zattrs_path = store_path / ".zattrs"
+    if zattrs_path.exists():
+        try:
+            payload = json.loads(zattrs_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if isinstance(payload, dict):
+            return dict(payload)
+    return {}
+
+
+def _water_mask_store_status(zarr_uri: str) -> dict[str, Any]:
+    raw_value = str(zarr_uri or "").strip()
+    if not raw_value:
+        return {"status": "unknown", "reason": "No Zarr store selected."}
+
+    candidate_paths: list[Path] = []
+    direct_path = Path(raw_value)
+    if direct_path.exists():
+        candidate_paths.append(direct_path)
+    host_hint = _container_to_host_path_hint(raw_value)
+    if host_hint:
+        host_path = Path(host_hint)
+        if host_path.exists() and host_path not in candidate_paths:
+            candidate_paths.append(host_path)
+
+    if not candidate_paths:
+        return {"status": "remote_or_unresolved", "reason": "Store path is remote or not mounted on this UI host."}
+
+    store_path = candidate_paths[0]
+    water_group = store_path / "masks" / "water"
+    attrs = _read_local_zarr_attributes(store_path)
+
+    if water_group.exists():
+        return {
+            "status": "written",
+            "reason": str(attrs.get("water_mask_reason") or ""),
+            "store_path": str(store_path),
+            "mask_path": str(water_group),
+            "status_path": str(attrs.get("water_mask_status_path") or ""),
+            "artifact_uri": str(attrs.get("water_mask_artifact_uri") or ""),
+        }
+
+    status_value = str(attrs.get("water_mask_status") or "").strip()
+    if status_value:
+        return {
+            "status": status_value,
+            "reason": str(attrs.get("water_mask_reason") or ""),
+            "store_path": str(store_path),
+            "mask_path": "",
+            "status_path": str(attrs.get("water_mask_status_path") or ""),
+            "artifact_uri": str(attrs.get("water_mask_artifact_uri") or ""),
+        }
+
+    return {
+        "status": "not_written",
+        "reason": "",
+        "store_path": str(store_path),
+        "mask_path": "",
+        "status_path": "",
+        "artifact_uri": "",
+    }
+
+
+def _latest_manual_watermask_artifacts_for_source(
+    api_url: str | None,
+    api_key: str | None,
+    *,
+    source_zarr_uri: str,
+    job_id: str | None,
+) -> dict[str, Any]:
+    if not api_url or not source_zarr_uri or not job_id:
+        return {}
+    items, _total = _list_artifacts(
+        api_url,
+        api_key,
+        job_id=job_id,
+        page=1,
+        page_size=200,
+    )
+    normalized_source = str(source_zarr_uri).strip()
+    masked: dict[str, Any] | None = None
+    mask_raster: dict[str, Any] | None = None
+    for item in items:
+        item_type = str(item.get("artifact_type") or "").strip().lower()
+        item_source = str(item.get("source_uri") or "").strip()
+        item_meta = dict(item.get("metadata") or {})
+        meta_source = str(item_meta.get("source_zarr_uri") or "").strip()
+        if normalized_source not in {item_source, meta_source}:
+            continue
+        if item_type == "zarr_masked" and masked is None:
+            masked = item
+        elif item_type == "watermask" and mask_raster is None:
+            mask_raster = item
+    payload: dict[str, Any] = {}
+    if masked:
+        payload["masked_zarr"] = masked
+        payload["status"] = "written"
+    if mask_raster:
+        payload["mask_raster"] = mask_raster
+        payload.setdefault("status", "mask_only")
+    return payload
+
+
+def _render_local_path_actions(*, title: str, path_value: str, open_label: str = "Open folder", copy_label: str = "Copy path") -> None:
+    normalized = str(path_value or "").strip()
+    if not normalized:
+        return
+    host_hint = _container_to_host_path_hint(normalized) or normalized
+    target_path = Path(host_hint)
+    open_target = target_path if target_path.is_dir() else target_path.parent
+    open_url = f"file://{quote(str(open_target))}"
+    safe_title = html.escape(title)
+    components.html(
+        f"""
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 8px 0;">
+          <div style="font-size:.78rem;color:#94a3b8;min-width:160px;">{safe_title}</div>
+          <button onclick="navigator.clipboard.writeText({json.dumps(host_hint)})"
+                  style="background:#0f172a;color:#e2e8f0;border:1px solid rgba(56,120,200,0.25);border-radius:10px;padding:8px 12px;cursor:pointer;">
+            {html.escape(copy_label)}
+          </button>
+          <button onclick="window.open({json.dumps(open_url)}, '_blank')"
+                  style="background:#0b2035;color:#7dd3fc;border:1px solid rgba(56,120,200,0.35);border-radius:10px;padding:8px 12px;cursor:pointer;">
+            {html.escape(open_label)}
+          </button>
+          <div style="font-size:.72rem;color:#64748b;overflow-wrap:anywhere;">{html.escape(host_hint)}</div>
+        </div>
+        """,
+        height=70,
+    )
 
 
 def _tracked_job_rows() -> list[dict[str, Any]]:
@@ -1683,8 +1949,8 @@ def main():
         unsafe_allow_html=True,
     )
 
-    tab_map, tab_dl, tab_zarr, tab_res, tab_set = st.tabs(
-        ["🗺️ Map", "⬇️ Download", "🧱 Zarr Conversion", "📂 Results", "🔧 Settings"]
+    tab_map, tab_dl, tab_watermask, tab_res, tab_set = st.tabs(
+        ["🗺️ Map", "⬇️ Download", "💧 Water mask", "📂 Results", "🔧 Settings"]
     )
 
     with tab_map:
@@ -1860,6 +2126,8 @@ def main():
             st.session_state["preview_items"] = []
             st.session_state["preview_total"] = 0
             st.session_state["preview_error"] = ""
+            st.session_state["preview_error_kind"] = ""
+            st.session_state["preview_error_detail"] = ""
             st.session_state["preview_fetched"] = False
 
         pr1, pr2 = st.columns([2, 1])
@@ -1874,6 +2142,8 @@ def main():
         auto_preview = bool(preview_wkt) and not bool(_ss("preview_fetched", False))
         if refresh_preview or auto_preview:
             prev = preview_products_cached(
+                api_url=_ss("api_url"),
+                api_key=_ss("api_key"),
                 provider=provider,
                 collection=collection,
                 product_type=str(effective_product_type),
@@ -1886,12 +2156,25 @@ def main():
             st.session_state["preview_items"] = prev.get("items", [])
             st.session_state["preview_total"] = int(prev.get("total", 0) or 0)
             st.session_state["preview_error"] = prev.get("error", "")
+            st.session_state["preview_error_kind"] = prev.get("error_kind", "")
+            st.session_state["preview_error_detail"] = prev.get("error_detail", "")
             st.session_state["preview_fetched"] = True
         if preview_wkt:
             st.caption("Preview refreshes automatically when AOI, dates, provider, or product change.")
 
         if _ss("preview_error"):
-            st.warning(f"Preview: {_ss('preview_error')}")
+            error_kind = str(_ss("preview_error_kind", "") or "")
+            error_text = str(_ss("preview_error", "") or "")
+            error_detail = str(_ss("preview_error_detail", "") or "")
+            if error_kind == "credentials_invalid":
+                st.error(f"Preview: {error_text}")
+            elif error_kind == "provider_unavailable":
+                st.warning(f"Preview: {error_text}")
+            else:
+                st.info(f"Preview: {error_text}")
+            if error_detail and error_detail != error_text:
+                with st.expander("Preview error details", expanded=False):
+                    st.code(error_detail, language="text")
         else:
             p_total = int(_ss("preview_total", 0))
             p_items = _ss("preview_items", [])
@@ -2109,33 +2392,22 @@ def main():
         else:
             _render_download_jobs_panel_static(download_provider_api)
 
-    with tab_zarr:
+    with tab_watermask:
         st.markdown(
-            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>🧱</span><span style="font-weight:600;font-size:.94rem;">Zarr Conversion</span></div>',
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>💧</span><span style="font-weight:600;font-size:.94rem;">Water mask</span></div>',
             unsafe_allow_html=True,
         )
-        if (
-            _ss("last_zarr_status_url", "") != str(_ss("api_url", DEFAULT_API_URL)).strip()
-            or _ss("zarr_health_snapshot") is None
-            or _ss("zarr_readiness_snapshot") is None
-        ):
-            _refresh_zarr_runtime_statuses()
-
-        zarr_schema = _zarr_service_schema(_ss("api_url"), _ss("api_key"))
-        resolution_policy_info = (zarr_schema.get("converter_config", {}) or {}).get("resolution_policy", {})
-        collections_policy = dict(resolution_policy_info.get("collections") or {})
-        sentinel2_target = (collections_policy.get("SENTINEL-2") or {}).get("target_pixel_size_meters")
-        landsat_l1_target = (collections_policy.get("landsat_ot_c2_l1") or {}).get("target_pixel_size_meters")
-        landsat_l2_target = (collections_policy.get("landsat_ot_c2_l2") or {}).get("target_pixel_size_meters")
-        sentinel1_target = (collections_policy.get("SENTINEL-1") or {}).get("target_pixel_size_meters")
+        st.caption(
+            "The automatic pipeline stops at Zarr for now. Apply OmniWaterMask manually to an existing Zarr source and create a derived masked Zarr copy."
+        )
 
         summary1, summary2, summary3 = st.columns(3)
         with summary1:
             st.markdown(
                 "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
                 "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 1</div>"
-                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Pick a raw source</div>"
-                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Use a recent download, a local path, or an OCI URI.</div>"
+                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Choose a Zarr store</div>"
+                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Pick an existing store registered by the pipeline or discovered on disk.</div>"
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -2143,8 +2415,8 @@ def main():
             st.markdown(
                 "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
                 "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 2</div>"
-                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Confirm metadata</div>"
-                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Provider, collection, product type, and scene ID are editable before conversion.</div>"
+                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Review context</div>"
+                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Confirm the scene, provider, job lineage, and local mask status before running.</div>"
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -2152,341 +2424,263 @@ def main():
             st.markdown(
                 "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
                 "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 3</div>"
-                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Write Zarr output</div>"
-                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Use the mounted downloads volume or an OCI destination for the final store.</div>"
+                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Apply water mask</div>"
+                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>The action should create a masked Zarr copy instead of mutating the source store or restarting the fetch pipeline.</div>"
                 "</div>",
                 unsafe_allow_html=True,
             )
 
-        with st.expander("Service connection & diagnostics", expanded=False):
-            zc1, zc2 = st.columns([3, 1])
-            with zc1:
-                st.code(
-                    "\n".join(
-                        [
-                            f"Backend API: {_ss('api_url')}",
-                            f"Converter health: {_ss('api_url').rstrip('/')}/v1/converter/health",
-                            f"Converter readiness: {_ss('api_url').rstrip('/')}/v1/converter/readiness",
-                            f"Converter schema: {_ss('api_url').rstrip('/')}/v1/converter/schema",
-                        ]
-                    ),
-                    language="text",
-                )
-            with zc2:
-                if st.button("Refresh converter status", width="stretch"):
-                    _refresh_zarr_runtime_statuses()
-            st.caption(f"Last checked: {_format_status_timestamp(_ss('zarr_status_checked_at'))}")
-            zstatus1, zstatus2 = st.columns(2)
-            with zstatus1:
-                _render_status_block("Zarr health", _ss("zarr_health_snapshot"), kind="service")
-            with zstatus2:
-                _render_status_block("Zarr readiness", _ss("zarr_readiness_snapshot"), kind="service")
-
-        if resolution_policy_info:
-            st.markdown(
-                "<div style='background:#0f172a;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:12px 14px;margin-top:10px;'>"
-                f"<div style='font-size:.8rem;color:#cbd5e1;'><b>Resolution policy</b> · Sentinel-2 → {sentinel2_target if sentinel2_target is not None else 'native'} m · "
-                f"Landsat L1 → {landsat_l1_target if landsat_l1_target is not None else 'native'} m · "
-                f"Landsat L2 → {landsat_l2_target if landsat_l2_target is not None else 'native'} m · "
-                f"Sentinel-1 → {sentinel1_target if sentinel1_target is not None else 'native reference'}</div>"
-                "<div style='font-size:.75rem;color:#94a3b8;margin-top:6px;'>Landsat Level-1 keeps the 15 m panchromatic band B8, but the normalized multispectral Zarr grid remains at 30 m.</div>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-
-        candidates = _recent_source_candidates()
         st.markdown("---")
-        st.markdown("**Step 1. Source**")
-        if not candidates:
-            st.info("No recent raw files or source folders were found in downloads. You can still paste a local path or an OCI URI below.")
-        source_col1, source_col2 = st.columns([3, 2])
-        with source_col1:
-            selected_raw_uri = st.selectbox(
-                "Recent raw source",
-                options=candidates if candidates else [""],
+        w1, w2, w3 = st.columns([2, 2, 3])
+        with w1:
+            artifact_provider = st.selectbox(
+                "Zarr provider",
+                options=["", "copernicus", "usgs"],
+                key="watermask_artifact_provider",
+                format_func=lambda value: "All providers" if not value else value,
+            )
+        with w2:
+            artifact_collection = st.text_input(
+                "Zarr mission",
+                key="watermask_artifact_collection",
+                placeholder="e.g. SENTINEL-2",
+            ).strip()
+        with w3:
+            artifact_query = st.text_input(
+                "Zarr path / scene search",
+                key="watermask_artifact_query",
+                placeholder="scene id or store path fragment",
+            ).strip()
+        show_legacy_stores = st.checkbox(
+            "Show legacy or unregistered local Zarr stores",
+            value=bool(_ss("show_legacy_watermask_zarr", False)),
+            key="show_legacy_watermask_zarr",
+            help="Legacy stores are visible for inspection, but manual water masking works best on stores linked to a backend job.",
+        )
+
+        artifacts, artifacts_total = _list_artifacts(
+            _ss("api_url"),
+            _ss("api_key"),
+            artifact_type="zarr",
+            provider=artifact_provider or None,
+            collection=artifact_collection or None,
+            uri_query=artifact_query or None,
+            include_local=True,
+            page=1,
+            page_size=120,
+        )
+        visible_artifacts, hidden_legacy_count = _filter_visible_artifacts(
+            artifacts,
+            include_legacy=show_legacy_stores,
+        )
+
+        if not visible_artifacts:
+            st.info("No existing Zarr store was found in the registry or on local disk.")
+        else:
+            caption = f"Showing {len(visible_artifacts)} / {artifacts_total} Zarr stores."
+            if hidden_legacy_count:
+                caption += f" Hidden legacy stores: {hidden_legacy_count}."
+            st.caption(caption)
+
+            store_options = [str(item["artifact_uri"]) for item in visible_artifacts]
+            selected_store = st.selectbox(
+                "Existing Zarr store",
+                options=store_options,
                 index=0,
-                key="zarr_raw_uri",
-                help="Recent downloads and extracted source folders.",
-                format_func=lambda value: (
-                    "-"
-                    if not value
-                    else f"{Path(str(value)).name}  |  {value}"
+                key="watermask_selected_store",
+                format_func=lambda value: next(
+                    (
+                        f"[{str(item.get('_visibility_status', _artifact_visibility_status(item))).upper()}] "
+                        f"{Path(str(item['artifact_uri'])).name}  |  "
+                        f"{_container_to_host_path_hint(str(item['artifact_uri'])) or str(item['artifact_uri'])}"
+                        for item in visible_artifacts
+                        if str(item["artifact_uri"]) == value
+                    ),
+                    value,
                 ),
             )
-        with source_col2:
-            if candidates:
-                st.metric("Detected sources", len(candidates))
+            selected_store_meta = next(
+                (item for item in visible_artifacts if str(item["artifact_uri"]) == selected_store),
+                visible_artifacts[0],
+            )
+            selected_store_uri = str(selected_store_meta.get("artifact_uri") or "").strip()
+            selected_host_hint = _container_to_host_path_hint(selected_store_uri)
+            selected_job_id = _find_pipeline_job_for_zarr_uri(
+                _ss("api_url"),
+                _ss("api_key"),
+                selected_store_uri,
+                artifacts=visible_artifacts,
+            )
+            mask_status = _water_mask_store_status(selected_store_uri)
+            latest_mask_artifacts = _latest_manual_watermask_artifacts_for_source(
+                _ss("api_url"),
+                _ss("api_key"),
+                source_zarr_uri=selected_store_uri,
+                job_id=selected_job_id,
+            )
+            scene_id = str(selected_store_meta.get("scene_id") or Path(selected_store_uri).stem).strip()
+            provider_api = str(selected_store_meta.get("provider") or "").strip()
+            collection_api = str(selected_store_meta.get("collection") or "").strip()
+            product_type = str((selected_store_meta.get("metadata") or {}).get("product_type") or "").strip()
+            masked_store_meta = dict(latest_mask_artifacts.get("masked_zarr") or {})
+            mask_raster_meta = dict(latest_mask_artifacts.get("mask_raster") or {})
+            derived_status_value = str(latest_mask_artifacts.get("status") or "").strip().lower()
+            derived_masked_zarr_uri = str(masked_store_meta.get("artifact_uri") or "").strip()
+            derived_mask_artifact_uri = str(mask_raster_meta.get("artifact_uri") or "").strip()
+
+            meta_cols = st.columns(4)
+            with meta_cols[0]:
+                st.metric("Provider", provider_api or "-")
+            with meta_cols[1]:
+                st.metric("Collection", collection_api or "-")
+            with meta_cols[2]:
+                st.metric("Bands", len(selected_store_meta.get("band_names") or []))
+            with meta_cols[3]:
+                effective_status = derived_status_value or str(mask_status.get("status") or "unknown")
+                st.metric("Mask status", effective_status)
+
+            details_lines = [
+                f"Scene: {scene_id or '-'}",
+                f"Container path: {selected_store_uri or '-'}",
+                f"Host path: {selected_host_hint or '-'}",
+                f"Associated job: {selected_job_id or '-'}",
+                f"Visibility status: {selected_store_meta.get('_visibility_status', _artifact_visibility_status(selected_store_meta))}",
+                f"Data family: {selected_store_meta.get('data_family', '-')}",
+                f"Dimensions: {', '.join([str(v) for v in (selected_store_meta.get('dimensions') or [])]) or '-'}",
+                f"Shape: {selected_store_meta.get('shape', []) or '-'}",
+                f"Bands: {', '.join([str(v) for v in (selected_store_meta.get('band_names') or [])]) or '-'}",
+                f"Derived masked Zarr: {derived_masked_zarr_uri or '-'}",
+                f"Updated: {selected_store_meta.get('updated_at', '-')}",
+                f"Size: {_human_size(selected_store_meta.get('size_bytes'))}",
+            ]
+            st.code("\n".join(details_lines), language="text")
+
+            mask_status_value = str(mask_status.get("status") or "").strip().lower()
+            mask_reason = str(mask_status.get("reason") or "").strip()
+            if derived_status_value == "written":
+                st.success("A derived masked Zarr is already registered for this source store.")
+            elif mask_status_value == "written":
+                st.success("A water mask is already recorded inside this selected Zarr store.")
+            elif mask_status_value in {"failed", "error"}:
+                st.error(mask_reason or "The last water-mask attempt failed for this store.")
+            elif mask_status_value == "remote_or_unresolved":
+                st.warning(mask_reason)
             else:
-                st.metric("Detected sources", 0)
-        last_selected_raw = str(_ss("zarr_last_selected_raw_uri", "")).strip()
-        current_raw_value = str(_ss("zarr_raw_uri_value", "")).strip()
-        if str(selected_raw_uri or "").strip() != last_selected_raw:
-            st.session_state["zarr_last_selected_raw_uri"] = str(selected_raw_uri or "").strip()
-            if (not current_raw_value) or (current_raw_value == last_selected_raw):
-                st.session_state["zarr_raw_uri_value"] = str(selected_raw_uri or "").strip()
-        raw_uri = st.text_input(
-            "Raw source path",
-            value=str(_ss("zarr_raw_uri_value", str(selected_raw_uri or ""))),
-            key="zarr_raw_uri_value",
-            help="Local path or OCI URI, for example oci://bucket@namespace/path/to/product.SAFE.zip",
-        ).strip()
+                st.info("No derived masked Zarr is currently recorded for this source store.")
 
-        guessed_scene = _guess_scene_id(raw_uri) if raw_uri else ""
-        default_provider = _guess_zarr_provider(raw_uri)
-        default_collection = _guess_zarr_collection(default_provider, guessed_scene)
-        default_product_type = _guess_zarr_product_type(default_provider, default_collection, guessed_scene)
-        default_output = _default_zarr_output(guessed_scene)
-        source_kind = _guess_raw_source_format(raw_uri) if raw_uri else "-"
-        source_host_hint = _container_to_host_path_hint(raw_uri) if raw_uri else None
+            if (
+                mask_status.get("mask_path")
+                or mask_status.get("status_path")
+                or mask_status.get("artifact_uri")
+                or derived_masked_zarr_uri
+                or derived_mask_artifact_uri
+            ):
+                extra_lines = [
+                    f"Source embedded mask path: {mask_status.get('mask_path') or '-'}",
+                    f"Derived masked Zarr: {derived_masked_zarr_uri or '-'}",
+                    f"Status file: {mask_status.get('status_path') or '-'}",
+                    f"Mask artifact: {derived_mask_artifact_uri or mask_status.get('artifact_uri') or '-'}",
+                ]
+                st.code("\n".join(extra_lines), language="text")
+                if derived_masked_zarr_uri:
+                    _render_local_path_actions(
+                        title="Masked Zarr",
+                        path_value=derived_masked_zarr_uri,
+                        open_label="Open masked Zarr folder",
+                        copy_label="Copy masked Zarr path",
+                    )
 
-        last_raw = str(_ss("zarr_last_raw_uri", ""))
-        if raw_uri and raw_uri != last_raw:
-            st.session_state["zarr_last_raw_uri"] = raw_uri
-            st.session_state["zarr_provider_api"] = default_provider
-            st.session_state["zarr_collection_api"] = default_collection
-            st.session_state["zarr_product_type"] = default_product_type
-            st.session_state["zarr_scene_id"] = guessed_scene
-            st.session_state["zarr_output_uri"] = default_output
-            st.session_state["zarr_last_auto_output"] = default_output
-
-        if raw_uri:
-            source_meta1, source_meta2, source_meta3 = st.columns(3)
-            with source_meta1:
-                st.metric("Source type", source_kind.upper() if source_kind else "-")
-            with source_meta2:
-                st.metric("Detected scene", guessed_scene or "-")
-            with source_meta3:
-                st.metric("Detected provider", default_provider or "-")
-            if source_host_hint and source_host_hint != raw_uri:
-                st.caption(f"Host path hint: {source_host_hint}")
-
-        provider_options = list((zarr_schema.get("supported_collections", {}) or {}).keys()) or ["copernicus", "usgs"]
-        provider_default = _ss("zarr_provider_api", default_provider)
-        provider_index = provider_options.index(provider_default) if provider_default in provider_options else 0
-
-        st.markdown("**Step 2. Conversion target**")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            provider_api = st.selectbox(
-                "Provider",
-                options=provider_options,
-                index=provider_index,
-                key="zarr_provider_api",
-            )
-        with col2:
-            collection_options = _zarr_supported_collections(zarr_schema, provider_api) or [default_collection]
-            current_collection = _ss("zarr_collection_api", default_collection)
-            collection_index = collection_options.index(current_collection) if current_collection in collection_options else 0
-            collection_api = st.selectbox(
-                "Collection",
-                options=collection_options,
-                index=collection_index,
-                key="zarr_collection_api",
-            )
-        with col3:
-            product_options = _zarr_supported_product_types(zarr_schema, collection_api) or [default_product_type]
-            current_product_type = _ss("zarr_product_type", default_product_type)
-            product_index = product_options.index(current_product_type) if current_product_type in product_options else 0
-            product_type = st.selectbox(
-                "Product type",
-                options=product_options,
-                index=product_index,
-                key="zarr_product_type",
-            )
-        with col4:
-            scene_id = st.text_input("Scene ID", value=guessed_scene, key="zarr_scene_id")
-
-        auto_output = _default_zarr_output(scene_id)
-        current_output = str(_ss("zarr_output_uri", "")).strip()
-        last_auto_output = str(_ss("zarr_last_auto_output", "")).strip()
-        if (not current_output) or (current_output == last_auto_output):
-            st.session_state["zarr_output_uri"] = auto_output
-            st.session_state["zarr_last_auto_output"] = auto_output
-
-        sentinel1_caps = ((zarr_schema.get("runtime_capabilities") or {}).get("sentinel1") or {})
-        raw_decoder_available = bool(sentinel1_caps.get("raw_decoder_available"))
-
-        zarr_conversion_blocker = None
-        if provider_api == "copernicus" and collection_api == "SENTINEL-1" and product_type == "RAW" and not raw_decoder_available:
-            zarr_conversion_blocker = (
-                "Sentinel-1 RAW conversion requires the optional RAW decoder runtime in the zarr service. "
-                "Install the decoder backend or use GRD/SLC products."
-            )
-            st.warning(zarr_conversion_blocker)
-        elif provider_api == "copernicus" and collection_api == "SENTINEL-1" and product_type == "RAW":
-            st.info("Sentinel-1 RAW decoder is available. Conversion will produce a non-georeferenced sample-space Zarr.")
-
-        st.markdown("**Step 3. Output**")
-        output_uri = st.text_input(
-            "Output Zarr path",
-            value=_default_zarr_output(scene_id),
-            key="zarr_output_uri",
-            help="Use /data/... for local output, or oci://bucket@namespace/path/to/store.zarr for remote output.",
-        )
-        output_meta1, output_meta2, output_meta3 = st.columns(3)
-        with output_meta1:
-            st.metric("Output kind", "OCI" if output_uri.strip().startswith("oci://") else "Local")
-        with output_meta2:
-            st.metric("Collection", collection_api or "-")
-        with output_meta3:
-            st.metric("Product type", product_type or "-")
-
-        run_convert = st.button(
-            "Run Zarr conversion",
-            type="primary",
-            width="stretch",
-            disabled=(not raw_uri) or (zarr_conversion_blocker is not None),
-        )
-        st.caption("The converter preserves native imagery layers and stores QA / ancillary layers separately when available. Manual conversion is attached to an existing pipeline job, not created as a separate job.")
-        if run_convert:
-            scene_id_value = scene_id.strip() or guessed_scene or "scene"
-            output_uri_value = output_uri.strip()
-            if output_uri_value.startswith("/tmp/"):
-                output_uri_value = _default_zarr_output(scene_id_value)
-                st.info(f"Output path adjusted to mounted volume: {output_uri_value}")
-            source_job_id = _find_pipeline_job_for_raw_uri(_ss("api_url"), _ss("api_key"), raw_uri)
-            if not source_job_id:
-                st.error(
-                    "No existing pipeline job was found for this raw source. "
-                    "Manual conversion must be attached to a downloaded job tracked by the backend."
+            action_col1, action_col2 = st.columns([3, 2])
+            with action_col1:
+                action_label = "Create masked Zarr copy"
+                if derived_status_value == "written":
+                    action_label = "Re-create masked Zarr copy"
+                run_water_mask = st.button(
+                    action_label,
+                    type="primary",
+                    width="stretch",
+                    disabled=(not selected_job_id),
                 )
-                source_job_id = ""
-            try:
-                if source_job_id:
+            with action_col2:
+                st.markdown(
+                    "<div style='background:#0f172a;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:12px;'>"
+                    "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Execution mode</div>"
+                    "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Manual derived masked copy</div>"
+                    "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>This action should keep the source Zarr unchanged and create a new masked Zarr artifact.</div>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            if not selected_job_id:
+                st.warning(
+                    "This Zarr store is not linked to a known backend job yet. "
+                    "Use a registered pipeline output to run manual water masking."
+                )
+
+            if run_water_mask:
+                try:
                     response = _api_request(
                         "POST",
                         _ss("api_url"),
-                        f"/v1/jobs/{source_job_id}/convert",
+                        f"/v1/jobs/{selected_job_id}/water-mask",
                         api_key=_ss("api_key"),
                         payload={
-                            "raw_uri": raw_uri,
-                            "output_uri": output_uri_value,
-                            "scene_id": scene_id_value,
-                            "product_type": product_type.strip() if product_type else None,
+                            "zarr_uri": selected_store_uri,
+                            "scene_id": scene_id or None,
+                            "product_type": product_type or None,
                         },
                         timeout=1800,
                     )
                     if response.ok:
                         body = response.json()
-                        manual_job_id = str(body.get("job_id") or source_job_id)
+                        manual_job_id = str(body.get("job_id") or selected_job_id)
                         cache = dict(_ss("job_status_cache", {}))
                         cache[manual_job_id] = body
                         st.session_state["job_status_cache"] = cache
-                        st.session_state["job_result_cache"] = {
-                            key: value
-                            for key, value in dict(_ss("job_result_cache", {})).items()
-                            if key != manual_job_id
-                        }
-                        _upsert_known_jobs([manual_job_id])
-                        st.success(
-                            f"Zarr conversion completed and attached to pipeline job {manual_job_id}."
-                        )
+                        _upsert_known_jobs([manual_job_id], active_job_ids=[manual_job_id])
+                        water_mask = dict(body.get("water_mask") or {})
+                        water_mask_status = str(water_mask.get("status") or "").strip().lower()
+                        masked_output_uri = str(water_mask.get("output_zarr_uri") or "").strip()
+                        mask_artifact_uri = str(water_mask.get("artifact_uri") or "").strip()
+                        if water_mask_status == "written":
+                            st.success(
+                                f"Masked Zarr created from `{Path(selected_store_uri).name}` via job {manual_job_id}."
+                            )
+                            st.code(
+                                "\n".join(
+                                    [
+                                        f"Source Zarr: {selected_store_uri}",
+                                        f"Masked Zarr: {masked_output_uri or '-'}",
+                                        f"Mask artifact: {mask_artifact_uri or '-'}",
+                                    ]
+                                ),
+                                language="text",
+                            )
+                            if masked_output_uri:
+                                _render_local_path_actions(
+                                    title="Masked Zarr",
+                                    path_value=masked_output_uri,
+                                    open_label="Open masked Zarr folder",
+                                    copy_label="Copy masked Zarr path",
+                                )
+                        elif water_mask_status in {"failed", "error"}:
+                            st.error(
+                                str(water_mask.get("reason") or "The water-mask execution failed.")
+                            )
+                        else:
+                            st.warning(
+                                str(
+                                    water_mask.get("reason")
+                                    or f"Water-mask execution completed with status `{water_mask_status or 'unknown'}`."
+                                )
+                            )
                     else:
                         st.error(f"{response.status_code}: {_response_error_message(response)}")
-            except Exception as exc:
-                st.error(str(exc))
+                except Exception as exc:
+                    st.error(str(exc))
 
         st.markdown("---")
-        with st.expander("Stored Zarr stores", expanded=True):
-            zaf1, zaf2, zaf3 = st.columns([2, 2, 3])
-            with zaf1:
-                zarr_provider_filter = st.selectbox(
-                    "Artifact provider",
-                    options=["", "copernicus", "usgs"],
-                    key="zarr_artifact_provider",
-                    format_func=lambda value: "All providers" if not value else value,
-                )
-            with zaf2:
-                zarr_collection_filter = st.text_input(
-                    "Artifact mission",
-                    key="zarr_artifact_collection",
-                    placeholder="e.g. SENTINEL-2",
-                ).strip()
-            with zaf3:
-                zarr_artifact_query = st.text_input(
-                    "Artifact path / scene search",
-                    key="zarr_artifact_query",
-                    placeholder="scene id or path fragment",
-                ).strip()
-            show_legacy_zarr = st.checkbox(
-                "Show legacy/unregistered local Zarr stores",
-                value=bool(_ss("show_legacy_zarr", False)),
-                key="show_legacy_zarr",
-                help="Legacy stores are old local Zarr directories discovered on disk but not registered by the current converter flow.",
-            )
-
-            artifacts, artifacts_total = _list_artifacts(
-                _ss("api_url"),
-                _ss("api_key"),
-                artifact_type="zarr",
-                provider=zarr_provider_filter or None,
-                collection=zarr_collection_filter or None,
-                uri_query=zarr_artifact_query or None,
-                include_local=True,
-                page=1,
-                page_size=120,
-            )
-            visible_artifacts, hidden_legacy_count = _filter_visible_artifacts(
-                artifacts,
-                include_legacy=show_legacy_zarr,
-            )
-            if not visible_artifacts:
-                st.info("No .zarr store found in the registry or on local disk yet.")
-            else:
-                caption = f"Showing {len(visible_artifacts)} / {artifacts_total} Zarr stores."
-                if hidden_legacy_count:
-                    caption += f" Hidden legacy stores: {hidden_legacy_count}."
-                st.caption(caption)
-                store_options = [str(item["artifact_uri"]) for item in visible_artifacts]
-                selected_store = st.selectbox(
-                    "Stored Zarr directory",
-                    options=store_options,
-                    index=0,
-                    key="zarr_selected_store",
-                    format_func=lambda value: next(
-                        (
-                            f"[{str(item.get('_visibility_status', _artifact_visibility_status(item))).upper()}] "
-                            f"{Path(str(item['artifact_uri'])).name}  |  "
-                            f"{_container_to_host_path_hint(str(item['artifact_uri'])) or str(item['artifact_uri'])}"
-                            for item in visible_artifacts
-                            if str(item["artifact_uri"]) == value
-                        ),
-                        value,
-                    ),
-                )
-                selected_store_meta = next(
-                    (item for item in visible_artifacts if str(item["artifact_uri"]) == selected_store),
-                    visible_artifacts[0],
-                )
-                selected_host_hint = _container_to_host_path_hint(str(selected_store_meta.get("artifact_uri", "")))
-                meta_cols = st.columns(4)
-                with meta_cols[0]:
-                    st.metric("Provider", str(selected_store_meta.get("provider", "-") or "-"))
-                with meta_cols[1]:
-                    st.metric("Collection", str(selected_store_meta.get("collection", "-") or "-"))
-                with meta_cols[2]:
-                    st.metric("Bands", len(selected_store_meta.get("band_names") or []))
-                with meta_cols[3]:
-                    st.metric("Size", _human_size(selected_store_meta.get("size_bytes")))
-                st.code(
-                    "\n".join(
-                        [
-                            f"Scene: {selected_store_meta.get('scene_id', '-')}",
-                            f"Container path: {selected_store_meta.get('artifact_uri', '-')}",
-                            f"Host path: {selected_host_hint or '-'}",
-                            f"Visibility status: {selected_store_meta.get('_visibility_status', _artifact_visibility_status(selected_store_meta))}",
-                            f"Data family: {selected_store_meta.get('data_family', '-')}",
-                            f"Dimensions: {', '.join([str(v) for v in (selected_store_meta.get('dimensions') or [])]) or '-'}",
-                            f"Shape: {selected_store_meta.get('shape', []) or '-'}",
-                            f"Bands: {', '.join([str(v) for v in (selected_store_meta.get('band_names') or [])]) or '-'}",
-                            f"Source: {selected_store_meta.get('source_uri', '-')}",
-                            f"Updated: {selected_store_meta.get('updated_at', '-')}",
-                        ]
-                    ),
-                    language="text",
-                )
-
-        with st.expander("Recent pipeline conversions", expanded=False):
+        with st.expander("Recent Zarr pipeline outputs", expanded=False):
             recent_rows, _ = _list_jobs(
                 _ss("api_url"),
                 _ss("api_key"),
@@ -2494,15 +2688,15 @@ def main():
                 page=1,
                 page_size=40,
             )
-            converted_rows = [
+            zarr_rows = [
                 row for row in recent_rows
                 if list(row.get("zarr_outputs") or [])
-                or str(row.get("pipeline_state") or "") in {"zarr_converting", "zarr_written", "zarr_failed"}
+                or str(row.get("pipeline_state") or "") in {"zarr_written", "zarr_failed"}
             ]
-            if not converted_rows:
-                st.info("No recent pipeline conversions found.")
+            if not zarr_rows:
+                st.info("No recent Zarr-producing pipeline job was found.")
             else:
-                for item in converted_rows[:20]:
+                for item in zarr_rows[:20]:
                     with st.container(border=True):
                         st.markdown(f"**{item.get('job_id', '-') }**")
                         st.caption(

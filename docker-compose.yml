@@ -5,6 +5,7 @@ x-runtime-env: &runtime-env
   NIMBUS_MONGODB_URI: ${NIMBUS_MONGODB_URI_INTERNAL:-mongodb://mongodb:27017}
   NIMBUS_MONGODB_DB: ${NIMBUS_MONGODB_DB:-nimbuschain_fetch}
   NIMBUS_DATA_DIR: /data/downloads
+  NIMBUS_ZARRMASK_DIR: /data/downloads/zarrmask
   NIMBUS_MAX_JOBS: ${NIMBUS_MAX_JOBS:-4}
   NIMBUS_LOG_LEVEL: ${NIMBUS_LOG_LEVEL:-INFO}
   NIMBUS_LOG_JSON: ${NIMBUS_LOG_JSON:-false}
