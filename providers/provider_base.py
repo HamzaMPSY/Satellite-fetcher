@@ -76,3 +76,10 @@ class ProviderBase(ABC):
             Exception: If download fails for any product.
         """
         pass
+
+    def compute_products(self, product_ids: List[Dict], aoi: Polygon, equation: str, output_dir: str, index_name: str = "computed"):
+        """
+        Optional method to stream and compute mathematical equations on products instead of downloading them fully.
+        Defaults to raising NotImplementedError.
+        """
+        raise NotImplementedError("This provider does not support dynamic streaming computation.")

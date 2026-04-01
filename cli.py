@@ -13,7 +13,7 @@ from hashlib import md5
 
 from loguru import logger
 
-from providers import Cds, Copernicus, GoogleEarthEngine, Modis, OpenTopography, Usgs
+from providers import Cds, Copernicus, GoogleEarthEngine, Modis, Nasa, OpenTopography, Usgs
 from utilities import ConfigLoader, GeometryHandler, OCIFSManager
 
 
@@ -32,8 +32,8 @@ def main():
         "--provider",
         type=str,
         required=True,
-        choices=["copernicus", "usgs", "opentopography", "cds", "modis", "google_earth_engine"],
-        help="Data provider (copernicus , usgs, open_topography or google_earth_engine)",
+        choices=["copernicus", "usgs", "opentopography", "cds", "modis", "google_earth_engine", "nasa"],
+        help="Data provider (copernicus , usgs, open_topography, google_earth_engine, or nasa)",
     )
     parser.add_argument("--collection", type=str, required=True, help="collection name")
     parser.add_argument(
@@ -56,6 +56,18 @@ def main():
         type=str,
         default="example_aoi.wkt",
         help="Path to AOI file (in WKT format)",
+    )
+    parser.add_argument(
+        "--equation",
+        type=str,
+        required=False,
+        help="Mathematical equation to compute on bands (e.g., '(B08-B04)/(B08+B04)')",
+    )
+    parser.add_argument(
+        "--index-name",
+        type=str,
+        default="computed",
+        help="Name of the computed index to use in the output filename (e.g., 'ndvi')",
     )
     parser.add_argument(
         "--crop-aoi", type=bool, default=False, help="Whether to crop the AOI"
@@ -106,6 +118,7 @@ def main():
         "cds": Cds,
         "modis": Modis,
         "google_earth_engine": GoogleEarthEngine,
+        "nasa": Nasa,
     }
     # Select provider based on input argument
     provider_cls = provider_map.get(args.provider.lower())
@@ -127,10 +140,10 @@ def main():
         f"Searching for products with provider: {args.provider}, collection: {args.collection}, product_type: {args.product_type}, dates: {args.start_date} to {args.end_date}"
     )
 
-    # If args.tile_id is provided, and the provider is copernicus we will use it with out looking at the aoi
-    if args.tile_id and args.provider.lower() == "copernicus":
+    # If args.tile_id is provided, and the provider is copernicus or nasa we will use it with out looking at the aoi
+    if args.tile_id and args.provider.lower() in ("copernicus", "nasa"):
         logger.info(
-            f"Tile ID provided ({args.tile_id}), ignoring AOI for Copernicus search."
+            f"Tile ID provided ({args.tile_id}), ignoring AOI for {args.provider} search."
         )
         products = provider_instance.search_products(
             collection=args.collection,
@@ -162,9 +175,15 @@ def main():
             ]
             path_parts = [str(p) for p in path_parts if p]
             output_dir = os.path.join(*path_parts)
-            provider_instance.download_products(
-                product_ids=products, output_dir=output_dir
-            )
+            if hasattr(args, 'equation') and args.equation:
+                logger.info(f"Computing equation: {args.equation}")
+                provider_instance.compute_products(
+                    product_ids=products, aoi=None, equation=args.equation, output_dir=output_dir, index_name=args.index_name
+                )
+            else:
+                provider_instance.download_products(
+                    product_ids=products, output_dir=output_dir
+                )
         else:
             logger.info("No products found for the given options.")
     else:
@@ -204,9 +223,15 @@ def main():
                 ]
                 path_parts = [str(p) for p in path_parts if p]
                 output_dir = os.path.join(*path_parts)
-                provider_instance.download_products(
-                    product_ids=products, output_dir=output_dir
-                )
+                if hasattr(args, 'equation') and args.equation:
+                    logger.info(f"Computing equation: {args.equation}")
+                    provider_instance.compute_products(
+                        product_ids=products, aoi=geom, equation=args.equation, output_dir=output_dir, index_name=args.index_name
+                    )
+                else:
+                    provider_instance.download_products(
+                        product_ids=products, output_dir=output_dir
+                    )
                 if args.crop_aoi:
                     logger.info("Cropping AOI...")
                     geometry_handler.crop_aoi(

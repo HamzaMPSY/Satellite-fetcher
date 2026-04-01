@@ -15,3 +15,11 @@ providers:
       credentials:
         project_id: <your_project_id>
         service_account_json: <path_to_service_account_json_optional>
+  - nasa:
+      name: NASA Earthdata
+      description: NASA Earthdata provides various satellite and airborne data.
+      credentials:
+        earthdata_username: <your_username>
+        earthdata_password: <your_password>
+      base_urls:
+        - cmr_url: https://cmr.earthdata.nasa.gov/search/granules.json
