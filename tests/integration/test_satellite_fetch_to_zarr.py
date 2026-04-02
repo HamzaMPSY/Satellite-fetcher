@@ -21,6 +21,7 @@ from nimbuschain_zarr_service.service import ZarrConversionService
 
 LOGGER = logging.getLogger(__name__)
 REPO_DOWNLOADS_DIR = Path(__file__).resolve().parents[2] / "data" / "downloads"
+MASK_RUNTIME_DIR_NAMES = {"watermask", "cloudmask", "zarrmask"}
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
@@ -139,7 +140,7 @@ CASES = (
         collection="landsat_ot_c2_l1",
         default_product_type="L1TP",
         expected_data_family="optical",
-        expected_resolution_m=30.0,
+        expected_resolution_m=10.0,
     ),
     PipelineCase(
         key="landsat_l2",
@@ -147,7 +148,7 @@ CASES = (
         collection="landsat_ot_c2_l2",
         default_product_type="L2SP",
         expected_data_family="optical",
-        expected_resolution_m=30.0,
+        expected_resolution_m=10.0,
     ),
 )
 
@@ -285,6 +286,8 @@ def _discover_local_raw(case: PipelineCase) -> RawProduct | None:
     if REPO_DOWNLOADS_DIR.exists():
         for path in REPO_DOWNLOADS_DIR.rglob("*"):
             if not path.exists() or str(path) in seen:
+                continue
+            if any(part.lower() in MASK_RUNTIME_DIR_NAMES for part in path.parts):
                 continue
             if ".zarr" in path.parts or path.name.endswith(".zarr"):
                 continue

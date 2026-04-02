@@ -480,6 +480,19 @@ def _build_sentinel1_dataset(
             coord_name="ancillary_layer",
         )
         ancillary_metadata = ancillary_stack["band_metadata"]
+        dataset.attrs.update(
+            {
+                "ancillary_layer_names": list(ancillary_stack["band_names"]),
+                "ancillary_dimensions": ["time", "ancillary_layer", "y", "x"],
+                "ancillary_shape": [
+                    1,
+                    len(ancillary_stack["band_names"]),
+                    int(imagery_stack["height"]),
+                    int(imagery_stack["width"]),
+                ],
+                "ancillary_metadata": ancillary_metadata,
+            }
+        )
 
     summary = {
         "provider": provider,

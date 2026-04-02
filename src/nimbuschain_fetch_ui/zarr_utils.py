@@ -106,6 +106,11 @@ def _host_to_container_path(path: Path) -> str:
     return str(path)
 
 
+def _is_mask_runtime_path(path: Path) -> bool:
+    blocked = {"watermask", "cloudmask", "zarrmask"}
+    return any(str(part).lower() in blocked for part in path.parts)
+
+
 def _candidate_runtime_path(path_value: str | Path) -> tuple[str, Optional[Path]]:
     raw_value = str(path_value or "").strip()
     if not raw_value:
@@ -246,6 +251,8 @@ def recent_source_candidates(limit: int = 200) -> List[str]:
     candidates: Dict[str, float] = {}
     for path in DOWNLOADS_DIR.rglob("*"):
         try:
+            if _is_mask_runtime_path(path):
+                continue
             if path.is_dir():
                 if _is_supported_raw_dir(path):
                     candidates[_host_to_container_path(path)] = path.stat().st_mtime

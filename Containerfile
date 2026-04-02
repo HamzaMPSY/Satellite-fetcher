@@ -32,7 +32,6 @@ COPY src /app/src
 COPY --from=builder /dist/*.whl /tmp/
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir /tmp/*.whl && \
-    pip install --no-cache-dir ".[zarr-service]" && \
     rm -rf /tmp/*.whl
 
 USER appuser

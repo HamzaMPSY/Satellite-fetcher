@@ -45,6 +45,7 @@ class SQLiteJobStore:
                     raw_outputs_json TEXT NOT NULL DEFAULT '[]',
                     zarr_outputs_json TEXT NOT NULL DEFAULT '[]',
                     watermask_outputs_json TEXT NOT NULL DEFAULT '[]',
+                    cloudmask_outputs_json TEXT NOT NULL DEFAULT '[]',
                     progress REAL NOT NULL,
                     bytes_downloaded INTEGER NOT NULL,
                     bytes_total INTEGER NOT NULL,
@@ -154,6 +155,7 @@ class SQLiteJobStore:
             self._ensure_column("jobs", "raw_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column("jobs", "zarr_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column("jobs", "watermask_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column("jobs", "cloudmask_outputs_json", "TEXT NOT NULL DEFAULT '[]'")
             self._conn.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
@@ -190,6 +192,7 @@ class SQLiteJobStore:
             "raw_outputs": json.loads(row["raw_outputs_json"]) if "raw_outputs_json" in row.keys() and row["raw_outputs_json"] else [],
             "zarr_outputs": json.loads(row["zarr_outputs_json"]) if "zarr_outputs_json" in row.keys() and row["zarr_outputs_json"] else [],
             "watermask_outputs": json.loads(row["watermask_outputs_json"]) if "watermask_outputs_json" in row.keys() and row["watermask_outputs_json"] else [],
+            "cloudmask_outputs": json.loads(row["cloudmask_outputs_json"]) if "cloudmask_outputs_json" in row.keys() and row["cloudmask_outputs_json"] else [],
             "progress": float(row["progress"]),
             "bytes_downloaded": int(row["bytes_downloaded"]),
             "bytes_total": int(row["bytes_total"]),
@@ -219,10 +222,10 @@ class SQLiteJobStore:
                 INSERT INTO jobs(
                     job_id, job_type, provider, collection, product_type, tile_id, request_json, state,
                     pipeline_state, pipeline_step, pipeline_progress, pipeline_metadata_json,
-                    conversion_metadata_json, raw_outputs_json, zarr_outputs_json, watermask_outputs_json,
+                    conversion_metadata_json, raw_outputs_json, zarr_outputs_json, watermask_outputs_json, cloudmask_outputs_json,
                     progress, bytes_downloaded, bytes_total, retry_count, last_retry_at, started_at, finished_at,
                     errors_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -238,6 +241,7 @@ class SQLiteJobStore:
                     0.0,
                     "{}",
                     "{}",
+                    "[]",
                     "[]",
                     "[]",
                     "[]",
@@ -277,7 +281,7 @@ class SQLiteJobStore:
                 normalized["request_json"] = json.dumps(value)
             elif key in {"pipeline_metadata", "conversion_metadata"}:
                 normalized[f"{key}_json"] = json.dumps(value or {})
-            elif key in {"raw_outputs", "zarr_outputs", "watermask_outputs"}:
+            elif key in {"raw_outputs", "zarr_outputs", "watermask_outputs", "cloudmask_outputs"}:
                 normalized[f"{key}_json"] = json.dumps(list(value or []))
             else:
                 normalized[key] = value

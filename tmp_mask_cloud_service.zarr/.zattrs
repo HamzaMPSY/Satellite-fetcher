@@ -1,0 +1,52 @@
+{
+  "provider": "copernicus",
+  "collection": "SENTINEL-2",
+  "scene_id": "S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719",
+  "product_id": "S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719",
+  "product_type": "S2MSI2A",
+  "product_level": "boa",
+  "data_family": "optical",
+  "source_uri": "/data/downloads/5c1f065fc42943eebc460453aafc3194/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719.SAFE.zip",
+  "band_names": [
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
+    "B06",
+    "B07",
+    "B08",
+    "B8A",
+    "B09",
+    "B11",
+    "B12"
+  ],
+  "zarr_format_version": 1,
+  "ancillary_layer_names": [
+    "SCL",
+    "AOT",
+    "WVP",
+    "TCI_R",
+    "TCI_G",
+    "TCI_B"
+  ],
+  "cloud_mask": {
+    "available": true,
+    "threshold": 0.45,
+    "backend": "heuristic",
+    "sensor": "sentinel-2",
+    "path": "masks/cloud",
+    "probability_path": "masks/cloud_probability",
+    "updated_at": "2026-03-30T09:14:23.256857+00:00"
+  },
+  "cloud_mask_path": "masks/cloud",
+  "cloud_mask_probability_path": "masks/cloud_probability",
+  "cloud_mask_written": true,
+  "cloud_mask_status": "written",
+  "cloud_mask_reason": "",
+  "cloud_mask_artifact_uri": "/Users/mehdidinari/Desktop/backend nimbus/data/downloads/cloudmask/debug-cloud/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719/cloud_mask.tif",
+  "cloud_mask_status_path": "/Users/mehdidinari/Desktop/backend nimbus/data/downloads/cloudmask/debug-cloud/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719/cloud_mask_status.json",
+  "cloud_mask_work_dir": "/Users/mehdidinari/Desktop/backend nimbus/data/downloads/cloudmask/debug-cloud/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719",
+  "cloud_mask_source_zarr_uri": "/Users/mehdidinari/Desktop/backend nimbus/data/downloads/zarr/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719.zarr",
+  "cloud_mask_output_zarr_uri": "/Users/mehdidinari/Desktop/backend nimbus/tmp_mask_cloud_service.zarr"
+}

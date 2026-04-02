@@ -35,6 +35,14 @@ class PipelineState(str, Enum):
     zarr_queued = "zarr_queued"
     zarr_converting = "zarr_converting"
     zarr_written = "zarr_written"
+    resolving_source_zarr = "resolving_source_zarr"
+    copying_source_zarr = "copying_source_zarr"
+    running_water_inference = "running_water_inference"
+    running_cloud_inference = "running_cloud_inference"
+    writing_mask_artifacts = "writing_mask_artifacts"
+    writing_masked_zarr = "writing_masked_zarr"
+    registering_artifacts = "registering_artifacts"
+    masked_zarr_written = "masked_zarr_written"
     zarr_failed = "zarr_failed"
     failed = "failed"
     cancelled = "cancelled"
@@ -158,6 +166,10 @@ class JobEvent(BaseModel):
 
 class JobStatusResponse(BaseModel):
     job_id: str
+    job_type: str | None = None
+    job_kind: Literal["fetch", "mask"] | None = None
+    service_name: str | None = None
+    source_job_id: str | None = None
     state: JobState
     pipeline_state: PipelineState = PipelineState.queued
     pipeline_step: str | None = None
@@ -166,7 +178,9 @@ class JobStatusResponse(BaseModel):
     conversion_metadata: dict[str, Any] = Field(default_factory=dict)
     raw_outputs: list[str] = Field(default_factory=list)
     zarr_outputs: list[str] = Field(default_factory=list)
+    masked_zarr_outputs: list[str] = Field(default_factory=list)
     watermask_outputs: list[str] = Field(default_factory=list)
+    cloudmask_outputs: list[str] = Field(default_factory=list)
     progress: float = Field(default=0, ge=0, le=100)
     bytes_downloaded: int = 0
     bytes_total: int = 0
@@ -186,10 +200,16 @@ class JobStatusResponse(BaseModel):
 
 class JobResultResponse(BaseModel):
     job_id: str
+    job_type: str | None = None
+    job_kind: Literal["fetch", "mask"] | None = None
+    service_name: str | None = None
+    source_job_id: str | None = None
     paths: list[str] = Field(default_factory=list)
     raw_outputs: list[str] = Field(default_factory=list)
     zarr_outputs: list[str] = Field(default_factory=list)
+    masked_zarr_outputs: list[str] = Field(default_factory=list)
     watermask_outputs: list[str] = Field(default_factory=list)
+    cloudmask_outputs: list[str] = Field(default_factory=list)
     checksums: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     manifest_entry: dict[str, Any] = Field(default_factory=dict)
@@ -206,22 +226,68 @@ class JobConvertRequest(BaseModel):
     product_type: str | None = None
 
 
-class JobWaterMaskRequest(BaseModel):
+class JobMaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     zarr_uri: str | None = None
     scene_id: str | None = None
     product_type: str | None = None
+    mask_types: list[Literal["water", "cloud"]] = Field(default_factory=lambda: ["water"], min_length=1)
+    backend: Literal["auto", "heuristic", "omnicloudmask"] = "auto"
+    threshold: float = Field(default=0.62, ge=0.0, le=1.0)
+    overwrite: bool = True
+    inference_device: str | None = None
+    include_shadows: bool = True
+    water_backend: Literal["auto", "heuristic", "omniwatermask", "fallback", "ndwi"] = "auto"
+    water_overwrite: bool | None = None
+    water_inference_device: str | None = None
     fail_on_error: bool = False
 
+    @field_validator("mask_types")
+    @classmethod
+    def _normalize_mask_types(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            candidate = str(value or "").strip().lower()
+            if candidate not in {"water", "cloud"}:
+                raise ValueError("mask_types must contain only 'water' and/or 'cloud'.")
+            if candidate not in normalized:
+                normalized.append(candidate)
+        if not normalized:
+            raise ValueError("mask_types cannot be empty.")
+        return normalized
 
-class JobWaterMaskResponse(BaseModel):
+
+class JobWaterMaskRequest(JobMaskRequest):
+    mask_types: list[Literal["water"]] = Field(default_factory=lambda: ["water"])
+
+
+class JobCloudMaskRequest(JobMaskRequest):
+    mask_types: list[Literal["cloud"]] = Field(default_factory=lambda: ["cloud"])
+    backend: Literal["auto", "heuristic", "omnicloudmask"] = "auto"
+    include_shadows: bool = True
+
+
+class JobMaskResponse(BaseModel):
     job_id: str
-    zarr_uri: str
+    source_job_id: str
+    source_zarr_uri: str
     masked_zarr_uri: str | None = None
+    mask_types: list[str] = Field(default_factory=list)
     water_mask: dict[str, Any] = Field(default_factory=dict)
+    cloud_mask: dict[str, Any] = Field(default_factory=dict)
+    masked_zarr_outputs: list[str] = Field(default_factory=list)
     watermask_outputs: list[str] = Field(default_factory=list)
+    cloudmask_outputs: list[str] = Field(default_factory=list)
     job: JobStatusResponse
+
+
+class JobWaterMaskResponse(JobMaskResponse):
+    pass
+
+
+class JobCloudMaskResponse(JobMaskResponse):
+    pass
 
 
 class JobListResponse(BaseModel):
@@ -235,6 +301,7 @@ class ArtifactType(str, Enum):
     zarr = "zarr"
     zarr_masked = "zarr_masked"
     watermask = "watermask"
+    cloudmask = "cloudmask"
 
 
 class ArtifactUpsertRequest(BaseModel):

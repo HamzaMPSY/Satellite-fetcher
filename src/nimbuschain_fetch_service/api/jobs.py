@@ -5,6 +5,8 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from nimbuschain_fetch.engine.nimbus_fetcher import JobNotFoundError, NimbusFetcher
+from nimbuschain_fetch.models import ProviderName
+from nimbuschain_fetch.provider_status import get_provider_status
 from nimbuschain_fetch.models import (
     BatchJobCreateRequest,
     BatchJobCreatedResponse,
@@ -14,7 +16,8 @@ from nimbuschain_fetch.models import (
     JobResultResponse,
     JobStatusResponse,
 )
-from nimbuschain_fetch_service.dependencies import get_fetcher
+from nimbuschain_fetch.settings import Settings
+from nimbuschain_fetch_service.dependencies import get_fetcher, get_runtime_settings
 from nimbuschain_fetch_service.observability import (
     record_job_cancellation,
     record_job_submission,
@@ -27,7 +30,9 @@ router = APIRouter(prefix="/v1", tags=["jobs"])
 async def create_job(
     request: JobCreateRequest,
     fetcher: NimbusFetcher = Depends(get_fetcher),
+    settings: Settings = Depends(get_runtime_settings),
 ) -> JobCreatedResponse:
+    _ensure_provider_submission_ready(request, settings)
     job_id = await fetcher.submit_job(request)
     record_job_submission(str(request.job_type), str(request.provider.value))
     return JobCreatedResponse(job_id=job_id)
@@ -37,7 +42,10 @@ async def create_job(
 async def create_batch_jobs(
     request: BatchJobCreateRequest,
     fetcher: NimbusFetcher = Depends(get_fetcher),
+    settings: Settings = Depends(get_runtime_settings),
 ) -> BatchJobCreatedResponse:
+    for item in request.jobs:
+        _ensure_provider_submission_ready(item, settings)
     job_ids = await fetcher.submit_batch(request)
     for item in request.jobs:
         record_job_submission(str(item.job_type), str(item.provider.value))
@@ -119,4 +127,28 @@ def list_jobs(
         sort_desc=sort_desc,
         page=page,
         page_size=page_size,
+    )
+
+
+def _ensure_provider_submission_ready(request: JobCreateRequest, settings: Settings) -> None:
+    if request.provider != ProviderName.usgs:
+        return
+    provider_status = get_provider_status(settings, "usgs")
+    if bool(provider_status.get("configured")) and bool(provider_status.get("auth_valid")):
+        return
+
+    error_kind = str(provider_status.get("error_kind") or "").strip().lower()
+    message = str(provider_status.get("message") or "USGS job submission is blocked.").strip()
+    detail = str(provider_status.get("detail") or message).strip()
+
+    if error_kind in {"credentials_missing", "credentials_invalid"}:
+        action = "Update NIMBUS_USGS_TOKEN in the runtime environment and restart the API/worker services."
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{message} {action} Detail: {detail}",
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=f"{message} Detail: {detail}",
     )

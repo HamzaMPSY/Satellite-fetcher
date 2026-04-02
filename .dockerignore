@@ -17,6 +17,12 @@ _leaflet_comp
 src/nimbuschain_fetch_ui/_leaflet_comp
 
 data/downloads
+data/nimbus.db
+data/nimbus.db-shm
+data/nimbus.db-wal
+*.zarr
+tmp_mask_cloud_service.zarr
+tmp_zarr_preview.png
 data/**/.DS_Store
 data/**/.st-tree.cache
 

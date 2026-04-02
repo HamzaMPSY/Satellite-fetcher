@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
+import json
 import re
 import os
+import shutil
 import socket
 import time
 import uuid
@@ -28,9 +31,13 @@ from nimbuschain_fetch.models import (
     ArtifactUpsertRequest,
     BatchJobCreateRequest,
     DownloadProductsRequest,
+    JobCloudMaskRequest,
+    JobCloudMaskResponse,
     JobConvertRequest,
     JobCreateRequest,
     JobListResponse,
+    JobMaskRequest,
+    JobMaskResponse,
     JobResultResponse,
     JobState,
     JobStatusResponse,
@@ -44,7 +51,7 @@ from nimbuschain_fetch.providers import CopernicusProvider, UsgsProvider
 from nimbuschain_fetch.security.paths import sanitize_output_dir
 from nimbuschain_fetch.jobs.store_factory import create_job_store
 from nimbuschain_fetch.settings import Settings, get_settings
-from nimbuschain_mask_service.service import MaskService
+from nimbuschain_mask_service.client import MaskServiceClient
 from nimbuschain_zarr_service.service import ZarrConversionService
 
 
@@ -58,6 +65,12 @@ class JobCancelledError(RuntimeError):
 
 class NimbusFetcher:
     """Core orchestrator for submission, execution and tracking of fetch jobs."""
+
+    MASK_CONTRACT_VERSION = "v2"
+    DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+    DOWNLOAD_PROGRESS_MAX_INTERVAL_SECONDS = 3.0
+    DOWNLOAD_PROGRESS_MIN_BYTES = 16 * 1024 * 1024
+    DOWNLOAD_PROGRESS_MIN_PERCENT = 1.0
 
     def __init__(
         self,
@@ -93,7 +106,7 @@ class NimbusFetcher:
         self._worker_started_at = datetime.now(timezone.utc).isoformat()
         self._cancel_check_cache: dict[str, tuple[float, bool]] = {}
         self._zarr_converter: ZarrConversionService | None = None
-        self._mask_service: MaskService | None = None
+        self._mask_service: Any | None = None
         self._started = False
 
     async def start(self) -> None:
@@ -101,7 +114,13 @@ class NimbusFetcher:
             return
         self.settings.ensure_runtime_dirs()
         if self._execution_enabled and self._executor is not None:
-            self.store.requeue_incomplete_jobs()
+            requeued_job_ids = self.store.requeue_incomplete_jobs()
+            self._retire_legacy_mask_jobs()
+            self._fail_interrupted_mask_jobs(
+                job_ids=requeued_job_ids,
+                reason="Mask job interrupted during service restart. Submit a new mask job from the Mask tab.",
+                event_type="job.mask_failed_after_restart",
+            )
             await self._executor.start()
             await self._enqueue_queued_jobs()
             self._publish_worker_heartbeat()
@@ -134,7 +153,302 @@ class NimbusFetcher:
             self._heartbeat_task = None
         if self._executor is not None:
             await self._executor.stop()
+        if self._mask_service is not None and hasattr(self._mask_service, "close"):
+            self._mask_service.close()
+            self._mask_service = None
         self._started = False
+
+    def _retire_legacy_mask_jobs(self) -> None:
+        rows, _total = self.store.list_jobs(
+            JobListFilters(
+                states=(
+                    JobState.queued.value,
+                    JobState.running.value,
+                    JobState.cancel_requested.value,
+                ),
+                page=1,
+                page_size=5000,
+            )
+        )
+        now = self._now_iso()
+        for row in rows:
+            if str(row.get("job_type") or "").strip().lower() != "mask_existing_zarr":
+                continue
+            request_payload = dict(row.get("request") or {})
+            if str(request_payload.get("mask_contract_version") or "").strip().lower() == self.MASK_CONTRACT_VERSION:
+                continue
+            job_id = str(row.get("job_id") or "").strip()
+            if not job_id:
+                continue
+            self._cleanup_mask_job_outputs(job_id=job_id, row=row)
+            self.store.update_job(
+                job_id,
+                state=JobState.failed.value,
+                finished_at=now,
+                progress=0.0,
+                pipeline_state=PipelineState.failed.value,
+                pipeline_step="failed",
+                pipeline_progress=100.0,
+                errors=[
+                    "Legacy mask job retired during mask-service v2 cutover. Submit a new mask job from the Mask tab."
+                ],
+            )
+            self.store.append_event(
+                job_id,
+                "job.mask_retired_after_cutover",
+                {"reason": "legacy_mask_contract"},
+            )
+
+    def _cleanup_mask_job_outputs(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+        result_payload: dict[str, Any] | None = None,
+        preserve_status_paths: bool = False,
+        failure_reason: str | None = None,
+    ) -> None:
+        result_payload = self._normalize_backend_paths_in_result_payload(
+            result_payload or self.store.get_result(job_id) or {}
+        )
+        normalized_row = self._normalize_backend_paths_in_job_row(self._normalize_historical_job_row(row))
+        request_payload = dict(normalized_row.get("request") or {})
+        pipeline_metadata = dict(
+            result_payload.get("pipeline_metadata")
+            or normalized_row.get("pipeline_metadata")
+            or {}
+        )
+        conversion_metadata = dict(
+            result_payload.get("conversion_metadata")
+            or normalized_row.get("conversion_metadata")
+            or {}
+        )
+        result_metadata = dict(result_payload.get("metadata") or {})
+        water_mask = dict(
+            conversion_metadata.get("water_mask")
+            or pipeline_metadata.get("water_mask")
+            or result_metadata.get("water_mask")
+            or {}
+        )
+        cloud_mask = dict(
+            conversion_metadata.get("cloud_mask")
+            or pipeline_metadata.get("cloud_mask")
+            or result_metadata.get("cloud_mask")
+            or {}
+        )
+        source_zarr_uri = str(
+            request_payload.get("source_zarr_uri")
+            or pipeline_metadata.get("source_zarr_uri")
+            or conversion_metadata.get("source_zarr_uri")
+            or result_metadata.get("source_zarr_uri")
+            or ""
+        ).strip()
+
+        masked_zarr_candidates: set[str] = set()
+        artifact_candidates: set[str] = set()
+        status_paths: list[tuple[str, dict[str, Any], str]] = []
+
+        for field_name in ("zarr_outputs", "masked_zarr_outputs"):
+            for value in list(normalized_row.get(field_name) or []):
+                masked_zarr_candidates.add(str(value))
+            for value in list(result_payload.get(field_name) or []):
+                masked_zarr_candidates.add(str(value))
+
+        for value in (
+            result_payload.get("masked_zarr_uri"),
+            result_metadata.get("masked_zarr_uri"),
+            pipeline_metadata.get("masked_zarr_uri"),
+            conversion_metadata.get("masked_zarr_uri"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                masked_zarr_candidates.add(text)
+
+        for label, payload in (("water", water_mask), ("cloud", cloud_mask)):
+            for key in ("output_zarr_uri", "working_zarr_uri"):
+                text = str(payload.get(key) or "").strip()
+                if text:
+                    masked_zarr_candidates.add(text)
+            for key in ("artifact_uri",):
+                text = str(payload.get(key) or "").strip()
+                if text:
+                    artifact_candidates.add(text)
+            status_path = str(payload.get("status_path") or "").strip()
+            if status_path:
+                status_paths.append((status_path, payload, label))
+                if not preserve_status_paths:
+                    artifact_candidates.add(status_path)
+
+        for field_name in ("watermask_outputs", "cloudmask_outputs", "paths"):
+            for value in list(normalized_row.get(field_name) or []):
+                text = str(value or "").strip()
+                if text and not text.endswith(".zarr"):
+                    artifact_candidates.add(text)
+            for value in list(result_payload.get(field_name) or []):
+                text = str(value or "").strip()
+                if text and not text.endswith(".zarr"):
+                    artifact_candidates.add(text)
+
+        for raw_value in masked_zarr_candidates:
+            normalized = str(self._normalize_backend_path(raw_value) or "").strip()
+            if not normalized or normalized == source_zarr_uri:
+                continue
+            target = Path(normalized)
+            self._remove_path_if_exists(target)
+            if target.parent.exists():
+                for pattern in (
+                    f".{target.stem}.tmp-*{target.suffix}",
+                    f".{target.stem}.backup-*{target.suffix}",
+                ):
+                    for sibling in target.parent.glob(pattern):
+                        self._remove_path_if_exists(sibling)
+
+        for raw_value in artifact_candidates:
+            normalized = str(self._normalize_backend_path(raw_value) or "").strip()
+            if not normalized:
+                continue
+            self._remove_path_if_exists(Path(normalized))
+
+        if preserve_status_paths:
+            for status_path, payload, label in status_paths:
+                self._mark_mask_status_failed(
+                    status_path=status_path,
+                    payload=payload,
+                    reason=failure_reason or f"{label} mask job interrupted.",
+                )
+
+    @staticmethod
+    def _remove_path_if_exists(target: Path) -> None:
+        try:
+            if not target.exists():
+                return
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except OSError:
+            return
+
+    def _mark_mask_status_failed(
+        self,
+        *,
+        status_path: str,
+        payload: dict[str, Any],
+        reason: str,
+    ) -> None:
+        normalized = str(self._normalize_backend_path(status_path) or "").strip()
+        if not normalized:
+            return
+        target = Path(normalized)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        failed_payload = dict(payload or {})
+        failed_payload["status"] = "failed"
+        failed_payload["reason"] = reason
+        failed_payload["status_path"] = normalized
+        failed_payload["updated_at"] = self._now_iso()
+        target.write_text(json.dumps(failed_payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _fail_interrupted_mask_jobs(
+        self,
+        *,
+        job_ids: list[str],
+        reason: str,
+        event_type: str,
+    ) -> None:
+        if not job_ids:
+            return
+        now = self._now_iso()
+        for job_id in job_ids:
+            row = self.store.get_job(job_id)
+            if not row:
+                continue
+            if str(row.get("job_type") or "").strip().lower() != "mask_existing_zarr":
+                continue
+            request_payload = dict(row.get("request") or {})
+            if str(request_payload.get("mask_contract_version") or "").strip().lower() != self.MASK_CONTRACT_VERSION:
+                continue
+
+            normalized_row = self._normalize_backend_paths_in_job_row(self._normalize_historical_job_row(row))
+            result_payload = self._normalize_backend_paths_in_result_payload(self.store.get_result(job_id) or {})
+            self._cleanup_mask_job_outputs(
+                job_id=job_id,
+                row=normalized_row,
+                result_payload=result_payload,
+                preserve_status_paths=True,
+                failure_reason=reason,
+            )
+
+            pipeline_metadata = dict(
+                result_payload.get("pipeline_metadata")
+                or normalized_row.get("pipeline_metadata")
+                or {}
+            )
+            conversion_metadata = dict(result_payload.get("conversion_metadata") or {})
+            metadata = dict(result_payload.get("metadata") or {})
+            for container in (pipeline_metadata, conversion_metadata, metadata):
+                for key in ("water_mask", "cloud_mask"):
+                    payload = dict(container.get(key) or {})
+                    if not payload:
+                        continue
+                    payload["status"] = "failed"
+                    payload["reason"] = reason
+                    container[key] = payload
+            for payload in (pipeline_metadata, conversion_metadata, metadata):
+                payload["status"] = "failed"
+                payload["interrupted_reason"] = reason
+                payload.pop("masked_zarr_uri", None)
+
+            self.store.set_result(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "job_type": "mask_existing_zarr",
+                    "job_kind": "mask",
+                    "service_name": "mask_service",
+                    "source_job_id": str(
+                        metadata.get("source_job_id")
+                        or pipeline_metadata.get("source_job_id")
+                        or conversion_metadata.get("source_job_id")
+                        or request_payload.get("source_job_id")
+                        or ""
+                    ).strip() or None,
+                    "paths": [],
+                    "raw_outputs": [],
+                    "zarr_outputs": [],
+                    "masked_zarr_outputs": [],
+                    "watermask_outputs": [],
+                    "cloudmask_outputs": [],
+                    "checksums": dict(result_payload.get("checksums") or {}),
+                    "metadata": metadata,
+                    "manifest_entry": dict(result_payload.get("manifest_entry") or {}),
+                    "pipeline_metadata": pipeline_metadata,
+                    "conversion_metadata": conversion_metadata,
+                },
+            )
+            self.store.update_job(
+                job_id,
+                state=JobState.failed.value,
+                finished_at=now,
+                progress=0.0,
+                pipeline_state=PipelineState.failed.value,
+                pipeline_step="failed",
+                pipeline_progress=95.0,
+                pipeline_metadata=pipeline_metadata,
+                conversion_metadata=conversion_metadata,
+                zarr_outputs=[],
+                watermask_outputs=[],
+                cloudmask_outputs=[],
+                errors=[reason],
+            )
+            self.store.append_event(
+                job_id,
+                event_type,
+                {
+                    "status": JobState.failed.value,
+                    "reason": reason,
+                    "pipeline_state": PipelineState.failed.value,
+                },
+            )
 
     async def submit_job(self, request: JobCreateRequest) -> str:
         if not self._started:
@@ -160,6 +474,45 @@ class NimbusFetcher:
             job_ids.append(await self.submit_job(job))
         return job_ids
 
+    @staticmethod
+    def _job_kind_for_type(job_type: str | None) -> str:
+        normalized = str(job_type or "").strip().lower()
+        if normalized == "mask_existing_zarr":
+            return "mask"
+        return "fetch"
+
+    @classmethod
+    def _service_name_for_type(cls, job_type: str | None) -> str:
+        return "mask_service" if cls._job_kind_for_type(job_type) == "mask" else "fetch_service"
+
+    def _create_mask_job(
+        self,
+        *,
+        source_job_id: str,
+        provider_name: str,
+        collection: str,
+        request_payload: dict[str, Any],
+    ) -> str:
+        job_id = uuid.uuid4().hex
+        self.store.create_job(
+            job_id=job_id,
+            job_type="mask_existing_zarr",
+            provider=provider_name,
+            collection=collection,
+            request_payload=request_payload,
+        )
+        self.store.append_event(
+            job_id,
+            "job.queued",
+            {
+                "state": JobState.queued.value,
+                "job_kind": "mask",
+                "source_job_id": source_job_id,
+                "mask_types": list(request_payload.get("mask_types") or []),
+            },
+        )
+        return job_id
+
     def get_job(self, job_id: str) -> JobStatusResponse:
         row = self.store.get_job(job_id)
         if not row:
@@ -180,17 +533,26 @@ class NimbusFetcher:
                 list(job_row.get("raw_outputs") or []),
                 list(job_row.get("zarr_outputs") or []),
                 list(job_row.get("watermask_outputs") or []),
+                list(job_row.get("cloudmask_outputs") or []),
             ]
         ):
             raise JobNotFoundError(job_id)
 
         result = self._normalize_backend_paths_in_result_payload(result)
+        zarr_outputs = list(result.get("zarr_outputs") or job_row.get("zarr_outputs") or [])
+        masked_zarr_outputs = self._masked_zarr_outputs_for_job(job_id=job_id, result=result, row=job_row)
         normalized_result = {
             "job_id": job_id,
+            "job_type": job_row.get("job_type"),
+            "job_kind": self._job_kind_for_type(job_row.get("job_type")),
+            "service_name": self._service_name_for_type(job_row.get("job_type")),
+            "source_job_id": str((result.get("metadata") or {}).get("source_job_id") or (result.get("pipeline_metadata") or {}).get("source_job_id") or (job_row.get("pipeline_metadata") or {}).get("source_job_id") or "").strip() or None,
             "paths": list(result.get("paths") or []),
             "raw_outputs": list(result.get("raw_outputs") or job_row.get("raw_outputs") or []),
-            "zarr_outputs": list(result.get("zarr_outputs") or job_row.get("zarr_outputs") or []),
+            "zarr_outputs": zarr_outputs,
+            "masked_zarr_outputs": masked_zarr_outputs,
             "watermask_outputs": list(result.get("watermask_outputs") or job_row.get("watermask_outputs") or []),
+            "cloudmask_outputs": list(result.get("cloudmask_outputs") or job_row.get("cloudmask_outputs") or []),
             "checksums": dict(result.get("checksums") or {}),
             "metadata": dict(result.get("metadata") or {}),
             "manifest_entry": dict(result.get("manifest_entry") or {}),
@@ -199,14 +561,14 @@ class NimbusFetcher:
         }
         return JobResultResponse.model_validate(normalized_result)
 
-    def apply_watermask_existing_job(self, job_id: str, request: JobWaterMaskRequest) -> JobWaterMaskResponse:
+    def apply_mask_existing_job(self, job_id: str, request: JobMaskRequest) -> JobMaskResponse:
         row = self.store.get_job(job_id)
         if not row:
             raise JobNotFoundError(job_id)
         row = self._normalize_backend_paths_in_job_row(row)
         state = str(row.get("state") or "")
         if state in {JobState.queued.value, JobState.running.value, JobState.cancel_requested.value}:
-            raise ValueError("Water mask is only allowed when the job is not actively running.")
+            raise ValueError("Masking is only allowed when the source job is not actively running.")
 
         result = self._normalize_backend_paths_in_result_payload(self.store.get_result(job_id) or {})
         available_zarr_uris = self._job_related_zarr_uris(job_id=job_id, row=row, result=result)
@@ -225,104 +587,466 @@ class NimbusFetcher:
             scene_id_override=request.scene_id,
             product_type_override=request.product_type,
         )
-        self.store.append_event(
-            job_id,
-            "job.water_masking",
-            {
-                "zarr_uri": selected_zarr_uri,
+        mask_types = [str(item).strip().lower() for item in list(request.mask_types or [])]
+        mask_job_request = {
+            "job_type": "mask_existing_zarr",
+            "mask_contract_version": self.MASK_CONTRACT_VERSION,
+            "provider": zarr_context["provider"],
+            "collection": zarr_context["collection"],
+            "product_type": zarr_context["product_type"],
+            "source_job_id": job_id,
+            "source_zarr_uri": selected_zarr_uri,
+            "scene_id": zarr_context["scene_id"],
+            "acquisition_datetime": zarr_context["acquisition_datetime"],
+            "dataset_summary": dict(zarr_context["dataset_summary"] or {}),
+            "mask_types": mask_types,
+            "backend": str(request.backend or "auto").strip().lower() or "auto",
+            "threshold": float(request.threshold if request.threshold is not None else 0.62),
+            "overwrite": bool(request.overwrite),
+            "inference_device": str(request.inference_device or "").strip() or None,
+            "include_shadows": bool(request.include_shadows),
+            "water_backend": str(request.water_backend or "auto").strip().lower() or "auto",
+            "water_overwrite": bool(request.water_overwrite) if request.water_overwrite is not None else bool(request.overwrite),
+            "water_inference_device": str(request.water_inference_device or "").strip() or None,
+            "fail_on_error": bool(request.fail_on_error),
+        }
+        mask_job_id = self._create_mask_job(
+            source_job_id=job_id,
+            provider_name=zarr_context["provider"],
+            collection=zarr_context["collection"],
+            request_payload=mask_job_request,
+        )
+        self.store.update_job(
+            mask_job_id,
+            state=JobState.queued.value,
+            pipeline_state=PipelineState.queued.value,
+            pipeline_step="queued",
+            pipeline_progress=0.0,
+            pipeline_metadata={
+                "source_job_id": job_id,
+                "source_zarr_uri": selected_zarr_uri,
                 "scene_id": zarr_context["scene_id"],
-                "provider": zarr_context["provider"],
-                "collection": zarr_context["collection"],
-                "product_type": zarr_context["product_type"],
+                "mask_types": mask_types,
+                "backend": mask_job_request["backend"],
+                "threshold": mask_job_request["threshold"],
+                "include_shadows": mask_job_request["include_shadows"],
+                "water_backend": mask_job_request["water_backend"],
+                "job_kind": "mask",
+            },
+            progress=0.0,
+        )
+        self.store.append_event(
+            mask_job_id,
+            "job.mask_queued",
+            {
+                "source_job_id": job_id,
+                "source_zarr_uri": selected_zarr_uri,
+                "scene_id": zarr_context["scene_id"],
+                "mask_types": mask_types,
+                "backend": mask_job_request["backend"],
+                "threshold": mask_job_request["threshold"],
+                "include_shadows": mask_job_request["include_shadows"],
+                "water_backend": mask_job_request["water_backend"],
             },
         )
-        water_mask = self._masker().apply_omniwater_to_zarr(
-            job_id=job_id,
-            zarr_uri=selected_zarr_uri,
-            provider=zarr_context["provider"],
-            collection=zarr_context["collection"],
-            product_type=zarr_context["product_type"],
-            scene_id=zarr_context["scene_id"],
-            acquisition_datetime=zarr_context["acquisition_datetime"],
-            dataset_summary=zarr_context["dataset_summary"],
-            fail_on_error=bool(request.fail_on_error),
-            stage_callback=None,
+        if self._execution_enabled and self._executor is not None:
+            try:
+                anyio.from_thread.run(self._executor.submit, mask_job_id)
+            except RuntimeError:
+                # Fall back to the queue poller when the request did not originate
+                # from an anyio-managed thread.
+                pass
+        return JobMaskResponse(
+            job_id=mask_job_id,
+            source_job_id=job_id,
+            source_zarr_uri=selected_zarr_uri,
+            masked_zarr_uri=None,
+            mask_types=mask_types,
+            water_mask={},
+            cloud_mask={},
+            masked_zarr_outputs=[],
+            watermask_outputs=[],
+            cloudmask_outputs=[],
+            job=self.get_job(mask_job_id),
         )
-        watermask_outputs = self._collect_watermask_outputs(result=result, water_mask=water_mask)
-        conversion_metadata = dict(result.get("conversion_metadata") or row.get("conversion_metadata") or {})
-        conversion_metadata["water_mask"] = water_mask
-        conversion_metadata["water_mask_source_zarr_uri"] = selected_zarr_uri
-        conversion_metadata["water_mask_output_zarr_uri"] = str(water_mask.get("output_zarr_uri") or "").strip()
 
-        pipeline_metadata = dict(result.get("pipeline_metadata") or row.get("pipeline_metadata") or {})
-        pipeline_metadata["water_mask_last_run_at"] = self._now_iso()
-        pipeline_metadata["water_mask_source_zarr_uri"] = selected_zarr_uri
-        pipeline_metadata["water_mask_output_zarr_uri"] = str(water_mask.get("output_zarr_uri") or "").strip()
+    def _execute_mask_existing_zarr_job(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+        is_cancelled_now: Callable[[], bool],
+    ) -> None:
+        request_payload = dict(row.get("request") or {})
+        if str(request_payload.get("mask_contract_version") or "").strip().lower() != self.MASK_CONTRACT_VERSION:
+            raise ValueError(
+                "Legacy mask jobs are kept as read-only history and cannot be executed by the v2 mask service."
+            )
+        source_job_id = str(request_payload.get("source_job_id") or "").strip()
+        selected_zarr_uri = str(request_payload.get("source_zarr_uri") or request_payload.get("zarr_uri") or "").strip()
+        if not source_job_id or not selected_zarr_uri:
+            raise ValueError("Mask job is missing source_job_id or source_zarr_uri.")
 
-        updated_result = {
+        mask_types = [str(item).strip().lower() for item in list(request_payload.get("mask_types") or [])]
+        if not mask_types:
+            raise ValueError("Mask job is missing mask_types.")
+
+        zarr_context = {
+            "provider": str(request_payload.get("provider") or row.get("provider") or "").strip().lower(),
+            "collection": str(request_payload.get("collection") or row.get("collection") or "").strip(),
+            "product_type": str(request_payload.get("product_type") or row.get("product_type") or "").strip() or None,
+            "scene_id": str(request_payload.get("scene_id") or "").strip(),
+            "acquisition_datetime": str(request_payload.get("acquisition_datetime") or "").strip() or None,
+            "dataset_summary": dict(request_payload.get("dataset_summary") or {}),
+        }
+        if not zarr_context["collection"] or not zarr_context["scene_id"] or not zarr_context["dataset_summary"]:
+            source_row = self.store.get_job(source_job_id) or {}
+            source_result = self.store.get_result(source_job_id) or {}
+            if source_row:
+                source_row = self._normalize_backend_paths_in_job_row(self._normalize_historical_job_row(source_row))
+            if source_result:
+                source_result = self._normalize_backend_paths_in_result_payload(source_result)
+            resolved = self._resolve_zarr_context(
+                job_id=source_job_id,
+                row=source_row,
+                result=source_result,
+                zarr_uri=selected_zarr_uri,
+                scene_id_override=zarr_context["scene_id"] or None,
+                product_type_override=zarr_context["product_type"],
+            )
+            zarr_context.update(resolved)
+
+        backend_name = str(request_payload.get("backend") or "auto").strip().lower() or "auto"
+        threshold = float(request_payload.get("threshold") if request_payload.get("threshold") is not None else 0.62)
+        inference_device = str(request_payload.get("inference_device") or "").strip() or None
+        include_shadows = bool(request_payload.get("include_shadows", True))
+        overwrite = bool(request_payload.get("overwrite", True))
+        water_backend_name = str(request_payload.get("water_backend") or "auto").strip().lower() or "auto"
+        water_overwrite = bool(request_payload.get("water_overwrite", overwrite))
+        water_inference_device = str(request_payload.get("water_inference_device") or "").strip() or None
+        fail_on_error = bool(request_payload.get("fail_on_error", False))
+
+        def stage_callback(stage_name: str, payload: dict[str, Any]) -> None:
+            if stage_name == "cloud_masking_progress":
+                fraction = float(payload.get("progress") or 0.0)
+                fraction = max(0.0, min(fraction, 1.0))
+                progress_span = 20.0 if "water" in mask_types else 45.0
+                pipeline_progress = min(89.0, 35.0 + (fraction * progress_span))
+                current_pipeline = dict((self.store.get_job(job_id) or {}).get("pipeline_metadata") or {})
+                current_pipeline.update(
+                    {
+                        "source_job_id": source_job_id,
+                        "source_zarr_uri": selected_zarr_uri,
+                        "scene_id": zarr_context["scene_id"],
+                        "mask_types": mask_types,
+                        "backend": backend_name,
+                        "threshold": threshold,
+                        "include_shadows": include_shadows,
+                        "water_backend": water_backend_name,
+                    }
+                )
+                self._update_pipeline(
+                    job_id,
+                    pipeline_state=PipelineState.running_cloud_inference,
+                    pipeline_step="running_cloud_inference",
+                    pipeline_progress=pipeline_progress,
+                    pipeline_metadata=current_pipeline,
+                    event_type="job.cloud_masking_progress",
+                    event_payload=payload,
+                )
+                return
+            stage_map: dict[str, tuple[PipelineState, str, float]] = {
+                "water_masking_started": (PipelineState.running_water_inference, "running_water_inference", 60.0),
+                "water_masking_finished": (PipelineState.writing_mask_artifacts, "writing_mask_artifacts", 80.0),
+                "water_masking_failed": (PipelineState.failed, "failed", 70.0),
+                "cloud_masking_started": (PipelineState.running_cloud_inference, "running_cloud_inference", 35.0),
+                "cloud_masking_finished": (PipelineState.writing_mask_artifacts, "writing_mask_artifacts", 55.0),
+                "cloud_masking_failed": (PipelineState.failed, "failed", 78.0),
+            }
+            mapped = stage_map.get(stage_name)
+            if not mapped:
+                return
+            pipeline_state, pipeline_step, pipeline_progress = mapped
+            current_pipeline = dict((self.store.get_job(job_id) or {}).get("pipeline_metadata") or {})
+            current_pipeline.update(
+                {
+                    "source_job_id": source_job_id,
+                    "source_zarr_uri": selected_zarr_uri,
+                    "scene_id": zarr_context["scene_id"],
+                    "mask_types": mask_types,
+                    "backend": backend_name,
+                    "threshold": threshold,
+                    "include_shadows": include_shadows,
+                    "water_backend": water_backend_name,
+                }
+            )
+            self._update_pipeline(
+                job_id,
+                pipeline_state=pipeline_state,
+                pipeline_step=pipeline_step,
+                pipeline_progress=pipeline_progress,
+                pipeline_metadata=current_pipeline,
+                event_type=f"job.{stage_name}",
+                event_payload=payload,
+            )
+
+        self._update_pipeline(
+            job_id,
+            pipeline_state=PipelineState.resolving_source_zarr,
+            pipeline_step="resolving_source_zarr",
+            pipeline_progress=5.0,
+            pipeline_metadata={
+                "source_job_id": source_job_id,
+                "source_zarr_uri": selected_zarr_uri,
+                "scene_id": zarr_context["scene_id"],
+                "mask_types": mask_types,
+                "backend": backend_name,
+                "threshold": threshold,
+                "include_shadows": include_shadows,
+                "water_backend": water_backend_name,
+            },
+            event_type="job.mask_started",
+            event_payload={
+                "source_job_id": source_job_id,
+                "source_zarr_uri": selected_zarr_uri,
+                "scene_id": zarr_context["scene_id"],
+                "mask_types": mask_types,
+                "backend": backend_name,
+                "threshold": threshold,
+                "include_shadows": include_shadows,
+                "water_backend": water_backend_name,
+            },
+        )
+        if is_cancelled_now():
+            raise JobCancelledError("Mask job cancellation requested before execution.")
+
+        masker = self._masker()
+        if not bool(getattr(masker, "supports_stage_callbacks", True)):
+            if "cloud" in mask_types:
+                stage_callback(
+                    "cloud_masking_started",
+                    {
+                        "zarr_uri": selected_zarr_uri,
+                        "output_zarr_uri": selected_zarr_uri,
+                        "scene_id": zarr_context["scene_id"],
+                    },
+                )
+            elif "water" in mask_types:
+                stage_callback(
+                    "water_masking_started",
+                    {
+                        "zarr_uri": selected_zarr_uri,
+                        "output_zarr_uri": selected_zarr_uri,
+                        "scene_id": zarr_context["scene_id"],
+                    },
+                )
+        if hasattr(masker, "apply_masks_to_zarr"):
+            mask_response = self._invoke_mask_method(
+                masker.apply_masks_to_zarr,
+                job_id=job_id,
+                zarr_uri=selected_zarr_uri,
+                provider=zarr_context["provider"],
+                collection=zarr_context["collection"],
+                product_type=zarr_context["product_type"],
+                scene_id=zarr_context["scene_id"],
+                acquisition_datetime=zarr_context["acquisition_datetime"],
+                dataset_summary=zarr_context["dataset_summary"],
+                mask_types=mask_types,
+                backend=backend_name,
+                threshold=threshold,
+                overwrite=overwrite,
+                inference_device=inference_device,
+                include_shadows=include_shadows,
+                water_backend=water_backend_name,
+                water_overwrite=water_overwrite,
+                water_inference_device=water_inference_device,
+                fail_on_error=fail_on_error,
+                stage_callback=stage_callback,
+            )
+        elif mask_types == ["water"] and hasattr(masker, "apply_omniwater_to_zarr"):
+            water_mask = self._invoke_mask_method(
+                masker.apply_omniwater_to_zarr,
+                job_id=job_id,
+                zarr_uri=selected_zarr_uri,
+                provider=zarr_context["provider"],
+                collection=zarr_context["collection"],
+                product_type=zarr_context["product_type"],
+                scene_id=zarr_context["scene_id"],
+                acquisition_datetime=zarr_context["acquisition_datetime"],
+                dataset_summary=zarr_context["dataset_summary"],
+                fail_on_error=fail_on_error,
+                stage_callback=stage_callback,
+            )
+            masked_zarr_uri = str(water_mask.get("output_zarr_uri") or selected_zarr_uri).strip()
+            mask_response = {
+                "status": str(water_mask.get("status") or ""),
+                "mask_types": ["water"],
+                "input_zarr_uri": selected_zarr_uri,
+                "output_zarr_uri": masked_zarr_uri,
+                "masked_zarr_uri": masked_zarr_uri or None,
+                "masked_zarr_outputs": [masked_zarr_uri] if masked_zarr_uri else [],
+                "water_mask": water_mask,
+                "cloud_mask": {},
+                "watermask_outputs": [],
+                "cloudmask_outputs": [],
+            }
+        else:
+            raise RuntimeError("Configured mask service does not expose apply_masks_to_zarr.")
+
+        masked_zarr_uri = str(mask_response.get("masked_zarr_uri") or mask_response.get("output_zarr_uri") or selected_zarr_uri).strip()
+        masked_zarr_outputs = [item for item in list(mask_response.get("masked_zarr_outputs") or []) if str(item).strip()]
+        water_mask = dict(mask_response.get("water_mask") or {})
+        cloud_mask = dict(mask_response.get("cloud_mask") or {})
+        watermask_outputs: list[str] = []
+        cloudmask_outputs: list[str] = []
+        final_status = str(mask_response.get("status") or "").strip().lower()
+        mask_job_succeeded = final_status == "written"
+        visible_masked_zarr_outputs = masked_zarr_outputs if mask_job_succeeded else []
+        if mask_job_succeeded and not visible_masked_zarr_outputs and masked_zarr_uri:
+            visible_masked_zarr_outputs = [masked_zarr_uri]
+        visible_watermask_outputs = watermask_outputs if mask_job_succeeded else []
+        visible_cloudmask_outputs = cloudmask_outputs if mask_job_succeeded else []
+        quality_fields = self._mask_quality_fields(water_mask=water_mask, cloud_mask=cloud_mask)
+        quality_scalars = {
+            "water_fraction": float(quality_fields.get("water_fraction") or 0.0),
+            "cloud_fraction": float(quality_fields.get("cloud_fraction") or 0.0),
+            "cloud_only_fraction": float(quality_fields.get("cloud_only_fraction") or 0.0),
+            "shadow_fraction": float(quality_fields.get("shadow_fraction") or 0.0),
+        }
+        pipeline_metadata = {
+            "mask_contract_version": "v2",
+            "source_job_id": source_job_id,
+            "source_zarr_uri": selected_zarr_uri,
+            "masked_zarr_uri": masked_zarr_uri if mask_job_succeeded else "",
+            "scene_id": zarr_context["scene_id"],
+            "mask_types": mask_types,
+            "backend": backend_name,
+            "threshold": threshold,
+            "include_shadows": include_shadows,
+            "water_backend": water_backend_name,
+            "status": str(mask_response.get("status") or ""),
+            "mask_quality": quality_fields,
+            **quality_scalars,
+        }
+        conversion_metadata = {
+            "mask_contract_version": "v2",
+            "mask_types": mask_types,
+            "source_zarr_uri": selected_zarr_uri,
+            "masked_zarr_uri": masked_zarr_uri if mask_job_succeeded else "",
+            "backend": backend_name,
+            "threshold": threshold,
+            "include_shadows": include_shadows,
+            "water_backend": water_backend_name,
+            "water_mask": water_mask,
+            "cloud_mask": cloud_mask,
+            "mask_quality": quality_fields,
+            **quality_scalars,
+        }
+        result_payload = {
             "job_id": job_id,
-            "paths": self._merge_paths(list(result.get("paths") or []), watermask_outputs),
-            "raw_outputs": list(result.get("raw_outputs") or row.get("raw_outputs") or []),
-            "zarr_outputs": list(result.get("zarr_outputs") or row.get("zarr_outputs") or []),
-            "watermask_outputs": watermask_outputs,
-            "checksums": dict(result.get("checksums") or {}),
-            "metadata": dict(result.get("metadata") or {}),
-            "manifest_entry": dict(result.get("manifest_entry") or {}),
+            "job_type": "mask_existing_zarr",
+            "paths": self._merge_paths(visible_masked_zarr_outputs, []),
+            "raw_outputs": [],
+            "zarr_outputs": visible_masked_zarr_outputs,
+            "masked_zarr_outputs": visible_masked_zarr_outputs,
+            "watermask_outputs": visible_watermask_outputs,
+            "cloudmask_outputs": visible_cloudmask_outputs,
+            "checksums": {},
+            "metadata": {
+                "mask_contract_version": "v2",
+                "source_job_id": source_job_id,
+                "source_zarr_uri": selected_zarr_uri,
+                "masked_zarr_uri": masked_zarr_uri if mask_job_succeeded else "",
+                "scene_id": zarr_context["scene_id"],
+                "mask_types": mask_types,
+                "backend": backend_name,
+                "threshold": threshold,
+                "include_shadows": include_shadows,
+                "water_backend": water_backend_name,
+                "mask_quality": quality_fields,
+                **quality_scalars,
+            },
+            "manifest_entry": {},
             "pipeline_metadata": pipeline_metadata,
             "conversion_metadata": conversion_metadata,
         }
-        self.store.set_result(job_id, updated_result)
-        self.store.update_job(
-            job_id,
-            pipeline_metadata=pipeline_metadata,
-            conversion_metadata=conversion_metadata,
-            raw_outputs=updated_result["raw_outputs"],
-            zarr_outputs=updated_result["zarr_outputs"],
-            watermask_outputs=watermask_outputs,
-        )
-        if water_mask.get("status") == "written":
+        self.store.set_result(job_id, result_payload)
+        if mask_job_succeeded:
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.registering_artifacts,
+                pipeline_step="registering_artifacts",
+                pipeline_progress=90.0,
+                pipeline_metadata=pipeline_metadata,
+                conversion_metadata=conversion_metadata,
+                zarr_outputs=visible_masked_zarr_outputs,
+                event_type="job.registering_artifacts",
+                event_payload={"masked_zarr_uri": masked_zarr_uri},
+            )
             self._register_masked_zarr_artifact(
                 job_id=job_id,
+                source_job_id=source_job_id,
                 provider_name=zarr_context["provider"],
                 collection=zarr_context["collection"],
                 scene_id=zarr_context["scene_id"],
                 source_zarr_uri=selected_zarr_uri,
-                water_mask=water_mask,
+                masked_zarr_uri=masked_zarr_uri,
+                mask_payload=mask_response,
                 dataset_summary=zarr_context["dataset_summary"],
             )
-            self._register_watermask_artifact(
-                job_id=job_id,
-                provider_name=zarr_context["provider"],
-                collection=zarr_context["collection"],
-                scene_id=zarr_context["scene_id"],
-                zarr_uri=selected_zarr_uri,
-                water_mask=water_mask,
-            )
-            self.store.append_event(
-                job_id,
-                "job.water_mask_written",
-                {
-                    "zarr_uri": selected_zarr_uri,
-                    "water_mask": water_mask,
-                },
-            )
-        else:
-            self.store.append_event(
-                job_id,
-                "job.water_mask_failed",
-                {
-                    "zarr_uri": selected_zarr_uri,
-                    "water_mask": water_mask,
-                },
-            )
-        return JobWaterMaskResponse(
-            job_id=job_id,
-            zarr_uri=selected_zarr_uri,
-            masked_zarr_uri=str(water_mask.get("output_zarr_uri") or "").strip() or None,
-            water_mask=water_mask,
-            watermask_outputs=watermask_outputs,
-            job=self.get_job(job_id),
+
+        terminal_pipeline_state = PipelineState.masked_zarr_written if mask_job_succeeded else PipelineState.failed
+        terminal_state = JobState.succeeded if terminal_pipeline_state == PipelineState.masked_zarr_written else JobState.failed
+        errors = []
+        if terminal_state == JobState.failed:
+            for payload in (water_mask, cloud_mask):
+                reason = str(payload.get("reason") or "").strip()
+                if reason and reason not in errors:
+                    errors.append(reason)
+            if not errors:
+                errors.append(f"Mask execution failed with status '{final_status or 'unknown'}'.")
+        self.store.update_job(
+            job_id,
+            state=terminal_state.value,
+            finished_at=self._now_iso(),
+            progress=100.0 if terminal_state == JobState.succeeded else 0.0,
+            pipeline_state=terminal_pipeline_state.value,
+            pipeline_step=terminal_pipeline_state.value,
+            pipeline_progress=100.0 if terminal_state == JobState.succeeded else 95.0,
+            pipeline_metadata=pipeline_metadata,
+            conversion_metadata=conversion_metadata,
+            zarr_outputs=visible_masked_zarr_outputs,
+            watermask_outputs=visible_watermask_outputs,
+            cloudmask_outputs=visible_cloudmask_outputs,
+            errors=errors,
         )
+        self.store.append_event(
+            job_id,
+            "job.mask_completed" if terminal_state == JobState.succeeded else "job.mask_failed",
+            {
+                "status": terminal_state.value,
+                "source_job_id": source_job_id,
+                "source_zarr_uri": selected_zarr_uri,
+                "masked_zarr_uri": masked_zarr_uri,
+                "mask_types": mask_types,
+                "backend": backend_name,
+                "threshold": threshold,
+                "include_shadows": include_shadows,
+                "water_backend": water_backend_name,
+                "water_mask": water_mask,
+                "cloud_mask": cloud_mask,
+            },
+        )
+
+    def apply_watermask_existing_job(self, job_id: str, request: JobWaterMaskRequest) -> JobWaterMaskResponse:
+        response = self.apply_mask_existing_job(job_id, JobMaskRequest.model_validate(request.model_dump(mode="python")))
+        return JobWaterMaskResponse.model_validate(response.model_dump(mode="python"))
+
+    def apply_cloud_mask_existing_job(self, job_id: str, request: JobCloudMaskRequest) -> JobCloudMaskResponse:
+        payload = request.model_dump(mode="python")
+        payload["mask_types"] = ["cloud"]
+        response = self.apply_mask_existing_job(job_id, JobMaskRequest.model_validate(payload))
+        return JobCloudMaskResponse.model_validate(response.model_dump(mode="python"))
 
     async def cancel_job(self, job_id: str) -> bool:
         row = self.store.get_job(job_id)
@@ -453,7 +1177,12 @@ class NimbusFetcher:
 
     async def _monitor_queued_jobs_loop(self) -> None:
         while True:
-            self.store.requeue_stale_running_jobs(self.settings.nimbus_stale_job_seconds)
+            stale_job_ids = self.store.requeue_stale_running_jobs(self.settings.nimbus_stale_job_seconds)
+            self._fail_interrupted_mask_jobs(
+                job_ids=stale_job_ids,
+                reason="Mask job marked stale after exceeding the worker timeout. Submit a new mask job from the Mask tab.",
+                event_type="job.mask_failed_stale_timeout",
+            )
             await self._enqueue_queued_jobs()
             await anyio.sleep(float(self.settings.nimbus_queue_poll_seconds))
 
@@ -757,6 +1486,7 @@ class NimbusFetcher:
         normalized["raw_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(row.get("raw_outputs") or []))))
         normalized["zarr_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(row.get("zarr_outputs") or []))))
         normalized["watermask_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(row.get("watermask_outputs") or []))))
+        normalized["cloudmask_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(row.get("cloudmask_outputs") or []))))
         return normalized
 
     def _normalize_backend_paths_in_result_payload(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -764,7 +1494,9 @@ class NimbusFetcher:
         normalized["paths"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("paths") or []))))
         normalized["raw_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("raw_outputs") or []))))
         normalized["zarr_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("zarr_outputs") or []))))
+        normalized["masked_zarr_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("masked_zarr_outputs") or []))))
         normalized["watermask_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("watermask_outputs") or []))))
+        normalized["cloudmask_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("cloudmask_outputs") or []))))
         normalized["metadata"] = dict(self._normalize_backend_paths_payload(dict(normalized.get("metadata") or {})))
         normalized["manifest_entry"] = dict(self._normalize_backend_paths_payload(dict(normalized.get("manifest_entry") or {})))
         normalized["pipeline_metadata"] = dict(self._normalize_backend_paths_payload(dict(normalized.get("pipeline_metadata") or {})))
@@ -827,6 +1559,7 @@ class NimbusFetcher:
         self,
         *,
         job_id: str,
+        source_job_id: str,
         provider_name: str,
         collection: str,
         scene_id: str,
@@ -844,13 +1577,16 @@ class NimbusFetcher:
             scene_id=scene_id,
             source_uri=zarr_uri,
             created_by_job_id=job_id,
-            source_job_id=job_id,
+            source_job_id=source_job_id,
             data_family="mask",
             dimensions=["time", "y", "x"],
             shape=list(water_mask.get("shape") or []),
             metadata={
                 "water_mask": water_mask,
-                "registered_via": "manual_watermask",
+                "quality": self._water_mask_quality_fields(water_mask),
+                "mask_contract_version": "v2",
+                "registered_via": "manual_mask_job",
+                "source_job_id": source_job_id,
             },
         )
         self.upsert_artifact(artifact_request)
@@ -859,15 +1595,17 @@ class NimbusFetcher:
         self,
         *,
         job_id: str,
+        source_job_id: str,
         provider_name: str,
         collection: str,
         scene_id: str,
         source_zarr_uri: str,
-        water_mask: dict[str, Any],
+        masked_zarr_uri: str,
+        mask_payload: dict[str, Any],
         dataset_summary: dict[str, Any],
     ) -> None:
-        artifact_uri = str(water_mask.get("output_zarr_uri") or "").strip()
-        if not artifact_uri:
+        artifact_uri = str(masked_zarr_uri or "").strip()
+        if not artifact_uri or artifact_uri == str(source_zarr_uri or "").strip():
             return
         artifact_request = ArtifactUpsertRequest(
             artifact_type=ArtifactType.zarr_masked,
@@ -877,23 +1615,150 @@ class NimbusFetcher:
             scene_id=scene_id,
             source_uri=source_zarr_uri,
             created_by_job_id=job_id,
-            source_job_id=job_id,
+            source_job_id=source_job_id,
             data_family="optical",
             band_names=list(dataset_summary.get("band_names") or []),
             dimensions=list(dataset_summary.get("dimensions") or []),
             shape=list(dataset_summary.get("shape") or []),
             metadata={
-                "water_mask": water_mask,
-                "registered_via": "manual_watermask",
+                "mask": mask_payload,
+                "quality": self._mask_quality_fields(
+                    water_mask=dict(mask_payload.get("water_mask") or {}),
+                    cloud_mask=dict(mask_payload.get("cloud_mask") or {}),
+                ),
+                "mask_contract_version": "v2",
+                "registered_via": "manual_mask_job",
                 "source_zarr_uri": source_zarr_uri,
+                "source_job_id": source_job_id,
             },
         )
         self.upsert_artifact(artifact_request)
 
-    def _masker(self) -> MaskService:
+    def _register_cloudmask_artifact(
+        self,
+        *,
+        job_id: str,
+        source_job_id: str,
+        provider_name: str,
+        collection: str,
+        scene_id: str,
+        zarr_uri: str,
+        cloud_mask: dict[str, Any],
+    ) -> None:
+        artifact_uri = str(cloud_mask.get("artifact_uri") or "").strip()
+        if not artifact_uri:
+            return
+        artifact_request = ArtifactUpsertRequest(
+            artifact_type=ArtifactType.cloudmask,
+            artifact_uri=artifact_uri,
+            provider=ProviderName(provider_name),
+            collection=collection,
+            scene_id=scene_id,
+            source_uri=zarr_uri,
+            created_by_job_id=job_id,
+            source_job_id=source_job_id,
+            data_family="mask",
+            dimensions=["time", "y", "x"],
+            shape=list(cloud_mask.get("shape") or []),
+            metadata={
+                "cloud_mask": cloud_mask,
+                "quality": self._cloud_mask_quality_fields(cloud_mask),
+                "mask_contract_version": "v2",
+                "registered_via": "manual_mask_job",
+                "source_job_id": source_job_id,
+            },
+        )
+        self.upsert_artifact(artifact_request)
+
+    @staticmethod
+    def _water_mask_quality_fields(water_mask: dict[str, Any]) -> dict[str, Any]:
+        if not water_mask:
+            return {}
+        return {
+            "status": str(water_mask.get("status") or "").strip().lower(),
+            "runtime_mode": str(water_mask.get("runtime_mode") or "").strip(),
+            "threshold_used": water_mask.get("threshold_used"),
+            "sensor_recipe": str(water_mask.get("sensor_recipe") or "").strip(),
+            "probability_source": str(water_mask.get("probability_source") or "").strip(),
+            "water_fraction": float(water_mask.get("water_fraction") or 0.0),
+            "cloud_blocked_fraction": float(water_mask.get("cloud_blocked_fraction") or 0.0),
+            "input_bands": [str(item) for item in list(water_mask.get("input_bands") or [])],
+            "mask_path": str(water_mask.get("mask_path") or "").strip(),
+            "probability_path": str(water_mask.get("probability_path") or "").strip(),
+        }
+
+    @staticmethod
+    def _cloud_mask_quality_fields(cloud_mask: dict[str, Any]) -> dict[str, Any]:
+        if not cloud_mask:
+            return {}
+        inference = dict(cloud_mask.get("inference") or {})
+        return {
+            "status": str(cloud_mask.get("status") or "").strip().lower(),
+            "backend": str(cloud_mask.get("backend") or "").strip(),
+            "threshold": cloud_mask.get("threshold"),
+            "includes_shadows": bool(
+                cloud_mask.get("include_shadows", inference.get("includes_shadows", False))
+            ),
+            "mask_source": str(cloud_mask.get("mask_source") or inference.get("mask_source") or "").strip(),
+            "probability_source": str(
+                cloud_mask.get("probability_source") or inference.get("probability_source") or ""
+            ).strip(),
+            "sensor_recipe": str(
+                cloud_mask.get("sensor_recipe") or cloud_mask.get("sensor") or inference.get("sensor_recipe") or ""
+            ).strip(),
+            "cloud_fraction": float(cloud_mask.get("cloud_fraction") or inference.get("cloud_fraction") or 0.0),
+            "cloud_only_fraction": float(
+                cloud_mask.get("cloud_only_fraction") or inference.get("cloud_only_fraction") or 0.0
+            ),
+            "shadow_fraction": float(cloud_mask.get("shadow_fraction") or inference.get("shadow_fraction") or 0.0),
+            "input_bands": [str(item) for item in list(cloud_mask.get("input_bands") or [])],
+            "mask_path": str(cloud_mask.get("mask_path") or "").strip(),
+            "probability_path": str(cloud_mask.get("probability_path") or "").strip(),
+        }
+
+    def _mask_quality_fields(self, *, water_mask: dict[str, Any], cloud_mask: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "water_mask": self._water_mask_quality_fields(water_mask),
+            "cloud_mask": self._cloud_mask_quality_fields(cloud_mask),
+            "water_fraction": float(water_mask.get("water_fraction") or 0.0),
+            "cloud_fraction": float(
+                cloud_mask.get("cloud_fraction")
+                or dict(cloud_mask.get("inference") or {}).get("cloud_fraction")
+                or 0.0
+            ),
+            "cloud_only_fraction": float(
+                cloud_mask.get("cloud_only_fraction")
+                or dict(cloud_mask.get("inference") or {}).get("cloud_only_fraction")
+                or 0.0
+            ),
+            "shadow_fraction": float(
+                cloud_mask.get("shadow_fraction")
+                or dict(cloud_mask.get("inference") or {}).get("shadow_fraction")
+                or 0.0
+            ),
+        }
+
+    def _masker(self) -> Any:
         if self._mask_service is None:
-            self._mask_service = MaskService()
+            self._mask_service = MaskServiceClient(
+                service_url=self.settings.nimbus_mask_service_url,
+            )
         return self._mask_service
+
+    @staticmethod
+    def _invoke_mask_method(method: Callable[..., Any], **kwargs: Any) -> Any:
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return method(**kwargs)
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+            return method(**kwargs)
+        filtered_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature.parameters
+        }
+        return method(**filtered_kwargs)
 
     def _job_related_zarr_uris(
         self,
@@ -925,6 +1790,33 @@ class NimbusFetcher:
                 if uri and uri not in related:
                     related.append(uri)
         return related
+
+    def _masked_zarr_outputs_for_job(
+        self,
+        *,
+        job_id: str,
+        result: dict[str, Any],
+        row: dict[str, Any],
+    ) -> list[str]:
+        outputs = self._merge_paths([], list(result.get("masked_zarr_outputs") or []))
+        if outputs:
+            return outputs
+        outputs = self._merge_paths([], list(row.get("masked_zarr_outputs") or []))
+        if outputs:
+            return outputs
+        artifacts = self.list_artifacts(
+            artifact_type=ArtifactType.zarr_masked.value,
+            provider=None,
+            collection=None,
+            scene_id=None,
+            job_id=job_id,
+            uri_query=None,
+            date_from=None,
+            date_to=None,
+            page=1,
+            page_size=500,
+        )
+        return [str(item.artifact_uri).strip() for item in artifacts.items if str(item.artifact_uri).strip()]
 
     def _resolve_zarr_context(
         self,
@@ -1041,6 +1933,10 @@ class NimbusFetcher:
             "crs": crs,
             "transform": transform,
             "dtype": str(attrs.get("dtype") or imagery.dtype),
+            "pixel_size": list(attrs.get("reference_pixel_size") or []),
+            "reference_pixel_size": list(attrs.get("reference_pixel_size") or []),
+            "band_metadata": dict(attrs.get("band_metadata") or {}),
+            "ancillary_metadata": dict(attrs.get("ancillary_metadata") or {}),
         }
 
     @staticmethod
@@ -1336,6 +2232,57 @@ class NimbusFetcher:
         )
         self.store.append_event(job_id, "job.started", {"state": JobState.running.value})
 
+        job_type = str(row.get("job_type") or "").strip().lower()
+        if job_type == "mask_existing_zarr":
+            try:
+                self._execute_mask_existing_zarr_job(
+                    job_id=job_id,
+                    row=row,
+                    is_cancelled_now=is_cancelled_now,
+                )
+            except (DownloadCancelled, JobCancelledError):
+                self._mark_cancelled(job_id, "cancelled_during_mask")
+            except Exception as exc:
+                current_row = self.store.get_job(job_id) or row
+                request_payload = dict(current_row.get("request") or {})
+                if (
+                    str(request_payload.get("mask_contract_version") or "").strip().lower()
+                    == self.MASK_CONTRACT_VERSION
+                ):
+                    self._fail_interrupted_mask_jobs(
+                        job_ids=[job_id],
+                        reason=f"Mask job crashed before finalization: {exc}",
+                        event_type="job.mask_failed",
+                    )
+                else:
+                    self.store.update_job(
+                        job_id,
+                        state=JobState.failed.value,
+                        finished_at=self._now_iso(),
+                        progress=0.0,
+                        pipeline_state=PipelineState.failed.value,
+                        pipeline_step="failed",
+                        pipeline_progress=95.0,
+                        pipeline_metadata=dict(current_row.get("pipeline_metadata") or {}),
+                        conversion_metadata=dict(current_row.get("conversion_metadata") or {}),
+                        zarr_outputs=[],
+                        watermask_outputs=[],
+                        cloudmask_outputs=[],
+                        errors=[str(exc)],
+                    )
+                    self.store.append_event(
+                        job_id,
+                        "job.mask_failed",
+                        {
+                            "status": JobState.failed.value,
+                            "error": str(exc),
+                            "pipeline_state": PipelineState.failed.value,
+                        },
+                    )
+            finally:
+                self._cancel_check_cache.pop(job_id, None)
+            return
+
         request = self._request_adapter.validate_python(row["request"])
         output_dir = sanitize_output_dir(
             self.settings.nimbus_data_dir,
@@ -1383,6 +2330,7 @@ class NimbusFetcher:
             "bytes_total": 0,
             "last_emit": 0.0,
             "last_bytes": 0,
+            "last_progress": 0.0,
             "last_time": time.monotonic(),
         }
 
@@ -1412,8 +2360,16 @@ class NimbusFetcher:
                 )
             pipeline_progress = min(69.0, 5.0 + (progress_pct * 0.64))
 
-            # Throttle DB writes and events.
-            if now_mono - float(aggregate["last_emit"]) >= 0.25 or delta == 0:
+            if self._should_emit_download_progress(
+                delta=int(delta),
+                now_mono=now_mono,
+                last_emit=float(aggregate["last_emit"]),
+                bytes_downloaded=int(aggregate["bytes_downloaded"]),
+                last_bytes=int(aggregate["last_bytes"]),
+                progress_pct=float(progress_pct),
+                last_progress=float(aggregate["last_progress"]),
+                bytes_total=int(aggregate["bytes_total"]),
+            ):
                 self.store.update_job(
                     job_id,
                     progress=progress_pct,
@@ -1437,6 +2393,7 @@ class NimbusFetcher:
                 aggregate["last_emit"] = now_mono
                 aggregate["last_time"] = now_mono
                 aggregate["last_bytes"] = int(aggregate["bytes_downloaded"])
+                aggregate["last_progress"] = float(progress_pct)
 
         def emit_retry(file_name: str, attempt: int, reason: str, retry_after: float | None) -> None:
             row_now = self.store.get_job(job_id) or {}
@@ -1678,6 +2635,18 @@ class NimbusFetcher:
                 gateway_timeout_retries=4,
                 gateway_timeout_floor_delay=10.0,
             )
+        elif provider_name == "usgs":
+            # Keep USGS closer to the older conservative downloader profile to
+            # reduce incomplete request churn and per-host pressure.
+            download_manager_kwargs.update(
+                max_concurrent=min(provider_limit, 2),
+                initial_delay=2.0,
+                backoff_factor=1.5,
+                connect_timeout=30.0,
+                chunk_size=128 * 1024,
+                max_connections=50,
+                max_connections_per_host=2,
+            )
 
         download_manager = DownloadManager(**download_manager_kwargs)
         provider = self._build_provider(provider_name, download_manager)
@@ -1890,9 +2859,23 @@ class NimbusFetcher:
         if started_at is not None:
             end_time = finished_at or datetime.now(timezone.utc)
             duration_seconds = max(0.0, (end_time - started_at).total_seconds())
+        job_type = row.get("job_type")
+        job_kind = self._job_kind_for_type(job_type)
+        service_name = self._service_name_for_type(job_type)
+        masked_zarr_outputs = self._masked_zarr_outputs_for_job(job_id=row["job_id"], result={}, row=row)
+        pipeline_metadata = dict(row.get("pipeline_metadata") or {})
+        source_job_id = str(
+            pipeline_metadata.get("source_job_id")
+            or (row.get("request") or {}).get("source_job_id")
+            or ""
+        ).strip() or None
 
         return JobStatusResponse(
             job_id=row["job_id"],
+            job_type=str(job_type or "") or None,
+            job_kind=cast(Any, job_kind),
+            service_name=service_name,
+            source_job_id=source_job_id,
             state=JobState(row["state"]),
             pipeline_state=PipelineState(str(row.get("pipeline_state") or PipelineState.queued.value)),
             pipeline_step=row.get("pipeline_step"),
@@ -1901,11 +2884,13 @@ class NimbusFetcher:
                 if row.get("pipeline_progress") is not None
                 else None
             ),
-            pipeline_metadata=dict(row.get("pipeline_metadata") or {}),
+            pipeline_metadata=pipeline_metadata,
             conversion_metadata=dict(row.get("conversion_metadata") or {}),
             raw_outputs=list(row.get("raw_outputs") or []),
             zarr_outputs=list(row.get("zarr_outputs") or []),
+            masked_zarr_outputs=masked_zarr_outputs,
             watermask_outputs=list(row.get("watermask_outputs") or []),
+            cloudmask_outputs=list(row.get("cloudmask_outputs") or []),
             progress=float(row["progress"]),
             bytes_downloaded=int(row["bytes_downloaded"]),
             bytes_total=int(row["bytes_total"]),
@@ -1941,6 +2926,35 @@ class NimbusFetcher:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @classmethod
+    def _should_emit_download_progress(
+        cls,
+        *,
+        delta: int,
+        now_mono: float,
+        last_emit: float,
+        bytes_downloaded: int,
+        last_bytes: int,
+        progress_pct: float,
+        last_progress: float,
+        bytes_total: int,
+    ) -> bool:
+        if delta == 0 or last_emit <= 0:
+            return True
+
+        elapsed = max(0.0, now_mono - last_emit)
+        if bytes_total > 0 and bytes_downloaded >= bytes_total:
+            return True
+        if elapsed < cls.DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS:
+            return False
+        if elapsed >= cls.DOWNLOAD_PROGRESS_MAX_INTERVAL_SECONDS:
+            return True
+        if max(0, bytes_downloaded - last_bytes) >= cls.DOWNLOAD_PROGRESS_MIN_BYTES:
+            return True
+        if max(0.0, progress_pct - last_progress) >= cls.DOWNLOAD_PROGRESS_MIN_PERCENT:
+            return True
+        return False
 
     def _publish_worker_heartbeat(self) -> dict[str, Any] | None:
         if not self._execution_enabled:

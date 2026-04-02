@@ -12,6 +12,7 @@ from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
+from nimbuschain_fetch.provider_status import classify_provider_error
 from nimbuschain_fetch.usgs_product_type import usgs_product_type_matches
 
 
@@ -27,15 +28,6 @@ def _preview_error(message: str, *, error_kind: str, detail: str | None = None) 
         "error_kind": error_kind,
         "error_detail": detail or "",
     }
-
-
-def _classify_preview_error(message: str) -> str:
-    text = str(message or "").strip().lower()
-    if any(token in text for token in ["auth_invalid", "auth unauthorized", "auth_unauthorized", "credential verification failed", "authentication failed", "access_token missing", "api key is empty"]):
-        return "credentials_invalid"
-    if any(token in text for token in ["temporarily unavailable", "retry in a few seconds", "http 429", "http 500", "http 502", "http 503", "http 504", "request failed on", "retry budget exhausted"]):
-        return "provider_unavailable"
-    return "technical"
 
 
 def _safe_union(geoms: list[BaseGeometry]) -> BaseGeometry | None:
@@ -189,7 +181,7 @@ def _copernicus_preview(
     if not username or not password:
         return _preview_error(
             "Copernicus credentials are missing in the backend runtime.",
-            error_kind="credentials_invalid",
+            error_kind="credentials_missing",
             detail="Missing NIMBUS_COPERNICUS_USERNAME or NIMBUS_COPERNICUS_PASSWORD.",
         )
     token_payload = {
@@ -335,7 +327,7 @@ def _usgs_preview(
     if not username or not token:
         return _preview_error(
             "USGS credentials are missing in the backend runtime.",
-            error_kind="credentials_invalid",
+            error_kind="credentials_missing",
             detail="Missing NIMBUS_USGS_USERNAME or NIMBUS_USGS_TOKEN.",
         )
     geom = parse_aoi_text(aoi_wkt)
@@ -375,7 +367,7 @@ def _usgs_preview(
         return parse_usgs_scenes(search_body, max_items=max_items, product_type=product_type)
     except Exception as exc:
         detail = f"USGS preview failed: {exc}"
-        error_kind = _classify_preview_error(detail)
+        error_kind = classify_provider_error(detail)
         if error_kind == "credentials_invalid":
             message = "USGS credentials are invalid or rejected."
         elif error_kind == "provider_unavailable":
@@ -422,7 +414,7 @@ def preview_products_from_env(
             )
         except Exception as exc:
             detail = f"Copernicus preview failed: {exc}"
-            error_kind = _classify_preview_error(detail)
+            error_kind = classify_provider_error(detail)
             if error_kind == "credentials_invalid":
                 message = "Copernicus credentials are invalid or rejected."
             elif error_kind == "provider_unavailable":

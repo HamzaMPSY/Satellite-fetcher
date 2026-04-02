@@ -97,14 +97,19 @@ def test_write_water_mask_to_existing_zarr_store(tmp_path: Path) -> None:
     group = zarr.open_group(written_uri, mode="r")
     assert "masks" in group
     assert "water" in group["masks"]
+    assert "water_probability" in group["masks"]
     water = group["masks"]["water"]
+    water_probability = group["masks"]["water_probability"]
     assert tuple(water.shape) == (1, height, width)
+    assert tuple(water_probability.shape) == (1, height, width)
     assert str(water.dtype) == "uint8"
+    assert str(water_probability.dtype) == "float32"
     assert set(np.unique(water[0, :, :]).tolist()).issubset({0, 1})
     assert water.attrs["mask_name"] == "water"
     assert water.attrs["mask_path"] == "masks/water"
     assert water.attrs["input_bands"] == ["B04", "B03", "B02", "B08"]
     assert group.attrs["water_mask_path"] == "masks/water"
+    assert group.attrs["water_mask_probability_path"] == "masks/water_probability"
     assert group.attrs["water_mask_written"] is True
     assert result["shape"] == [1, height, width]
     assert result["classes"] == {"0": "non-water", "1": "water"}

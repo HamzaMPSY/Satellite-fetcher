@@ -35,6 +35,8 @@ class DownloadManager:
         connect_timeout: float = 20,
         read_timeout: float | None = None,
         chunk_size: int = 1024 * 1024,
+        max_connections: int | None = None,
+        max_connections_per_host: int | None = None,
         enable_resume: bool = True,
         min_resume_size: int = 1024 * 1024,
         gateway_timeout_retries: int = 3,
@@ -51,6 +53,10 @@ class DownloadManager:
         self.connect_timeout = max(1.0, float(connect_timeout))
         self.read_timeout = None if read_timeout is None else max(1.0, float(read_timeout))
         self.chunk_size = max(64 * 1024, int(chunk_size))
+        self.max_connections = max(1, int(max_connections)) if max_connections is not None else None
+        self.max_connections_per_host = (
+            max(1, int(max_connections_per_host)) if max_connections_per_host is not None else None
+        )
         self.enable_resume = bool(enable_resume)
         self.min_resume_size = max(0, int(min_resume_size))
         self.gateway_timeout_retries = max(0, int(gateway_timeout_retries))
@@ -83,8 +89,12 @@ class DownloadManager:
             sock_read=self.read_timeout,
         )
         connector = aiohttp.TCPConnector(
-            limit=max(10, self.max_concurrent * 4),
-            limit_per_host=max(2, self.max_concurrent),
+            limit=self.max_connections if self.max_connections is not None else max(10, self.max_concurrent * 4),
+            limit_per_host=(
+                self.max_connections_per_host
+                if self.max_connections_per_host is not None
+                else max(2, self.max_concurrent)
+            ),
             enable_cleanup_closed=True,
             use_dns_cache=True,
             ttl_dns_cache=300,

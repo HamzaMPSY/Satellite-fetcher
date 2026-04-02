@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
+
+from nimbuschain_fetch_ui.provider_auth import provider_action_guidance, provider_auth_state_label
 
 
 def render_settings_tab(
@@ -12,6 +15,7 @@ def render_settings_tab(
     downloads_dir: Path,
     map_center: list[float],
     map_zoom: int,
+    provider_status_snapshot: dict[str, Any] | None,
 ) -> None:
     st.markdown(
         '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>🔧</span><span style="font-weight:600;font-size:.94rem;">Settings</span></div>',
@@ -26,6 +30,38 @@ def render_settings_tab(
         st.metric("System", skey)
     st.markdown("---")
     st.code(f"API URL: {api_url}\nDownloads dir: {downloads_dir}", language="text")
+    st.markdown("---")
+
+    st.markdown("**Provider auth runtime**")
+    providers = []
+    if isinstance(provider_status_snapshot, dict):
+        providers = [
+            item
+            for item in list(provider_status_snapshot.get("providers") or [])
+            if isinstance(item, dict)
+        ]
+    if not providers:
+        st.caption("Provider auth status unavailable. Refresh service status from Connection.")
+    else:
+        for item in providers:
+            provider_name = str(item.get("provider") or "").upper()
+            state_label = provider_auth_state_label(item)
+            guidance = provider_action_guidance(str(item.get("provider") or ""), {"providers": [item]})
+            st.markdown(
+                "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:12px;margin-bottom:8px;'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center;gap:8px;'><span style='font-size:.78rem;color:#94a3b8;font-weight:600;'>{provider_name}</span>"
+                f"<span style='font-size:.72rem;color:{'#22c55e' if state_label == 'valid' else '#ef4444' if state_label in {'missing', 'credentials invalid', 'credentials missing'} else '#f59e0b'};font-weight:700;text-transform:uppercase;'>{state_label}</span></div>"
+                f"<div style='font-size:.72rem;color:#cbd5e1;margin-top:6px;'>{str(item.get('message') or '-')}</div>"
+                f"<div style='font-size:.65rem;color:#64748b;margin-top:4px;'>Credential source: runtime env · username present: {'yes' if item.get('username_present') else 'no'} · token present: {'yes' if item.get('token_present') or item.get('password_present') else 'no'}</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            detail = str(item.get("detail") or "").strip()
+            if detail:
+                with st.expander(f"{provider_name} auth details", expanded=False):
+                    st.code(detail, language="text")
+            if guidance:
+                st.caption(guidance)
     st.markdown("---")
 
     st.markdown("**Converter / Zarr settings**")

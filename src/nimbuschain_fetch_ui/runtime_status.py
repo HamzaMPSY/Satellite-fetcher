@@ -58,6 +58,11 @@ def refresh_api_runtime_statuses(*, api_url: str, api_key: str) -> dict[str, Any
             path="/v1/worker/status",
             api_key=api_key,
         ),
+        "provider_status_snapshot": fetch_status_json(
+            base_url=api_url,
+            path="/v1/providers/status",
+            api_key=api_key,
+        ),
         "service_status_checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "last_api_status_url": api_url,
     }

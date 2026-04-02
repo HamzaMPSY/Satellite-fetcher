@@ -75,6 +75,15 @@ def _build_landsat_bundle(root: Path, *, scene_id: str, l1: bool) -> Path:
                 f'LANDSAT_SCENE_ID = "{scene_id}"',
                 'DATE_ACQUIRED = 2026-01-01',
                 'SCENE_CENTER_TIME = "10:55:01.0240000Z"',
+                'SUN_ELEVATION = 45.0',
+                *[
+                    f"REFLECTANCE_MULT_BAND_{index} = {'2.0000E-05' if l1 else '2.7500E-05'}"
+                    for index in range(1, 8 if not l1 else 10)
+                ],
+                *[
+                    f"REFLECTANCE_ADD_BAND_{index} = {'-0.100000' if l1 else '-0.200000'}"
+                    for index in range(1, 8 if not l1 else 10)
+                ],
             ]
         ),
         encoding="utf-8",
@@ -131,11 +140,11 @@ def _install_fake_omniwatermask(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "omniwatermask", module)
 
 
-def _assert_source_zarr_unchanged(zarr_uri: str) -> None:
-    group = zarr.open_group(zarr_uri, mode="r")
+def _assert_zarr_has_no_water_mask(zarr_uri: str) -> None:
+    group = zarr.open_group(zarr_uri, mode="r", use_consolidated=False)
     assert "masks" not in group or "water" not in group["masks"]
     assert group.attrs.get("water_mask_written") in (None, False)
-    assert group.attrs.get("water_mask_status") in (None, "")
+    assert group.attrs.get("water_mask_status") in (None, "", "failed")
     assert group.attrs.get("water_mask_path") in (None, "")
 
 
@@ -157,7 +166,7 @@ def test_sentinel2_manual_watermask_creates_masked_copy_without_mutating_source(
         product_type="S2MSI1C",
     )
 
-    _assert_source_zarr_unchanged(written_uri)
+    _assert_zarr_has_no_water_mask(written_uri)
     assert summary.get("water_mask") in (None, {})
     assert dataset_summary.get("water_mask_written") in (None, False)
 
@@ -173,13 +182,14 @@ def test_sentinel2_manual_watermask_creates_masked_copy_without_mutating_source(
 
     masked_uri = str(result["output_zarr_uri"])
     assert result["input_zarr_uri"] == written_uri
-    assert masked_uri != written_uri
+    assert masked_uri == written_uri
     assert Path(masked_uri).exists()
 
-    _assert_source_zarr_unchanged(written_uri)
     group = zarr.open_group(masked_uri, mode="r")
     assert "masks" in group and "water" in group["masks"]
-    assert tuple(group["masks"]["water"].shape) == (1, 6, 6)
+    assert tuple(group["masks"]["water"].shape) == (1, int(dataset_summary["shape"][2]), int(dataset_summary["shape"][3]))
+    assert tuple(group["imagery"].shape) == tuple(dataset_summary["shape"])
+    assert len(group["band"][:].tolist()) == len(dataset_summary["band_names"])
     assert result["status"] == "written"
     assert group.attrs["water_mask_written"] is True
     assert group.attrs["water_mask_path"] == "masks/water"
@@ -204,7 +214,7 @@ def test_landsat_manual_watermask_creates_masked_copy_without_mutating_source(
         product_type="L1TP",
     )
 
-    _assert_source_zarr_unchanged(written_uri)
+    _assert_zarr_has_no_water_mask(written_uri)
 
     result = MaskService().apply_omniwater_to_zarr(
         zarr_uri=written_uri,
@@ -218,13 +228,14 @@ def test_landsat_manual_watermask_creates_masked_copy_without_mutating_source(
 
     masked_uri = str(result["output_zarr_uri"])
     assert result["input_zarr_uri"] == written_uri
-    assert masked_uri != written_uri
+    assert masked_uri == written_uri
     assert Path(masked_uri).exists()
 
-    _assert_source_zarr_unchanged(written_uri)
     group = zarr.open_group(masked_uri, mode="r")
     assert "masks" in group and "water" in group["masks"]
-    assert tuple(group["masks"]["water"].shape) == (1, 4, 4)
+    assert tuple(group["masks"]["water"].shape) == (1, int(dataset_summary["shape"][2]), int(dataset_summary["shape"][3]))
+    assert tuple(group["imagery"].shape) == tuple(dataset_summary["shape"])
+    assert len(group["band"][:].tolist()) == len(dataset_summary["band_names"])
     assert result["status"] == "written"
     assert group.attrs["water_mask_written"] is True
     assert group.attrs["water_mask_path"] == "masks/water"
@@ -268,11 +279,11 @@ def test_manual_omniwater_stage_callback_reports_pipeline_steps(
     assert stages[0][1]["zarr_uri"] == output_uri
     assert stages[1][1]["water_mask"]["status"] == "written"
     assert stages[1][1]["water_mask"]["input_zarr_uri"] == output_uri
-    assert stages[1][1]["water_mask"]["output_zarr_uri"] != output_uri
+    assert stages[1][1]["water_mask"]["output_zarr_uri"] == output_uri
     assert Path(str(stages[1][1]["water_mask"]["output_zarr_uri"])).exists()
 
 
-def test_manual_omniwater_tiles_existing_zarr_and_persists_artifacts(
+def test_manual_omniwater_tiles_existing_zarr_and_writes_masks_in_place(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -302,10 +313,13 @@ def test_manual_omniwater_tiles_existing_zarr_and_persists_artifacts(
     )
 
     assert result["status"] == "written"
-    assert Path(str(result["artifact_uri"])).exists()
-    assert Path(str(result["status_path"])).exists()
+    assert result["artifact_uri"] is None
+    assert result["status_path"] is None
+    masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
+    assert "masks" in masked_group and "water" in masked_group["masks"]
+    assert "water_probability" in masked_group["masks"]
     assert result["input_zarr_uri"] == written_uri
-    assert result["output_zarr_uri"] != written_uri
+    assert result["output_zarr_uri"] == written_uri
     assert Path(str(result["output_zarr_uri"])).exists()
 
 
@@ -352,9 +366,10 @@ def test_manual_omniwater_failure_preserves_zarr_and_records_mask_failure(
     assert result["status"] == "failed"
     assert result["reason"] == "simulated_omniwater_failure"
     assert result["input_zarr_uri"] == written_uri
-    _assert_source_zarr_unchanged(written_uri)
+    _assert_zarr_has_no_water_mask(written_uri)
     group = zarr.open_group(written_uri, mode="r")
-    assert group.attrs.get("water_mask_status_path") in (None, "")
+    assert group.attrs.get("water_mask_status") == "failed"
+    assert str(group.attrs.get("water_mask_status_path") or "").strip() == ""
 
 
 def test_manual_omniwater_uses_ndwi_fallback_when_legacy_fastai_is_missing(
@@ -397,11 +412,14 @@ def test_manual_omniwater_uses_ndwi_fallback_when_legacy_fastai_is_missing(
     )
 
     assert result["status"] == "written"
-    assert result["runtime_mode"] == "ndwi_fallback"
+    assert result["runtime_mode"] == "heuristic_fallback"
+    assert result["probability_path"] == "masks/water_probability"
+    assert result["water_fraction"] >= 0.0
     assert result["input_zarr_uri"] == written_uri
-    assert result["output_zarr_uri"] != written_uri
+    assert result["output_zarr_uri"] == written_uri
     assert Path(str(result["output_zarr_uri"])).exists()
-    _assert_source_zarr_unchanged(written_uri)
+    masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
+    assert "masks" in masked_group and "water_probability" in masked_group["masks"]
 
 
 def test_manual_omniwater_uses_internal_ndwi_fallback_when_module_is_missing(
@@ -444,8 +462,12 @@ def test_manual_omniwater_uses_internal_ndwi_fallback_when_module_is_missing(
     )
 
     assert result["status"] == "written"
-    assert result["runtime_mode"] == "ndwi_fallback"
-    assert Path(str(result["artifact_uri"])).exists()
+    assert result["runtime_mode"] == "heuristic_fallback"
+    assert result["probability_path"] == "masks/water_probability"
+    assert result["water_fraction"] >= 0.0
+    assert result["artifact_uri"] is None
     assert result["input_zarr_uri"] == written_uri
-    assert result["output_zarr_uri"] != written_uri
+    assert result["output_zarr_uri"] == written_uri
     assert Path(str(result["output_zarr_uri"])).exists()
+    masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
+    assert "masks" in masked_group and "water_probability" in masked_group["masks"]

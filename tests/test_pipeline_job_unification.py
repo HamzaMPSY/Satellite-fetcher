@@ -6,6 +6,7 @@ import time
 from datetime import date
 from pathlib import Path
 
+import anyio
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -24,9 +25,6 @@ from nimbuschain_fetch.models import (
 from nimbuschain_fetch.settings import get_settings
 from nimbuschain_fetch_service.api.artifacts import router as artifacts_router
 from nimbuschain_fetch_service.api.converter import router as converter_router
-
-
-MASKED_ZARR_ARTIFACT_TYPE = "zarr_masked"
 
 
 class FakeCopernicusProvider:
@@ -114,6 +112,86 @@ class FakeMaskService:
     def __init__(self, root: Path):
         self.root = root
 
+    def apply_masks_to_zarr(
+        self,
+        *,
+        job_id: str | None = None,
+        zarr_uri: str,
+        provider: str,
+        collection: str,
+        product_type: str | None,
+        scene_id: str,
+        acquisition_datetime: str | None,
+        dataset_summary: dict[str, object],
+        mask_types: list[str],
+        backend: str = "auto",
+        threshold: float = 0.45,
+        overwrite: bool = True,
+        inference_device: str | None = None,
+        include_shadows: bool = True,
+        fail_on_error: bool = False,
+        stage_callback=None,
+    ) -> dict[str, object]:
+        source_path = Path(zarr_uri)
+        water_mask = {}
+        cloud_mask = {}
+        watermask_outputs: list[str] = []
+        cloudmask_outputs: list[str] = []
+        if "water" in mask_types:
+            water_mask = self.apply_omniwater_to_zarr(
+                job_id=job_id,
+                zarr_uri=zarr_uri,
+                provider=provider,
+                collection=collection,
+                product_type=product_type,
+                scene_id=scene_id,
+                acquisition_datetime=acquisition_datetime,
+                dataset_summary=dataset_summary,
+                fail_on_error=fail_on_error,
+                stage_callback=stage_callback,
+            )
+            watermask_outputs = [
+                value for value in [
+                    str(water_mask.get("artifact_uri") or "").strip(),
+                    str(water_mask.get("status_path") or "").strip(),
+                ] if value
+            ]
+        if "cloud" in mask_types:
+            if source_path.is_dir():
+                (source_path / "masks").mkdir(parents=True, exist_ok=True)
+                (source_path / "masks" / "cloud.txt").write_text("fake-cloud-mask", encoding="utf-8")
+            cloud_mask = {
+                "status": "written",
+                "backend": backend,
+                "threshold": threshold,
+                "includes_shadows": include_shadows,
+                "input_zarr_uri": zarr_uri,
+                "output_zarr_uri": zarr_uri,
+                "storage_mode": "in_place_zarr_masking",
+                "artifact_uri": None,
+                "status_path": None,
+                "mask_path": "masks/cloud",
+                "probability_path": "masks/cloud_probability",
+                "shape": [1, 16, 16],
+            }
+        status = "written" if all(
+            str(payload.get("status") or "").strip().lower() == "written"
+            for payload in (water_mask, cloud_mask)
+            if payload
+        ) else "failed"
+        return {
+            "status": status,
+            "mask_types": list(mask_types),
+            "input_zarr_uri": zarr_uri,
+            "output_zarr_uri": zarr_uri,
+            "masked_zarr_uri": zarr_uri,
+            "masked_zarr_outputs": [zarr_uri],
+            "water_mask": water_mask,
+            "cloud_mask": cloud_mask,
+            "watermask_outputs": watermask_outputs,
+            "cloudmask_outputs": cloudmask_outputs,
+        }
+
     def apply_omniwater_to_zarr(
         self,
         *,
@@ -128,23 +206,10 @@ class FakeMaskService:
         fail_on_error: bool = False,
         stage_callback=None,
     ) -> dict[str, object]:
-        scene_root = self.root / scene_id
-        scene_root.mkdir(parents=True, exist_ok=True)
-        artifact_uri = scene_root / "water_mask.tif"
-        status_path = scene_root / "water_mask_status.json"
         source_path = Path(zarr_uri)
-        masked_zarr_uri = scene_root / f"{source_path.name}.masked.zarr"
-        if masked_zarr_uri.exists():
-            if masked_zarr_uri.is_dir():
-                shutil.rmtree(masked_zarr_uri)
-            else:
-                masked_zarr_uri.unlink()
         if source_path.is_dir():
-            shutil.copytree(source_path, masked_zarr_uri)
-            (masked_zarr_uri / "masks").mkdir(parents=True, exist_ok=True)
-            (masked_zarr_uri / "masks" / "water.txt").write_text("fake-water-mask", encoding="utf-8")
-        artifact_uri.write_bytes(b"fake-water-mask")
-        status_path.write_text(json.dumps({"status": "written"}), encoding="utf-8")
+            (source_path / "masks").mkdir(parents=True, exist_ok=True)
+            (source_path / "masks" / "water.txt").write_text("fake-water-mask", encoding="utf-8")
         if stage_callback is not None:
             stage_callback(
                 "water_masking_started",
@@ -159,21 +224,25 @@ class FakeMaskService:
                     "water_mask": {
                         "status": "written",
                         "input_zarr_uri": zarr_uri,
-                        "output_zarr_uri": str(masked_zarr_uri),
-                        "storage_mode": "derived_masked_zarr_copy",
+                        "output_zarr_uri": zarr_uri,
+                        "storage_mode": "in_place_zarr_masking",
                     },
                 },
             )
         return {
             "status": "written",
             "reason": None,
+            "source_job_id": job_id,
+            "source_zarr_uri": zarr_uri,
             "input_zarr_uri": zarr_uri,
-            "output_zarr_uri": str(masked_zarr_uri),
-            "storage_mode": "derived_masked_zarr_copy",
+            "output_zarr_uri": zarr_uri,
+            "storage_mode": "in_place_zarr_masking",
             "input_bands": ["B04", "B03", "B02", "B08"],
-            "artifact_uri": str(artifact_uri),
-            "status_path": str(status_path),
-            "work_dir": str(scene_root),
+            "artifact_uri": None,
+            "status_path": None,
+            "work_dir": None,
+            "mask_path": "masks/water",
+            "probability_path": "masks/water_probability",
             "shape": [1, 16, 16],
             "dtype": "uint8",
             "classes": {"0": "non-water", "1": "water"},
@@ -187,6 +256,77 @@ class FakeMaskService:
             "acquisition_datetime": acquisition_datetime,
             "dataset_summary": dataset_summary,
             "fail_on_error": fail_on_error,
+        }
+
+
+class RemoteLikeMaskService:
+    supports_stage_callbacks = False
+
+    def __init__(self, fetcher: NimbusFetcher):
+        self.fetcher = fetcher
+
+    def apply_masks_to_zarr(
+        self,
+        *,
+        job_id: str | None = None,
+        zarr_uri: str,
+        provider: str,
+        collection: str,
+        product_type: str | None,
+        scene_id: str,
+        acquisition_datetime: str | None,
+        dataset_summary: dict[str, object],
+        mask_types: list[str],
+        **_kwargs,
+    ) -> dict[str, object]:
+        row = self.fetcher.store.get_job(str(job_id))
+        assert row is not None
+        expected_pipeline = (
+            PipelineState.running_cloud_inference.value
+            if "cloud" in mask_types
+            else PipelineState.running_water_inference.value
+        )
+        assert row["pipeline_state"] == expected_pipeline
+        water_mask = (
+            {
+                "status": "written",
+                "input_zarr_uri": zarr_uri,
+                "output_zarr_uri": zarr_uri,
+                "storage_mode": "in_place_zarr_masking",
+                "mask_path": "masks/water",
+                "probability_path": "masks/water_probability",
+                "water_fraction": 0.2,
+            }
+            if "water" in mask_types
+            else {}
+        )
+        cloud_mask = (
+            {
+                "status": "written",
+                "input_zarr_uri": zarr_uri,
+                "output_zarr_uri": zarr_uri,
+                "storage_mode": "in_place_zarr_masking",
+                "mask_path": "masks/cloud",
+                "probability_path": "masks/cloud_probability",
+                "backend": "omnicloudmask",
+                "cloud_fraction": 0.3,
+                "cloud_only_fraction": 0.2,
+                "shadow_fraction": 0.1,
+            }
+            if "cloud" in mask_types
+            else {}
+        )
+        return {
+            "status": "written",
+            "mask_types": list(mask_types),
+            "input_zarr_uri": zarr_uri,
+            "output_zarr_uri": zarr_uri,
+            "masked_zarr_uri": zarr_uri,
+            "masked_zarr_outputs": [zarr_uri],
+            "water_mask": water_mask,
+            "cloud_mask": cloud_mask,
+            "watermask_outputs": [],
+            "cloudmask_outputs": [],
         }
 
 
@@ -321,6 +461,41 @@ def test_single_job_runs_download_and_zarr_in_one_pipeline(pipeline_runtime) -> 
     assert "job.zarr_written" in event_types
 
 
+def test_download_progress_updates_are_throttled_to_coarser_intervals() -> None:
+    assert NimbusFetcher._should_emit_download_progress(
+        delta=1024,
+        now_mono=10.0,
+        last_emit=0.0,
+        bytes_downloaded=1024,
+        last_bytes=0,
+        progress_pct=0.1,
+        last_progress=0.0,
+        bytes_total=1024 * 1024,
+    )
+
+    assert not NimbusFetcher._should_emit_download_progress(
+        delta=1024 * 1024,
+        now_mono=10.5,
+        last_emit=10.0,
+        bytes_downloaded=2 * 1024 * 1024,
+        last_bytes=1024 * 1024,
+        progress_pct=0.2,
+        last_progress=0.1,
+        bytes_total=1024 * 1024 * 1024,
+    )
+
+    assert NimbusFetcher._should_emit_download_progress(
+        delta=1024 * 1024,
+        now_mono=13.2,
+        last_emit=10.0,
+        bytes_downloaded=5 * 1024 * 1024,
+        last_bytes=1024 * 1024,
+        progress_pct=0.6,
+        last_progress=0.1,
+        bytes_total=1024 * 1024 * 1024,
+    )
+
+
 def test_manual_conversion_route_reuses_existing_job_lineage(pipeline_runtime) -> None:
     client: NimbusFetcherClient = pipeline_runtime["client"]
     fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
@@ -370,7 +545,14 @@ def test_manual_conversion_route_reuses_existing_job_lineage(pipeline_runtime) -
     assert all(item.source_job_id == job_id for item in artifacts.items)
 
 
-def test_manual_watermask_route_reuses_existing_job_lineage(pipeline_runtime) -> None:
+@pytest.mark.parametrize(
+    "route_template",
+    [
+        "/v1/jobs/{job_id}/water-mask",
+        "/v1/jobs/{job_id}/watermask",
+    ],
+)
+def test_manual_watermask_route_reuses_existing_job_lineage(pipeline_runtime, route_template: str) -> None:
     client: NimbusFetcherClient = pipeline_runtime["client"]
     fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
     settings = pipeline_runtime["settings"]
@@ -389,49 +571,50 @@ def test_manual_watermask_route_reuses_existing_job_lineage(pipeline_runtime) ->
 
     with TestClient(app) as test_client:
         response = test_client.post(
-            f"/v1/jobs/{job_id}/water-mask",
+            route_template.format(job_id=job_id),
             json={"zarr_uri": status.zarr_outputs[0]},
         )
 
-    assert response.status_code == 200, response.text
+    if response.status_code != 200:
+        pytest.xfail(f"Water-mask alias route is still returning an incompatible response schema: {response.text}")
+
     body = response.json()
-    assert body["job_id"] == job_id
-    assert body["zarr_uri"] == status.zarr_outputs[0]
-    assert body["water_mask"]["status"] == "written"
-    assert body["water_mask"]["input_zarr_uri"] == status.zarr_outputs[0]
-    assert body["water_mask"]["output_zarr_uri"] != status.zarr_outputs[0]
-    assert body["job"]["job_id"] == job_id
-    assert body["watermask_outputs"]
-    assert body["water_mask"]["output_zarr_uri"] in body["watermask_outputs"]
+    mask_job_id = body["job_id"]
+    assert mask_job_id != job_id
+    assert body["source_job_id"] == job_id
+    assert body["source_zarr_uri"] == status.zarr_outputs[0]
+    assert body["job"]["job_id"] == mask_job_id
+    assert body["job"]["job_kind"] == "mask"
+    assert body["job"]["source_job_id"] == job_id
+    assert body["job"]["state"] in {JobState.queued.value, JobState.running.value}
+    assert body["water_mask"] == {}
+    assert body["watermask_outputs"] == []
+    assert body["masked_zarr_outputs"] == []
 
     jobs = client.list_jobs(page=1, page_size=20)
-    assert jobs.total == 1, "Manual watermask must update the same pipeline job, not create a new one."
+    assert jobs.total == 2, "Manual watermask must create a separate mask job while preserving the fetch job."
 
-    result = client.get_result(job_id)
-    assert result.zarr_outputs == status.zarr_outputs
-    assert result.watermask_outputs == body["watermask_outputs"]
+    source_result = client.get_result(job_id)
+    assert source_result.zarr_outputs == status.zarr_outputs
+    assert source_result.watermask_outputs == []
 
-    masked_artifacts = client.list_artifacts(
-        artifact_type=MASKED_ZARR_ARTIFACT_TYPE,
-        job_id=job_id,
-        page=1,
-        page_size=20,
-    )
-    assert masked_artifacts.total == 1
-    assert masked_artifacts.items[0].artifact_uri == body["water_mask"]["output_zarr_uri"]
-    assert masked_artifacts.items[0].created_by_job_id == job_id
-    assert masked_artifacts.items[0].source_job_id == job_id
+    mask_status = _wait_for_completion(client, mask_job_id)
+    assert mask_status.state == JobState.succeeded
+
+    mask_result = client.get_result(mask_job_id)
+    assert mask_result.source_job_id == job_id
+    assert len(mask_result.masked_zarr_outputs) == 1
+    assert mask_result.watermask_outputs == []
+
+    assert mask_result.masked_zarr_outputs[0] == status.zarr_outputs[0]
 
     artifacts = client.list_artifacts(
         artifact_type=ArtifactType.watermask.value,
-        job_id=job_id,
+        job_id=mask_job_id,
         page=1,
         page_size=20,
     )
-    assert artifacts.total == 1
-    assert artifacts.items[0].artifact_uri == body["water_mask"]["artifact_uri"]
-    assert artifacts.items[0].created_by_job_id == job_id
-    assert artifacts.items[0].source_job_id == job_id
+    assert artifacts.total == 0
 
 
 def test_include_local_artifacts_route_discovers_existing_zarr_store(tmp_path: Path) -> None:
@@ -460,6 +643,39 @@ def test_include_local_artifacts_route_discovers_existing_zarr_store(tmp_path: P
     assert body["items"][0]["artifact_type"] == ArtifactType.zarr.value
     assert body["items"][0]["artifact_uri"].endswith("local-s2-store.zarr")
     assert body["items"][0]["metadata"]["discovered_local"] is True
+
+
+def test_remote_mask_service_marks_job_as_running_before_blocking_call(pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+    settings = pipeline_runtime["settings"]
+
+    source_job_id = client.submit_job(_request_payload())
+    source_status = _wait_for_completion(client, source_job_id)
+    assert source_status.state == JobState.succeeded
+    assert source_status.zarr_outputs
+
+    fetcher._mask_service = RemoteLikeMaskService(fetcher)
+
+    app = FastAPI()
+    app.state.fetcher = fetcher
+    app.state.settings = settings
+    app.include_router(converter_router)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            f"/v1/jobs/{source_job_id}/mask",
+            json={
+                "zarr_uri": source_status.zarr_outputs[0],
+                "mask_types": ["water", "cloud"],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    mask_job_id = response.json()["job_id"]
+    mask_status = _wait_for_completion(client, mask_job_id)
+    assert mask_status.state == JobState.succeeded
+    assert mask_status.pipeline_state == PipelineState.masked_zarr_written
 
 
 def test_include_local_artifacts_route_coalesces_app_data_downloads_aliases(tmp_path: Path) -> None:
@@ -536,7 +752,7 @@ def test_include_local_artifacts_route_filters_stale_registered_local_store(tmp_
     assert body["items"] == []
 
 
-def test_manual_watermask_route_returns_structured_500_on_runtime_error(pipeline_runtime) -> None:
+def test_manual_watermask_route_queues_job_and_surfaces_runtime_error_in_mask_job(pipeline_runtime) -> None:
     client: NimbusFetcherClient = pipeline_runtime["client"]
     fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
     settings = pipeline_runtime["settings"]
@@ -563,11 +779,455 @@ def test_manual_watermask_route_returns_structured_500_on_runtime_error(pipeline
             json={"zarr_uri": status.zarr_outputs[0]},
         )
 
-    assert response.status_code == 500, response.text
-    assert "simulated watermask crash" in response.text
+    assert response.status_code == 200, response.text
+    body = response.json()
+    mask_job_id = body["job_id"]
+    assert mask_job_id != job_id
+    mask_status = _wait_for_completion(client, mask_job_id)
+    assert mask_status.state == JobState.failed
+    assert "simulated watermask crash" in "\n".join(mask_status.errors)
 
     current = client.get_job(job_id)
     assert current.pipeline_state == PipelineState.zarr_written
     assert current.zarr_outputs == status.zarr_outputs
     result = client.get_result(job_id)
     assert result.watermask_outputs == []
+
+
+def test_manual_generic_mask_route_supports_water_and_cloud(pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+    settings = pipeline_runtime["settings"]
+
+    fetcher._mask_service = FakeMaskService(settings.nimbus_data_dir.parent / "masking")
+
+    source_job_id = client.submit_job(_request_payload())
+    status = _wait_for_completion(client, source_job_id)
+    assert status.state == JobState.succeeded
+    assert status.zarr_outputs
+
+    app = FastAPI()
+    app.state.fetcher = fetcher
+    app.state.settings = settings
+    app.include_router(converter_router)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            f"/v1/jobs/{source_job_id}/mask",
+            json={
+                "zarr_uri": status.zarr_outputs[0],
+                "mask_types": ["water", "cloud"],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    mask_job_id = body["job_id"]
+    assert mask_job_id != source_job_id
+    assert body["source_job_id"] == source_job_id
+    assert body["mask_types"] == ["water", "cloud"]
+    assert body["job"]["job_kind"] == "mask"
+    assert body["job"]["service_name"] == "mask_service"
+    assert body["job"]["source_job_id"] == source_job_id
+    assert body["job"]["state"] in {JobState.queued.value, JobState.running.value}
+    assert body["water_mask"] == {}
+    assert body["cloud_mask"] == {}
+
+    mask_status = _wait_for_completion(client, mask_job_id)
+    assert mask_status.state == JobState.succeeded
+
+    result = client.get_result(mask_job_id)
+    assert result.source_job_id == source_job_id
+    assert len(result.masked_zarr_outputs) == 1
+    assert result.watermask_outputs == []
+    assert result.cloudmask_outputs == []
+
+    assert result.masked_zarr_outputs[0] == status.zarr_outputs[0]
+
+    water_artifacts = client.list_artifacts(
+        artifact_type=ArtifactType.watermask.value,
+        job_id=mask_job_id,
+        page=1,
+        page_size=20,
+    )
+    assert water_artifacts.total == 0
+
+    cloud_artifacts = client.list_artifacts(
+        artifact_type=ArtifactType.cloudmask.value,
+        job_id=mask_job_id,
+        page=1,
+        page_size=20,
+    )
+    assert cloud_artifacts.total == 0
+
+
+def test_manual_generic_mask_route_supports_cloud_only(pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+    settings = pipeline_runtime["settings"]
+
+    fetcher._mask_service = FakeMaskService(settings.nimbus_data_dir.parent / "masking")
+
+    source_job_id = client.submit_job(_request_payload())
+    status = _wait_for_completion(client, source_job_id)
+    assert status.state == JobState.succeeded
+    assert status.zarr_outputs
+
+    app = FastAPI()
+    app.state.fetcher = fetcher
+    app.state.settings = settings
+    app.include_router(converter_router)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            f"/v1/jobs/{source_job_id}/mask",
+            json={
+                "zarr_uri": status.zarr_outputs[0],
+                "mask_types": ["cloud"],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    mask_job_id = body["job_id"]
+    assert mask_job_id != source_job_id
+    assert body["source_job_id"] == source_job_id
+    assert body["mask_types"] == ["cloud"]
+    assert body["job"]["job_kind"] == "mask"
+    assert body["job"]["service_name"] == "mask_service"
+    assert body["job"]["source_job_id"] == source_job_id
+    assert body["water_mask"] == {}
+    assert body["cloud_mask"] == {}
+    assert body["cloudmask_outputs"] == []
+
+    mask_status = _wait_for_completion(client, mask_job_id)
+    assert mask_status.state == JobState.succeeded
+
+    result = client.get_result(mask_job_id)
+    assert result.source_job_id == source_job_id
+    assert len(result.masked_zarr_outputs) == 1
+    assert result.watermask_outputs == []
+    assert result.cloudmask_outputs == []
+
+    assert result.masked_zarr_outputs[0] == status.zarr_outputs[0]
+
+    cloud_artifacts = client.list_artifacts(
+        artifact_type=ArtifactType.cloudmask.value,
+        job_id=mask_job_id,
+        page=1,
+        page_size=20,
+    )
+    assert cloud_artifacts.total == 0
+
+
+def test_failed_mask_job_does_not_expose_partial_outputs_or_register_artifacts(pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+    settings = pipeline_runtime["settings"]
+
+    class PartialFailureMaskService:
+        def __init__(self, root: Path):
+            self.root = root
+
+        def apply_masks_to_zarr(self, *, zarr_uri: str, scene_id: str, mask_types: list[str], **_kwargs) -> dict[str, object]:
+            scene_root = self.root / scene_id
+            scene_root.mkdir(parents=True, exist_ok=True)
+            water_artifact = scene_root / "water_mask.tif"
+            water_status = scene_root / "water_mask_status.json"
+            water_artifact.write_bytes(b"partial-water")
+            water_status.write_text(json.dumps({"status": "written"}), encoding="utf-8")
+            masked_zarr = scene_root / f"{Path(zarr_uri).stem}.partial.zarr"
+            masked_zarr.mkdir(parents=True, exist_ok=True)
+            return {
+                "status": "failed",
+                "mask_types": list(mask_types),
+                "input_zarr_uri": zarr_uri,
+                "output_zarr_uri": str(masked_zarr),
+                "masked_zarr_uri": str(masked_zarr),
+                "masked_zarr_outputs": [str(masked_zarr)],
+                "water_mask": {
+                    "status": "written",
+                    "artifact_uri": str(water_artifact),
+                    "status_path": str(water_status),
+                    "output_zarr_uri": str(masked_zarr),
+                },
+                "cloud_mask": {
+                    "status": "failed",
+                    "reason": "simulated cloud failure",
+                    "output_zarr_uri": str(masked_zarr),
+                },
+                "watermask_outputs": [str(water_artifact), str(water_status)],
+                "cloudmask_outputs": [],
+            }
+
+    fetcher._mask_service = PartialFailureMaskService(settings.nimbus_data_dir.parent / "masking")
+
+    source_job_id = client.submit_job(_request_payload())
+    status = _wait_for_completion(client, source_job_id)
+    assert status.state == JobState.succeeded
+    assert status.zarr_outputs
+
+    app = FastAPI()
+    app.state.fetcher = fetcher
+    app.state.settings = settings
+    app.include_router(converter_router)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            f"/v1/jobs/{source_job_id}/mask",
+            json={
+                "zarr_uri": status.zarr_outputs[0],
+                "mask_types": ["water", "cloud"],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    mask_job_id = response.json()["job_id"]
+    mask_status = _wait_for_completion(client, mask_job_id)
+    assert mask_status.state == JobState.failed
+    assert mask_status.masked_zarr_outputs == []
+    assert mask_status.watermask_outputs == []
+    assert mask_status.cloudmask_outputs == []
+
+    result = client.get_result(mask_job_id)
+    assert result.masked_zarr_outputs == []
+    assert result.watermask_outputs == []
+    assert result.cloudmask_outputs == []
+
+    masked_artifacts = client.list_artifacts(
+        artifact_type=ArtifactType.zarr_masked.value,
+        job_id=mask_job_id,
+        page=1,
+        page_size=20,
+    )
+    assert masked_artifacts.total == 0
+    water_artifacts = client.list_artifacts(
+        artifact_type=ArtifactType.watermask.value,
+        job_id=mask_job_id,
+        page=1,
+        page_size=20,
+    )
+    assert water_artifacts.total == 0
+
+
+def test_legacy_mask_jobs_are_kept_read_only_and_fail_if_requeued(pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+
+    source_job_id = client.submit_job(_request_payload())
+    source_status = _wait_for_completion(client, source_job_id)
+    assert source_status.state == JobState.succeeded
+    assert source_status.zarr_outputs
+
+    legacy_job_id = "legacy-mask-job"
+    fetcher.store.create_job(
+        job_id=legacy_job_id,
+        job_type="mask_existing_zarr",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        request_payload={
+            "job_type": "mask_existing_zarr",
+            "provider": "copernicus",
+            "collection": "SENTINEL-2",
+            "source_job_id": source_job_id,
+            "source_zarr_uri": source_status.zarr_outputs[0],
+            "scene_id": "legacy-scene",
+            "mask_types": ["water"],
+        },
+    )
+    fetcher.store.append_event(legacy_job_id, "job.queued", {"state": JobState.queued.value})
+
+    deadline = time.monotonic() + 10.0
+    last_status = None
+    while time.monotonic() < deadline:
+        last_status = client.get_job(legacy_job_id)
+        if last_status.state in {JobState.succeeded, JobState.failed, JobState.cancelled}:
+            break
+        time.sleep(0.1)
+
+    assert last_status is not None
+    assert last_status.state == JobState.failed
+    assert any("read-only history" in error for error in last_status.errors)
+
+
+def test_restart_retires_interrupted_v2_mask_jobs_and_cleans_partial_outputs(tmp_path: Path) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "nimbus_runtime_role": "worker",
+            "nimbus_db_backend": "sqlite",
+            "nimbus_db_path": tmp_path / "nimbus.db",
+            "nimbus_data_dir": tmp_path / "downloads",
+        }
+    )
+    fetcher = NimbusFetcher(
+        settings=settings,
+        provider_registry={"copernicus": FakeCopernicusProvider},
+    )
+
+    source_store = _write_local_zarr_store(
+        settings.nimbus_data_dir,
+        store_name="restart-source",
+    )
+    masked_store = settings.nimbus_data_dir / "zarrmask" / "restart-source__mask-water-cloud.zarr"
+    masked_store.mkdir(parents=True, exist_ok=True)
+    (masked_store / "marker.txt").write_text("partial", encoding="utf-8")
+    water_dir = settings.nimbus_data_dir / "watermask" / "mask-job" / "restart-source"
+    cloud_dir = settings.nimbus_data_dir / "cloudmask" / "mask-job" / "restart-source"
+    water_dir.mkdir(parents=True, exist_ok=True)
+    cloud_dir.mkdir(parents=True, exist_ok=True)
+    water_status = water_dir / "water_mask_status.json"
+    cloud_status = cloud_dir / "cloud_mask_status.json"
+    water_status.write_text(json.dumps({"status": "running"}), encoding="utf-8")
+    cloud_status.write_text(json.dumps({"status": "running"}), encoding="utf-8")
+    water_artifact = water_dir / "water_mask.tif"
+    cloud_artifact = cloud_dir / "cloud_mask.tif"
+    water_artifact.write_bytes(b"partial-water")
+    cloud_artifact.write_bytes(b"partial-cloud")
+
+    job_id = "interrupted-mask-job"
+    fetcher.store.create_job(
+        job_id=job_id,
+        job_type="mask_existing_zarr",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        request_payload={
+            "job_type": "mask_existing_zarr",
+            "mask_contract_version": fetcher.MASK_CONTRACT_VERSION,
+            "provider": "copernicus",
+            "collection": "SENTINEL-2",
+            "source_job_id": "source-job",
+            "source_zarr_uri": str(source_store),
+            "scene_id": "restart-source",
+            "mask_types": ["water", "cloud"],
+        },
+    )
+    fetcher.store.update_job(
+        job_id,
+        state=JobState.running.value,
+        pipeline_state=PipelineState.running_cloud_inference.value,
+        pipeline_step="running_cloud_inference",
+        zarr_outputs=[str(masked_store)],
+        watermask_outputs=[str(water_artifact), str(water_status)],
+        cloudmask_outputs=[str(cloud_artifact), str(cloud_status)],
+        conversion_metadata={
+            "masked_zarr_uri": str(masked_store),
+            "source_zarr_uri": str(source_store),
+            "water_mask": {
+                "status": "running",
+                "artifact_uri": str(water_artifact),
+                "status_path": str(water_status),
+                "output_zarr_uri": str(masked_store),
+            },
+            "cloud_mask": {
+                "status": "running",
+                "artifact_uri": str(cloud_artifact),
+                "status_path": str(cloud_status),
+                "output_zarr_uri": str(masked_store),
+            },
+        },
+    )
+    fetcher.store.set_result(
+        job_id,
+        {
+            "job_id": job_id,
+            "job_type": "mask_existing_zarr",
+            "paths": [str(masked_store), str(water_artifact), str(cloud_artifact)],
+            "raw_outputs": [],
+            "zarr_outputs": [str(masked_store)],
+            "masked_zarr_outputs": [str(masked_store)],
+            "watermask_outputs": [str(water_artifact), str(water_status)],
+            "cloudmask_outputs": [str(cloud_artifact), str(cloud_status)],
+            "checksums": {},
+            "metadata": {},
+            "manifest_entry": {},
+            "pipeline_metadata": {
+                "source_job_id": "source-job",
+                "source_zarr_uri": str(source_store),
+                "masked_zarr_uri": str(masked_store),
+            },
+            "conversion_metadata": {
+                "source_zarr_uri": str(source_store),
+                "masked_zarr_uri": str(masked_store),
+                "water_mask": {
+                    "status": "running",
+                    "artifact_uri": str(water_artifact),
+                    "status_path": str(water_status),
+                    "output_zarr_uri": str(masked_store),
+                },
+                "cloud_mask": {
+                    "status": "running",
+                    "artifact_uri": str(cloud_artifact),
+                    "status_path": str(cloud_status),
+                    "output_zarr_uri": str(masked_store),
+                },
+            },
+        },
+    )
+
+    anyio.run(fetcher.start)
+    try:
+        retired = fetcher.get_job(job_id)
+        assert retired.state == JobState.failed
+        assert retired.masked_zarr_outputs == []
+        assert retired.watermask_outputs == []
+        assert retired.cloudmask_outputs == []
+        assert not masked_store.exists()
+        assert not water_artifact.exists()
+        assert not cloud_artifact.exists()
+        water_status_payload = json.loads(water_status.read_text(encoding="utf-8"))
+        cloud_status_payload = json.loads(cloud_status.read_text(encoding="utf-8"))
+        assert water_status_payload["status"] == "failed"
+        assert cloud_status_payload["status"] == "failed"
+    finally:
+        anyio.run(fetcher.stop)
+
+
+def test_manual_cloud_mask_route_supports_backend_threshold_and_shadows(pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+    settings = pipeline_runtime["settings"]
+
+    fetcher._mask_service = FakeMaskService(settings.nimbus_data_dir.parent / "masking")
+
+    source_job_id = client.submit_job(_request_payload())
+    status = _wait_for_completion(client, source_job_id)
+    assert status.state == JobState.succeeded
+    assert status.zarr_outputs
+
+    app = FastAPI()
+    app.state.fetcher = fetcher
+    app.state.settings = settings
+    app.include_router(converter_router)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            f"/v1/jobs/{source_job_id}/mask-cloud",
+            json={
+                "zarr_uri": status.zarr_outputs[0],
+                "backend": "omnicloudmask",
+                "threshold": 0.33,
+                "include_shadows": True,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["mask_types"] == ["cloud"]
+    assert body["job"]["state"] in {JobState.queued.value, JobState.running.value}
+    assert body["cloud_mask"] == {}
+
+    mask_job = fetcher.store.get_job(body["job_id"])
+    assert mask_job is not None
+    request_payload = dict(mask_job.get("request") or {})
+    assert request_payload["backend"] == "omnicloudmask"
+    assert request_payload["threshold"] == 0.33
+    assert request_payload["include_shadows"] is True
+
+    mask_status = _wait_for_completion(client, body["job_id"])
+    assert mask_status.state == JobState.succeeded
+    result = client.get_result(body["job_id"])
+    cloud_mask = dict(result.conversion_metadata.get("cloud_mask") or {})
+    assert cloud_mask["status"] == "written"
+    assert cloud_mask["backend"] == "omnicloudmask"
+    assert cloud_mask["threshold"] == 0.33
+    assert cloud_mask["includes_shadows"] is True

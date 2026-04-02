@@ -17,10 +17,14 @@ from nimbuschain_fetch.models import (
     ArtifactUpsertRequest,
     BatchJobCreateRequest,
     BatchJobCreatedResponse,
+    JobCloudMaskRequest,
+    JobCloudMaskResponse,
     JobCreateRequest,
     JobConvertRequest,
     JobEvent,
     JobListResponse,
+    JobMaskRequest,
+    JobMaskResponse,
     JobResultResponse,
     JobStatusResponse,
     JobWaterMaskRequest,
@@ -177,6 +181,36 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
         )
         response.raise_for_status()
         return JobWaterMaskResponse.model_validate(response.json())
+
+    def apply_mask(self, job_id: str, request: JobMaskRequest | dict[str, Any]) -> JobMaskResponse:
+        payload = JobMaskRequest.model_validate(request)
+        if self.mode == "direct":
+            assert self._portal and self._fetcher
+            return self._portal.call(self._fetcher.apply_mask_existing_job, job_id, payload)
+
+        assert self._session is not None
+        response = self._session.post(
+            f"{self.service_url}/v1/jobs/{job_id}/mask",
+            json=payload.model_dump(mode="json"),
+            timeout=1800,
+        )
+        response.raise_for_status()
+        return JobMaskResponse.model_validate(response.json())
+
+    def apply_cloudmask(self, job_id: str, request: JobCloudMaskRequest | dict[str, Any]) -> JobCloudMaskResponse:
+        payload = JobCloudMaskRequest.model_validate(request)
+        if self.mode == "direct":
+            assert self._portal and self._fetcher
+            return self._portal.call(self._fetcher.apply_cloud_mask_existing_job, job_id, payload)
+
+        assert self._session is not None
+        response = self._session.post(
+            f"{self.service_url}/v1/jobs/{job_id}/mask-cloud",
+            json=payload.model_dump(mode="json"),
+            timeout=1800,
+        )
+        response.raise_for_status()
+        return JobCloudMaskResponse.model_validate(response.json())
 
     def list_jobs(
         self,

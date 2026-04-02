@@ -6,6 +6,7 @@ x-runtime-env: &runtime-env
   NIMBUS_MONGODB_DB: ${NIMBUS_MONGODB_DB:-nimbuschain_fetch}
   NIMBUS_DATA_DIR: /data/downloads
   NIMBUS_ZARRMASK_DIR: /data/downloads/zarrmask
+  NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-http://nimbus-mask:8020}
   NIMBUS_MAX_JOBS: ${NIMBUS_MAX_JOBS:-4}
   NIMBUS_LOG_LEVEL: ${NIMBUS_LOG_LEVEL:-INFO}
   NIMBUS_LOG_JSON: ${NIMBUS_LOG_JSON:-false}
@@ -43,6 +44,7 @@ services:
       dockerfile: Containerfile
     depends_on:
       - mongodb
+      - nimbus-mask
     command: ["uvicorn", "nimbuschain_fetch_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped
     ports:
@@ -70,6 +72,7 @@ services:
       dockerfile: Containerfile
     depends_on:
       - mongodb
+      - nimbus-mask
     command: ["nimbuschain-worker"]
     restart: unless-stopped
     environment:
@@ -128,6 +131,25 @@ services:
       - ./data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8010/readiness'))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  nimbus-mask:
+    build:
+      context: .
+      dockerfile: mask-service/Containerfile
+    restart: unless-stopped
+    command: ["uvicorn", "nimbuschain_mask_service.main:app", "--host", "0.0.0.0", "--port", "8020"]
+    environment:
+      <<: *runtime-env
+      NIMBUS_RUNTIME_ROLE: api
+    volumes: *runtime-volumes
+    ports:
+      - "${NIMBUS_MASK_PORT:-8020}:8020"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8020/health'))"]
       interval: 20s
       timeout: 5s
       retries: 5

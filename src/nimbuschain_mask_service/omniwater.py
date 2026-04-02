@@ -6,10 +6,26 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
+import tempfile
 from typing import Any
 import importlib
 
-from nimbuschain_mask_service.writers import write_water_mask_tiles_to_zarr
+import numpy as np
+
+from nimbuschain_mask_service.io import (
+    copy_source_zarr,
+    delete_mask_layers,
+    open_zarr_group,
+    read_context,
+    read_required_channels_window,
+)
+from nimbuschain_mask_service.sensor_mapping import SensorMaskSpec, resolve_sensor_mask_spec
+from nimbuschain_mask_service.writers import (
+    finalize_water_outputs,
+    prepare_water_output_arrays,
+    write_water_mask_to_zarr,
+)
 from nimbuschain_zarr_service.core import ConversionDependencyError, ConversionError, _open_existing_output_store
 
 
@@ -22,7 +38,10 @@ _LANDSAT_L2_INPUT_BANDS = ["SR_B4", "SR_B3", "SR_B2", "SR_B5"]
 class OmniWaterPlan:
     required: bool
     supported: bool
+    sensor: SensorMaskSpec | None
     input_bands: list[str]
+    fallback_bands: list[str]
+    threshold: float | None = None
     reason: str | None = None
 
 
@@ -36,9 +55,8 @@ class OmniWaterTile:
 
 
 def omniwater_support_status() -> dict[str, Any]:
-    spec = importlib.util.find_spec("omniwatermask")
     return {
-        "available": spec is not None,
+        "available": _omniwater_module_available(),
         "module": "omniwatermask",
     }
 
@@ -47,21 +65,26 @@ def apply_omniwatermask_to_zarr(
     *,
     job_id: str | None = None,
     zarr_uri: str,
+    source_zarr_uri: str | None = None,
     provider: str,
     collection: str,
     product_type: str | None,
     scene_id: str,
     acquisition_datetime: str | None,
     dataset_summary: dict[str, Any],
+    output_zarr_uri: str | None = None,
+    runtime_preference: str | None = None,
+    overwrite: bool = True,
+    inference_device: str | None = None,
     fail_on_error: bool = False,
     stage_callback: Any = None,
 ) -> dict[str, Any]:
-    scene_dir = _watermask_scene_dir(job_id=job_id, scene_id=scene_id)
-    status_path = scene_dir / "water_mask_status.json"
-    masked_zarr_uri = _masked_zarr_output_uri(
-        source_zarr_uri=zarr_uri,
-        scene_dir=scene_dir,
-        scene_id=scene_id,
+    del inference_device
+    source_lineage_uri = str(source_zarr_uri or zarr_uri).strip()
+    masked_zarr_uri = str(output_zarr_uri or "").strip() or source_lineage_uri
+    storage_mode = _water_storage_mode(
+        source_zarr_uri=source_lineage_uri,
+        output_zarr_uri=masked_zarr_uri,
     )
     plan = _build_plan(
         provider=provider,
@@ -74,16 +97,18 @@ def apply_omniwatermask_to_zarr(
         result = {
             "status": status,
             "reason": plan.reason or "unsupported",
-            "input_zarr_uri": zarr_uri,
+            "input_zarr_uri": source_lineage_uri,
             "output_zarr_uri": masked_zarr_uri,
-            "storage_mode": "derived_zarr_copy",
+            "storage_mode": storage_mode,
             "input_bands": list(plan.input_bands),
+            "fallback_bands": list(plan.fallback_bands),
+            "threshold_used": plan.threshold,
             "mask_path": None,
+            "probability_path": None,
             "artifact_uri": None,
-            "status_path": str(status_path),
-            "work_dir": str(scene_dir),
+            "status_path": None,
+            "work_dir": None,
         }
-        _persist_status_artifacts(scene_dir=scene_dir, status_path=status_path, payload=result)
         if fail_on_error and plan.required:
             raise ConversionError(
                 "OmniWaterMask is required for this product, but the mask plan is not supported "
@@ -93,133 +118,176 @@ def apply_omniwatermask_to_zarr(
 
     module_version: str | None = None
     make_water_mask: Any | None = None
-    try:
-        make_water_mask, _make_water_mask_debug, module_version = _load_make_water_mask()
-    except ConversionDependencyError as exc:
-        make_water_mask = None
+    preferred_runtime = _watermask_runtime_mode(runtime_preference)
+    if preferred_runtime == "model":
+        try:
+            make_water_mask, _make_water_mask_debug, module_version = _load_make_water_mask()
+        except ConversionDependencyError:
+            make_water_mask = None
+
+    target_root: Any | None = None
 
     try:
-        _prepare_scene_dir(scene_dir)
-        running_payload = {
-            "status": "running",
-            "reason": None,
-            "input_zarr_uri": zarr_uri,
-            "output_zarr_uri": masked_zarr_uri,
-            "storage_mode": "derived_zarr_copy",
-            "input_bands": list(plan.input_bands),
-            "mask_path": None,
-            "artifact_uri": None,
-            "status_path": str(status_path),
-            "work_dir": str(scene_dir),
-        }
-        _persist_status_artifacts(scene_dir=scene_dir, status_path=status_path, payload=running_payload)
-        prepared_output_zarr_uri = _prepare_masked_zarr_copy(source_zarr_uri=zarr_uri, output_zarr_uri=masked_zarr_uri)
-        tiles_dir = scene_dir / "tiles"
-        cache_dir = scene_dir / "cache"
-        output_dir = scene_dir / "outputs"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        tile_manifest = _export_rgbnir_tiles(
-            zarr_uri=zarr_uri,
-            tiles_dir=tiles_dir,
-            dataset_summary=dataset_summary,
-            input_bands=plan.input_bands,
+        prepared_output_zarr_uri = (
+            source_lineage_uri
+            if storage_mode == "in_place_zarr_masking"
+            else _prepare_masked_zarr_output(
+                source_zarr_uri=zarr_uri,
+                output_zarr_uri=masked_zarr_uri,
+                overwrite=overwrite,
+            )
         )
-        tile_paths = [tile.path for tile in tile_manifest["tiles"]]
+        target_root = open_zarr_group(prepared_output_zarr_uri, mode="a")
+        water_arr = None
+        water_prob_arr = None
         if stage_callback is not None:
             stage_callback(
                 "water_masking_started",
                 {
-                    "zarr_uri": zarr_uri,
+                    "zarr_uri": source_lineage_uri,
                     "output_zarr_uri": prepared_output_zarr_uri,
                     "scene_id": scene_id,
                     "provider": provider,
                     "collection": collection,
                     "product_type": product_type,
-                    "work_dir": str(scene_dir),
-                    "status_path": str(status_path),
-                    "tile_count": len(tile_paths),
                 },
             )
-        mask_output, runtime_mode = _run_omniwater(
-            make_water_mask=make_water_mask,
-            scene_paths=tile_paths,
-            output_dir=output_dir,
-            cache_dir=cache_dir,
-            scene_dir=scene_dir,
-            tile_size=int(tile_manifest["tile_size"]),
-        )
-        mask_paths = _normalize_mask_outputs(
-            mask_output,
-            output_dir=output_dir,
-            expected_count=len(tile_paths),
-        )
-        artifact_path = _write_mask_artifact(
-            scene_dir=scene_dir,
-            tiles=tile_manifest["tiles"],
-            mask_paths=mask_paths,
-            height=int(tile_manifest["height"]),
-            width=int(tile_manifest["width"]),
-            crs=tile_manifest["crs"],
-            transform=tile_manifest["transform"],
-        )
-        result = write_water_mask_tiles_to_zarr(
-            output_uri=prepared_output_zarr_uri,
-            tiles=[
-                {
-                    "row_start": tile.row_start,
-                    "row_stop": tile.row_stop,
-                    "col_start": tile.col_start,
-                    "col_stop": tile.col_stop,
-                }
-                for tile in tile_manifest["tiles"]
-            ],
-            mask_paths=[str(path) for path in mask_paths],
-            height=int(tile_manifest["height"]),
-            width=int(tile_manifest["width"]),
-            acquisition_datetime=acquisition_datetime,
-            model_name="omniwatermask" if runtime_mode == "model" else "omniwatermask_ndwi_fallback",
-            model_version=module_version,
-            input_bands=list(plan.input_bands),
+        if preferred_runtime == "model" and make_water_mask is not None:
+            with tempfile.TemporaryDirectory(prefix=f"nimbus-water-{scene_id}-") as tmp_dir:
+                scene_dir = Path(tmp_dir)
+                tiles_dir = scene_dir / "tiles"
+                cache_dir = scene_dir / "cache"
+                output_dir = scene_dir / "outputs"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                tile_manifest = _export_rgbnir_tiles(
+                    zarr_uri=prepared_output_zarr_uri,
+                    tiles_dir=tiles_dir,
+                    dataset_summary=dataset_summary,
+                    input_bands=plan.input_bands,
+                    sensor=plan.sensor,
+                )
+                tile_paths = [tile.path for tile in tile_manifest["tiles"]]
+                try:
+                    mask_output = _run_omniwater_model(
+                        make_water_mask=make_water_mask,
+                        scene_paths=tile_paths,
+                        output_dir=output_dir,
+                        cache_dir=cache_dir,
+                        scene_dir=scene_dir,
+                        tile_size=int(tile_manifest["tile_size"]),
+                    )
+                    mask_paths = _normalize_mask_outputs(
+                        mask_output,
+                        output_dir=output_dir,
+                        expected_count=len(tile_paths),
+                    )
+                    water_arr, water_prob_arr = prepare_water_output_arrays(target_root, overwrite=True)
+                    runtime_summary = _write_model_water_outputs(
+                        output_zarr_uri=prepared_output_zarr_uri,
+                        tiles=tile_manifest["tiles"],
+                        mask_paths=mask_paths,
+                        water_arr=water_arr,
+                        water_prob_arr=water_prob_arr,
+                    )
+                    runtime_mode = "model"
+                    input_bands = list(plan.input_bands)
+                except Exception as exc:
+                    if not _is_legacy_model_dependency_error(exc):
+                        raise
+                    water_arr, water_prob_arr = prepare_water_output_arrays(target_root, overwrite=True)
+                    runtime_summary = _run_water_fallback_tiled(
+                        zarr_uri=prepared_output_zarr_uri,
+                        sensor=plan.sensor,
+                        threshold=float(plan.threshold or 0.0),
+                        water_arr=water_arr,
+                        water_prob_arr=water_prob_arr,
+                    )
+                    runtime_mode = "heuristic_fallback"
+                    input_bands = list(plan.fallback_bands)
+        else:
+            water_arr, water_prob_arr = prepare_water_output_arrays(target_root, overwrite=True)
+            runtime_summary = _run_water_fallback_tiled(
+                zarr_uri=prepared_output_zarr_uri,
+                sensor=plan.sensor,
+                threshold=float(plan.threshold or 0.0),
+                water_arr=water_arr,
+                water_prob_arr=water_prob_arr,
+            )
+            runtime_mode = "heuristic_fallback"
+            input_bands = list(plan.fallback_bands)
+
+        result = finalize_water_outputs(
+            target_root,
+            runtime_mode=runtime_mode,
+            sensor_key=str(plan.sensor.sensor_key if plan.sensor is not None else "unknown"),
+            threshold=(runtime_summary.get("threshold_used") if runtime_mode != "model" else None),
+            input_bands=tuple(input_bands),
             metadata={
                 "provider": provider,
                 "collection": collection,
                 "product_type": product_type,
                 "scene_id": scene_id,
-                "source_mask_raster": str(artifact_path),
-                "artifact_uri": str(artifact_path),
-                "status_path": str(status_path),
-                "work_dir": str(scene_dir),
-                "tile_count": len(tile_paths),
+                "source_mask_raster": "",
+                "artifact_uri": "",
+                "status_path": "",
+                "work_dir": "",
                 "runtime_mode": runtime_mode,
+                "input_zarr_uri": source_lineage_uri,
+                "output_zarr_uri": prepared_output_zarr_uri,
+                "storage_mode": storage_mode,
+                "threshold_used": runtime_summary.get("threshold_used"),
+                "sensor_recipe": str(plan.sensor.sensor_key if plan.sensor is not None else "unknown"),
+                "probability_source": str(runtime_summary.get("probability_source") or "water_score"),
             },
+            water_fraction=float(runtime_summary.get("water_fraction") or 0.0),
+            water_arr=water_arr,
+            water_prob_arr=water_prob_arr,
+            summary=runtime_summary,
+        )
+        target_root.attrs["source_zarr_uri"] = source_lineage_uri
+        target_root.attrs["masked_zarr_uri"] = prepared_output_zarr_uri
+        result.update(
+            {
+                "model_name": "omniwatermask" if runtime_mode == "model" else "omniwatermask_heuristic_fallback",
+                "model_version": module_version,
+                "input_bands": list(input_bands),
+            }
         )
         payload = {
             "status": "written",
             "reason": None,
-            "input_zarr_uri": zarr_uri,
+            "input_zarr_uri": source_lineage_uri,
+            "working_zarr_uri": prepared_output_zarr_uri,
             "output_zarr_uri": prepared_output_zarr_uri,
-            "storage_mode": "derived_zarr_copy",
-            "input_bands": list(plan.input_bands),
+            "storage_mode": storage_mode,
+            "input_bands": list(input_bands),
+            "fallback_bands": list(plan.fallback_bands),
             "mask_path": result["mask_path"],
-            "artifact_uri": str(artifact_path),
-            "status_path": str(status_path),
-            "work_dir": str(scene_dir),
-            "shape": result["shape"],
-            "dtype": result["dtype"],
+            "probability_path": result["probability_path"],
+            "artifact_uri": None,
+            "status_path": None,
+            "work_dir": None,
+            "shape": result["mask_shape"],
+            "dtype": result["mask_dtype"],
+            "probability_dtype": result["probability_dtype"],
             "classes": result["classes"],
-            "model_name": result["model_name"],
-            "model_version": result["model_version"],
+            "model_name": "omniwatermask" if runtime_mode == "model" else "omniwatermask_heuristic_fallback",
+            "model_version": module_version,
             "written_at": result["written_at"],
             "runtime_mode": runtime_mode,
+            "threshold_used": runtime_summary.get("threshold_used"),
+            "sensor_recipe": str(plan.sensor.sensor_key if plan.sensor is not None else "unknown"),
+            "water_fraction": float(runtime_summary.get("water_fraction") or 0.0),
+            "probability_source": str(runtime_summary.get("probability_source") or "water_score"),
+            "cloud_blocked_fraction": float(runtime_summary.get("cloud_blocked_fraction") or 0.0),
         }
-        _persist_status_artifacts(scene_dir=scene_dir, status_path=status_path, payload=payload)
         _sync_zarr_mask_attrs(zarr_uri=prepared_output_zarr_uri, payload=payload)
         if stage_callback is not None:
             stage_callback(
                 "water_masking_finished",
                 {
-                    "zarr_uri": zarr_uri,
+                    "zarr_uri": source_lineage_uri,
                     "output_zarr_uri": prepared_output_zarr_uri,
                     "scene_id": scene_id,
                     "provider": provider,
@@ -233,22 +301,27 @@ def apply_omniwatermask_to_zarr(
         payload = {
             "status": "failed",
             "reason": str(exc),
-            "input_zarr_uri": zarr_uri,
+            "input_zarr_uri": source_lineage_uri,
             "output_zarr_uri": masked_zarr_uri,
-            "storage_mode": "derived_zarr_copy",
+            "storage_mode": storage_mode,
             "input_bands": list(plan.input_bands),
             "mask_path": None,
+            "probability_path": None,
             "artifact_uri": None,
-            "status_path": str(status_path),
-            "work_dir": str(scene_dir),
+            "status_path": None,
+            "work_dir": None,
         }
-        _persist_status_artifacts(scene_dir=scene_dir, status_path=status_path, payload=payload)
-        _cleanup_masked_zarr_copy(masked_zarr_uri)
+        if storage_mode == "in_place_zarr_masking":
+            target_root = None
+            _delete_water_layers(zarr_uri=masked_zarr_uri)
+            _sync_zarr_mask_attrs(zarr_uri=masked_zarr_uri, payload=payload)
+        else:
+            _cleanup_masked_zarr_copy(masked_zarr_uri)
         if stage_callback is not None:
             stage_callback(
                 "water_masking_failed",
                 {
-                    "zarr_uri": zarr_uri,
+                    "zarr_uri": source_lineage_uri,
                     "output_zarr_uri": masked_zarr_uri,
                     "scene_id": scene_id,
                     "provider": provider,
@@ -272,6 +345,7 @@ def maybe_write_omniwater_mask(
     scene_id: str,
     acquisition_datetime: str | None,
     dataset_summary: dict[str, Any],
+    output_zarr_uri: str | None = None,
     fail_on_error: bool = False,
 ) -> dict[str, Any]:
     return apply_omniwatermask_to_zarr(
@@ -283,6 +357,7 @@ def maybe_write_omniwater_mask(
         scene_id=scene_id,
         acquisition_datetime=acquisition_datetime,
         dataset_summary=dataset_summary,
+        output_zarr_uri=output_zarr_uri,
         fail_on_error=fail_on_error,
     )
 
@@ -295,35 +370,41 @@ def _build_plan(
     dataset_summary: dict[str, Any],
 ) -> OmniWaterPlan:
     band_names = [str(value) for value in list(dataset_summary.get("band_names") or [])]
-    normalized_collection = str(collection or "").strip().upper()
-    normalized_product_type = str(product_type or "").strip().upper()
+    try:
+        sensor = resolve_sensor_mask_spec(
+            provider=provider,
+            collection=collection,
+            product_type=product_type,
+        )
+    except ValueError:
+        return OmniWaterPlan(
+            required=is_omniwater_required(provider=provider, collection=collection),
+            supported=False,
+            sensor=None,
+            input_bands=[],
+            fallback_bands=[],
+            reason="unsupported_collection_for_omniwatermask",
+        )
 
-    if provider == "copernicus" and normalized_collection == "SENTINEL-2":
-        if all(name in band_names for name in _S2_INPUT_BANDS):
-            return OmniWaterPlan(required=True, supported=True, input_bands=list(_S2_INPUT_BANDS))
+    required_bands = tuple(dict.fromkeys((*sensor.water_input_bands, *sensor.water_fallback_bands)))
+    missing = [name for name in required_bands if name not in band_names]
+    if missing:
         return OmniWaterPlan(
             required=True,
             supported=False,
-            input_bands=list(_S2_INPUT_BANDS),
-            reason="required_sentinel2_rgbnir_bands_missing",
+            sensor=sensor,
+            input_bands=list(sensor.water_input_bands),
+            fallback_bands=list(sensor.water_fallback_bands),
+            threshold=float(sensor.water_threshold_default),
+            reason="required_water_bands_missing:" + ",".join(missing),
         )
-
-    if provider == "usgs" and normalized_collection.startswith("LANDSAT"):
-        if normalized_product_type.startswith("L2") or any(name.startswith("SR_B") for name in band_names):
-            required = _LANDSAT_L2_INPUT_BANDS
-            reason = "required_landsat_l2_rgbnir_bands_missing"
-        else:
-            required = _LANDSAT_L1_INPUT_BANDS
-            reason = "required_landsat_l1_rgbnir_bands_missing"
-        if all(name in band_names for name in required):
-            return OmniWaterPlan(required=True, supported=True, input_bands=list(required))
-        return OmniWaterPlan(required=True, supported=False, input_bands=list(required), reason=reason)
-
     return OmniWaterPlan(
-        required=False,
-        supported=False,
-        input_bands=[],
-        reason="unsupported_collection_for_omniwatermask",
+        required=True,
+        supported=True,
+        sensor=sensor,
+        input_bands=list(sensor.water_input_bands),
+        fallback_bands=list(sensor.water_fallback_bands),
+        threshold=float(sensor.water_threshold_default),
     )
 
 
@@ -359,6 +440,7 @@ def _export_rgbnir_tiles(
     tiles_dir: Path,
     dataset_summary: dict[str, Any],
     input_bands: list[str],
+    sensor: SensorMaskSpec,
 ) -> dict[str, Any]:
     try:
         import numpy as np
@@ -378,13 +460,8 @@ def _export_rgbnir_tiles(
     if imagery is None:
         raise ConversionError("The target Zarr store does not contain an imagery array.")
 
-    band_coord = root.get("band")
-    if band_coord is None:
-        raise ConversionError("The target Zarr store does not contain a band coordinate.")
-
-    band_names = [_normalize_coord_value(value) for value in band_coord[:].tolist()]
-    band_index = {name: index for index, name in enumerate(band_names)}
-    missing = [name for name in input_bands if name not in band_index]
+    context = read_context(root, zarr_uri=zarr_uri)
+    missing = [name for name in input_bands if name not in context.band_names]
     if missing:
         raise ConversionError(
             f"Cannot export OmniWaterMask input because the Zarr store is missing bands: {missing}."
@@ -397,7 +474,6 @@ def _export_rgbnir_tiles(
 
     height = int(dataset_summary["shape"][2])
     width = int(dataset_summary["shape"][3])
-    dtype = str(dataset_summary.get("dtype") or imagery.dtype)
     transform = Affine(*transform_values[:6])
     tile_size = _watermask_tile_size()
     tiles: list[OmniWaterTile] = []
@@ -422,13 +498,28 @@ def _export_rgbnir_tiles(
                 height=row_stop - row_start,
                 width=col_stop - col_start,
                 count=4,
-                dtype=np.dtype(dtype),
+                dtype=np.uint16,
                 crs=crs,
                 transform=window_transform(tile_window, transform),
             ) as dataset:
+                channels, _missing = read_required_channels_window(
+                    root,
+                    band_names=context.band_names,
+                    required_bands=tuple(input_bands),
+                    scale_hint=sensor.scale_hint,
+                    row_start=row_start,
+                    row_stop=row_stop,
+                    col_start=col_start,
+                    col_stop=col_stop,
+                    normalize=True,
+                )
                 for output_band_index, band_name in enumerate(input_bands, start=1):
                     dataset.write(
-                        imagery[0, band_index[band_name], row_start:row_stop, col_start:col_stop],
+                        np.clip(
+                            np.round(channels[band_name] * 10000.0),
+                            0.0,
+                            10000.0,
+                        ).astype(np.uint16),
                         output_band_index,
                     )
             tiles.append(
@@ -450,19 +541,15 @@ def _export_rgbnir_tiles(
     }
 
 
-def _run_omniwater(
+def _run_omniwater_model(
     *,
-    make_water_mask: Any | None,
+    make_water_mask: Any,
     scene_paths: list[Path],
     output_dir: Path,
     cache_dir: Path,
     scene_dir: Path,
     tile_size: int,
-) -> tuple[Any, str]:
-    # If omniwatermask or its legacy model runtime is unavailable, fall back to a
-    # deterministic NDWI mask instead of aborting the manual existing-Zarr flow.
-    if _watermask_runtime_mode() != "model":
-        return _run_internal_ndwi(scene_paths=scene_paths, output_dir=output_dir), "ndwi_fallback"
+) -> Any:
     kwargs: dict[str, Any] = {
         "scene_paths": scene_paths,
         "band_order": [1, 2, 3, 4],
@@ -498,14 +585,7 @@ def _run_omniwater(
     for key, value in optional_kwargs.items():
         if not accepted or key in accepted:
             kwargs[key] = value
-    if make_water_mask is None:
-        return _run_internal_ndwi(scene_paths=scene_paths, output_dir=output_dir), "ndwi_fallback"
-    try:
-        return make_water_mask(**kwargs), "model"
-    except Exception as exc:
-        if not _is_legacy_model_dependency_error(exc):
-            raise
-        return _run_internal_ndwi(scene_paths=scene_paths, output_dir=output_dir), "ndwi_fallback"
+    return make_water_mask(**kwargs)
 
 
 def _run_internal_ndwi(*, scene_paths: list[Path], output_dir: Path) -> list[Path]:
@@ -538,6 +618,232 @@ def _run_internal_ndwi(*, scene_paths: list[Path], output_dir: Path) -> list[Pat
                 dst.write(mask, 1)
         outputs.append(mask_path)
     return outputs
+
+
+def _run_water_fallback_tiled(
+    *,
+    zarr_uri: str,
+    sensor: SensorMaskSpec,
+    threshold: float,
+    water_arr: Any,
+    water_prob_arr: Any,
+) -> dict[str, Any]:
+    root = open_zarr_group(zarr_uri, mode="a")
+    context = read_context(root, zarr_uri=zarr_uri)
+    imagery = root["imagery"]
+    height = int(imagery.shape[2])
+    width = int(imagery.shape[3])
+    cloud_arr = None
+    if "masks" in root and "cloud" in root["masks"]:
+        cloud_arr = root["masks"]["cloud"]
+
+    total_pixels = max(1, height * width)
+    water_pixels = 0
+    cloud_blocked_pixels = 0
+    probability_sum = 0.0
+    effective_threshold = float(threshold)
+    for row_start in range(0, height, _watermask_tile_size()):
+        row_stop = min(height, row_start + _watermask_tile_size())
+        for col_start in range(0, width, _watermask_tile_size()):
+            col_stop = min(width, col_start + _watermask_tile_size())
+            channels, _missing = read_required_channels_window(
+                root,
+                band_names=context.band_names,
+                required_bands=sensor.water_fallback_bands,
+                scale_hint=sensor.scale_hint,
+                row_start=row_start,
+                row_stop=row_stop,
+                col_start=col_start,
+                col_stop=col_stop,
+                normalize=True,
+            )
+            cloud_window = None
+            if cloud_arr is not None:
+                cloud_window = np.asarray(
+                    cloud_arr[0, row_start:row_stop, col_start:col_stop],
+                    dtype=np.uint8,
+                )
+            probability_tile, mask_tile, tile_summary = _run_water_fallback_window(
+                sensor=sensor,
+                channels=channels,
+                threshold=effective_threshold,
+                cloud_mask=cloud_window,
+            )
+            water_arr[0, row_start:row_stop, col_start:col_stop] = mask_tile
+            water_prob_arr[0, row_start:row_stop, col_start:col_stop] = probability_tile
+            water_pixels += int(np.asarray(mask_tile, dtype=np.uint64).sum())
+            probability_sum += float(np.asarray(probability_tile, dtype=np.float64).sum())
+            cloud_blocked_pixels += int(tile_summary["cloud_blocked_pixels"])
+
+    return {
+        "runtime_mode": "heuristic_fallback",
+        "water_fraction": float(water_pixels / total_pixels),
+        "probability_mean": float(probability_sum / total_pixels),
+        "threshold_used": effective_threshold,
+        "sensor_recipe": sensor.sensor_key,
+        "input_bands": list(sensor.water_fallback_bands),
+        "probability_source": "water_score",
+        "cloud_blocked_fraction": float(cloud_blocked_pixels / total_pixels),
+    }
+
+
+def _run_water_fallback_window(
+    *,
+    sensor: SensorMaskSpec,
+    channels: dict[str, np.ndarray],
+    threshold: float,
+    cloud_mask: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    blue, green, red, nir, swir1, swir2 = _water_recipe_channels(sensor=sensor, channels=channels)
+    ndwi = _safe_index(green, nir)
+    mndwi = _safe_index(green, swir1)
+    ndvi = _safe_index(nir, red)
+    swir_mean = (swir1 + swir2) / 2.0
+    brightness = np.clip((blue + green + red) / 3.0, 0.0, 1.0)
+    darkness = 1.0 - np.clip((0.55 * nir) + (0.45 * swir_mean), 0.0, 1.0)
+    awei_like = (4.0 * (green - swir1)) - (0.25 * nir + 2.75 * swir2)
+
+    ndwi_score = np.clip((ndwi + 0.18) / 0.78, 0.0, 1.0)
+    mndwi_score = np.clip((mndwi + 0.22) / 0.82, 0.0, 1.0)
+    awei_score = np.clip((awei_like + 0.25) / 1.35, 0.0, 1.0)
+    darkness_score = np.clip(darkness, 0.0, 1.0)
+    vegetation_penalty = np.clip((ndvi - 0.08) / 0.42, 0.0, 1.0)
+    dry_bright_penalty = np.clip((brightness - 0.46) / 0.34, 0.0, 1.0) * (1.0 - mndwi_score)
+
+    probability = (
+        0.34 * ndwi_score
+        + 0.34 * mndwi_score
+        + 0.20 * awei_score
+        + 0.12 * darkness_score
+        - 0.18 * vegetation_penalty
+        - 0.10 * dry_bright_penalty
+    )
+    probability = np.clip(probability, 0.0, 1.0).astype(np.float32, copy=False)
+
+    cloud_blocked_pixels = 0
+    if cloud_mask is not None:
+        cloud_block = np.asarray(cloud_mask, dtype=np.uint8) > 0
+        cloud_blocked_pixels = int(cloud_block.sum())
+        probability = np.where(cloud_block, 0.0, probability)
+
+    raw_mask = probability >= float(threshold)
+    refined_mask = _refine_binary_mask(raw_mask)
+    if cloud_mask is not None:
+        refined_mask = np.logical_and(refined_mask, np.asarray(cloud_mask, dtype=np.uint8) == 0)
+    return (
+        probability.astype(np.float32, copy=False),
+        refined_mask.astype(np.uint8, copy=False),
+        {"cloud_blocked_pixels": cloud_blocked_pixels},
+    )
+
+
+def _write_model_water_outputs(
+    *,
+    output_zarr_uri: str,
+    tiles: list[OmniWaterTile],
+    mask_paths: list[Path],
+    water_arr: Any,
+    water_prob_arr: Any,
+) -> dict[str, Any]:
+    root = open_zarr_group(output_zarr_uri, mode="a")
+    height = int(root["imagery"].shape[2])
+    width = int(root["imagery"].shape[3])
+    cloud_arr = None
+    if "masks" in root and "cloud" in root["masks"]:
+        cloud_arr = root["masks"]["cloud"]
+
+    total_pixels = max(1, height * width)
+    water_pixels = 0
+    cloud_blocked_pixels = 0
+    for tile, mask_path in zip(tiles, mask_paths, strict=True):
+        tile_mask = _read_mask(mask_path).astype(np.uint8, copy=False)
+        if cloud_arr is not None:
+            cloud_window = np.asarray(
+                cloud_arr[0, tile.row_start:tile.row_stop, tile.col_start:tile.col_stop],
+                dtype=np.uint8,
+            )
+            cloud_block = cloud_window > 0
+            cloud_blocked_pixels += int(cloud_block.sum())
+            tile_mask = np.where(cloud_block, 0, tile_mask).astype(np.uint8, copy=False)
+        water_arr[0, tile.row_start:tile.row_stop, tile.col_start:tile.col_stop] = tile_mask
+        water_prob_arr[0, tile.row_start:tile.row_stop, tile.col_start:tile.col_stop] = tile_mask.astype(np.float32)
+        water_pixels += int(np.asarray(tile_mask, dtype=np.uint64).sum())
+
+    return {
+        "runtime_mode": "model",
+        "water_fraction": float(water_pixels / total_pixels),
+        "probability_mean": float(water_pixels / total_pixels),
+        "threshold_used": None,
+        "probability_source": "model_binary_mask",
+        "cloud_blocked_fraction": float(cloud_blocked_pixels / total_pixels),
+    }
+
+
+def _water_recipe_channels(
+    *,
+    sensor: SensorMaskSpec,
+    channels: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if sensor.sensor_key == "sentinel-2":
+        return (
+            channels["B02"],
+            channels["B03"],
+            channels["B04"],
+            channels["B08"],
+            channels["B11"],
+            channels["B12"],
+        )
+    if sensor.sensor_key == "landsat-8-9-l1":
+        return (
+            channels["B2"],
+            channels["B3"],
+            channels["B4"],
+            channels["B5"],
+            channels["B6"],
+            channels["B7"],
+        )
+    if sensor.sensor_key == "landsat-8-9-l2":
+        return (
+            channels["SR_B2"],
+            channels["SR_B3"],
+            channels["SR_B4"],
+            channels["SR_B5"],
+            channels["SR_B6"],
+            channels["SR_B7"],
+        )
+    raise ConversionError(f"Unsupported water-mask sensor recipe: {sensor.sensor_key}")
+
+
+def _safe_index(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    denom = a + b
+    return np.divide(a - b, denom, out=np.zeros_like(a, dtype=np.float32), where=np.abs(denom) > 1e-6)
+
+
+def _delete_water_layers(*, zarr_uri: str) -> None:
+    delete_mask_layers(zarr_uri, layer_names=("water", "water_probability"))
+
+
+def _refine_binary_mask(mask: np.ndarray) -> np.ndarray:
+    mask_bool = np.asarray(mask, dtype=bool)
+    neighbor_count = _box_filter2d(mask_bool.astype(np.uint8), radius=1)
+    filled = np.logical_or(mask_bool, neighbor_count >= 7)
+    keep = np.logical_and(filled, neighbor_count >= 2)
+    return keep
+
+
+def _box_filter2d(array: np.ndarray, *, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return np.asarray(array, dtype=np.uint8, copy=False)
+    src = np.asarray(array, dtype=np.uint8, copy=False)
+    padded = np.pad(src, radius, mode="edge")
+    height, width = src.shape
+    result = np.zeros_like(src, dtype=np.uint8)
+    for row_offset in range(0, 2 * radius + 1):
+        row_slice = slice(row_offset, row_offset + height)
+        for col_offset in range(0, 2 * radius + 1):
+            col_slice = slice(col_offset, col_offset + width)
+            result = result + padded[row_slice, col_slice]
+    return result
 
 
 def _normalize_mask_outputs(result: Any, *, output_dir: Path, expected_count: int) -> list[Path]:
@@ -669,6 +975,14 @@ def _watermask_scene_dir(*, job_id: str | None, scene_id: str) -> Path:
     return path
 
 
+def _water_storage_mode(*, source_zarr_uri: str, output_zarr_uri: str) -> str:
+    source_value = str(source_zarr_uri or "").strip()
+    output_value = str(output_zarr_uri or "").strip()
+    if source_value and output_value and source_value == output_value:
+        return "in_place_zarr_masking"
+    return "derived_zarr_copy"
+
+
 def _masked_zarr_output_uri(*, source_zarr_uri: str, scene_dir: Path, scene_id: str) -> str:
     source_path = Path(str(source_zarr_uri).strip())
     safe_scene_id = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in scene_id).strip("._")
@@ -686,19 +1000,19 @@ def _masked_zarr_output_uri(*, source_zarr_uri: str, scene_dir: Path, scene_id: 
 
 
 def _prepare_masked_zarr_copy(*, source_zarr_uri: str, output_zarr_uri: str) -> str:
+    return copy_source_zarr(source_zarr_uri=source_zarr_uri, output_zarr_uri=output_zarr_uri)
+
+
+def _prepare_masked_zarr_output(*, source_zarr_uri: str, output_zarr_uri: str, overwrite: bool = True) -> str:
     source_path = Path(str(source_zarr_uri).strip())
     output_path = Path(str(output_zarr_uri).strip())
-    if not source_path.exists():
-        raise ConversionError(f"Source Zarr store not found: {source_zarr_uri}")
-    if not source_path.is_dir():
-        raise ConversionError(f"Source Zarr store must be a directory: {source_zarr_uri}")
     if source_path.resolve() == output_path.resolve():
-        raise ConversionError("Masked Zarr output must differ from the source Zarr store.")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists():
-        shutil.rmtree(output_path)
-    shutil.copytree(source_path, output_path)
-    return str(output_path)
+        if not output_path.exists():
+            raise ConversionError(f"Masked Zarr store not found: {output_zarr_uri}")
+        return str(output_path)
+    if output_path.exists() and not overwrite:
+        return str(output_path)
+    return _prepare_masked_zarr_copy(source_zarr_uri=source_zarr_uri, output_zarr_uri=output_zarr_uri)
 
 
 def _cleanup_masked_zarr_copy(output_zarr_uri: str) -> None:
@@ -791,9 +1105,19 @@ def _watermask_tile_size() -> int:
     return max(256, value)
 
 
-def _watermask_runtime_mode() -> str:
-    raw = str(os.getenv("NIMBUS_WATERMASK_RUNTIME_MODE") or "").strip().lower()
-    return "model" if raw == "model" else "ndwi"
+def _watermask_runtime_mode(explicit: str | None = None) -> str:
+    raw = str(explicit or os.getenv("NIMBUS_WATERMASK_RUNTIME_MODE") or "").strip().lower()
+    if raw in {"fallback", "heuristic", "ndwi"}:
+        return "fallback"
+    if _omniwater_module_available():
+        return "model"
+    return "fallback"
+
+
+def _omniwater_module_available() -> bool:
+    if "omniwatermask" in sys.modules:
+        return True
+    return importlib.util.find_spec("omniwatermask") is not None
 
 
 def _watermask_model_dir(scene_dir: Path) -> Path:

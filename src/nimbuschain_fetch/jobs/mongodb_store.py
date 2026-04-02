@@ -107,6 +107,7 @@ class MongoJobStore:
         doc["raw_outputs"] = list(doc.get("raw_outputs") or [])
         doc["zarr_outputs"] = list(doc.get("zarr_outputs") or [])
         doc["watermask_outputs"] = list(doc.get("watermask_outputs") or [])
+        doc["cloudmask_outputs"] = list(doc.get("cloudmask_outputs") or [])
         return doc
 
     @staticmethod
@@ -162,6 +163,7 @@ class MongoJobStore:
                 "raw_outputs": [],
                 "zarr_outputs": [],
                 "watermask_outputs": [],
+                "cloudmask_outputs": [],
                 "progress": 0.0,
                 "bytes_downloaded": 0,
                 "bytes_total": 0,
@@ -188,7 +190,7 @@ class MongoJobStore:
                 normalized_fields[key] = list(value or [])
             elif key in {"pipeline_metadata", "conversion_metadata"}:
                 normalized_fields[key] = dict(value or {})
-            elif key in {"raw_outputs", "zarr_outputs", "watermask_outputs"}:
+            elif key in {"raw_outputs", "zarr_outputs", "watermask_outputs", "cloudmask_outputs"}:
                 normalized_fields[key] = list(value or [])
             elif key == "pipeline_progress" and value is not None:
                 normalized_fields[key] = float(value)

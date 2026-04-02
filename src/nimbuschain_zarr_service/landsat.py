@@ -115,6 +115,11 @@ def build_landsat_dataset(
             available=ordered_imagery,
         )
         target_pixel_size = target_pixel_size_for(provider, collection)
+        radiometric_metadata = _landsat_radiometric_metadata(
+            collection=collection,
+            product_type=resolved_product_type,
+            values=mtl_values,
+        )
         imagery_stack = load_aligned_raster_stack(
             imagery_paths,
             ordered_bands=ordered_imagery,
@@ -150,6 +155,7 @@ def build_landsat_dataset(
                 "reference_band": imagery_stack["reference_band"],
                 "reference_pixel_size": imagery_stack["pixel_size"],
                 "band_metadata": imagery_stack["band_metadata"],
+                "radiometric_metadata": radiometric_metadata,
             },
         )
         ancillary_metadata: dict[str, Any] = {}
@@ -204,6 +210,7 @@ def build_landsat_dataset(
                 "reference_band": imagery_stack["reference_band"],
             },
             target_pixel_size=target_pixel_size,
+            radiometric_metadata=radiometric_metadata,
             ancillary_paths=ancillary_paths,
             ancillary_layer_names=ordered_ancillary,
             ancillary_metadata=ancillary_metadata,
@@ -289,6 +296,11 @@ def convert_landsat_to_zarr(
             collection=collection,
             product_id=product_id,
         )
+        radiometric_metadata = _landsat_radiometric_metadata(
+            collection=collection,
+            product_type=resolved_product_type,
+            values=mtl_values,
+        )
         metadata = {
             "provider": provider,
             "collection": collection,
@@ -300,6 +312,7 @@ def convert_landsat_to_zarr(
             "product_level": product_level,
             "data_family": "optical",
             "source_uri": str(extracted.raw_path),
+            "radiometric_metadata": radiometric_metadata,
         }
         written_uri, dataset_summary = stream_raster_product_to_zarr(
             imagery_band_paths=imagery_paths,
@@ -336,6 +349,7 @@ def convert_landsat_to_zarr(
                 "reference_band": reference_band,
             },
             target_pixel_size=target_pixel_size,
+            radiometric_metadata=radiometric_metadata,
             ancillary_paths=ancillary_paths,
             ancillary_layer_names=list(dataset_summary.get("ancillary_layer_names") or []),
             ancillary_metadata=dict(dataset_summary.get("ancillary_metadata") or {}),
@@ -481,6 +495,80 @@ def _build_acquisition_datetime(values: dict[str, str]) -> str | None:
     return parsed.replace(tzinfo=timezone.utc).isoformat()
 
 
+def _landsat_radiometric_metadata(
+    *,
+    collection: str,
+    product_type: str,
+    values: dict[str, str],
+) -> dict[str, Any]:
+    collection_lower = str(collection).lower()
+    payload: dict[str, Any] = {
+        "collection": collection,
+        "product_type": product_type,
+        "sun_elevation": _as_float(values.get("SUN_ELEVATION")),
+        "bands": {},
+    }
+    bands = payload["bands"]
+    if collection_lower.endswith("_l1"):
+        for index in range(1, 10):
+            bands[f"B{index}"] = {
+                "quantity": "toa_reflectance",
+                "mult": _first_float(
+                    values,
+                    f"REFLECTANCE_MULT_BAND_{index}",
+                    f"SURFACE_REFLECTANCE_MULT_BAND_{index}",
+                    f"SR_MULT_BAND_{index}",
+                )
+                or 2.0e-5,
+                "add": _first_float(
+                    values,
+                    f"REFLECTANCE_ADD_BAND_{index}",
+                    f"SURFACE_REFLECTANCE_ADD_BAND_{index}",
+                    f"SR_ADD_BAND_{index}",
+                )
+                or -0.1,
+                "apply_sun_elevation": True,
+            }
+    else:
+        for index in range(1, 8):
+            bands[f"SR_B{index}"] = {
+                "quantity": "surface_reflectance",
+                "mult": _first_float(
+                    values,
+                    f"REFLECTANCE_MULT_BAND_{index}",
+                    f"SURFACE_REFLECTANCE_MULT_BAND_{index}",
+                    f"SR_MULT_BAND_{index}",
+                )
+                or 2.75e-5,
+                "add": _first_float(
+                    values,
+                    f"REFLECTANCE_ADD_BAND_{index}",
+                    f"SURFACE_REFLECTANCE_ADD_BAND_{index}",
+                    f"SR_ADD_BAND_{index}",
+                )
+                or -0.2,
+                "apply_sun_elevation": False,
+            }
+    return payload
+
+
+def _first_float(values: dict[str, str], *keys: str) -> float | None:
+    for key in keys:
+        value = _as_float(values.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _as_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip().strip('"'))
+    except ValueError:
+        return None
+
+
 def _landsat_product_type(product_id: str, *, requested: str | None = None) -> str:
     requested_upper = str(requested or "").strip().upper()
     if requested_upper:
@@ -556,6 +644,7 @@ def _summarize_landsat_product(
     imagery_metadata: dict[str, Any],
     grid: dict[str, Any],
     target_pixel_size: float | None,
+    radiometric_metadata: dict[str, Any],
     ancillary_paths: dict[str, Path],
     ancillary_layer_names: list[str],
     ancillary_metadata: dict[str, Any],
@@ -574,6 +663,7 @@ def _summarize_landsat_product(
         "raw_path": str(extracted.raw_path),
         "normalized_band_order": imagery_band_names,
         "resolution_policy_meters": target_pixel_size,
+        "radiometric_metadata": radiometric_metadata,
         "band_sources": {
             band: str(path.relative_to(extracted.root)) for band, path in imagery_paths.items()
         },

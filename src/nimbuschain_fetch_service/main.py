@@ -15,6 +15,7 @@ from nimbuschain_fetch_service.api.health import router as health_router
 from nimbuschain_fetch_service.api.jobs import router as jobs_router
 from nimbuschain_fetch_service.api.metrics import router as metrics_router
 from nimbuschain_fetch_service.api.preview import router as preview_router
+from nimbuschain_fetch_service.api.providers import router as providers_router
 from nimbuschain_fetch_service.logging_config import configure_logging
 from nimbuschain_fetch_service.middleware import (
     APIKeyMiddleware,
@@ -64,6 +65,7 @@ app.include_router(artifacts_router)
 app.include_router(events_router)
 app.include_router(metrics_router)
 app.include_router(preview_router)
+app.include_router(providers_router)
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)

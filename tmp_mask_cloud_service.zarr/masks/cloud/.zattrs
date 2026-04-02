@@ -1,0 +1,37 @@
+{
+  "created_at": "2026-03-30T09:14:23.256857+00:00",
+  "backend": "heuristic",
+  "sensor": "sentinel-2",
+  "threshold": 0.45,
+  "input_bands": [
+    "B02",
+    "B03",
+    "B04",
+    "B08",
+    "B11",
+    "B12"
+  ],
+  "dimensions": [
+    "time",
+    "y",
+    "x"
+  ],
+  "metadata": {
+    "provider": "copernicus",
+    "collection": "SENTINEL-2",
+    "product_type": "S2MSI2A",
+    "scene_id": "S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719",
+    "artifact_uri": "/Users/mehdidinari/Desktop/backend nimbus/data/downloads/cloudmask/debug-cloud/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719/cloud_mask.tif",
+    "status_path": "/Users/mehdidinari/Desktop/backend nimbus/data/downloads/cloudmask/debug-cloud/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719/cloud_mask_status.json",
+    "work_dir": "/Users/mehdidinari/Desktop/backend nimbus/data/downloads/cloudmask/debug-cloud/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719",
+    "input_zarr_uri": "/Users/mehdidinari/Desktop/backend nimbus/data/downloads/zarr/S2B_MSIL2A_20260325T105029_N0512_R051_T31UDS_20260325T144719.zarr",
+    "output_zarr_uri": "/Users/mehdidinari/Desktop/backend nimbus/tmp_mask_cloud_service.zarr"
+  },
+  "mask_name": "cloud",
+  "mask_path": "masks/cloud",
+  "classes": {
+    "0": "clear",
+    "1": "cloud"
+  },
+  "description": "Cloud mask written by Nimbus mask service"
+}

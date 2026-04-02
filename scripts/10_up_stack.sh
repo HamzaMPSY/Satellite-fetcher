@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-${PROJECT_ROOT}/.env}"
 BUILD="${BUILD:-0}"
+NO_CACHE="${NO_CACHE:-0}"
 WAIT_SECONDS="${WAIT_SECONDS:-45}"
 
 if ! command -v podman >/dev/null 2>&1; then
@@ -15,6 +16,24 @@ if command -v podman machine >/dev/null 2>&1; then
   podman machine start >/dev/null 2>&1 || true
 fi
 
+wait_podman() {
+  local deadline=$((SECONDS + WAIT_SECONDS))
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    if podman info >/dev/null 2>&1; then
+      return 0
+    fi
+    podman system connection default podman-machine-default >/dev/null 2>&1 || true
+    if command -v podman machine >/dev/null 2>&1; then
+      podman machine start >/dev/null 2>&1 || true
+    fi
+    sleep 2
+  done
+  echo "ERROR: podman did not become ready within ${WAIT_SECONDS}s." >&2
+  exit 1
+}
+
+wait_podman
+
 if command -v podman-compose >/dev/null 2>&1; then
   COMPOSE_CMD=(podman-compose)
 else
@@ -24,6 +43,7 @@ fi
 EXPECTED_CONTAINERS=(
   "nimbus-mongodb"
   "backendnimbus_nimbus-api_1"
+  "backendnimbus_nimbus-mask_1"
   "backendnimbus_nimbus-worker_1"
   "backendnimbus_nimbus-ui_1"
   "backendnimbus_nimbus-zarr_1"
@@ -63,13 +83,17 @@ if [ "${#existing_containers[@]}" -gt 0 ] && [ "${#missing_containers[@]}" -eq 0
     echo "Stack containers already exist and are running; skipping compose up."
   fi
 else
-ARGS=(--env-file "${ENV_FILE}" -f podman-compose.yml up -d)
-if [ "${BUILD}" = "1" ]; then
-  ARGS=(--env-file "${ENV_FILE}" -f podman-compose.yml up -d --build)
-fi
-
 cd "${PROJECT_ROOT}"
-"${COMPOSE_CMD[@]}" "${ARGS[@]}"
+COMPOSE_ARGS=(--env-file "${ENV_FILE}" -f podman-compose.yml)
+if [ "${BUILD}" = "1" ] && [ "${NO_CACHE}" = "1" ]; then
+  "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" down --remove-orphans || true
+  "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" build --no-cache
+  "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans
+elif [ "${BUILD}" = "1" ]; then
+  "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" up -d --build --force-recreate --remove-orphans
+else
+  "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" up -d
+fi
 fi
 
 wait_http() {
@@ -96,6 +120,7 @@ wait_http() {
 wait_http "API" "http://127.0.0.1:8000/v1/health"
 wait_http "UI" "http://127.0.0.1:8501"
 wait_http "ZARR" "http://127.0.0.1:${NIMBUS_ZARR_PORT:-8010}/health"
+wait_http "MASK" "http://127.0.0.1:${NIMBUS_MASK_PORT:-8020}/health"
 
 wait_worker() {
   local url="http://127.0.0.1:8000/v1/worker/status"
@@ -128,4 +153,5 @@ echo
 echo "Stack started."
 echo "API: http://127.0.0.1:8000"
 echo "UI:  http://127.0.0.1:8501"
+echo "MASK: http://127.0.0.1:${NIMBUS_MASK_PORT:-8020}"
 echo "ZARR: http://127.0.0.1:${NIMBUS_ZARR_PORT:-8010}"

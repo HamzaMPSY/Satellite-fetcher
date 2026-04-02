@@ -144,8 +144,8 @@ def default_zarr_model() -> dict[str, Any]:
     payload["resolution_policy"] = {
         "optical": (
             "Use a collection-specific target grid that preserves the intended multispectral geometry. "
-            "Sentinel-2 is normalized to 10 m. Landsat is normalized to 30 m even when Level-1 includes "
-            "the 15 m panchromatic band B8. Coarser bands are reprojected to that collection-specific target grid."
+            "Sentinel-2 is normalized to 10 m. Landsat 8/9 Collection 2 products are normalized to 10 m. "
+            "Coarser bands are reprojected to that collection-specific target grid."
         ),
         "sentinel-2": {
             "reference_band": "B04",
@@ -153,7 +153,7 @@ def default_zarr_model() -> dict[str, Any]:
         },
         "landsat-8-9": {
             "reference_band": "B4 or SR_B4",
-            "target_pixel_size_meters": 30,
+            "target_pixel_size_meters": 10,
         },
         "sentinel-1": {
             "reference_band": "first_available_polarization",

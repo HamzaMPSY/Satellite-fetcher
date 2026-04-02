@@ -48,6 +48,7 @@ def _write_raster(path: Path, *, shape: tuple[int, int], pixel_size: float, valu
 
 def _build_s2_bundle(root: Path, *, scene_id: str, l1c: bool) -> Path:
     safe_root = root / scene_id
+    safe_root.mkdir(parents=True, exist_ok=True)
     (safe_root / "manifest.safe").write_text("SAFE", encoding="utf-8")
     img_root = safe_root / "GRANULE" / "T31TDN" / "IMG_DATA"
 
@@ -101,6 +102,15 @@ def _build_landsat_bundle(root: Path, *, scene_id: str, l1: bool) -> Path:
                 f'LANDSAT_SCENE_ID = "{scene_id}"',
                 'DATE_ACQUIRED = 2026-01-01',
                 'SCENE_CENTER_TIME = "10:55:01.0240000Z"',
+                'SUN_ELEVATION = 45.0',
+                *[
+                    f"REFLECTANCE_MULT_BAND_{index} = {'2.0000E-05' if l1 else '2.7500E-05'}"
+                    for index in range(1, 8 if not l1 else 10)
+                ],
+                *[
+                    f"REFLECTANCE_ADD_BAND_{index} = {'-0.100000' if l1 else '-0.200000'}"
+                    for index in range(1, 8 if not l1 else 10)
+                ],
             ]
         ),
         encoding="utf-8",
@@ -150,6 +160,7 @@ def _build_landsat_bundle(root: Path, *, scene_id: str, l1: bool) -> Path:
 
 def _build_s1_bundle(root: Path, *, scene_id: str) -> Path:
     safe_root = root / scene_id
+    safe_root.mkdir(parents=True, exist_ok=True)
     (safe_root / "manifest.safe").write_text("SAFE", encoding="utf-8")
     measurement_root = safe_root / "measurement"
     annotation_root = safe_root / "annotation"
@@ -251,7 +262,7 @@ def zarr_service() -> ZarrConversionService:
                     "B11",
                 ),
                 expected_ancillary_names=("QA_PIXEL", "QA_RADSAT", "SAA"),
-                expected_pixel_size=(30.0, 30.0),
+                expected_pixel_size=(10.0, 10.0),
             ),
             lambda root, scene_id: _build_landsat_bundle(root, scene_id=scene_id, l1=True),
         ),
@@ -273,7 +284,7 @@ def zarr_service() -> ZarrConversionService:
                     "ST_B10",
                 ),
                 expected_ancillary_names=("QA_PIXEL", "QA_RADSAT", "ST_QA", "SZA"),
-                expected_pixel_size=(30.0, 30.0),
+                expected_pixel_size=(10.0, 10.0),
             ),
             lambda root, scene_id: _build_landsat_bundle(root, scene_id=scene_id, l1=False),
         ),
@@ -340,11 +351,18 @@ def test_converter_preserves_exact_native_layers(
     group = zarr.open_group(str(written_uri), mode="r")
     assert tuple(group["band"][:].tolist()) == case.expected_band_names
     assert tuple(group["imagery"].shape) == tuple(dataset_summary["shape"])
+    if case.expected_pixel_size is not None:
+        assert tuple(group.attrs.get("reference_pixel_size") or []) == case.expected_pixel_size
+    assert dict(group.attrs.get("band_metadata") or {})
+    if case.provider == "usgs":
+        radiometric_metadata = dict(group.attrs.get("radiometric_metadata") or {})
+        assert radiometric_metadata.get("bands")
 
     if case.expected_ancillary_names:
         assert "ancillary" in group
         assert "ancillary_layer" in group
         assert tuple(group["ancillary_layer"][:].tolist()) == case.expected_ancillary_names
         assert tuple(group["ancillary"].shape) == tuple(dataset_summary["ancillary_shape"])
+        assert dict(group.attrs.get("ancillary_metadata") or {})
     else:
         assert "ancillary" not in group
