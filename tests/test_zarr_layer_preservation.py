@@ -347,16 +347,30 @@ def test_converter_preserves_exact_native_layers(
     assert normalization_summary["validation"]["ancillary_layer_count"] == len(case.expected_ancillary_names)
     if case.expected_pixel_size is not None:
         assert tuple(dataset_summary["pixel_size"]) == case.expected_pixel_size
+    assert dataset_summary.get("quadkey_schema_version") == 1
+    assert dataset_summary.get("quadkey_coverage_mode") == "bbox_intersection"
+    assert isinstance(dataset_summary.get("quadkey_zoom_index"), int)
+    assert isinstance(dataset_summary.get("quadkeys_index"), list)
+    assert dataset_summary.get("quadkeys_index"), f"{case.name}: expected non-empty quadkeys_index"
 
     group = zarr.open_group(str(written_uri), mode="r")
     assert tuple(group["band"][:].tolist()) == case.expected_band_names
     assert tuple(group["imagery"].shape) == tuple(dataset_summary["shape"])
     if case.expected_pixel_size is not None:
         assert tuple(group.attrs.get("reference_pixel_size") or []) == case.expected_pixel_size
+    assert group.attrs["quadkey_schema_version"] == 1
+    assert group.attrs["quadkey_coverage_mode"] == "bbox_intersection"
+    assert isinstance(group.attrs["quadkeys_index"], list)
+    assert group.attrs["quadkeys_index"], f"{case.name}: expected non-empty root quadkeys_index"
     assert dict(group.attrs.get("band_metadata") or {})
     if case.provider == "usgs":
         radiometric_metadata = dict(group.attrs.get("radiometric_metadata") or {})
         assert radiometric_metadata.get("bands")
+    by_time = group.attrs["quadkeys_by_time"]
+    assert isinstance(by_time, dict)
+    assert len(by_time) == 1
+    (_, time_payload), = by_time.items()
+    assert time_payload["quadkeys_index"] == group.attrs["quadkeys_index"]
 
     if case.expected_ancillary_names:
         assert "ancillary" in group
@@ -366,3 +380,28 @@ def test_converter_preserves_exact_native_layers(
         assert dict(group.attrs.get("ancillary_metadata") or {})
     else:
         assert "ancillary" not in group
+
+
+def test_landsat_converter_accepts_strict_satellite_prefixed_product_type(
+    tmp_path: Path,
+    zarr_service: ZarrConversionService,
+) -> None:
+    scene_id = "LC09_L1TP_190026_20260101_20260101_02_T1"
+    raw_root = _build_landsat_bundle(tmp_path, scene_id=scene_id, l1=True)
+    output_uri = str((tmp_path / "landsat_strict_prefixed.zarr").resolve())
+
+    written_uri, _data_family, normalization_summary, _dataset_summary = zarr_service.convert(
+        provider="usgs",
+        collection="landsat_ot_c2_l1",
+        scene_id=scene_id,
+        raw_uri=str(raw_root),
+        output_uri=output_uri,
+        product_type="9L1TP",
+    )
+
+    assert Path(written_uri).exists()
+    assert normalization_summary["product_type"] == "L1TP"
+    assert normalization_summary["product_type_short"] == "9L1TP"
+    group = zarr.open_group(str(written_uri), mode="r")
+    assert group.attrs["product_type"] == "L1TP"
+    assert group.attrs["product_type_short"] == "9L1TP"

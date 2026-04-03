@@ -108,7 +108,8 @@ def read_required_channels(
     scale_hint: str,
     normalize: bool = True,
     time_index: int = 0,
-) -> tuple[dict[str, np.ndarray], list[str]]:
+    include_validity: bool = False,
+) -> tuple[dict[str, np.ndarray], list[str]] | tuple[dict[str, np.ndarray], list[str], np.ndarray]:
     missing = [name for name in required_bands if name not in band_names]
     if missing:
         raise ConversionError(
@@ -118,9 +119,22 @@ def read_required_channels(
     imagery = root["imagery"]
     root_attrs = dict(root.attrs)
     channels: dict[str, np.ndarray] = {}
+    validity_masks: list[np.ndarray] = []
+    nonzero_masks: list[np.ndarray] = []
+    has_explicit_nodata = False
     for band_name in required_bands:
         band_index = band_names.index(band_name)
-        array = np.asarray(imagery[time_index, band_index, :, :], dtype=np.float32)
+        raw = np.asarray(imagery[time_index, band_index, :, :])
+        valid_band, nonzero_band, explicit_nodata = _valid_pixels_from_raw(
+            raw,
+            band_name=band_name,
+            scale_hint=scale_hint,
+            root_attrs=root_attrs,
+        )
+        validity_masks.append(valid_band)
+        nonzero_masks.append(nonzero_band)
+        has_explicit_nodata = has_explicit_nodata or explicit_nodata
+        array = np.asarray(raw, dtype=np.float32)
         channels[band_name] = (
             _normalize_channel(
                 array,
@@ -130,6 +144,13 @@ def read_required_channels(
             )
             if normalize
             else array
+        )
+    if include_validity:
+        return channels, missing, _combine_validity_masks(
+            validity_masks=validity_masks,
+            nonzero_masks=nonzero_masks,
+            scale_hint=scale_hint,
+            has_explicit_nodata=has_explicit_nodata,
         )
     return channels, missing
 
@@ -146,7 +167,8 @@ def read_required_channels_window(
     col_stop: int,
     normalize: bool = True,
     time_index: int = 0,
-) -> tuple[dict[str, np.ndarray], list[str]]:
+    include_validity: bool = False,
+) -> tuple[dict[str, np.ndarray], list[str]] | tuple[dict[str, np.ndarray], list[str], np.ndarray]:
     missing = [name for name in required_bands if name not in band_names]
     if missing:
         raise ConversionError(
@@ -156,12 +178,24 @@ def read_required_channels_window(
     imagery = root["imagery"]
     root_attrs = dict(root.attrs)
     channels: dict[str, np.ndarray] = {}
+    validity_masks: list[np.ndarray] = []
+    nonzero_masks: list[np.ndarray] = []
+    has_explicit_nodata = False
     for band_name in required_bands:
         band_index = band_names.index(band_name)
-        array = np.asarray(
+        raw = np.asarray(
             imagery[time_index, band_index, row_start:row_stop, col_start:col_stop],
-            dtype=np.float32,
         )
+        valid_band, nonzero_band, explicit_nodata = _valid_pixels_from_raw(
+            raw,
+            band_name=band_name,
+            scale_hint=scale_hint,
+            root_attrs=root_attrs,
+        )
+        validity_masks.append(valid_band)
+        nonzero_masks.append(nonzero_band)
+        has_explicit_nodata = has_explicit_nodata or explicit_nodata
+        array = np.asarray(raw, dtype=np.float32)
         channels[band_name] = (
             _normalize_channel(
                 array,
@@ -171,6 +205,13 @@ def read_required_channels_window(
             )
             if normalize
             else array
+        )
+    if include_validity:
+        return channels, missing, _combine_validity_masks(
+            validity_masks=validity_masks,
+            nonzero_masks=nonzero_masks,
+            scale_hint=scale_hint,
+            has_explicit_nodata=has_explicit_nodata,
         )
     return channels, missing
 
@@ -307,6 +348,72 @@ def _resolve_landsat_scaling(
         "apply_sun_elevation": False,
         "sun_elevation": 0.0,
     }
+
+
+def _valid_pixels_from_raw(
+    raw: np.ndarray,
+    *,
+    band_name: str,
+    scale_hint: str,
+    root_attrs: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    del scale_hint
+    raw_native = np.asarray(raw)
+    raw_float = np.asarray(raw_native, dtype=np.float32)
+    valid = np.isfinite(raw_float)
+    nonzero = np.abs(raw_float) > 1e-6
+    band_metadata = dict((root_attrs.get("band_metadata") or {}).get(str(band_name), {}) or {})
+    explicit_nodata = False
+    for key in ("target_nodata", "source_nodata"):
+        nodata = _coerce_numeric_metadata(band_metadata.get(key))
+        if nodata is None:
+            continue
+        explicit_nodata = True
+        if np.issubdtype(raw_native.dtype, np.floating):
+            valid = np.logical_and(valid, ~np.isclose(raw_float, nodata, atol=1e-6, rtol=0.0))
+        else:
+            valid = np.logical_and(valid, raw_native != raw_native.dtype.type(nodata))
+    return valid, nonzero, explicit_nodata
+
+
+def _combine_validity_masks(
+    *,
+    validity_masks: list[np.ndarray],
+    nonzero_masks: list[np.ndarray],
+    scale_hint: str,
+    has_explicit_nodata: bool,
+) -> np.ndarray:
+    if not validity_masks:
+        raise ConversionError("Cannot derive a validity mask because no bands were read.")
+    valid = np.logical_or.reduce(validity_masks).astype(bool, copy=False)
+    if not has_explicit_nodata and scale_hint in {
+        "reflectance_0_10000",
+        "landsat_l1_reflectance",
+        "landsat_l2_reflectance",
+    }:
+        any_nonzero = np.logical_or.reduce(nonzero_masks).astype(bool, copy=False)
+        valid = np.logical_and(valid, any_nonzero)
+    return valid.astype(bool, copy=False)
+
+
+def _coerce_numeric_metadata(value: Any) -> float | int | None:
+    if value is None:
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    else:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+    if not np.isfinite(numeric):
+        return None
+    integer = int(numeric)
+    if abs(numeric - integer) < 1e-9:
+        return integer
+    return numeric
 
 
 def _attr_as_text(value: Any) -> str | None:

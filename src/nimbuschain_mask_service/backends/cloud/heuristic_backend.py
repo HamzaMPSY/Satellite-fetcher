@@ -28,6 +28,7 @@ def run(
     threshold: float,
     inference_device: str | None = None,
     include_shadows: bool = True,
+    valid_mask: Any | None = None,
 ) -> CloudMaskResult:
     del inference_device
     return run_heuristic_cloud_inference(
@@ -35,4 +36,5 @@ def run(
         channels=channels,
         threshold=threshold,
         include_shadows=include_shadows,
+        valid_mask=valid_mask,
     )

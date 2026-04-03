@@ -571,6 +571,8 @@ def _as_float(value: str | None) -> float | None:
 
 def _landsat_product_type(product_id: str, *, requested: str | None = None) -> str:
     requested_upper = str(requested or "").strip().upper()
+    if re.fullmatch(r"[0-9]L[0-9A-Z]{3}", requested_upper):
+        requested_upper = requested_upper[1:]
     if requested_upper:
         return requested_upper
     match = _LANDSAT_PRODUCT_TYPE_RE.search(str(product_id))

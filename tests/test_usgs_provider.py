@@ -4,8 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.providers.usgs import UsgsProvider
 from nimbuschain_fetch.settings import Settings
+from nimbuschain_fetch.usgs_product_type import canonicalize_usgs_product_type
 
 
 class _DummyDownloadManager:
@@ -96,3 +98,10 @@ def test_download_options_403_includes_permission_hint(monkeypatch):
     text = str(excinfo.value)
     assert "USGS HTTP 403 on download-options" in text
     assert "MACHINE download access" in text
+
+
+def test_canonicalize_usgs_product_type_strips_satellite_digit() -> None:
+    assert canonicalize_usgs_product_type("9L1TP") == "L1TP"
+    assert canonicalize_usgs_product_type("8L2SP") == "L2SP"
+    assert canonicalize_usgs_product_type("L1TP") == "L1TP"
+    assert NimbusFetcher._normalize_product_type_for_zarr("9L1TP") == "L1TP"

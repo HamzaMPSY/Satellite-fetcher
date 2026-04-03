@@ -149,7 +149,13 @@ def test_cloud_first_obstruction_improves_water_output(case_name: str, sensor: S
     )
 
 
-def _write_source_zarr_from_scene(root: Path, *, channels: dict[str, np.ndarray], sensor: SensorMaskSpec) -> Path:
+def _write_source_zarr_from_scene(
+    root: Path,
+    *,
+    channels: dict[str, np.ndarray],
+    sensor: SensorMaskSpec,
+    invalid_mask: np.ndarray | None = None,
+) -> Path:
     output = root / "source.zarr"
     band_names = list(dict.fromkeys(sensor.cloud_required_bands + sensor.water_fallback_bands))
     height, width = next(iter(channels.values())).shape
@@ -162,21 +168,75 @@ def _write_source_zarr_from_scene(root: Path, *, channels: dict[str, np.ndarray]
         overwrite=True,
     )
     for band_index, band_name in enumerate(band_names):
-        imagery[0, band_index, :, :] = np.clip(np.round(channels[band_name] * 10000.0), 0, 10000).astype(np.uint16)
+        band_data = np.clip(np.round(channels[band_name] * 10000.0), 0, 10000).astype(np.uint16)
+        if invalid_mask is not None:
+            band_data = np.where(invalid_mask, 0, band_data).astype(np.uint16, copy=False)
+        imagery[0, band_index, :, :] = band_data
     group.create_array("band", shape=(len(band_names),), chunks=(len(band_names),), dtype="U8", overwrite=True)
     group["band"][:] = np.array(band_names, dtype="U8")
-    group.attrs.update(
-        {
-            "provider": "copernicus" if sensor.sensor_key == "sentinel-2" else "usgs",
-            "collection": "SENTINEL-2" if sensor.sensor_key == "sentinel-2" else "LANDSAT_OT_C2_L2",
-            "product_type": "S2MSI2A" if sensor.sensor_key == "sentinel-2" else "L2SR",
-            "scene_id": "synthetic_scene",
-            "dimensions": ["time", "band", "y", "x"],
-            "shape": [1, len(band_names), height, width],
-            "band_names": band_names,
-            "crs": "EPSG:32631",
-            "transform": [10.0, 0.0, 399960.0, 0.0, -10.0, 5300040.0],
+    band_metadata = {
+        band_name: {
+            "source_nodata": 0,
+            "target_nodata": 0,
         }
+        for band_name in band_names
+    }
+    attrs = {
+        "provider": "copernicus" if sensor.sensor_key == "sentinel-2" else "usgs",
+        "scene_id": "synthetic_scene",
+        "dimensions": ["time", "band", "y", "x"],
+        "shape": [1, len(band_names), height, width],
+        "band_names": band_names,
+        "crs": "EPSG:32631",
+        "transform": [10.0, 0.0, 399960.0, 0.0, -10.0, 5300040.0],
+        "reference_pixel_size": [10.0, 10.0],
+        "band_metadata": band_metadata,
+    }
+    if sensor.sensor_key == "sentinel-2":
+        attrs.update(
+            {
+                "collection": "SENTINEL-2",
+                "product_type": "S2MSI2A",
+            }
+        )
+    elif sensor.sensor_key == "landsat-8-9-l1":
+        attrs.update(
+            {
+                "collection": "LANDSAT_OT_C2_L1",
+                "product_type": "L1TP",
+                "radiometric_metadata": {
+                    "bands": {
+                        band_name: {
+                            "mult": 1.0e-4,
+                            "add": 0.0,
+                            "apply_sun_elevation": False,
+                        }
+                        for band_name in band_names
+                    },
+                    "sun_elevation": 45.0,
+                },
+            }
+        )
+    else:
+        attrs.update(
+            {
+                "collection": "LANDSAT_OT_C2_L2",
+                "product_type": "L2SR",
+                "radiometric_metadata": {
+                    "bands": {
+                        band_name: {
+                            "mult": 1.0e-4,
+                            "add": 0.0,
+                            "apply_sun_elevation": False,
+                        }
+                        for band_name in band_names
+                    },
+                    "sun_elevation": 45.0,
+                },
+            }
+        )
+    group.attrs.update(
+        attrs
     )
     zarr.consolidate_metadata(str(output))
     return output
@@ -228,3 +288,80 @@ def test_combined_water_cloud_run_preserves_both_masks_and_probabilities(tmp_pat
     assert float(cloud_mask[_cloud_target_mask(masks)].mean()) >= 0.90
     assert float(water_mask[masks["open_water"]].mean()) >= 0.80
     assert float(water_mask[masks["cloud_shadow"]].mean()) <= 0.25
+
+
+@pytest.mark.parametrize(
+    "case_name,sensor,mask_types",
+    [
+        (
+            "landsat_l1_cloud_only",
+            resolve_sensor_mask_spec(provider="usgs", collection="LANDSAT_OT_C2_L1", product_type="L1TP"),
+            ["cloud"],
+        ),
+        (
+            "landsat_l2_water_only",
+            resolve_sensor_mask_spec(provider="usgs", collection="LANDSAT_OT_C2_L2", product_type="L2SR"),
+            ["water"],
+        ),
+        (
+            "landsat_l2_water_cloud",
+            resolve_sensor_mask_spec(provider="usgs", collection="LANDSAT_OT_C2_L2", product_type="L2SR"),
+            ["water", "cloud"],
+        ),
+    ],
+)
+def test_landsat_invalid_wedge_stays_clear_in_mask_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case_name: str,
+    sensor: SensorMaskSpec,
+    mask_types: list[str],
+) -> None:
+    channels, _masks = _synthetic_scene(sensor)
+    rows, cols = np.indices(next(iter(channels.values())).shape)
+    invalid_mask = (rows >= 34) & (cols < 16)
+    source = _write_source_zarr_from_scene(
+        tmp_path / case_name,
+        channels=channels,
+        sensor=sensor,
+        invalid_mask=invalid_mask,
+    )
+    monkeypatch.setenv("NIMBUS_WATERMASK_RUNTIME_MODE", "fallback")
+
+    band_names = list(dict.fromkeys(sensor.cloud_required_bands + sensor.water_fallback_bands))
+    result = MaskService().apply_masks_to_zarr(
+        job_id=f"mask-{case_name}",
+        zarr_uri=str(source),
+        provider="usgs",
+        collection="LANDSAT_OT_C2_L1" if sensor.sensor_key == "landsat-8-9-l1" else "LANDSAT_OT_C2_L2",
+        product_type="L1TP" if sensor.sensor_key == "landsat-8-9-l1" else "L2SR",
+        scene_id=case_name,
+        acquisition_datetime="2026-03-30T00:00:00Z",
+        dataset_summary={
+            "crs": "EPSG:32631",
+            "transform": [10.0, 0.0, 399960.0, 0.0, -10.0, 5300040.0],
+            "shape": [1, len(band_names), 48, 48],
+            "band_names": band_names,
+        },
+        mask_types=mask_types,
+        backend="heuristic",
+        threshold=0.45,
+        overwrite=True,
+        include_shadows=True,
+    )
+
+    assert result["status"] == "written"
+    derived = zarr.open_group(str(source), mode="r", use_consolidated=False)
+    masks_group = derived["masks"]
+
+    if "cloud" in mask_types:
+        cloud_mask = np.asarray(masks_group["cloud"][0], dtype=np.uint8)
+        cloud_probability = np.asarray(masks_group["cloud_probability"][0], dtype=np.float32)
+        assert int(cloud_mask[invalid_mask].sum()) == 0
+        assert float(cloud_probability[invalid_mask].sum()) == pytest.approx(0.0)
+
+    if "water" in mask_types:
+        water_mask = np.asarray(masks_group["water"][0], dtype=np.uint8)
+        water_probability = np.asarray(masks_group["water_probability"][0], dtype=np.float32)
+        assert int(water_mask[invalid_mask].sum()) == 0
+        assert float(water_probability[invalid_mask].sum()) == pytest.approx(0.0)

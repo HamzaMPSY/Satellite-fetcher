@@ -365,15 +365,24 @@ def run_cloud_inference(
     backend: str | None = None,
     inference_device: str | None = None,
     include_shadows: bool = True,
+    valid_mask: np.ndarray | None = None,
 ) -> Any:
     descriptor = backend_descriptor or resolve_cloud_backend(backend)
-    return descriptor.run(
-        sensor=sensor,
-        channels=channels,
-        threshold=threshold,
-        inference_device=inference_device,
-        include_shadows=include_shadows,
-    )
+    kwargs = {
+        "sensor": sensor,
+        "channels": channels,
+        "threshold": threshold,
+        "inference_device": inference_device,
+        "include_shadows": include_shadows,
+        "valid_mask": valid_mask,
+    }
+    try:
+        return descriptor.run(**kwargs)
+    except TypeError as exc:
+        if "valid_mask" not in str(exc):
+            raise
+        kwargs.pop("valid_mask", None)
+        return descriptor.run(**kwargs)
 
 
 def support_status() -> dict[str, Any]:
@@ -545,6 +554,7 @@ def _run_cloud_inference_tiled(
     width = int(imagery.shape[3])
     cloud_arr, cloud_prob_arr = prepare_cloud_output_arrays(root, overwrite=True)
     total_pixels = max(1, height * width)
+    valid_pixels_total = 0
     cloud_pixels = 0
     shadow_pixels = 0
     cloud_only_pixels = 0
@@ -563,29 +573,68 @@ def _run_cloud_inference_tiled(
     total_tiles = ((height + tile_size - 1) // tile_size) * ((width + tile_size - 1) // tile_size)
     for row_start, row_stop, col_start, col_stop in _iter_windows(height=height, width=width, tile_size=tile_size):
         tile_index += 1
-        channels, _missing = read_required_channels_window(
-            root,
-            band_names=context.band_names,
-            required_bands=required_bands,
-            scale_hint=sensor.scale_hint,
-            row_start=row_start,
-            row_stop=row_stop,
-            col_start=col_start,
-            col_stop=col_stop,
-            normalize=normalize,
-        )
-        result = run_cloud_inference(
-            sensor=sensor,
-            channels=channels,
-            threshold=threshold,
-            backend=backend_descriptor.name,
-            inference_device=inference_device,
-            include_shadows=include_shadows,
-        )
+        try:
+            channels_result = read_required_channels_window(
+                root,
+                band_names=context.band_names,
+                required_bands=required_bands,
+                scale_hint=sensor.scale_hint,
+                row_start=row_start,
+                row_stop=row_stop,
+                col_start=col_start,
+                col_stop=col_stop,
+                normalize=normalize,
+                include_validity=True,
+            )
+        except TypeError as exc:
+            if "include_validity" not in str(exc):
+                raise
+            channels_result = read_required_channels_window(
+                root,
+                band_names=context.band_names,
+                required_bands=required_bands,
+                scale_hint=sensor.scale_hint,
+                row_start=row_start,
+                row_stop=row_stop,
+                col_start=col_start,
+                col_stop=col_stop,
+                normalize=normalize,
+            )
+        if len(channels_result) == 3:
+            channels, _missing, valid_mask = channels_result
+        else:
+            channels, _missing = channels_result
+            valid_mask = None
+        try:
+            result = run_cloud_inference(
+                sensor=sensor,
+                channels=channels,
+                threshold=threshold,
+                backend=backend_descriptor.name,
+                inference_device=inference_device,
+                include_shadows=include_shadows,
+                valid_mask=valid_mask,
+            )
+        except TypeError as exc:
+            if "valid_mask" not in str(exc):
+                raise
+            result = run_cloud_inference(
+                sensor=sensor,
+                channels=channels,
+                threshold=threshold,
+                backend=backend_descriptor.name,
+                inference_device=inference_device,
+                include_shadows=include_shadows,
+            )
         cloud_arr[0, row_start:row_stop, col_start:col_stop] = result.mask
         cloud_prob_arr[0, row_start:row_stop, col_start:col_stop] = result.probability
         cloud_pixels += int(np.asarray(result.mask, dtype=np.uint64).sum())
-        tile_pixels = max(1, (row_stop - row_start) * (col_stop - col_start))
+        tile_pixels = max(
+            1,
+            int(result.summary.get("valid_pixels") or 0)
+            or (row_stop - row_start) * (col_stop - col_start),
+        )
+        valid_pixels_total += tile_pixels
         shadow_pixels += int(round(float(result.summary.get("shadow_fraction") or 0.0) * tile_pixels))
         cloud_only_pixels += int(round(float(result.summary.get("cloud_only_fraction") or 0.0) * tile_pixels))
         confidence_available = confidence_available or bool(result.summary.get("confidence_available"))
@@ -607,6 +656,7 @@ def _run_cloud_inference_tiled(
                 },
             )
 
+    total_pixels = max(1, valid_pixels_total or total_pixels)
     cloud_fraction = float(cloud_pixels / total_pixels)
     backend_name = str(backend_descriptor.name)
     write_summary = finalize_cloud_outputs(

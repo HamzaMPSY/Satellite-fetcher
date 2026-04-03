@@ -3,6 +3,24 @@ from __future__ import annotations
 import re
 
 
+def canonicalize_usgs_product_type(product_type: str | None) -> str:
+    """
+    Convert strict UI/backend Landsat keys such as:
+
+      8L2SP
+      9L1TP
+
+    back to the canonical USGS product type expected by downstream Zarr logic:
+
+      L2SP
+      L1TP
+    """
+    value = str(product_type or "").strip().upper()
+    if re.fullmatch(r"[0-9]L[0-9A-Z]{3}", value):
+        return value[1:]
+    return value
+
+
 def normalize_usgs_product_type_from_display_id(display_id: str) -> str:
     """
     Convert a USGS display ID such as:

@@ -25,6 +25,7 @@ def run_cloud_inference(
     backend: str,
     inference_device: str | None = None,
     include_shadows: bool = True,
+    valid_mask: np.ndarray | None = None,
 ) -> CloudMaskResult:
     backend_name = _resolve_backend_name(backend)
     if backend_name in {"heuristic", "default", "fallback"}:
@@ -33,6 +34,7 @@ def run_cloud_inference(
             channels=channels,
             threshold=threshold,
             include_shadows=include_shadows,
+            valid_mask=valid_mask,
         )
     if backend_name == "omnicloudmask":
         return _run_omnicloudmask(
@@ -41,6 +43,7 @@ def run_cloud_inference(
             threshold=threshold,
             inference_device=inference_device,
             include_shadows=include_shadows,
+            valid_mask=valid_mask,
         )
     raise ValueError(f"Unsupported cloud-mask backend: {backend}")
 
@@ -51,12 +54,14 @@ def run_heuristic_cloud_inference(
     channels: dict[str, np.ndarray],
     threshold: float,
     include_shadows: bool,
+    valid_mask: np.ndarray | None = None,
 ) -> CloudMaskResult:
     return _run_heuristic(
         sensor=sensor,
         channels=channels,
         threshold=threshold,
         include_shadows=include_shadows,
+        valid_mask=valid_mask,
     )
 
 
@@ -67,6 +72,7 @@ def run_omnicloudmask_cloud_inference(
     threshold: float,
     inference_device: str | None = None,
     include_shadows: bool,
+    valid_mask: np.ndarray | None = None,
 ) -> CloudMaskResult:
     return _run_omnicloudmask(
         sensor=sensor,
@@ -74,6 +80,7 @@ def run_omnicloudmask_cloud_inference(
         threshold=threshold,
         inference_device=inference_device,
         include_shadows=include_shadows,
+        valid_mask=valid_mask,
     )
 
 
@@ -83,6 +90,7 @@ def _run_heuristic(
     channels: dict[str, np.ndarray],
     threshold: float,
     include_shadows: bool,
+    valid_mask: np.ndarray | None,
 ) -> CloudMaskResult:
     effective_threshold = _effective_heuristic_threshold(sensor=sensor, threshold=threshold)
     if sensor.sensor_key == "sentinel-2":
@@ -162,9 +170,26 @@ def _run_heuristic(
     else:
         shadow_mask = np.zeros_like(cloud_only_mask, dtype=bool)
         mask = cloud_only_mask.astype(np.uint8, copy=False)
-    cloud_fraction = float(mask.mean()) if mask.size else 0.0
-    shadow_fraction = float(shadow_mask.mean()) if shadow_mask.size else 0.0
-    cloud_only_fraction = float(cloud_only_mask.mean()) if cloud_only_mask.size else 0.0
+    probability, mask, valid_pixels = _apply_validity_to_outputs(
+        probability=probability,
+        mask=mask,
+        valid_mask=valid_mask,
+    )
+    valid = np.asarray(valid_mask, dtype=bool) if valid_mask is not None else None
+    cloud_pixels = int(np.asarray(mask, dtype=np.uint64).sum())
+    shadow_pixels = (
+        int(np.logical_and(shadow_mask, valid).sum())
+        if valid is not None
+        else int(shadow_mask.astype(np.uint64, copy=False).sum())
+    )
+    cloud_only_pixels = (
+        int(np.logical_and(cloud_only_mask, valid).sum())
+        if valid is not None
+        else int(cloud_only_mask.astype(np.uint64, copy=False).sum())
+    )
+    cloud_fraction = float(cloud_pixels / valid_pixels) if valid_pixels else 0.0
+    shadow_fraction = float(shadow_pixels / valid_pixels) if valid_pixels else 0.0
+    cloud_only_fraction = float(cloud_only_pixels / valid_pixels) if valid_pixels else 0.0
     return CloudMaskResult(
         probability=probability.astype(np.float32, copy=False),
         mask=mask,
@@ -178,6 +203,7 @@ def _run_heuristic(
             "shadow_threshold": float(shadow_threshold),
             "threshold_used": float(effective_threshold),
             "sensor_recipe": sensor.sensor_key,
+            "valid_pixels": int(valid_pixels),
         },
     )
 
@@ -189,6 +215,7 @@ def _run_omnicloudmask(
     threshold: float,
     inference_device: str | None,
     include_shadows: bool,
+    valid_mask: np.ndarray | None,
 ) -> CloudMaskResult:
     try:
         import omnicloudmask  # type: ignore
@@ -215,10 +242,26 @@ def _run_omnicloudmask(
         include_shadows=include_shadows,
         obstruction_mask=obstruction_mask,
     )
-    mask = obstruction_mask.astype(np.uint8, copy=False)
-    cloud_fraction = float(mask.mean()) if mask.size else 0.0
-    shadow_fraction = float(shadow_mask.mean()) if shadow_mask.size else 0.0
-    cloud_only_fraction = float(cloud_only_mask.mean()) if cloud_only_mask.size else 0.0
+    probability, mask, valid_pixels = _apply_validity_to_outputs(
+        probability=probability,
+        mask=obstruction_mask.astype(np.uint8, copy=False),
+        valid_mask=valid_mask,
+    )
+    valid = np.asarray(valid_mask, dtype=bool) if valid_mask is not None else None
+    cloud_pixels = int(np.asarray(mask, dtype=np.uint64).sum())
+    shadow_pixels = (
+        int(np.logical_and(shadow_mask, valid).sum())
+        if valid is not None
+        else int(shadow_mask.astype(np.uint64, copy=False).sum())
+    )
+    cloud_only_pixels = (
+        int(np.logical_and(cloud_only_mask, valid).sum())
+        if valid is not None
+        else int(cloud_only_mask.astype(np.uint64, copy=False).sum())
+    )
+    cloud_fraction = float(cloud_pixels / valid_pixels) if valid_pixels else 0.0
+    shadow_fraction = float(shadow_pixels / valid_pixels) if valid_pixels else 0.0
+    cloud_only_fraction = float(cloud_only_pixels / valid_pixels) if valid_pixels else 0.0
     return CloudMaskResult(
         probability=probability,
         mask=mask,
@@ -235,13 +278,14 @@ def _run_omnicloudmask(
                 "2": "thin_cloud",
                 "3": "cloud_shadow",
             },
-            "class_histogram": _class_histogram(class_map),
+            "class_histogram": _class_histogram(class_map, valid_mask=valid_mask),
             "confidence_available": confidence_cube is not None,
             "inference_device": device or "auto",
             "mask_source": "class_map",
             "probability_source": "confidence_cube" if confidence_cube is not None else "class_map",
             "threshold_for_mask": None,
             "requested_threshold": float(threshold),
+            "valid_pixels": int(valid_pixels),
         },
     )
 
@@ -422,9 +466,36 @@ def _omnicloudmask_obstruction_mask(*, class_map: np.ndarray, include_shadows: b
     return cloud_only_mask
 
 
-def _class_histogram(class_map: np.ndarray) -> dict[str, int]:
-    values, counts = np.unique(class_map.astype(np.uint8, copy=False), return_counts=True)
+def _class_histogram(class_map: np.ndarray, *, valid_mask: np.ndarray | None = None) -> dict[str, int]:
+    values_source = class_map.astype(np.uint8, copy=False)
+    if valid_mask is not None:
+        values_source = values_source[np.asarray(valid_mask, dtype=bool)]
+    if values_source.size == 0:
+        return {}
+    values, counts = np.unique(values_source, return_counts=True)
     return {str(int(value)): int(count) for value, count in zip(values, counts, strict=False)}
+
+
+def _apply_validity_to_outputs(
+    *,
+    probability: np.ndarray,
+    mask: np.ndarray,
+    valid_mask: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    probability_array = np.asarray(probability, dtype=np.float32, copy=False)
+    mask_array = np.asarray(mask, dtype=np.uint8, copy=False)
+    if valid_mask is None:
+        return probability_array, mask_array, int(mask_array.size)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if valid.shape != probability_array.shape:
+        raise ValueError(
+            f"valid_mask shape {valid.shape} does not match cloud output shape {probability_array.shape}."
+        )
+    return (
+        np.where(valid, probability_array, 0.0).astype(np.float32, copy=False),
+        np.where(valid, mask_array, 0).astype(np.uint8, copy=False),
+        int(valid.sum()),
+    )
 
 
 def _max_filter2d(array: np.ndarray, *, radius: int) -> np.ndarray:

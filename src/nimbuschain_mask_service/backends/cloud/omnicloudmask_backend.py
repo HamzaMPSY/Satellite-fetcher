@@ -30,6 +30,7 @@ def run(
     threshold: float,
     inference_device: str | None = None,
     include_shadows: bool = True,
+    valid_mask: Any | None = None,
 ) -> CloudMaskResult:
     return run_omnicloudmask_cloud_inference(
         sensor=sensor,
@@ -37,4 +38,5 @@ def run(
         threshold=threshold,
         inference_device=inference_device,
         include_shadows=include_shadows,
+        valid_mask=valid_mask,
     )

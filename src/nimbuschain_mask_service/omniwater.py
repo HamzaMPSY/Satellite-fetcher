@@ -189,6 +189,8 @@ def apply_omniwatermask_to_zarr(
                         mask_paths=mask_paths,
                         water_arr=water_arr,
                         water_prob_arr=water_prob_arr,
+                        sensor=plan.sensor,
+                        input_bands=tuple(plan.input_bands),
                     )
                     runtime_mode = "model"
                     input_bands = list(plan.input_bands)
@@ -501,27 +503,49 @@ def _export_rgbnir_tiles(
                 dtype=np.uint16,
                 crs=crs,
                 transform=window_transform(tile_window, transform),
+                nodata=0,
             ) as dataset:
-                channels, _missing = read_required_channels_window(
-                    root,
-                    band_names=context.band_names,
-                    required_bands=tuple(input_bands),
-                    scale_hint=sensor.scale_hint,
-                    row_start=row_start,
-                    row_stop=row_stop,
-                    col_start=col_start,
-                    col_stop=col_stop,
-                    normalize=True,
-                )
-                for output_band_index, band_name in enumerate(input_bands, start=1):
-                    dataset.write(
-                        np.clip(
-                            np.round(channels[band_name] * 10000.0),
-                            0.0,
-                            10000.0,
-                        ).astype(np.uint16),
-                        output_band_index,
+                try:
+                    channels_result = read_required_channels_window(
+                        root,
+                        band_names=context.band_names,
+                        required_bands=tuple(input_bands),
+                        scale_hint=sensor.scale_hint,
+                        row_start=row_start,
+                        row_stop=row_stop,
+                        col_start=col_start,
+                        col_stop=col_stop,
+                        normalize=True,
+                        include_validity=True,
                     )
+                except TypeError as exc:
+                    if "include_validity" not in str(exc):
+                        raise
+                    channels_result = read_required_channels_window(
+                        root,
+                        band_names=context.band_names,
+                        required_bands=tuple(input_bands),
+                        scale_hint=sensor.scale_hint,
+                        row_start=row_start,
+                        row_stop=row_stop,
+                        col_start=col_start,
+                        col_stop=col_stop,
+                        normalize=True,
+                    )
+                if len(channels_result) == 3:
+                    channels, _missing, valid_mask = channels_result
+                else:
+                    channels, _missing = channels_result
+                    valid_mask = None
+                for output_band_index, band_name in enumerate(input_bands, start=1):
+                    scaled = np.clip(
+                        np.round(channels[band_name] * 10000.0),
+                        0.0,
+                        10000.0,
+                    ).astype(np.uint16)
+                    if valid_mask is not None:
+                        scaled = np.where(valid_mask, scaled, 0).astype(np.uint16, copy=False)
+                    dataset.write(scaled, output_band_index)
             tiles.append(
                 OmniWaterTile(
                     path=tile_path,
@@ -638,6 +662,7 @@ def _run_water_fallback_tiled(
         cloud_arr = root["masks"]["cloud"]
 
     total_pixels = max(1, height * width)
+    valid_pixels_total = 0
     water_pixels = 0
     cloud_blocked_pixels = 0
     probability_sum = 0.0
@@ -646,17 +671,38 @@ def _run_water_fallback_tiled(
         row_stop = min(height, row_start + _watermask_tile_size())
         for col_start in range(0, width, _watermask_tile_size()):
             col_stop = min(width, col_start + _watermask_tile_size())
-            channels, _missing = read_required_channels_window(
-                root,
-                band_names=context.band_names,
-                required_bands=sensor.water_fallback_bands,
-                scale_hint=sensor.scale_hint,
-                row_start=row_start,
-                row_stop=row_stop,
-                col_start=col_start,
-                col_stop=col_stop,
-                normalize=True,
-            )
+            try:
+                channels_result = read_required_channels_window(
+                    root,
+                    band_names=context.band_names,
+                    required_bands=sensor.water_fallback_bands,
+                    scale_hint=sensor.scale_hint,
+                    row_start=row_start,
+                    row_stop=row_stop,
+                    col_start=col_start,
+                    col_stop=col_stop,
+                    normalize=True,
+                    include_validity=True,
+                )
+            except TypeError as exc:
+                if "include_validity" not in str(exc):
+                    raise
+                channels_result = read_required_channels_window(
+                    root,
+                    band_names=context.band_names,
+                    required_bands=sensor.water_fallback_bands,
+                    scale_hint=sensor.scale_hint,
+                    row_start=row_start,
+                    row_stop=row_stop,
+                    col_start=col_start,
+                    col_stop=col_stop,
+                    normalize=True,
+                )
+            if len(channels_result) == 3:
+                channels, _missing, valid_mask = channels_result
+            else:
+                channels, _missing = channels_result
+                valid_mask = None
             cloud_window = None
             if cloud_arr is not None:
                 cloud_window = np.asarray(
@@ -668,22 +714,26 @@ def _run_water_fallback_tiled(
                 channels=channels,
                 threshold=effective_threshold,
                 cloud_mask=cloud_window,
+                valid_mask=valid_mask,
             )
             water_arr[0, row_start:row_stop, col_start:col_stop] = mask_tile
             water_prob_arr[0, row_start:row_stop, col_start:col_stop] = probability_tile
             water_pixels += int(np.asarray(mask_tile, dtype=np.uint64).sum())
             probability_sum += float(np.asarray(probability_tile, dtype=np.float64).sum())
             cloud_blocked_pixels += int(tile_summary["cloud_blocked_pixels"])
+            valid_pixels_total += int(tile_summary.get("valid_pixels") or 0)
 
+    denominator = max(1, valid_pixels_total or total_pixels)
     return {
         "runtime_mode": "heuristic_fallback",
-        "water_fraction": float(water_pixels / total_pixels),
-        "probability_mean": float(probability_sum / total_pixels),
+        "water_fraction": float(water_pixels / denominator),
+        "probability_mean": float(probability_sum / denominator),
         "threshold_used": effective_threshold,
         "sensor_recipe": sensor.sensor_key,
         "input_bands": list(sensor.water_fallback_bands),
         "probability_source": "water_score",
-        "cloud_blocked_fraction": float(cloud_blocked_pixels / total_pixels),
+        "cloud_blocked_fraction": float(cloud_blocked_pixels / denominator),
+        "valid_pixel_fraction": float(denominator / total_pixels),
     }
 
 
@@ -693,6 +743,7 @@ def _run_water_fallback_window(
     channels: dict[str, np.ndarray],
     threshold: float,
     cloud_mask: np.ndarray | None,
+    valid_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     blue, green, red, nir, swir1, swir2 = _water_recipe_channels(sensor=sensor, channels=channels)
     ndwi = _safe_index(green, nir)
@@ -723,6 +774,8 @@ def _run_water_fallback_window(
     cloud_blocked_pixels = 0
     if cloud_mask is not None:
         cloud_block = np.asarray(cloud_mask, dtype=np.uint8) > 0
+        if valid_mask is not None:
+            cloud_block = np.logical_and(cloud_block, np.asarray(valid_mask, dtype=bool))
         cloud_blocked_pixels = int(cloud_block.sum())
         probability = np.where(cloud_block, 0.0, probability)
 
@@ -730,10 +783,24 @@ def _run_water_fallback_window(
     refined_mask = _refine_binary_mask(raw_mask)
     if cloud_mask is not None:
         refined_mask = np.logical_and(refined_mask, np.asarray(cloud_mask, dtype=np.uint8) == 0)
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != probability.shape:
+            raise ValueError(
+                f"valid_mask shape {valid.shape} does not match water tile shape {probability.shape}."
+            )
+        probability = np.where(valid, probability, 0.0).astype(np.float32, copy=False)
+        refined_mask = np.logical_and(refined_mask, valid)
+        valid_pixels = int(valid.sum())
+    else:
+        valid_pixels = int(probability.size)
     return (
         probability.astype(np.float32, copy=False),
         refined_mask.astype(np.uint8, copy=False),
-        {"cloud_blocked_pixels": cloud_blocked_pixels},
+        {
+            "cloud_blocked_pixels": cloud_blocked_pixels,
+            "valid_pixels": valid_pixels,
+        },
     )
 
 
@@ -744,8 +811,11 @@ def _write_model_water_outputs(
     mask_paths: list[Path],
     water_arr: Any,
     water_prob_arr: Any,
+    sensor: SensorMaskSpec,
+    input_bands: tuple[str, ...],
 ) -> dict[str, Any]:
     root = open_zarr_group(output_zarr_uri, mode="a")
+    context = read_context(root, zarr_uri=output_zarr_uri)
     height = int(root["imagery"].shape[2])
     width = int(root["imagery"].shape[3])
     cloud_arr = None
@@ -755,27 +825,70 @@ def _write_model_water_outputs(
     total_pixels = max(1, height * width)
     water_pixels = 0
     cloud_blocked_pixels = 0
+    valid_pixels_total = 0
     for tile, mask_path in zip(tiles, mask_paths, strict=True):
         tile_mask = _read_mask(mask_path).astype(np.uint8, copy=False)
+        try:
+            channels_result = read_required_channels_window(
+                root,
+                band_names=context.band_names,
+                required_bands=input_bands,
+                scale_hint=sensor.scale_hint,
+                row_start=tile.row_start,
+                row_stop=tile.row_stop,
+                col_start=tile.col_start,
+                col_stop=tile.col_stop,
+                normalize=False,
+                include_validity=True,
+            )
+        except TypeError as exc:
+            if "include_validity" not in str(exc):
+                raise
+            channels_result = read_required_channels_window(
+                root,
+                band_names=context.band_names,
+                required_bands=input_bands,
+                scale_hint=sensor.scale_hint,
+                row_start=tile.row_start,
+                row_stop=tile.row_stop,
+                col_start=tile.col_start,
+                col_stop=tile.col_stop,
+                normalize=False,
+            )
+        if len(channels_result) == 3:
+            _channels, _missing, valid_mask = channels_result
+        else:
+            _channels, _missing = channels_result
+            valid_mask = None
         if cloud_arr is not None:
             cloud_window = np.asarray(
                 cloud_arr[0, tile.row_start:tile.row_stop, tile.col_start:tile.col_stop],
                 dtype=np.uint8,
             )
             cloud_block = cloud_window > 0
+            if valid_mask is not None:
+                cloud_block = np.logical_and(cloud_block, valid_mask)
             cloud_blocked_pixels += int(cloud_block.sum())
             tile_mask = np.where(cloud_block, 0, tile_mask).astype(np.uint8, copy=False)
+        if valid_mask is not None:
+            tile_mask = np.where(valid_mask, tile_mask, 0).astype(np.uint8, copy=False)
+            tile_valid_pixels = int(valid_mask.sum())
+        else:
+            tile_valid_pixels = int(tile_mask.size)
         water_arr[0, tile.row_start:tile.row_stop, tile.col_start:tile.col_stop] = tile_mask
         water_prob_arr[0, tile.row_start:tile.row_stop, tile.col_start:tile.col_stop] = tile_mask.astype(np.float32)
         water_pixels += int(np.asarray(tile_mask, dtype=np.uint64).sum())
+        valid_pixels_total += tile_valid_pixels
 
+    denominator = max(1, valid_pixels_total or total_pixels)
     return {
         "runtime_mode": "model",
-        "water_fraction": float(water_pixels / total_pixels),
-        "probability_mean": float(water_pixels / total_pixels),
+        "water_fraction": float(water_pixels / denominator),
+        "probability_mean": float(water_pixels / denominator),
         "threshold_used": None,
         "probability_source": "model_binary_mask",
-        "cloud_blocked_fraction": float(cloud_blocked_pixels / total_pixels),
+        "cloud_blocked_fraction": float(cloud_blocked_pixels / denominator),
+        "valid_pixel_fraction": float(denominator / total_pixels),
     }
 
 

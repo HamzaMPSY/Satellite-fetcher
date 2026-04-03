@@ -51,6 +51,7 @@ from nimbuschain_fetch.providers import CopernicusProvider, UsgsProvider
 from nimbuschain_fetch.security.paths import sanitize_output_dir
 from nimbuschain_fetch.jobs.store_factory import create_job_store
 from nimbuschain_fetch.settings import Settings, get_settings
+from nimbuschain_fetch.usgs_product_type import canonicalize_usgs_product_type
 from nimbuschain_mask_service.client import MaskServiceClient
 from nimbuschain_zarr_service.service import ZarrConversionService
 
@@ -1519,7 +1520,9 @@ class NimbusFetcher:
         if product_type is None:
             return None
         normalized = str(product_type).strip()
-        return normalized.upper() if normalized else None
+        if not normalized:
+            return None
+        return canonicalize_usgs_product_type(normalized)
 
     def _register_zarr_artifact(
         self,

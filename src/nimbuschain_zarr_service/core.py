@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import unquote, urlparse
+import os
 import shutil
 import tarfile
 import zipfile
@@ -18,6 +19,7 @@ from nimbuschain_zarr_service.oci_storage import (
     is_oci_uri,
 )
 from nimbuschain_zarr_service.schema import ChunkShape, ZARR_FORMAT_VERSION
+from nimbuschain_zarr_service.utils.tile_math import TileMath
 
 
 class ConversionError(ValueError):
@@ -246,12 +248,15 @@ def load_aligned_raster_stack(
                 and tuple(src.transform) == tuple(ref_transform)
             )
             for expanded_name, source_band_index in _expand_raster_layer_names(band_name, src.count):
+                source_nodata = _band_nodata_value(src, source_band_index)
+                target_nodata = _target_nodata_value(src, source_band_index)
                 if not resampled:
                     data = src.read(source_band_index)
                 else:
-                    data = np.empty(
+                    data = np.full(
                         (ref_height, ref_width),
-                        dtype=src.dtypes[source_band_index - 1],
+                        target_nodata,
+                        dtype=np.dtype(src.dtypes[source_band_index - 1]),
                     )
                     resampling = (
                         Resampling.nearest if band_name in categorical_bands else Resampling.bilinear
@@ -263,6 +268,9 @@ def load_aligned_raster_stack(
                         src_crs=src.crs,
                         dst_transform=ref_transform,
                         dst_crs=ref_crs,
+                        src_nodata=source_nodata,
+                        dst_nodata=target_nodata,
+                        init_dest_nodata=True,
                         resampling=resampling,
                     )
 
@@ -284,6 +292,8 @@ def load_aligned_raster_stack(
                     "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
                     "resampled_to_reference": bool(resampled),
                     "categorical": bool(band_name in categorical_bands),
+                    "source_nodata": _serialize_metadata_scalar(source_nodata),
+                    "target_nodata": _serialize_metadata_scalar(target_nodata),
                 }
 
     if not arrays:
@@ -378,6 +388,8 @@ def inspect_aligned_raster_stack(
                 and tuple(src.transform) == tuple(ref_transform)
             )
             for expanded_name, source_band_index in _expand_raster_layer_names(band_name, src.count):
+                source_nodata = _band_nodata_value(src, source_band_index)
+                target_nodata = _target_nodata_value(src, source_band_index)
                 band_metadata[expanded_name] = {
                     "path": str(band_path),
                     "source_layer": band_name,
@@ -394,6 +406,8 @@ def inspect_aligned_raster_stack(
                     "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
                     "resampled_to_reference": bool(resampled),
                     "categorical": bool(band_name in categorical_bands),
+                    "source_nodata": _serialize_metadata_scalar(source_nodata),
+                    "target_nodata": _serialize_metadata_scalar(target_nodata),
                 }
                 dtype_candidates.append(np.dtype(src.dtypes[source_band_index - 1]))
                 available_bands.append(expanded_name)
@@ -534,6 +548,24 @@ def write_dataset_to_zarr(dataset: xr.Dataset, output_uri: str) -> str:
         encoding=encoding,
         zarr_format=2,
     )
+    try:
+        import zarr
+
+        root = zarr.open_group(output_store, mode="a", zarr_format=2)
+        quadkey_attrs = _build_quadkey_metadata(
+            crs=dataset.attrs.get("crs"),
+            transform=dataset.attrs.get("transform"),
+            width=int(imagery.sizes["x"]),
+            height=int(imagery.sizes["y"]),
+            time_values=[str(item) for item in imagery.coords["time"].values.tolist()],
+            pixel_size=dataset.attrs.get("reference_pixel_size"),
+        )
+        if quadkey_attrs:
+            root.attrs.update(quadkey_attrs)
+            zarr.consolidate_metadata(output_store)
+    except Exception:
+        # Quadkeys are optional indexing metadata.
+        pass
     return public_uri
 
 
@@ -627,6 +659,8 @@ def stream_raster_stack_to_zarr(
         if "y" not in root:
             root.create_array("y", data=y_coords, chunks=(min(chunk_spec.y, height),))
 
+    quadkey_attrs: dict[str, Any] | None = None
+
     if array_name == "imagery":
         root.attrs.update(
             {
@@ -641,6 +675,17 @@ def stream_raster_stack_to_zarr(
                 "band_metadata": band_metadata,
             }
         )
+        if output_mode == "w":
+            quadkey_attrs = _build_quadkey_metadata(
+                crs=crs,
+                transform=transform,
+                width=width,
+                height=height,
+                time_values=[timestamp.isoformat()],
+                pixel_size=stack["pixel_size"],
+            )
+            if quadkey_attrs:
+                root.attrs.update(quadkey_attrs)
     elif array_name == "ancillary":
         root.attrs.update(
             {
@@ -698,6 +743,8 @@ def stream_raster_stack_to_zarr(
         "pixel_size": stack["pixel_size"],
         "band_metadata": band_metadata,
     }
+    if quadkey_attrs:
+        dataset_summary.update(_quadkey_summary_from_attrs(quadkey_attrs))
     return public_uri, dataset_summary
 
 
@@ -802,7 +849,191 @@ def summarize_dataset(dataset: "xr.Dataset", *, data_family: str, zarr_uri: str)
         summary["ancillary_layer_names"] = [
             str(item) for item in ancillary.coords["ancillary_layer"].values.tolist()
         ]
+    quadkey_attrs = _build_quadkey_metadata(
+        crs=dataset.attrs.get("crs"),
+        transform=dataset.attrs.get("transform"),
+        width=int(imagery.sizes["x"]),
+        height=int(imagery.sizes["y"]),
+        time_values=[str(item) for item in imagery.coords["time"].values.tolist()],
+        pixel_size=dataset.attrs.get("reference_pixel_size"),
+    )
+    if quadkey_attrs:
+        summary.update(_quadkey_summary_from_attrs(quadkey_attrs))
     return summary
+
+
+def _quadkey_index_zoom() -> int:
+    raw = str(os.getenv("NIMBUS_QUADKEY_INDEX_ZOOM", "12")).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 12
+    return max(1, min(value, 23))
+
+
+def _estimate_native_zoom(pixel_size: Any) -> int | None:
+    if not isinstance(pixel_size, (list, tuple)) or len(pixel_size) < 2:
+        return None
+    try:
+        x_size = abs(float(pixel_size[0]))
+        y_size = abs(float(pixel_size[1]))
+    except (TypeError, ValueError):
+        return None
+    if x_size <= 0.0 or y_size <= 0.0:
+        return None
+    meters_per_pixel = (x_size + y_size) / 2.0
+    if meters_per_pixel <= 0.0:
+        return None
+    zoom = int(round(float(np.log2(156543.03392804097 / meters_per_pixel))))
+    return max(1, min(zoom, 23))
+
+
+def _build_quadkey_metadata(
+    *,
+    crs: Any,
+    transform: Any,
+    width: int,
+    height: int,
+    time_values: list[str],
+    pixel_size: Any,
+) -> dict[str, Any] | None:
+    index_zoom = _quadkey_index_zoom()
+    native_zoom = _estimate_native_zoom(pixel_size)
+    index_quadkeys = _quadkeys_for_grid(
+        crs=crs,
+        transform=transform,
+        width=width,
+        height=height,
+        zoom=index_zoom,
+    )
+    if not index_quadkeys:
+        return None
+    native_quadkeys = (
+        _quadkeys_for_grid(
+            crs=crs,
+            transform=transform,
+            width=width,
+            height=height,
+            zoom=native_zoom,
+        )
+        if native_zoom is not None and native_zoom != index_zoom
+        else list(index_quadkeys)
+    )
+    by_time: dict[str, dict[str, Any]] = {}
+    for item in time_values:
+        stamp = str(item)
+        by_time[stamp] = {
+            "index_zoom": index_zoom,
+            "native_zoom": native_zoom,
+            "quadkeys_index": list(index_quadkeys),
+            "quadkeys_native": list(native_quadkeys),
+        }
+    return {
+        "quadkey_schema_version": 1,
+        "quadkey_coverage_mode": "bbox_intersection",
+        "quadkey_crs": "EPSG:4326",
+        "quadkey_zoom_index": index_zoom,
+        "quadkey_zoom_native": native_zoom,
+        "quadkeys_index": list(index_quadkeys),
+        "quadkeys_native": list(native_quadkeys),
+        "quadkey_primary_index": index_quadkeys[0] if index_quadkeys else None,
+        "quadkey_primary_native": native_quadkeys[0] if native_quadkeys else None,
+        "quadkeys_by_time": by_time,
+        "quadkeys_generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _quadkey_summary_from_attrs(attrs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "quadkey_schema_version": attrs.get("quadkey_schema_version"),
+        "quadkey_coverage_mode": attrs.get("quadkey_coverage_mode"),
+        "quadkey_zoom_index": attrs.get("quadkey_zoom_index"),
+        "quadkey_zoom_native": attrs.get("quadkey_zoom_native"),
+        "quadkeys_index": list(attrs.get("quadkeys_index") or []),
+        "quadkeys_native": list(attrs.get("quadkeys_native") or []),
+        "quadkey_primary_index": attrs.get("quadkey_primary_index"),
+        "quadkey_primary_native": attrs.get("quadkey_primary_native"),
+    }
+
+
+def _quadkeys_for_grid(
+    *,
+    crs: Any,
+    transform: Any,
+    width: int,
+    height: int,
+    zoom: int | None,
+) -> list[str]:
+    if zoom is None:
+        return []
+    if not crs:
+        return []
+    if not isinstance(transform, (list, tuple)) or len(transform) < 6:
+        return []
+    if width <= 0 or height <= 0:
+        return []
+    try:
+        import rasterio
+        from rasterio.transform import Affine, array_bounds
+        from rasterio.warp import transform_bounds
+
+        affine = Affine(*[float(v) for v in transform[:6]])
+        left, bottom, right, top = array_bounds(height, width, affine)
+        min_lon, min_lat, max_lon, max_lat = transform_bounds(
+            src_crs=crs,
+            dst_crs="EPSG:4326",
+            left=left,
+            bottom=bottom,
+            right=right,
+            top=top,
+            densify_pts=21,
+        )
+    except Exception:
+        return []
+
+    if not np.isfinite([min_lon, min_lat, max_lon, max_lat]).all():
+        return []
+
+    if min_lon > max_lon:
+        first = _bbox_to_quadkeys(min_lon, min_lat, 180.0, max_lat, zoom)
+        second = _bbox_to_quadkeys(-180.0, min_lat, max_lon, max_lat, zoom)
+        return sorted(set(first + second))
+
+    return _bbox_to_quadkeys(min_lon, min_lat, max_lon, max_lat, zoom)
+
+
+def _bbox_to_quadkeys(
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    zoom: int,
+) -> list[str]:
+    min_lat = TileMath.clip(min_lat, TileMath.MIN_LAT, TileMath.MAX_LAT)
+    max_lat = TileMath.clip(max_lat, TileMath.MIN_LAT, TileMath.MAX_LAT)
+    min_lon = TileMath.clip(min_lon, TileMath.MIN_LON, TileMath.MAX_LON)
+    max_lon = TileMath.clip(max_lon, TileMath.MIN_LON, TileMath.MAX_LON)
+
+    if max_lat < min_lat:
+        min_lat, max_lat = max_lat, min_lat
+    if max_lon < min_lon:
+        min_lon, max_lon = max_lon, min_lon
+
+    px_min, py_min = TileMath.lat_lon_to_pixel_xy(max_lat, min_lon, zoom)
+    px_max, py_max = TileMath.lat_lon_to_pixel_xy(min_lat, max_lon, zoom)
+    tx_min, ty_min = TileMath.pixel_xy_to_tile_xy(px_min, py_min)
+    tx_max, ty_max = TileMath.pixel_xy_to_tile_xy(px_max, py_max)
+
+    if tx_max < tx_min:
+        tx_min, tx_max = tx_max, tx_min
+    if ty_max < ty_min:
+        ty_min, ty_max = ty_max, ty_min
+
+    quadkeys: list[str] = []
+    for tile_y in range(ty_min, ty_max + 1):
+        for tile_x in range(tx_min, tx_max + 1):
+            quadkeys.append(TileMath.tile_xy_to_quadkey(tile_x, tile_y, zoom))
+    return sorted(set(quadkeys))
 
 
 def _derive_spatial_coords(
@@ -833,6 +1064,49 @@ def _coerce_timestamp(value: str | None) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _band_nodata_value(src: Any, source_band_index: int) -> float | int | None:
+    nodata_values = getattr(src, "nodatavals", None)
+    value = None
+    if isinstance(nodata_values, (list, tuple)) and len(nodata_values) >= source_band_index:
+        value = nodata_values[source_band_index - 1]
+    if value is None:
+        value = getattr(src, "nodata", None)
+    return _serialize_metadata_scalar(value)
+
+
+def _target_nodata_value(src: Any, source_band_index: int) -> float | int:
+    source_nodata = _band_nodata_value(src, source_band_index)
+    if source_nodata is not None:
+        return source_nodata
+    dtype = np.dtype(src.dtypes[source_band_index - 1])
+    if np.issubdtype(dtype, np.floating):
+        return np.nan
+    return dtype.type(0).item()
+
+
+def _serialize_metadata_scalar(value: Any) -> float | int | None:
+    if value is None:
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return float(value)
+    if isinstance(value, int):
+        return int(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    integer = int(numeric)
+    if abs(numeric - integer) < 1e-9:
+        return integer
+    return numeric
 
 
 def _fallback_mounted_data_path(candidate: Path) -> Path | None:
