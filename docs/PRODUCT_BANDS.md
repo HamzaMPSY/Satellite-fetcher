@@ -21,7 +21,7 @@ The converter now follows these rules:
 4. Store QA, masks, classification, cloud, snow, angle, aerosol, water vapour, or other ancillary layers in separate arrays when applicable.
 5. Use a sensor-aware target grid:
    - Sentinel-2 -> `10 m`
-   - Landsat 8/9 -> `30 m`
+   - Landsat 8/9 -> `10 m`
    - Sentinel-1 standard products -> native raster grid
    - Sentinel-1 RAW -> sample-space grid, not georeferenced
 

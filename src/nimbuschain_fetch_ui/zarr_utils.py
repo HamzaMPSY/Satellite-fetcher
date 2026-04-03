@@ -13,6 +13,9 @@ from nimbuschain_fetch_ui.constants import DOWNLOADS_DIR, PROJECT_ROOT, ZARR_STO
 from nimbuschain_fetch_ui.jobs_helpers import _api_request
 
 
+_MASK_LAYER_ORDER = ("water", "cloud", "water_probability", "cloud_probability")
+
+
 def _is_remote_uri(path_value: str | Path) -> bool:
     parsed = urlparse(str(path_value or "").strip())
     return bool(parsed.scheme and parsed.scheme.lower() not in {"", "file"})
@@ -155,6 +158,250 @@ def _path_exists_in_runtime(path_value: str | Path) -> bool:
     if host_path is not None and host_path.exists():
         return True
     return False
+
+
+def read_local_zarr_attributes(store_path: Path) -> Dict[str, Any]:
+    zarr_json_path = store_path / "zarr.json"
+    if zarr_json_path.exists():
+        try:
+            payload = json.loads(zarr_json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if isinstance(payload, dict):
+            return dict(payload.get("attributes") or {})
+        return {}
+    zattrs_path = store_path / ".zattrs"
+    if zattrs_path.exists():
+        try:
+            payload = json.loads(zattrs_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if isinstance(payload, dict):
+            return dict(payload)
+    return {}
+
+
+def resolve_local_store_path(path_value: str | Path) -> Optional[Path]:
+    raw_value = str(path_value or "").strip()
+    if not raw_value or _is_remote_uri(raw_value):
+        return None
+    direct_path = Path(raw_value)
+    if direct_path.exists():
+        return direct_path
+    host_hint = container_to_host_path_hint(raw_value)
+    if host_hint:
+        host_path = Path(host_hint)
+        if host_path.exists():
+            return host_path
+    runtime_value, host_path = _candidate_runtime_path(raw_value)
+    if host_path is not None and host_path.exists():
+        return host_path
+    if runtime_value and not _is_remote_uri(runtime_value):
+        runtime_host_path = _container_to_host_path(runtime_value)
+        if runtime_host_path.exists():
+            return runtime_host_path
+    return None
+
+
+def _normalize_mask_types(values: Any) -> tuple[str, ...]:
+    raw_values = values
+    if isinstance(raw_values, str):
+        raw_values = [raw_values]
+    normalized = {
+        str(item).strip().lower()
+        for item in list(raw_values or [])
+        if str(item).strip().lower() in {"water", "cloud"}
+    }
+    ordered: list[str] = []
+    for label in ("water", "cloud"):
+        if label in normalized:
+            ordered.append(label)
+    return tuple(ordered)
+
+
+def _mask_state_label(mask_state: str) -> str:
+    normalized = str(mask_state or "").strip().lower()
+    if normalized == "water+cloud":
+        return "Water + cloud"
+    if normalized == "water":
+        return "Water only"
+    if normalized == "cloud":
+        return "Cloud only"
+    if normalized == "partial":
+        return "Partial masks"
+    if normalized == "none":
+        return "No masks"
+    if normalized == "missing":
+        return "Missing locally"
+    if normalized == "remote_or_unresolved":
+        return "Remote / unresolved"
+    return normalized or "Unknown"
+
+
+def _requested_mask_state_label(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "written":
+        return "Complete"
+    if normalized == "partial":
+        return "Partial"
+    if normalized == "not_written":
+        return "Missing"
+    if normalized == "remote_or_unresolved":
+        return "Remote / unresolved"
+    if normalized == "unknown":
+        return "Unknown"
+    return normalized or "Unknown"
+
+
+def inspect_local_zarr_store(
+    path_value: str | Path,
+    *,
+    artifact: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    raw_value = str(path_value or "").strip()
+    store_path = resolve_local_store_path(raw_value)
+    attrs = read_local_zarr_attributes(store_path) if store_path is not None else {}
+    metadata = dict((artifact or {}).get("metadata") or {})
+    band_names = list((artifact or {}).get("band_names") or [])
+    if not band_names:
+        band_names = list((attrs.get("band_names") or {}).keys()) if isinstance(attrs.get("band_names"), dict) else list(attrs.get("band_names") or [])
+    if not band_names and isinstance(attrs.get("band_metadata"), dict):
+        band_names = list(attrs.get("band_metadata", {}).keys())
+    dimensions = list((artifact or {}).get("dimensions") or attrs.get("dimensions") or [])
+    shape = list((artifact or {}).get("shape") or attrs.get("shape") or [])
+    provider = str((artifact or {}).get("provider") or metadata.get("provider") or guess_zarr_provider(raw_value)).strip()
+    collection = str((artifact or {}).get("collection") or metadata.get("collection") or guess_zarr_collection(provider, guess_scene_id(raw_value))).strip()
+    scene_id = str((artifact or {}).get("scene_id") or metadata.get("scene_id") or guess_scene_id(raw_value)).strip()
+    reference_pixel_size = list(attrs.get("reference_pixel_size") or metadata.get("reference_pixel_size") or [])
+
+    if store_path is None:
+        return {
+            "artifact_uri": raw_value,
+            "host_path": "",
+            "store_name": Path(raw_value).name if raw_value else "",
+            "runtime_exists": False,
+            "store_state": "remote_or_unresolved",
+            "provider": provider,
+            "collection": collection,
+            "scene_id": scene_id,
+            "band_names": band_names,
+            "band_count": len(band_names),
+            "dimensions": dimensions,
+            "shape": shape,
+            "reference_pixel_size": reference_pixel_size,
+            "mask_layers": {key: False for key in _MASK_LAYER_ORDER},
+            "primary_masks": [],
+            "debug_layers": [],
+            "present_mask_layers": [],
+            "mask_state": "remote_or_unresolved",
+            "mask_state_label": _mask_state_label("remote_or_unresolved"),
+            "attrs": attrs,
+            "mask_type_status": {"water": "", "cloud": ""},
+            "mask_type_reason": {"water": "", "cloud": ""},
+        }
+
+    mask_group = store_path / "masks"
+    mask_layers = {key: (mask_group / key).exists() for key in _MASK_LAYER_ORDER}
+    primary_masks = [key for key in ("water", "cloud") if mask_layers.get(key)]
+    debug_layers = [key for key in ("water_probability", "cloud_probability") if mask_layers.get(key)]
+    present_mask_layers = [key for key in _MASK_LAYER_ORDER if mask_layers.get(key)]
+
+    if len(primary_masks) == 2:
+        mask_state = "water+cloud"
+    elif primary_masks == ["water"]:
+        mask_state = "water"
+    elif primary_masks == ["cloud"]:
+        mask_state = "cloud"
+    elif present_mask_layers:
+        mask_state = "partial"
+    else:
+        mask_state = "none"
+
+    return {
+        "artifact_uri": raw_value,
+        "host_path": str(store_path),
+        "store_name": store_path.name,
+        "runtime_exists": True,
+        "store_state": "local",
+        "provider": provider,
+        "collection": collection,
+        "scene_id": scene_id,
+        "band_names": band_names,
+        "band_count": len(band_names),
+        "dimensions": dimensions,
+        "shape": shape,
+        "reference_pixel_size": reference_pixel_size,
+        "mask_layers": mask_layers,
+        "primary_masks": primary_masks,
+        "debug_layers": debug_layers,
+        "present_mask_layers": present_mask_layers,
+        "mask_state": mask_state,
+        "mask_state_label": _mask_state_label(mask_state),
+        "attrs": attrs,
+        "mask_type_status": {
+            "water": str(attrs.get("water_mask_status") or "").strip().lower(),
+            "cloud": str(attrs.get("cloud_mask_status") or "").strip().lower(),
+        },
+        "mask_type_reason": {
+            "water": str(attrs.get("water_mask_reason") or "").strip(),
+            "cloud": str(attrs.get("cloud_mask_reason") or "").strip(),
+        },
+    }
+
+
+def requested_mask_state(
+    store_summary: Dict[str, Any],
+    requested_mask_types: list[str] | tuple[str, ...],
+) -> Dict[str, Any]:
+    requested = _normalize_mask_types(requested_mask_types)
+    if not requested:
+        return {
+            "status": "unknown",
+            "label": _requested_mask_state_label("unknown"),
+            "present_primary": [],
+            "missing_primary": [],
+            "present_debug": [],
+            "reason": "",
+        }
+
+    store_state = str(store_summary.get("store_state") or "").strip().lower()
+    if store_state == "remote_or_unresolved":
+        return {
+            "status": "remote_or_unresolved",
+            "label": _requested_mask_state_label("remote_or_unresolved"),
+            "present_primary": [],
+            "missing_primary": list(requested),
+            "present_debug": [],
+            "reason": "Store path is remote or not mounted on this UI host.",
+        }
+
+    mask_layers = dict(store_summary.get("mask_layers") or {})
+    present_primary = [mask_name for mask_name in requested if mask_layers.get(mask_name)]
+    missing_primary = [mask_name for mask_name in requested if not mask_layers.get(mask_name)]
+    present_debug = [
+        f"{mask_name}_probability"
+        for mask_name in requested
+        if mask_layers.get(f"{mask_name}_probability")
+    ]
+
+    if not missing_primary:
+        status = "written"
+        reason = ""
+    elif present_primary or present_debug:
+        status = "partial"
+        reason = "Some requested mask layers already exist, but the store is not complete for this selection."
+    else:
+        status = "not_written"
+        reason = ""
+
+    return {
+        "status": status,
+        "label": _requested_mask_state_label(status),
+        "present_primary": present_primary,
+        "missing_primary": missing_primary,
+        "present_debug": present_debug,
+        "reason": reason,
+    }
 
 
 def _looks_like_scene_name(name: str) -> bool:

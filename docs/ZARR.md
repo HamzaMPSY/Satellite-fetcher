@@ -41,9 +41,8 @@ The converter uses the best target grid per sensor family, not a fake one-size-f
 - every native spectral raster layer found in the source product is preserved
 
 ### Landsat 8/9
-- target grid: `30 m`
-- all native image bands are aligned to the `30 m` grid
-- Level-1 `B8` panchromatic is preserved as a band, but it does **not** force the whole cube to `15 m`
+- target grid: `10 m`
+- all native image bands are aligned to the `10 m` grid
 - ancillary layers such as QA and angle rasters are stored separately when present
 
 ### Sentinel-1

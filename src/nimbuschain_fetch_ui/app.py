@@ -161,6 +161,8 @@ from nimbuschain_fetch_ui.zarr_utils import (
     list_artifacts as _list_artifacts,
     artifact_visibility_status as _artifact_visibility_status,
     filter_visible_artifacts as _filter_visible_artifacts,
+    inspect_local_zarr_store as _inspect_local_zarr_store,
+    requested_mask_state as _requested_mask_state,
 )
 
 if str(SRC_ROOT) not in sys.path:
@@ -492,6 +494,7 @@ def init_state():
         "watermask_artifact_provider": "",
         "watermask_artifact_collection": "",
         "show_legacy_watermask_zarr": False,
+        "mask_hide_complete_stores": False,
         "mask_mode": "water",
         "preferred_mask_job_ids": {},
         "mask_submission_notice": {},
@@ -904,6 +907,62 @@ def _normalize_mask_types(values: Any) -> tuple[str, ...]:
         if label in normalized:
             ordered.append(label)
     return tuple(ordered)
+
+
+def _store_mask_layers_label(store_summary: dict[str, Any]) -> str:
+    primary_masks = list(store_summary.get("primary_masks") or [])
+    debug_layers = list(store_summary.get("debug_layers") or [])
+    if not primary_masks and not debug_layers:
+        return "none"
+    labels = list(primary_masks)
+    for layer_name in debug_layers:
+        if layer_name not in labels:
+            labels.append(layer_name)
+    return ", ".join(labels)
+
+
+def _mask_request_target_label(mask_types: list[str] | tuple[str, ...]) -> str:
+    normalized = _normalize_mask_types(mask_types)
+    if normalized == ("water", "cloud"):
+        return "water + cloud"
+    if normalized == ("water",):
+        return "water"
+    if normalized == ("cloud",):
+        return "cloud"
+    return "mask"
+
+
+def _mask_store_sort_key(entry: dict[str, Any]) -> tuple[int, int, float]:
+    requested_status = str(dict(entry.get("requested_state") or {}).get("status") or "").strip().lower()
+    visibility_status = str(entry.get("visibility_status") or "").strip().lower()
+    updated_at = _parse_iso_datetime(entry.get("updated_at"))
+    updated_ts = updated_at.timestamp() if updated_at is not None else 0.0
+    requested_rank = {
+        "not_written": 0,
+        "partial": 1,
+        "remote_or_unresolved": 2,
+        "written": 3,
+        "unknown": 4,
+    }.get(requested_status, 5)
+    visibility_rank = {"current": 0, "local": 1, "legacy": 2}.get(visibility_status, 3)
+    return (requested_rank, visibility_rank, -updated_ts)
+
+
+def _mask_store_option_label(entry: dict[str, Any]) -> str:
+    scene_id = str(entry.get("scene_id") or entry.get("store_name") or "-").strip()
+    requested_label = str(dict(entry.get("requested_state") or {}).get("label") or "Unknown").strip()
+    visibility_status = str(entry.get("visibility_status") or "").strip().upper() or "CURRENT"
+    tracking_label = "tracked" if entry.get("associated_job_id") else "untracked"
+    band_count = int(entry.get("band_count") or 0)
+    mask_layers = _store_mask_layers_label(entry)
+    return (
+        f"[{requested_label.upper()}] {scene_id}"
+        f" | {entry.get('provider', '-')}/{entry.get('collection', '-')}"
+        f" | {band_count} bands"
+        f" | masks: {mask_layers}"
+        f" | {visibility_status}"
+        f" | {tracking_label}"
+    )
 
 
 def _mask_types_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
@@ -3094,45 +3153,130 @@ def main():
             artifacts,
             include_legacy=show_legacy_stores,
         )
+        selected_mask_types = ["water", "cloud"] if mask_mode == "water + cloud" else [mask_mode]
+        mask_target_label = _mask_request_target_label(selected_mask_types)
+        hide_complete_stores = st.checkbox(
+            f"Show only stores that still need `{mask_target_label}`",
+            value=bool(_ss("mask_hide_complete_stores", False)),
+            key="mask_hide_complete_stores",
+            help="Use the actual local Zarr contents (`masks/...`) as the source of truth when deciding whether a store already satisfies the selected mask mode.",
+        )
 
         if not visible_artifacts:
             st.info("No existing Zarr store was found in the registry or on local disk.")
         else:
-            caption = f"Showing {len(visible_artifacts)} / {artifacts_total} Zarr stores."
+            store_catalog: list[dict[str, Any]] = []
+            for item in visible_artifacts:
+                artifact_uri = str(item.get("artifact_uri") or "").strip()
+                if not artifact_uri:
+                    continue
+                local_store_summary = _inspect_local_zarr_store(artifact_uri, artifact=item)
+                requested_state = _requested_mask_state(local_store_summary, selected_mask_types)
+                associated_job_id = _find_pipeline_job_for_zarr_uri(
+                    _ss("api_url"),
+                    _ss("api_key"),
+                    artifact_uri,
+                    artifacts=visible_artifacts,
+                )
+                catalog_entry = {
+                    **item,
+                    **local_store_summary,
+                    "associated_job_id": associated_job_id,
+                    "requested_state": requested_state,
+                    "visibility_status": str(
+                        item.get("_visibility_status", _artifact_visibility_status(item))
+                    ).strip().lower(),
+                    "updated_at": item.get("updated_at"),
+                    "selection_label": "",
+                }
+                catalog_entry["selection_label"] = _mask_store_option_label(catalog_entry)
+                store_catalog.append(catalog_entry)
+
+            store_catalog.sort(key=_mask_store_sort_key)
+            if hide_complete_stores:
+                filtered_catalog = [
+                    item
+                    for item in store_catalog
+                    if str(dict(item.get("requested_state") or {}).get("status") or "").strip().lower() != "written"
+                ]
+            else:
+                filtered_catalog = list(store_catalog)
+
+            if not filtered_catalog:
+                st.info(
+                    f"Every visible Zarr already contains `{mask_target_label}`. "
+                    "Disable the filter above if you want to inspect or re-run a masked store."
+                )
+                filtered_catalog = list(store_catalog)
+
+            needs_mask_count = sum(
+                1
+                for item in store_catalog
+                if str(dict(item.get("requested_state") or {}).get("status") or "").strip().lower() == "not_written"
+            )
+            complete_count = sum(
+                1
+                for item in store_catalog
+                if str(dict(item.get("requested_state") or {}).get("status") or "").strip().lower() == "written"
+            )
+            partial_count = sum(
+                1
+                for item in store_catalog
+                if str(dict(item.get("requested_state") or {}).get("status") or "").strip().lower() == "partial"
+            )
+            untracked_count = sum(1 for item in store_catalog if not item.get("associated_job_id"))
+
+            caption = f"Showing {len(filtered_catalog)} / {artifacts_total} Zarr stores."
             if hidden_legacy_count:
                 caption += f" Hidden legacy stores: {hidden_legacy_count}."
             st.caption(caption)
 
-            store_options = [str(item["artifact_uri"]) for item in visible_artifacts]
+            overview_cols = st.columns(4)
+            with overview_cols[0]:
+                st.metric("Matching Zarrs", len(filtered_catalog))
+            with overview_cols[1]:
+                st.metric("Need selected masks", needs_mask_count)
+            with overview_cols[2]:
+                st.metric("Already complete", complete_count)
+            with overview_cols[3]:
+                st.metric("Partial / untracked", f"{partial_count} / {untracked_count}")
+
+            preview_rows = []
+            for item in filtered_catalog[:20]:
+                requested_state = dict(item.get("requested_state") or {})
+                preview_rows.append(
+                    {
+                        "scene": str(item.get("scene_id") or item.get("store_name") or "-"),
+                        "provider": item.get("provider", "-"),
+                        "collection": item.get("collection", "-"),
+                        "bands": int(item.get("band_count") or 0),
+                        "store_masks": item.get("mask_state_label", "-"),
+                        "selected_request": requested_state.get("label", "-"),
+                        "tracked": "yes" if item.get("associated_job_id") else "no",
+                        "visibility": str(item.get("visibility_status") or "-").upper(),
+                    }
+                )
+            st.dataframe(preview_rows, width="stretch", hide_index=True)
+
+            store_options = [str(item["artifact_uri"]) for item in filtered_catalog]
+            if store_options and str(_ss("watermask_selected_store", "")).strip() not in store_options:
+                st.session_state["watermask_selected_store"] = store_options[0]
             selected_store = st.selectbox(
-                "Existing Zarr store",
+                "Choose source Zarr",
                 options=store_options,
-                index=0,
                 key="watermask_selected_store",
                 format_func=lambda value: next(
-                    (
-                        f"[{str(item.get('_visibility_status', _artifact_visibility_status(item))).upper()}] "
-                        f"{Path(str(item['artifact_uri'])).name}  |  "
-                        f"{_container_to_host_path_hint(str(item['artifact_uri'])) or str(item['artifact_uri'])}"
-                        for item in visible_artifacts
-                        if str(item["artifact_uri"]) == value
-                    ),
+                    (item["selection_label"] for item in filtered_catalog if str(item["artifact_uri"]) == value),
                     value,
                 ),
             )
             selected_store_meta = next(
-                (item for item in visible_artifacts if str(item["artifact_uri"]) == selected_store),
-                visible_artifacts[0],
+                (item for item in filtered_catalog if str(item["artifact_uri"]) == selected_store),
+                filtered_catalog[0],
             )
             selected_store_uri = str(selected_store_meta.get("artifact_uri") or "").strip()
-            selected_host_hint = _container_to_host_path_hint(selected_store_uri)
-            selected_job_id = _find_pipeline_job_for_zarr_uri(
-                _ss("api_url"),
-                _ss("api_key"),
-                selected_store_uri,
-                artifacts=visible_artifacts,
-            )
-            selected_mask_types = ["water", "cloud"] if mask_mode == "water + cloud" else [mask_mode]
+            selected_host_hint = str(selected_store_meta.get("host_path") or _container_to_host_path_hint(selected_store_uri)).strip()
+            selected_job_id = str(selected_store_meta.get("associated_job_id") or "").strip()
             mask_request_key = _mask_request_key(selected_store_uri, selected_mask_types)
             preferred_mask_job_id = str(
                 dict(_ss("preferred_mask_job_ids", {})).get(mask_request_key) or ""
@@ -3145,41 +3289,20 @@ def main():
                 selected_mask_types=selected_mask_types,
                 preferred_mask_job_id=preferred_mask_job_id,
             )
-            latest_mask_artifacts = _latest_manual_mask_artifacts_for_source(
-                _ss("api_url"),
-                _ss("api_key"),
-                source_zarr_uri=selected_store_uri,
-                selected_mask_types=selected_mask_types,
-                preferred_mask_job_id=str(dict(backend_mask_snapshot.get("job") or {}).get("job_id") or "").strip(),
-            )
             scene_id = str(selected_store_meta.get("scene_id") or Path(selected_store_uri).stem).strip()
             provider_api = str(selected_store_meta.get("provider") or "").strip()
             collection_api = str(selected_store_meta.get("collection") or "").strip()
             product_type = str((selected_store_meta.get("metadata") or {}).get("product_type") or "").strip()
-            masked_store_meta = dict(latest_mask_artifacts.get("masked_zarr") or {})
-            water_mask_raster_meta = dict(latest_mask_artifacts.get("water_mask_raster") or {})
-            cloud_mask_raster_meta = dict(latest_mask_artifacts.get("cloud_mask_raster") or {})
             backend_water_mask = dict(backend_mask_snapshot.get("water_mask") or {})
             backend_cloud_mask = dict(backend_mask_snapshot.get("cloud_mask") or {})
-            derived_status_value, derived_status_reason = _effective_manual_mask_status_from_backend(
-                selected_mask_types=selected_mask_types,
-                backend_snapshot=backend_mask_snapshot,
-                latest_mask_artifacts=latest_mask_artifacts,
-            )
-            derived_masked_zarr_uri = str(
-                masked_store_meta.get("artifact_uri")
-                or backend_mask_snapshot.get("masked_zarr_uri")
-                or ""
-            ).strip()
-            masked_store_label = (
-                f"{derived_masked_zarr_uri} (same source store)"
-                if derived_masked_zarr_uri and derived_masked_zarr_uri == selected_store_uri
-                else (derived_masked_zarr_uri or "-")
-            )
-            derived_water_mask_artifact_uri = str(water_mask_raster_meta.get("artifact_uri") or "").strip()
-            derived_cloud_mask_artifact_uri = str(cloud_mask_raster_meta.get("artifact_uri") or "").strip()
+            requested_store_state = dict(selected_store_meta.get("requested_state") or {})
+            local_store_masks_label = str(selected_store_meta.get("mask_state_label") or "Unknown").strip()
             quality_snapshot = dict(backend_mask_snapshot.get("quality") or {})
             backend_job_state = str(dict(backend_mask_snapshot.get("job") or {}).get("state") or "").strip().lower()
+            backend_job_id = str(dict(backend_mask_snapshot.get("job") or {}).get("job_id") or "").strip()
+            current_request_complete = str(requested_store_state.get("status") or "").strip().lower() == "written"
+            current_request_partial = str(requested_store_state.get("status") or "").strip().lower() == "partial"
+            selected_reference_pixel_size = list(selected_store_meta.get("reference_pixel_size") or [])
 
             meta_cols = st.columns(4)
             with meta_cols[0]:
@@ -3187,41 +3310,68 @@ def main():
             with meta_cols[1]:
                 st.metric("Collection", collection_api or "-")
             with meta_cols[2]:
-                st.metric("Bands", len(selected_store_meta.get("band_names") or []))
+                st.metric("Bands", int(selected_store_meta.get("band_count") or len(selected_store_meta.get("band_names") or [])))
             with meta_cols[3]:
-                st.metric("Mask status", derived_status_value or "unknown")
+                st.metric("Store masks", local_store_masks_label or "Unknown")
+
+            status_cols = st.columns(4)
+            with status_cols[0]:
+                st.metric("Selected request", requested_store_state.get("label") or "Unknown")
+            with status_cols[1]:
+                st.metric("Latest mask job", backend_job_state or "-")
+            with status_cols[2]:
+                st.metric("Tracking", "tracked" if selected_job_id else "local only")
+            with status_cols[3]:
+                pixel_size_label = (
+                    f"{float(selected_reference_pixel_size[0]):.1f} m"
+                    if len(selected_reference_pixel_size) >= 2
+                    else "-"
+                )
+                st.metric("Pixel size", pixel_size_label)
 
             details_lines = [
                 f"Scene: {scene_id or '-'}",
                 f"Container path: {selected_store_uri or '-'}",
                 f"Host path: {selected_host_hint or '-'}",
                 f"Associated job: {selected_job_id or '-'}",
-                f"Visibility status: {selected_store_meta.get('_visibility_status', _artifact_visibility_status(selected_store_meta))}",
+                f"Visibility status: {str(selected_store_meta.get('visibility_status') or '-').upper()}",
                 f"Data family: {selected_store_meta.get('data_family', '-')}",
                 f"Dimensions: {', '.join([str(v) for v in (selected_store_meta.get('dimensions') or [])]) or '-'}",
                 f"Shape: {selected_store_meta.get('shape', []) or '-'}",
                 f"Bands: {', '.join([str(v) for v in (selected_store_meta.get('band_names') or [])]) or '-'}",
+                f"Store masks present: {_store_mask_layers_label(selected_store_meta)}",
+                f"Selected request status: {requested_store_state.get('label') or '-'}",
                 f"Water status: {backend_water_mask.get('status') or '-'}",
                 f"Cloud status: {backend_cloud_mask.get('status') or '-'}",
-                f"Target Zarr store: {masked_store_label}",
+                f"Latest mask job id: {backend_job_id or '-'}",
+                f"Target Zarr store: {selected_store_uri or '-'}",
                 f"Updated: {selected_store_meta.get('updated_at', '-')}",
                 f"Size: {_human_size(selected_store_meta.get('size_bytes'))}",
             ]
             st.code("\n".join(details_lines), language="text")
 
-            if derived_status_value == "written":
-                st.success("The selected Zarr already has the requested masks recorded by the latest mask job.")
-            elif derived_status_value in {"queued", "running", "cancel_requested"}:
+            if current_request_complete:
+                st.success(
+                    f"The selected Zarr already contains `{mask_target_label}` in `masks/...`."
+                )
+            elif current_request_partial:
+                st.warning(
+                    requested_store_state.get("reason")
+                    or "The selected Zarr already contains a partial set of the requested mask layers."
+                )
+            else:
                 st.info(
-                    f"The latest mask job is `{derived_status_value}`. "
+                    f"The selected Zarr does not yet contain `{mask_target_label}`."
+                )
+
+            if backend_job_state in {"queued", "running", "cancel_requested"}:
+                st.info(
+                    f"The latest mask job is `{backend_job_state}`. "
                     "Track progress in `📋 Jobs`."
                 )
-            elif derived_status_value == "mask_only":
-                st.warning(derived_status_reason or "Legacy mask artifacts exist, but no matching v2 backend job snapshot was found.")
-            elif derived_status_value in {"failed", "error"}:
-                st.error(derived_status_reason or "The last selected mask attempt failed for this store.")
-            else:
-                st.info("No in-place mask result is currently recorded for this source store.")
+            elif backend_job_state in {"failed", "error"}:
+                failure_reason = str(backend_water_mask.get("reason") or backend_cloud_mask.get("reason") or "").strip()
+                st.error(failure_reason or "The latest mask job failed for this store.")
 
             submission_notice = dict(_ss("mask_submission_notice", {}))
             if (
@@ -3274,31 +3424,28 @@ def main():
                 ]
                 st.code("\n".join(quality_lines), language="text")
 
-            if (
-                backend_water_mask.get("mask_path")
-                or backend_cloud_mask.get("mask_path")
-                or derived_masked_zarr_uri
-            ):
+            if backend_water_mask.get("mask_path") or backend_cloud_mask.get("mask_path"):
                 extra_lines = [
-                    f"Latest mask job: {str(dict(backend_mask_snapshot.get('job') or {}).get('job_id') or '-').strip() or '-'}",
+                    f"Latest mask job: {backend_job_id or '-'}",
                     f"Latest mask job state: {backend_job_state or '-'}",
                     f"Water mask layer: {backend_water_mask.get('mask_path') or '-'}",
                     f"Cloud mask layer: {backend_cloud_mask.get('mask_path') or '-'}",
-                    f"Target Zarr store: {masked_store_label}",
+                    f"Target Zarr store: {selected_store_uri or '-'}",
                 ]
                 st.code("\n".join(extra_lines), language="text")
-                if derived_masked_zarr_uri:
-                    _render_local_path_actions(
-                        title="Target Zarr store",
-                        path_value=derived_masked_zarr_uri,
-                        open_label="Open Zarr folder",
-                        copy_label="Copy Zarr path",
-                    )
+
+            if selected_store_uri:
+                _render_local_path_actions(
+                    title="Selected Zarr store",
+                    path_value=selected_store_uri,
+                    open_label="Open Zarr folder",
+                    copy_label="Copy Zarr path",
+                )
 
             action_col1, action_col2 = st.columns([3, 2])
             with action_col1:
                 action_label = "Create mask job"
-                if derived_status_value == "written":
+                if current_request_complete:
                     action_label = "Re-run mask job"
                 run_mask = st.button(
                     action_label,
