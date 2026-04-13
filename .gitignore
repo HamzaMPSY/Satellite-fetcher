@@ -25,3 +25,4 @@ data/*
 !data/Landsat-tiles/**
 !data/Sentinel-2-tiles/
 !data/Sentinel-2-tiles/**
+cache/
