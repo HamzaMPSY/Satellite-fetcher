@@ -26,3 +26,14 @@ data/*
 !data/Sentinel-2-tiles/
 !data/Sentinel-2-tiles/**
 cache/
+
+# Local validation/output artifacts
+real_validation_outputs/
+
+# Local temporary workspace
+tmp/
+
+# Local scripts workspace
+scripts/
+docs/copernicus_account_pool.json
+docs/copernicus_account_pool.example.json
