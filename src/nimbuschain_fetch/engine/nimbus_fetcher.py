@@ -2178,16 +2178,53 @@ class NimbusFetcher:
                 outputs.append(derived_zarr_uri)
         return outputs
 
+    def _scene_parallelism_target_from_download(
+        self,
+        *,
+        pipeline_metadata: dict[str, Any] | None,
+        total: int,
+    ) -> int:
+        if total <= 1:
+            return 1
+        metadata = dict(pipeline_metadata or {})
+        strategy = str(metadata.get("download_strategy") or "").strip().lower()
+        if strategy != "copernicus_account_pool":
+            return 1
+        selected_accounts = int(metadata.get("account_pool_selected_accounts", 0) or 0)
+        if selected_accounts <= 0:
+            selected_accounts = sum(
+                1
+                for item in list(metadata.get("account_pool_assignments") or [])
+                if str((item or {}).get("account_label") or "").strip()
+            )
+        if selected_accounts <= 0:
+            selected_accounts = int(metadata.get("account_pool_size", 0) or 0)
+        return max(
+            1,
+            min(
+                int(selected_accounts or 1),
+                max(1, total),
+                max(1, int(self.settings.nimbus_max_jobs or 1)),
+                4,
+            ),
+        )
+
     @staticmethod
-    def _zarr_convert_max_workers(*, total: int) -> int:
+    def _zarr_convert_max_workers(
+        *,
+        total: int,
+        preferred_parallelism: int | None = None,
+        max_limit: int = 4,
+    ) -> int:
         raw = str(os.getenv("NIMBUS_ZARR_CONVERT_MAX_WORKERS") or "").strip()
         try:
             configured = int(raw) if raw else None
         except ValueError:
             configured = None
-        default_value = 1
+        cpu_budget = max(1, min(4, max(1, int((os.cpu_count() or 2) / 2))))
+        default_value = min(max(1, int(preferred_parallelism or 1)), cpu_budget)
         value = configured if configured is not None else default_value
-        return max(1, min(int(value), max(1, total), 4))
+        return max(1, min(int(value), max(1, total), max(1, int(max_limit or 1))))
 
     @staticmethod
     def _integrated_mask_max_workers(
@@ -2196,6 +2233,8 @@ class NimbusFetcher:
         inference_device: str | None,
         water_inference_device: str | None,
         remote_runtime: dict[str, Any] | None = None,
+        preferred_parallelism: int | None = None,
+        max_limit: int = 4,
     ) -> int:
         raw = str(os.getenv("NIMBUS_MASK_SCENE_MAX_WORKERS") or "").strip()
         try:
@@ -2221,10 +2260,21 @@ class NimbusFetcher:
             resolved_cloud = remote_cloud
         if remote_water not in {"", "auto"}:
             resolved_water = remote_water
+        remote_service = remote_runtime is not None
         has_accelerator = any(device in {"cuda", "mps"} for device in {resolved_cloud, resolved_water})
-        default_value = 2 if total > 1 and has_accelerator else 1
+        cpu_budget = max(1, min(4, max(1, int((os.cpu_count() or 2) / 2))))
+        if remote_service:
+            heuristic_budget = min(cpu_budget, 2 if has_accelerator else 1)
+        else:
+            heuristic_budget = min(cpu_budget, 3 if has_accelerator else 2)
+        default_target = (
+            max(1, int(preferred_parallelism or 1))
+            if preferred_parallelism is not None
+            else (2 if total > 1 and has_accelerator else 1)
+        )
+        default_value = min(default_target, heuristic_budget)
         value = configured if configured is not None else default_value
-        return max(1, min(int(value), max(1, total), 4))
+        return max(1, min(int(value), max(1, total), max(1, int(max_limit or 1))))
 
     def _convert_single_raw_output(
         self,
@@ -2274,6 +2324,7 @@ class NimbusFetcher:
         is_cancelled: Callable[[], bool],
         scene_id_override: str | None = None,
         output_uri_override: str | None = None,
+        pipeline_metadata: dict[str, Any] | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         if not raw_outputs:
             return [], {"status": "skipped", "reason": "no_raw_outputs"}
@@ -2319,7 +2370,14 @@ class NimbusFetcher:
                 }
             )
 
-        max_workers = self._zarr_convert_max_workers(total=total)
+        max_workers = self._zarr_convert_max_workers(
+            total=total,
+            preferred_parallelism=self._scene_parallelism_target_from_download(
+                pipeline_metadata=pipeline_metadata,
+                total=total,
+            ),
+            max_limit=min(4, max(1, int(self.settings.nimbus_max_jobs or 1))),
+        )
         if max_workers <= 1:
             for item in prepared_items:
                 if is_cancelled():
@@ -2366,6 +2424,7 @@ class NimbusFetcher:
                     output_uri=output_uri,
                     index=index,
                     total=total,
+                    parallel_workers=max_workers,
                 )
                 converted = self._convert_single_raw_output(
                     provider_name=provider_name,
@@ -2450,6 +2509,101 @@ class NimbusFetcher:
             },
         )
         completed_by_index: dict[int, dict[str, Any]] = {}
+        progress_lock = threading.Lock()
+        progress_by_index: dict[int, float] = {
+            int(item["index"]): 0.0 for item in prepared_items
+        }
+        last_emit = {"mono": 0.0, "progress": -1.0}
+
+        def _make_parallel_progress_callback(item: dict[str, Any]) -> Callable[[dict[str, Any]], None]:
+            index = int(item["index"])
+            raw_uri = str(item["raw_uri"])
+            scene_id = str(item["scene_id"])
+            output_uri = str(item["output_uri"])
+
+            def _callback(payload: dict[str, Any]) -> None:
+                fraction = min(1.0, max(0.0, float(payload.get("fraction") or 0.0)))
+                blocks_written = int(payload.get("blocks_written") or 0)
+                total_blocks = int(payload.get("total_blocks") or 0)
+                source_array_name = str(
+                    payload.get("source_array_name") or payload.get("array_name") or ""
+                ).strip()
+                band_name = str(payload.get("band_name") or "").strip()
+                now_mono = time.monotonic()
+                with progress_lock:
+                    progress_by_index[index] = max(progress_by_index.get(index, 0.0), fraction)
+                    aggregate_fraction = sum(progress_by_index.values()) / total
+                    pipeline_progress = min(99.0, aggregate_fraction * 85.0)
+                    if not self._should_emit_zarr_progress(
+                        now_mono=now_mono,
+                        last_emit=float(last_emit["mono"]),
+                        progress_pct=pipeline_progress,
+                        last_progress=float(last_emit["progress"]),
+                    ):
+                        return
+                    last_emit["mono"] = now_mono
+                    last_emit["progress"] = pipeline_progress
+                    items_completed = sum(
+                        1 for current_fraction in progress_by_index.values() if current_fraction >= 1.0
+                    )
+                    items_active = sum(
+                        1 for current_fraction in progress_by_index.values() if 0.0 < current_fraction < 1.0
+                    )
+                conversion_payload = {
+                    "status": "running",
+                    "stage": "writing_chunks",
+                    "current_raw_uri": raw_uri,
+                    "current_scene_id": scene_id,
+                    "current_output_uri": output_uri,
+                    "current_index": index,
+                    "total": total,
+                    "parallel_workers": max_workers,
+                    "chunk_fraction": round(fraction, 6),
+                    "aggregate_fraction": round(aggregate_fraction, 6),
+                    "blocks_written": blocks_written,
+                    "total_blocks": total_blocks,
+                    "items_total": total,
+                    "items_completed": items_completed,
+                    "items_active": items_active,
+                }
+                if source_array_name:
+                    conversion_payload["current_array"] = source_array_name
+                if band_name:
+                    conversion_payload["current_band"] = band_name
+                event_payload = {
+                    "raw_uri": raw_uri,
+                    "scene_id": scene_id,
+                    "output_uri": output_uri,
+                    "index": index,
+                    "total": total,
+                    "stage": "writing_chunks",
+                    "parallel_workers": max_workers,
+                    "chunk_fraction": round(fraction, 6),
+                    "aggregate_fraction": round(aggregate_fraction, 6),
+                    "blocks_written": blocks_written,
+                    "total_blocks": total_blocks,
+                    "items_total": total,
+                    "items_completed": items_completed,
+                    "items_active": items_active,
+                }
+                if source_array_name:
+                    event_payload["array_name"] = source_array_name
+                if band_name:
+                    event_payload["band_name"] = band_name
+                self._update_pipeline(
+                    job_id,
+                    pipeline_state=PipelineState.zarr_converting,
+                    pipeline_step="writing_chunks",
+                    pipeline_progress=pipeline_progress,
+                    raw_outputs=raw_outputs,
+                    zarr_outputs=zarr_outputs,
+                    conversion_metadata=conversion_payload,
+                    event_type="job.zarr_converting",
+                    event_payload=event_payload,
+                )
+
+            return _callback
+
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="zarr-convert") as executor:
             future_to_item = {
                 executor.submit(
@@ -2460,6 +2614,7 @@ class NimbusFetcher:
                     raw_uri=str(item["raw_uri"]),
                     scene_id=str(item["scene_id"]),
                     output_uri=str(item["output_uri"]),
+                    progress_callback=_make_parallel_progress_callback(item),
                 ): item
                 for item in prepared_items
             }
@@ -2469,6 +2624,14 @@ class NimbusFetcher:
                 item = future_to_item[future]
                 converted = future.result()
                 index = int(item["index"])
+                with progress_lock:
+                    progress_by_index[index] = 1.0
+                    items_completed = sum(
+                        1 for current_fraction in progress_by_index.values() if current_fraction >= 1.0
+                    )
+                    items_active = sum(
+                        1 for current_fraction in progress_by_index.values() if 0.0 < current_fraction < 1.0
+                    )
                 completed_by_index[index] = converted
                 ordered_indices = sorted(completed_by_index)
                 zarr_outputs = [str(completed_by_index[current]["zarr_uri"]) for current in ordered_indices]
@@ -2493,6 +2656,9 @@ class NimbusFetcher:
                         "current_index": len(completed_by_index),
                         "total": total,
                         "parallel_workers": max_workers,
+                        "items_total": total,
+                        "items_completed": items_completed,
+                        "items_active": items_active,
                     },
                     event_type="job.zarr_converting",
                     event_payload={
@@ -2503,6 +2669,9 @@ class NimbusFetcher:
                         "total": total,
                         "stage": "registering_artifact",
                         "parallel_workers": max_workers,
+                        "items_total": total,
+                        "items_completed": items_completed,
+                        "items_active": items_active,
                     },
                 )
                 self._register_zarr_artifact(
@@ -2558,6 +2727,7 @@ class NimbusFetcher:
             is_cancelled=lambda: self._is_job_cancel_requested(job_id),
             scene_id_override=scene_id,
             output_uri_override=output_uri,
+            pipeline_metadata=dict(row.get("pipeline_metadata") or {}),
         )
         pipeline_state = PipelineState.zarr_written
         pipeline_metadata = {
@@ -2565,6 +2735,7 @@ class NimbusFetcher:
             "manual_conversion": True,
             "raw_output_count": len(raw_outputs),
             "zarr_output_count": len(zarr_outputs),
+            "zarr_parallel_workers": int(conversion_metadata.get("parallel_workers", 1) or 1),
         }
         result_payload = {
             "job_id": job_id,
@@ -3013,6 +3184,7 @@ class NimbusFetcher:
                 product_type=getattr(request, "product_type", None),
                 raw_outputs=raw_outputs,
                 is_cancelled=is_cancelled_now,
+                pipeline_metadata=pipeline_metadata,
             )
             final_paths = [*raw_result_paths, *zarr_outputs]
             conversion_status = str(conversion_metadata.get("status") or "")
@@ -3029,6 +3201,7 @@ class NimbusFetcher:
                 **pipeline_metadata,
                 "zarr_output_count": len(zarr_outputs),
                 "manual_conversion": False,
+                "zarr_parallel_workers": int(conversion_metadata.get("parallel_workers", 1) or 1),
             }
             if requested_mask_types:
                 final_pipeline_metadata["mask_types"] = requested_mask_types
@@ -3088,6 +3261,11 @@ class NimbusFetcher:
                         inference_device=mask_inference_device,
                         water_inference_device=water_inference_device,
                         remote_runtime=remote_mask_runtime,
+                        preferred_parallelism=self._scene_parallelism_target_from_download(
+                            pipeline_metadata=final_pipeline_metadata,
+                            total=len(zarr_outputs),
+                        ),
+                        max_limit=min(4, max(1, int(self.settings.nimbus_max_jobs or 1))),
                     )
                     mask_items: list[dict[str, Any] | None] = [None] * len(zarr_outputs)
                     mask_errors: list[str] = []
@@ -3154,6 +3332,16 @@ class NimbusFetcher:
                                     **dict(payload.get("pipeline_metadata") or {}),
                                     "mask_parallel_workers": mask_workers,
                                     "mask_total_scenes": scene_count,
+                                    "mask_completed_scenes": sum(
+                                        1
+                                        for current_fraction in progress_by_index.values()
+                                        if current_fraction >= 1.0
+                                    ),
+                                    "mask_active_scenes": sum(
+                                        1
+                                        for current_fraction in progress_by_index.values()
+                                        if 0.0 < current_fraction < 1.0
+                                    ),
                                 }
                                 aggregate_event_payload = {
                                     **dict(payload.get("event_payload") or {}),
@@ -3200,6 +3388,16 @@ class NimbusFetcher:
                                     **final_pipeline_metadata,
                                     "mask_parallel_workers": mask_workers,
                                     "mask_total_scenes": scene_count,
+                                    "mask_completed_scenes": sum(
+                                        1
+                                        for current_fraction in progress_by_index.values()
+                                        if current_fraction >= 1.0
+                                    ),
+                                    "mask_active_scenes": sum(
+                                        1
+                                        for current_fraction in progress_by_index.values()
+                                        if 0.0 < current_fraction < 1.0
+                                    ),
                                 },
                             )
 
@@ -3296,6 +3494,9 @@ class NimbusFetcher:
                                     last_mask_execution = mask_execution
                     mask_items = [item for item in mask_items if item is not None]
                     final_pipeline_metadata["mask_parallel_workers"] = mask_workers
+                    final_pipeline_metadata["mask_total_scenes"] = scene_count
+                    final_pipeline_metadata["mask_completed_scenes"] = len(mask_items)
+                    final_pipeline_metadata["mask_active_scenes"] = 0
 
                     mask_succeeded = bool(last_mask_execution and last_mask_execution.get("succeeded")) and not mask_errors
                     mask_summary = {
@@ -4102,6 +4303,7 @@ class NimbusFetcher:
         output_uri: str,
         index: int,
         total: int,
+        parallel_workers: int = 1,
     ) -> Callable[[dict[str, Any]], None]:
         last_emit = {"mono": 0.0, "progress": -1.0}
         base_progress = ((index - 1) / total) * 100.0
@@ -4132,10 +4334,13 @@ class NimbusFetcher:
                 "current_output_uri": output_uri,
                 "current_index": index,
                 "total": total,
-                "parallel_workers": 1,
+                "parallel_workers": parallel_workers,
                 "chunk_fraction": round(fraction, 6),
                 "blocks_written": blocks_written,
                 "total_blocks": total_blocks,
+                "items_total": total,
+                "items_completed": max(0, index - 1),
+                "items_active": 1,
             }
             if source_array_name:
                 metadata["current_array"] = source_array_name
@@ -4148,10 +4353,13 @@ class NimbusFetcher:
                 "index": index,
                 "total": total,
                 "stage": "writing_chunks",
-                "parallel_workers": 1,
+                "parallel_workers": parallel_workers,
                 "chunk_fraction": round(fraction, 6),
                 "blocks_written": blocks_written,
                 "total_blocks": total_blocks,
+                "items_total": total,
+                "items_completed": max(0, index - 1),
+                "items_active": 1,
             }
             if source_array_name:
                 event_payload["array_name"] = source_array_name

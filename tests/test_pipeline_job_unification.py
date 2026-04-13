@@ -547,7 +547,12 @@ def test_download_progress_updates_are_throttled_to_coarser_intervals() -> None:
 
 def test_zarr_conversion_defaults_to_single_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("NIMBUS_ZARR_CONVERT_MAX_WORKERS", raising=False)
+    monkeypatch.setattr("nimbuschain_fetch.engine.nimbus_fetcher.os.cpu_count", lambda: 8)
     assert NimbusFetcher._zarr_convert_max_workers(total=4) == 1
+    assert NimbusFetcher._zarr_convert_max_workers(
+        total=4,
+        preferred_parallelism=3,
+    ) == 3
 
     monkeypatch.setenv("NIMBUS_ZARR_CONVERT_MAX_WORKERS", "2")
     assert NimbusFetcher._zarr_convert_max_workers(total=4) == 2

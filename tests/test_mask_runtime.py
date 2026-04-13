@@ -88,6 +88,7 @@ def test_runtime_device_status_reports_requested_and_resolved_device(monkeypatch
 
 def test_integrated_mask_workers_only_parallelize_with_accelerator(monkeypatch) -> None:
     monkeypatch.delenv("NIMBUS_MASK_SCENE_MAX_WORKERS", raising=False)
+    monkeypatch.setattr("nimbuschain_fetch.engine.nimbus_fetcher.os.cpu_count", lambda: 8)
     monkeypatch.setattr(
         "nimbuschain_fetch.engine.nimbus_fetcher.resolve_inference_device",
         lambda **kwargs: "cpu",
@@ -96,6 +97,19 @@ def test_integrated_mask_workers_only_parallelize_with_accelerator(monkeypatch) 
         total=5,
         inference_device=None,
         water_inference_device=None,
+    ) == 1
+    assert NimbusFetcher._integrated_mask_max_workers(
+        total=5,
+        inference_device=None,
+        water_inference_device=None,
+        preferred_parallelism=3,
+    ) == 2
+    assert NimbusFetcher._integrated_mask_max_workers(
+        total=5,
+        inference_device=None,
+        water_inference_device=None,
+        preferred_parallelism=3,
+        remote_runtime={},
     ) == 1
 
     monkeypatch.setattr(
@@ -111,6 +125,7 @@ def test_integrated_mask_workers_only_parallelize_with_accelerator(monkeypatch) 
 
 def test_integrated_mask_workers_use_remote_runtime_when_external_service_has_mps(monkeypatch) -> None:
     monkeypatch.delenv("NIMBUS_MASK_SCENE_MAX_WORKERS", raising=False)
+    monkeypatch.setattr("nimbuschain_fetch.engine.nimbus_fetcher.os.cpu_count", lambda: 8)
     monkeypatch.setattr(
         "nimbuschain_fetch.engine.nimbus_fetcher.resolve_inference_device",
         lambda **kwargs: "cpu",

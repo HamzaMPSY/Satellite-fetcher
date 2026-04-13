@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 import requests
@@ -12,6 +13,9 @@ from nimbuschain_mask_service.schema import default_mask_model
 
 class MaskServiceClient:
     REMOTE_PROGRESS_POLL_SECONDS = 2.0
+    REMOTE_APPLY_MAX_RETRIES = 1
+    REMOTE_APPLY_RESTART_WAIT_SECONDS = 30.0
+    REMOTE_APPLY_RESTART_POLL_SECONDS = 1.0
 
     def __init__(self, *, service_url: str | None = None):
         self.service_url = str(service_url or "").strip().rstrip("/")
@@ -134,12 +138,28 @@ class MaskServiceClient:
             }
             if remote_job_id:
                 request_kwargs["params"] = {"job_id": remote_job_id}
-            response = self._session.post(
-                f"{self.service_url}/apply",
-                **request_kwargs,
-            )
-            response.raise_for_status()
-            return dict(response.json())
+            apply_url = f"{self.service_url}/apply"
+            for attempt in range(self.REMOTE_APPLY_MAX_RETRIES + 1):
+                try:
+                    response = self._session.post(
+                        apply_url,
+                        **request_kwargs,
+                    )
+                    response.raise_for_status()
+                    return dict(response.json())
+                except requests.RequestException as exc:
+                    should_retry = (
+                        attempt < self.REMOTE_APPLY_MAX_RETRIES
+                        and self._is_retryable_remote_error(exc)
+                        and self._wait_for_remote_health()
+                    )
+                    if should_retry:
+                        continue
+                    detail = str(exc).strip() or exc.__class__.__name__
+                    raise RuntimeError(
+                        "Mask service request failed. The remote mask process may have restarted, exhausted memory, "
+                        f"or closed the connection unexpectedly. Original error: {detail}"
+                    ) from exc
         except requests.RequestException as exc:
             detail = str(exc).strip() or exc.__class__.__name__
             raise RuntimeError(
@@ -158,6 +178,43 @@ class MaskServiceClient:
         response = self._session.get(f"{self.service_url}/health", timeout=30)
         response.raise_for_status()
         return dict(response.json())
+
+    def _wait_for_remote_health(self) -> bool:
+        assert self._session is not None
+        health_get = getattr(self._session, "get", None)
+        if not callable(health_get):
+            return False
+        deadline = time.monotonic() + float(self.REMOTE_APPLY_RESTART_WAIT_SECONDS)
+        while time.monotonic() < deadline:
+            try:
+                response = health_get(
+                    f"{self.service_url}/health",
+                    timeout=5,
+                )
+                response.raise_for_status()
+                return True
+            except requests.RequestException:
+                time.sleep(float(self.REMOTE_APPLY_RESTART_POLL_SECONDS))
+        return False
+
+    @staticmethod
+    def _is_retryable_remote_error(exc: requests.RequestException) -> bool:
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            return True
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in {502, 503, 504}:
+            return True
+        detail = str(exc).strip().lower()
+        return any(
+            pattern in detail
+            for pattern in (
+                "connection aborted",
+                "connection reset",
+                "remote end closed connection without response",
+                "temporarily unavailable",
+            )
+        )
 
     def schema(self) -> dict[str, Any]:
         if self._service is not None:

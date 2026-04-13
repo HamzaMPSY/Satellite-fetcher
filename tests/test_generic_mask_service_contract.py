@@ -1007,6 +1007,61 @@ def test_remote_mask_service_client_surfaces_clear_error_when_connection_drops()
     assert "mask process may have restarted" in str(excinfo.value).lower()
 
 
+def test_remote_mask_service_client_retries_once_after_service_restart() -> None:
+    captured: dict[str, object] = {"posts": 0, "health_checks": 0}
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object], *, status_code: int = 200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"status={self.status_code}", response=self)
+
+        def json(self) -> dict[str, object]:
+            return dict(self._payload)
+
+    class _FakeSession:
+        def post(self, url: str, *, json: dict[str, object], timeout, params=None):  # noqa: A002
+            captured["posts"] = int(captured["posts"]) + 1
+            assert url == "http://nimbus-mask:8020/apply"
+            assert timeout == (30, None)
+            assert params is None
+            if captured["posts"] == 1:
+                raise requests.ConnectionError("Remote end closed connection without response")
+            return _FakeResponse({"status": "written"})
+
+        def get(self, url: str, *, timeout):
+            captured["health_checks"] = int(captured["health_checks"]) + 1
+            assert url == "http://nimbus-mask:8020/health"
+            assert timeout == 5
+            return _FakeResponse({"status": "ok"})
+
+        def close(self) -> None:
+            return None
+
+    client = MaskServiceClient(service_url="http://nimbus-mask:8020")
+    client.REMOTE_APPLY_RESTART_WAIT_SECONDS = 0.01
+    client.REMOTE_APPLY_RESTART_POLL_SECONDS = 0.0
+    client._session = _FakeSession()
+
+    result = client.apply_masks_to_zarr(
+        zarr_uri="/tmp/source.zarr",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        scene_id="S2A_SCENE",
+        acquisition_datetime="2026-04-01T10:00:00Z",
+        dataset_summary={"shape": [1, 12, 4, 4]},
+        mask_types=["cloud"],
+    )
+
+    assert result["status"] == "written"
+    assert captured["posts"] == 2
+    assert captured["health_checks"] >= 1
+
+
 def test_remote_mask_service_client_forwards_progress_callbacks_during_apply() -> None:
     progress_calls: list[tuple[str, dict[str, object]]] = []
 

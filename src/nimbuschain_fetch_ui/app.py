@@ -1938,12 +1938,27 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
             or conversion_meta.get("mask_types")
             or []
         )
+        mask_workers = int(pipeline_meta.get("mask_parallel_workers", 0) or 0)
+        mask_total_scenes = int(pipeline_meta.get("mask_total_scenes", 0) or 0)
+        mask_completed_scenes = int(pipeline_meta.get("mask_completed_scenes", 0) or 0)
+        mask_suffix = (
+            f" ({mask_completed_scenes}/{mask_total_scenes})"
+            if mask_total_scenes > 0 and mask_completed_scenes > 0
+            else ""
+        )
+        worker_suffix = f" with {mask_workers} parallel worker(s)" if mask_workers > 1 else ""
         if pipeline_state == "queued":
             return f"Requested mask types: {', '.join(mask_types) or '-'}."
         if pipeline_state == "running_cloud_inference":
-            return "Cloud inference is active. The selected Zarr will receive masks/cloud and masks/cloud_probability."
+            return (
+                "Cloud inference is active"
+                f"{mask_suffix}{worker_suffix}. The selected Zarr will receive masks/cloud and masks/cloud_probability."
+            )
         if pipeline_state == "running_water_inference":
-            return "Water inference is active. The selected Zarr will receive masks/water and masks/water_probability."
+            return (
+                "Water inference is active"
+                f"{mask_suffix}{worker_suffix}. The selected Zarr will receive masks/water and masks/water_probability."
+            )
         if pipeline_state == "writing_masked_zarr":
             return "Consolidating metadata and finalizing the selected Zarr after in-place mask writes."
         return None
@@ -1968,23 +1983,60 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
             return "Copernicus account pool was requested, but the backend fell back to the primary account because no extra accounts were available."
     current_index = int(conversion_meta.get("current_index", 0) or 0)
     total = int(conversion_meta.get("total", 0) or 0)
-    item_suffix = f" ({current_index}/{total})" if current_index > 0 and total > 0 else ""
+    items_completed = int(conversion_meta.get("items_completed", 0) or 0)
+    items_total = int(conversion_meta.get("items_total", 0) or total or 0)
+    parallel_workers = int(
+        conversion_meta.get("parallel_workers", 0)
+        or pipeline_meta.get("zarr_parallel_workers", 0)
+        or 0
+    )
+    if items_total > 0 and items_completed > 0:
+        item_suffix = f" ({items_completed}/{items_total})"
+    else:
+        item_suffix = f" ({current_index}/{total})" if current_index > 0 and total > 0 else ""
+    worker_suffix = f" with {parallel_workers} parallel worker(s)" if parallel_workers > 1 else ""
     if pipeline_state == "zarr_queued":
         return f"Waiting for the worker to start Zarr conversion{item_suffix}."
     if pipeline_state == "zarr_converting":
         if pipeline_step == "writing_chunks":
-            return f"Writing chunks into the Zarr store{item_suffix}."
+            return f"Writing chunks into the Zarr store{item_suffix}{worker_suffix}."
         if pipeline_step == "registering_artifact":
-            return f"Registering the Zarr artifact in the backend{item_suffix}."
-        return f"Zarr conversion is active{item_suffix}."
+            return f"Registering the Zarr artifact in the backend{item_suffix}{worker_suffix}."
+        return f"Zarr conversion is active{item_suffix}{worker_suffix}."
     if pipeline_state == "downloaded":
         return "Raw product is available locally. The backend is about to start the Zarr stage."
     if integrated_mask and pipeline_state == "zarr_written":
-        return f"Mask orchestration requested: {', '.join(mask_types)}."
+        mask_workers = int(pipeline_meta.get("mask_parallel_workers", 0) or 0)
+        worker_suffix = f" Planned scene workers: {mask_workers}." if mask_workers > 1 else ""
+        return f"Mask orchestration requested: {', '.join(mask_types)}.{worker_suffix}"
     if integrated_mask and pipeline_state == "running_cloud_inference":
-        return "Cloud layers will be written into `masks/cloud` and `masks/cloud_probability` in the same Zarr store."
+        mask_workers = int(pipeline_meta.get("mask_parallel_workers", 0) or 0)
+        mask_total_scenes = int(pipeline_meta.get("mask_total_scenes", 0) or 0)
+        mask_completed_scenes = int(pipeline_meta.get("mask_completed_scenes", 0) or 0)
+        suffix = (
+            f" ({mask_completed_scenes}/{mask_total_scenes})"
+            if mask_total_scenes > 0 and mask_completed_scenes > 0
+            else ""
+        )
+        worker_suffix = f" with {mask_workers} parallel worker(s)" if mask_workers > 1 else ""
+        return (
+            "Cloud layers will be written into `masks/cloud` and `masks/cloud_probability`"
+            f" in the same Zarr store{suffix}{worker_suffix}."
+        )
     if integrated_mask and pipeline_state == "running_water_inference":
-        return "Water layers will be written into `masks/water` and `masks/water_probability` in the same Zarr store."
+        mask_workers = int(pipeline_meta.get("mask_parallel_workers", 0) or 0)
+        mask_total_scenes = int(pipeline_meta.get("mask_total_scenes", 0) or 0)
+        mask_completed_scenes = int(pipeline_meta.get("mask_completed_scenes", 0) or 0)
+        suffix = (
+            f" ({mask_completed_scenes}/{mask_total_scenes})"
+            if mask_total_scenes > 0 and mask_completed_scenes > 0
+            else ""
+        )
+        worker_suffix = f" with {mask_workers} parallel worker(s)" if mask_workers > 1 else ""
+        return (
+            "Water layers will be written into `masks/water` and `masks/water_probability`"
+            f" in the same Zarr store{suffix}{worker_suffix}."
+        )
     return None
 
 
