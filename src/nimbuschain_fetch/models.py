@@ -13,6 +13,17 @@ from nimbuschain_fetch.geometry.aoi import validate_aoi_payload
 COLLECTION_RE = re.compile(r"^[A-Za-z0-9._\-/]{1,120}$")
 
 
+def _normalize_mask_type_values(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in list(values or []):
+        candidate = str(value or "").strip().lower()
+        if candidate not in {"water", "cloud"}:
+            raise ValueError("mask_types must contain only 'water' and/or 'cloud'.")
+        if candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
+
+
 class ProviderName(str, Enum):
     copernicus = "copernicus"
     usgs = "usgs"
@@ -72,6 +83,8 @@ class SearchDownloadRequest(BaseModel):
     aoi: AOIInput
     tile_id: str | None = None
     output_dir: str | None = None
+    mask_types: list[Literal["water", "cloud"]] = Field(default_factory=list)
+    download_strategy: Literal["default", "copernicus_account_pool"] = "default"
 
     @field_validator("collection", "product_type")
     @classmethod
@@ -91,10 +104,17 @@ class SearchDownloadRequest(BaseModel):
             raise ValueError("output_dir traversal is not allowed.")
         return value
 
+    @field_validator("mask_types")
+    @classmethod
+    def _normalize_mask_types(cls, values: list[str]) -> list[str]:
+        return _normalize_mask_type_values(values)
+
     @model_validator(mode="after")
     def _validate_dates(self) -> "SearchDownloadRequest":
         if self.end_date < self.start_date:
             raise ValueError("end_date must be greater or equal to start_date.")
+        if self.provider != ProviderName.copernicus and self.download_strategy != "default":
+            raise ValueError("download_strategy is only supported for Copernicus jobs.")
         return self
 
 
@@ -106,6 +126,7 @@ class DownloadProductsRequest(BaseModel):
     collection: str
     product_ids: list[str] = Field(min_length=1)
     output_dir: str | None = None
+    download_strategy: Literal["default", "copernicus_account_pool"] = "default"
 
     @field_validator("collection")
     @classmethod
@@ -132,6 +153,12 @@ class DownloadProductsRequest(BaseModel):
         if ".." in value.split("/"):
             raise ValueError("output_dir traversal is not allowed.")
         return value
+
+    @model_validator(mode="after")
+    def _validate_download_strategy(self) -> "DownloadProductsRequest":
+        if self.provider != ProviderName.copernicus and self.download_strategy != "default":
+            raise ValueError("download_strategy is only supported for Copernicus jobs.")
+        return self
 
 
 JobCreateRequest = Annotated[
@@ -233,7 +260,7 @@ class JobMaskRequest(BaseModel):
     scene_id: str | None = None
     product_type: str | None = None
     mask_types: list[Literal["water", "cloud"]] = Field(default_factory=lambda: ["water"], min_length=1)
-    backend: Literal["auto", "heuristic", "omnicloudmask"] = "auto"
+    backend: Literal["auto", "omnicloudmask"] = "auto"
     threshold: float = Field(default=0.62, ge=0.0, le=1.0)
     overwrite: bool = True
     inference_device: str | None = None
@@ -246,16 +273,18 @@ class JobMaskRequest(BaseModel):
     @field_validator("mask_types")
     @classmethod
     def _normalize_mask_types(cls, values: list[str]) -> list[str]:
-        normalized: list[str] = []
-        for value in values:
-            candidate = str(value or "").strip().lower()
-            if candidate not in {"water", "cloud"}:
-                raise ValueError("mask_types must contain only 'water' and/or 'cloud'.")
-            if candidate not in normalized:
-                normalized.append(candidate)
+        normalized = _normalize_mask_type_values(values)
         if not normalized:
             raise ValueError("mask_types cannot be empty.")
         return normalized
+
+    @field_validator("backend", mode="before")
+    @classmethod
+    def _normalize_cloud_backend(cls, value: str | None) -> str:
+        candidate = str(value or "auto").strip().lower()
+        if candidate in {"heuristic", "default", "fallback"}:
+            return "omnicloudmask"
+        return candidate or "auto"
 
 
 class JobWaterMaskRequest(JobMaskRequest):
@@ -264,7 +293,7 @@ class JobWaterMaskRequest(JobMaskRequest):
 
 class JobCloudMaskRequest(JobMaskRequest):
     mask_types: list[Literal["cloud"]] = Field(default_factory=lambda: ["cloud"])
-    backend: Literal["auto", "heuristic", "omnicloudmask"] = "auto"
+    backend: Literal["auto", "omnicloudmask"] = "auto"
     include_shadows: bool = True
 
 

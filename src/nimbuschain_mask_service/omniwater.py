@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass
 import json
@@ -16,17 +17,24 @@ import numpy as np
 from nimbuschain_mask_service.io import (
     copy_source_zarr,
     delete_mask_layers,
+    local_path_for_uri,
     open_zarr_group,
     read_context,
     read_required_channels_window,
 )
 from nimbuschain_mask_service.sensor_mapping import SensorMaskSpec, resolve_sensor_mask_spec
+from nimbuschain_mask_service.runtime import (
+    batch_size_for_device,
+    normalize_device_name,
+    parallel_worker_count,
+    resolve_inference_device,
+)
 from nimbuschain_mask_service.writers import (
     finalize_water_outputs,
     prepare_water_output_arrays,
     write_water_mask_to_zarr,
 )
-from nimbuschain_zarr_service.core import ConversionDependencyError, ConversionError, _open_existing_output_store
+from nimbuschain_zarr_service.core import ConversionDependencyError, ConversionError
 
 
 _S2_INPUT_BANDS = ["B04", "B03", "B02", "B08"]
@@ -79,7 +87,10 @@ def apply_omniwatermask_to_zarr(
     fail_on_error: bool = False,
     stage_callback: Any = None,
 ) -> dict[str, Any]:
-    del inference_device
+    resolved_device = resolve_inference_device(
+        explicit=inference_device,
+        env_var="NIMBUS_WATERMASK_DEVICE",
+    )
     source_lineage_uri = str(source_zarr_uri or zarr_uri).strip()
     masked_zarr_uri = str(output_zarr_uri or "").strip() or source_lineage_uri
     storage_mode = _water_storage_mode(
@@ -176,6 +187,7 @@ def apply_omniwatermask_to_zarr(
                         cache_dir=cache_dir,
                         scene_dir=scene_dir,
                         tile_size=int(tile_manifest["tile_size"]),
+                        inference_device=resolved_device,
                     )
                     mask_paths = _normalize_mask_outputs(
                         mask_output,
@@ -204,6 +216,11 @@ def apply_omniwatermask_to_zarr(
                         threshold=float(plan.threshold or 0.0),
                         water_arr=water_arr,
                         water_prob_arr=water_prob_arr,
+                        inference_device=resolved_device,
+                        stage_callback=stage_callback,
+                        source_zarr_uri=source_lineage_uri,
+                        target_zarr_uri=prepared_output_zarr_uri,
+                        scene_id=scene_id,
                     )
                     runtime_mode = "heuristic_fallback"
                     input_bands = list(plan.fallback_bands)
@@ -215,6 +232,11 @@ def apply_omniwatermask_to_zarr(
                 threshold=float(plan.threshold or 0.0),
                 water_arr=water_arr,
                 water_prob_arr=water_prob_arr,
+                inference_device=resolved_device,
+                stage_callback=stage_callback,
+                source_zarr_uri=source_lineage_uri,
+                target_zarr_uri=prepared_output_zarr_uri,
+                scene_id=scene_id,
             )
             runtime_mode = "heuristic_fallback"
             input_bands = list(plan.fallback_bands)
@@ -235,6 +257,7 @@ def apply_omniwatermask_to_zarr(
                 "status_path": "",
                 "work_dir": "",
                 "runtime_mode": runtime_mode,
+                "inference_device": resolved_device,
                 "input_zarr_uri": source_lineage_uri,
                 "output_zarr_uri": prepared_output_zarr_uri,
                 "storage_mode": storage_mode,
@@ -456,8 +479,10 @@ def _export_rgbnir_tiles(
             f"({exc}). Ensure rasterio and zarr are installed."
         ) from exc
 
-    output_store = _open_existing_output_store(zarr_uri)
-    root = zarr.open_group(output_store, mode="r")
+    output_path = local_path_for_uri(zarr_uri)
+    if not output_path.exists():
+        raise ConversionError(f"Output store does not exist yet: {output_path}")
+    root = zarr.open_group(str(output_path), mode="r")
     imagery = root.get("imagery")
     if imagery is None:
         raise ConversionError("The target Zarr store does not contain an imagery array.")
@@ -573,43 +598,80 @@ def _run_omniwater_model(
     cache_dir: Path,
     scene_dir: Path,
     tile_size: int,
+    inference_device: str | None,
 ) -> Any:
+    device = resolve_inference_device(
+        explicit=inference_device,
+        env_var="NIMBUS_WATERMASK_DEVICE",
+    )
     kwargs: dict[str, Any] = {
         "scene_paths": scene_paths,
         "band_order": [1, 2, 3, 4],
         "output_dir": output_dir,
         "overwrite": True,
         "cache_dir": cache_dir,
-        "batch_size": 1,
-        "mosaic_device": "cpu",
-        "inference_device": "cpu",
+        "batch_size": batch_size_for_device(
+            device=device,
+            env_var="NIMBUS_WATERMASK_BATCH_SIZE",
+            cpu_default=1,
+            gpu_default=2,
+            hard_limit=8,
+        ),
+        "mosaic_device": device,
+        "inference_device": device,
         "inference_patch_size": min(_watermask_inference_patch_size(), tile_size),
         "inference_overlap_size": min(_watermask_inference_overlap_size(), max(0, tile_size - 1)),
         "destination_model_dir": _watermask_model_dir(scene_dir),
         "model_download_source": "hugging_face",
     }
     signature = getattr(make_water_mask, "__signature__", None)
+    inspect_module = None
     if signature is None:
         try:
             import inspect
 
+            inspect_module = inspect
             signature = inspect.signature(make_water_mask)
         except Exception:
             signature = None
+    else:
+        try:
+            import inspect
+
+            inspect_module = inspect
+        except Exception:
+            inspect_module = None
     accepted = set(signature.parameters.keys()) if signature is not None else set()
+    accepts_var_kwargs = False
+    if signature is not None and inspect_module is not None:
+        accepts_var_kwargs = any(
+            getattr(parameter, "kind", None) == inspect_module.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
     optional_kwargs = {
         "use_cache": False,
-        "use_osm_water": False,
-        "use_osm_building": False,
-        "use_osm_roads": False,
-        "optimise_model": False,
+        "use_osm_water": _bool_env("NIMBUS_WATERMASK_USE_OSM_WATER", default=True),
+        "use_osm_building": _bool_env("NIMBUS_WATERMASK_USE_OSM_BUILDING", default=True),
+        "use_osm_roads": _bool_env("NIMBUS_WATERMASK_USE_OSM_ROADS", default=True),
+        "optimise_model": normalize_device_name(device) in {"cuda", "mps"},
         "use_model": True,
         "use_ndwi": True,
     }
     for key, value in optional_kwargs.items():
-        if not accepted or key in accepted:
+        if accepts_var_kwargs or not accepted or key in accepted:
             kwargs[key] = value
     return make_water_mask(**kwargs)
+
+
+def _bool_env(name: str, *, default: bool) -> bool:
+    raw = str(os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _run_internal_ndwi(*, scene_paths: list[Path], output_dir: Path) -> list[Path]:
@@ -651,6 +713,11 @@ def _run_water_fallback_tiled(
     threshold: float,
     water_arr: Any,
     water_prob_arr: Any,
+    inference_device: str | None,
+    stage_callback: Any = None,
+    source_zarr_uri: str = "",
+    target_zarr_uri: str = "",
+    scene_id: str = "",
 ) -> dict[str, Any]:
     root = open_zarr_group(zarr_uri, mode="a")
     context = read_context(root, zarr_uri=zarr_uri)
@@ -667,61 +734,107 @@ def _run_water_fallback_tiled(
     cloud_blocked_pixels = 0
     probability_sum = 0.0
     effective_threshold = float(threshold)
-    for row_start in range(0, height, _watermask_tile_size()):
-        row_stop = min(height, row_start + _watermask_tile_size())
-        for col_start in range(0, width, _watermask_tile_size()):
-            col_stop = min(width, col_start + _watermask_tile_size())
-            try:
-                channels_result = read_required_channels_window(
-                    root,
-                    band_names=context.band_names,
-                    required_bands=sensor.water_fallback_bands,
-                    scale_hint=sensor.scale_hint,
-                    row_start=row_start,
-                    row_stop=row_stop,
-                    col_start=col_start,
-                    col_stop=col_stop,
-                    normalize=True,
-                    include_validity=True,
-                )
-            except TypeError as exc:
-                if "include_validity" not in str(exc):
-                    raise
-                channels_result = read_required_channels_window(
-                    root,
-                    band_names=context.band_names,
-                    required_bands=sensor.water_fallback_bands,
-                    scale_hint=sensor.scale_hint,
-                    row_start=row_start,
-                    row_stop=row_stop,
-                    col_start=col_start,
-                    col_stop=col_stop,
-                    normalize=True,
-                )
-            if len(channels_result) == 3:
-                channels, _missing, valid_mask = channels_result
-            else:
-                channels, _missing = channels_result
-                valid_mask = None
-            cloud_window = None
-            if cloud_arr is not None:
-                cloud_window = np.asarray(
-                    cloud_arr[0, row_start:row_stop, col_start:col_stop],
-                    dtype=np.uint8,
-                )
-            probability_tile, mask_tile, tile_summary = _run_water_fallback_window(
-                sensor=sensor,
-                channels=channels,
-                threshold=effective_threshold,
-                cloud_mask=cloud_window,
-                valid_mask=valid_mask,
+    tile_size = _watermask_tile_size()
+    windows = [
+        (
+            row_start,
+            min(height, row_start + tile_size),
+            col_start,
+            min(width, col_start + tile_size),
+        )
+        for row_start in range(0, height, tile_size)
+        for col_start in range(0, width, tile_size)
+    ]
+    tile_workers = parallel_worker_count(
+        device=resolve_inference_device(explicit=inference_device, env_var="NIMBUS_WATERMASK_DEVICE"),
+        env_var="NIMBUS_WATERMASK_TILE_WORKERS",
+        cpu_default=2,
+        gpu_default=1,
+        hard_limit=4,
+    )
+
+    def process_window(window: tuple[int, int, int, int]) -> tuple[tuple[int, int, int, int], np.ndarray, np.ndarray, dict[str, Any]]:
+        row_start, row_stop, col_start, col_stop = window
+        try:
+            channels_result = read_required_channels_window(
+                root,
+                band_names=context.band_names,
+                required_bands=sensor.water_fallback_bands,
+                scale_hint=sensor.scale_hint,
+                row_start=row_start,
+                row_stop=row_stop,
+                col_start=col_start,
+                col_stop=col_stop,
+                normalize=True,
+                include_validity=True,
             )
+        except TypeError as exc:
+            if "include_validity" not in str(exc):
+                raise
+            channels_result = read_required_channels_window(
+                root,
+                band_names=context.band_names,
+                required_bands=sensor.water_fallback_bands,
+                scale_hint=sensor.scale_hint,
+                row_start=row_start,
+                row_stop=row_stop,
+                col_start=col_start,
+                col_stop=col_stop,
+                normalize=True,
+            )
+        if len(channels_result) == 3:
+            channels, _missing, valid_mask = channels_result
+        else:
+            channels, _missing = channels_result
+            valid_mask = None
+        cloud_window = None
+        if cloud_arr is not None:
+            cloud_window = np.asarray(
+                cloud_arr[0, row_start:row_stop, col_start:col_stop],
+                dtype=np.uint8,
+            )
+        probability_tile, mask_tile, tile_summary = _run_water_fallback_window(
+            sensor=sensor,
+            channels=channels,
+            threshold=effective_threshold,
+            cloud_mask=cloud_window,
+            valid_mask=valid_mask,
+        )
+        return window, probability_tile, mask_tile, tile_summary
+
+    if tile_workers <= 1 or len(windows) <= 1:
+        results_iter = map(process_window, windows)
+    else:
+        executor = ThreadPoolExecutor(max_workers=tile_workers, thread_name_prefix="water-mask")
+        results_iter = executor.map(process_window, windows)
+
+    tile_index = 0
+    try:
+        for window, probability_tile, mask_tile, tile_summary in results_iter:
+            row_start, row_stop, col_start, col_stop = window
+            tile_index += 1
             water_arr[0, row_start:row_stop, col_start:col_stop] = mask_tile
             water_prob_arr[0, row_start:row_stop, col_start:col_stop] = probability_tile
             water_pixels += int(np.asarray(mask_tile, dtype=np.uint64).sum())
             probability_sum += float(np.asarray(probability_tile, dtype=np.float64).sum())
             cloud_blocked_pixels += int(tile_summary["cloud_blocked_pixels"])
             valid_pixels_total += int(tile_summary.get("valid_pixels") or 0)
+
+            if stage_callback is not None and (tile_index == 1 or tile_index == len(windows) or tile_index % 8 == 0):
+                stage_callback(
+                    "water_masking_progress",
+                    {
+                        "zarr_uri": source_zarr_uri,
+                        "output_zarr_uri": target_zarr_uri,
+                        "scene_id": scene_id,
+                        "tiles_completed": tile_index,
+                        "tiles_total": len(windows),
+                        "progress": round(tile_index / max(1, len(windows)), 4),
+                    },
+                )
+    finally:
+        if tile_workers > 1 and len(windows) > 1:
+            executor.shutdown(wait=True)
 
     denominator = max(1, valid_pixels_total or total_pixels)
     return {
@@ -734,6 +847,7 @@ def _run_water_fallback_tiled(
         "probability_source": "water_score",
         "cloud_blocked_fraction": float(cloud_blocked_pixels / denominator),
         "valid_pixel_fraction": float(denominator / total_pixels),
+        "tile_workers": tile_workers,
     }
 
 
@@ -1097,7 +1211,7 @@ def _water_storage_mode(*, source_zarr_uri: str, output_zarr_uri: str) -> str:
 
 
 def _masked_zarr_output_uri(*, source_zarr_uri: str, scene_dir: Path, scene_id: str) -> str:
-    source_path = Path(str(source_zarr_uri).strip())
+    source_path = local_path_for_uri(source_zarr_uri)
     safe_scene_id = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in scene_id).strip("._")
     safe_scene_id = safe_scene_id or "unknown_scene"
     if source_path.suffix == ".zarr":
@@ -1117,8 +1231,8 @@ def _prepare_masked_zarr_copy(*, source_zarr_uri: str, output_zarr_uri: str) -> 
 
 
 def _prepare_masked_zarr_output(*, source_zarr_uri: str, output_zarr_uri: str, overwrite: bool = True) -> str:
-    source_path = Path(str(source_zarr_uri).strip())
-    output_path = Path(str(output_zarr_uri).strip())
+    source_path = local_path_for_uri(source_zarr_uri)
+    output_path = local_path_for_uri(output_zarr_uri)
     if source_path.resolve() == output_path.resolve():
         if not output_path.exists():
             raise ConversionError(f"Masked Zarr store not found: {output_zarr_uri}")
@@ -1129,7 +1243,7 @@ def _prepare_masked_zarr_output(*, source_zarr_uri: str, output_zarr_uri: str, o
 
 
 def _cleanup_masked_zarr_copy(output_zarr_uri: str) -> None:
-    target = Path(str(output_zarr_uri).strip())
+    target = local_path_for_uri(output_zarr_uri)
     try:
         if target.exists():
             shutil.rmtree(target)
@@ -1272,10 +1386,12 @@ def _sync_zarr_mask_attrs(*, zarr_uri: str, payload: dict[str, Any]) -> None:
         return
 
     try:
-        output_store = _open_existing_output_store(zarr_uri)
+        output_path = local_path_for_uri(zarr_uri)
+        if not output_path.exists():
+            return
     except ConversionError:
         return
-    root = zarr.open_group(output_store, mode="a", zarr_format=2)
+    root = zarr.open_group(str(output_path), mode="a", zarr_format=2)
     root.attrs["water_mask_status"] = str(payload.get("status") or "")
     root.attrs["water_mask_reason"] = str(payload.get("reason") or "")
     root.attrs["water_mask_status_path"] = str(payload.get("status_path") or "")
@@ -1283,4 +1399,4 @@ def _sync_zarr_mask_attrs(*, zarr_uri: str, payload: dict[str, Any]) -> None:
     root.attrs["water_mask_work_dir"] = str(payload.get("work_dir") or "")
     if str(payload.get("status") or "").strip().lower() != "written":
         root.attrs["water_mask_written"] = False
-    zarr.consolidate_metadata(output_store)
+    zarr.consolidate_metadata(root.store)

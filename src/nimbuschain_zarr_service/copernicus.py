@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,7 @@ def convert_copernicus_to_zarr(
     scene_id: str,
     output_uri: str,
     product_type: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
     extracted = prepare_source(raw_uri, label="copernicus")
     try:
@@ -148,6 +150,7 @@ def convert_copernicus_to_zarr(
                 output_uri=output_uri,
                 product_type=product_type,
                 requested_scene_id=scene_id,
+                progress_callback=progress_callback,
             )
         if data_family == "sar":
             s1_product_type = _s1_product_type(resolved_scene_id, requested=product_type)
@@ -327,6 +330,7 @@ def _convert_sentinel2_to_zarr(
     output_uri: str,
     product_type: str | None = None,
     requested_scene_id: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
     imagery_paths, ancillary_paths, s2_product_type = _prepare_sentinel2_layers(
         extracted,
@@ -359,6 +363,7 @@ def _convert_sentinel2_to_zarr(
         ancillary_band_paths=ancillary_paths,
         ancillary_layer_names=ordered_ancillary,
         ancillary_categorical_layers=_S2_CATEGORICAL_LAYER_TOKENS.intersection(ordered_ancillary),
+        progress_callback=progress_callback,
     )
     summary = _summarize_optical_product(
         provider=provider,

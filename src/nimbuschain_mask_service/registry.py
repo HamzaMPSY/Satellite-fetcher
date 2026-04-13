@@ -57,7 +57,7 @@ def list_backends(kind: str) -> list[BackendDescriptor]:
 def resolve_cloud_backend(name: str | None) -> BackendDescriptor:
     requested = str(name or "auto").strip().lower()
     if requested in {"", "auto"}:
-        requested = "omnicloudmask" if omnicloudmask_backend.available() else "heuristic"
+        requested = "omnicloudmask"
     module = _CLOUD_BACKENDS.get(requested)
     if module is None:
         raise ValueError(f"Unsupported cloud backend: {name}")

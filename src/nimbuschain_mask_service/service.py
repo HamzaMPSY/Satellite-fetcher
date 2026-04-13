@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,10 +15,13 @@ from nimbuschain_mask_service.io import (
     cleanup_derived_zarr,
     copy_source_zarr,
     delete_mask_layers,
+    local_path_for_uri,
     open_zarr_group,
     read_context,
     read_required_channels_window,
 )
+from nimbuschain_mask_service.inference import CloudMaskResult
+from nimbuschain_mask_service.runtime import parallel_worker_count, resolve_inference_device, runtime_device_status
 from nimbuschain_mask_service.sensor_mapping import resolve_sensor_mask_spec
 from nimbuschain_mask_service.writer import (
     finalize_cloud_outputs,
@@ -148,7 +151,11 @@ class MaskService:
 
         cloud_written = str(cloud_mask.get("status") or "").strip().lower() == "written"
         if "water" in normalized_mask_types and ("cloud" not in normalized_mask_types or cloud_written):
-            water_input_zarr_uri = masked_zarr_uri if ("cloud" in normalized_mask_types and Path(masked_zarr_uri).exists()) else zarr_uri
+            water_input_zarr_uri = (
+                masked_zarr_uri
+                if ("cloud" in normalized_mask_types and local_path_for_uri(masked_zarr_uri).exists())
+                else zarr_uri
+            )
             water_mask = self.apply_omniwater_to_zarr(
                 job_id=job_id,
                 zarr_uri=water_input_zarr_uri,
@@ -181,7 +188,7 @@ class MaskService:
                 masked_zarr_uri,
                 layer_names=_requested_mask_layer_names(normalized_mask_types),
             )
-        masked_outputs = [masked_zarr_uri] if status == "written" and Path(masked_zarr_uri).exists() else []
+        masked_outputs = [masked_zarr_uri] if status == "written" and local_path_for_uri(masked_zarr_uri).exists() else []
         target_zarr_uri = masked_outputs[0] if masked_outputs else None
         return {
             "status": status,
@@ -218,7 +225,8 @@ class MaskService:
         include_shadows: bool = True,
     ) -> dict[str, Any]:
         target_zarr_uri = str(output_zarr_uri or source_zarr_uri).strip()
-        output_path = Path(target_zarr_uri)
+        source_path = local_path_for_uri(source_zarr_uri)
+        output_path = local_path_for_uri(target_zarr_uri)
         storage_mode = _storage_mode_for_paths(
             source_zarr_uri=source_zarr_uri,
             output_zarr_uri=target_zarr_uri,
@@ -233,7 +241,7 @@ class MaskService:
                         "scene_id": scene_id,
                     },
                 )
-            if not output_path.exists() and Path(source_zarr_uri).resolve() != output_path.resolve():
+            if not output_path.exists() and source_path.resolve() != output_path.resolve():
                 copy_source_zarr(source_zarr_uri=source_zarr_uri, output_zarr_uri=target_zarr_uri)
             root = open_zarr_group(target_zarr_uri, mode="a")
             context = read_context(root, zarr_uri=target_zarr_uri)
@@ -242,7 +250,11 @@ class MaskService:
                 collection=collection or context.collection,
                 product_type=product_type or context.product_type,
             )
-            backend_descriptor = resolve_cloud_backend(backend)
+            backend_request = _effective_cloud_backend_request(
+                backend=backend,
+                inference_device=inference_device,
+            )
+            backend_descriptor = resolve_cloud_backend(backend_request)
             backend_name = backend_descriptor.name
             effective_threshold = _effective_cloud_threshold(
                 sensor=sensor,
@@ -305,6 +317,7 @@ class MaskService:
                 "mask_source": str(inference_summary.get("mask_source") or ""),
                 "probability_source": str(inference_summary.get("probability_source") or ""),
                 "sensor_recipe": sensor.sensor_key,
+                "backend_request": str(backend_request or backend or "auto"),
             }
             if stage_callback is not None:
                 stage_callback(
@@ -396,6 +409,10 @@ def support_status() -> dict[str, Any]:
             item.get("name") == "omnicloudmask" and bool(item.get("available"))
             for item in list(registry.get("cloud") or [])
         ),
+        "runtime": {
+            "cloud": runtime_device_status(explicit=None, env_var="NIMBUS_CLOUDMASK_DEVICE"),
+            "water": runtime_device_status(explicit=None, env_var="NIMBUS_WATERMASK_DEVICE"),
+        },
         "registry": registry,
     }
 
@@ -403,7 +420,7 @@ def support_status() -> dict[str, Any]:
 def _resolved_cloud_backend(backend: str | None) -> str:
     value = str(backend or "auto").strip().lower()
     if value in {"", "auto"}:
-        return "omnicloudmask" if importlib.util.find_spec("omnicloudmask") is not None else "heuristic"
+        return "omnicloudmask"
     return value
 
 
@@ -495,7 +512,7 @@ def _cloudmask_scene_dir(*, job_id: str | None, scene_id: str) -> Path:
 
 
 def _derived_zarr_uri(*, source_zarr_uri: str, scene_id: str, mask_types: list[str]) -> str:
-    source_path = Path(str(source_zarr_uri).strip())
+    source_path = local_path_for_uri(source_zarr_uri)
     suffix = "-".join(mask_types)
     if source_path.suffix == ".zarr":
         if source_path.parent.name.lower() == "zarr":
@@ -559,20 +576,34 @@ def _run_cloud_inference_tiled(
     shadow_pixels = 0
     cloud_only_pixels = 0
     tile_index = 0
-    total_tiles = ((height + _cloud_tile_size() - 1) // _cloud_tile_size()) * (
-        (width + _cloud_tile_size() - 1) // _cloud_tile_size()
-    )
-
     required_bands = backend_descriptor.required_bands(sensor)
     normalize = backend_descriptor.normalize_inputs(sensor)
     confidence_available = False
     class_histogram: dict[str, int] = {}
     mask_source = "class_map" if backend_descriptor.name == "omnicloudmask" else "threshold"
     probability_source = "class_map" if backend_descriptor.name == "omnicloudmask" else "heuristic_score"
-    tile_size = _cloud_tile_size()
+    try:
+        tile_size = _cloud_tile_size(backend_name=str(backend_descriptor.name))
+    except TypeError as exc:
+        if "backend_name" not in str(exc):
+            raise
+        tile_size = _cloud_tile_size()
     total_tiles = ((height + tile_size - 1) // tile_size) * ((width + tile_size - 1) // tile_size)
-    for row_start, row_stop, col_start, col_stop in _iter_windows(height=height, width=width, tile_size=tile_size):
-        tile_index += 1
+    resolved_device = resolve_inference_device(
+        explicit=inference_device,
+        env_var="NIMBUS_CLOUDMASK_DEVICE",
+    )
+    tile_workers = parallel_worker_count(
+        device=resolved_device,
+        env_var="NIMBUS_CLOUDMASK_TILE_WORKERS",
+        cpu_default=1 if str(backend_descriptor.name) == "omnicloudmask" else 2,
+        gpu_default=1,
+        hard_limit=4,
+    )
+    windows = list(_iter_windows(height=height, width=width, tile_size=tile_size))
+
+    def process_window(window: tuple[int, int, int, int]) -> tuple[tuple[int, int, int, int], Any]:
+        row_start, row_stop, col_start, col_stop = window
         try:
             channels_result = read_required_channels_window(
                 root,
@@ -605,13 +636,35 @@ def _run_cloud_inference_tiled(
         else:
             channels, _missing = channels_result
             valid_mask = None
+        if valid_mask is not None and not bool(np.asarray(valid_mask, dtype=bool).any()):
+            tile_height = row_stop - row_start
+            tile_width = col_stop - col_start
+            zeros_probability = np.zeros((tile_height, tile_width), dtype=np.float32)
+            zeros_mask = np.zeros((tile_height, tile_width), dtype=np.uint8)
+            return window, CloudMaskResult(
+                probability=zeros_probability,
+                mask=zeros_mask,
+                summary={
+                    "backend": backend_descriptor.name,
+                    "sensor": sensor.sensor_key,
+                    "cloud_fraction": 0.0,
+                    "cloud_only_fraction": 0.0,
+                    "shadow_fraction": 0.0,
+                    "includes_shadows": bool(include_shadows),
+                    "valid_pixels": 0,
+                    "mask_source": "class_map" if backend_descriptor.name == "omnicloudmask" else "threshold",
+                    "probability_source": "class_map" if backend_descriptor.name == "omnicloudmask" else "heuristic_score",
+                    "confidence_available": False,
+                    "class_histogram": {},
+                },
+            )
         try:
             result = run_cloud_inference(
                 sensor=sensor,
                 channels=channels,
                 threshold=threshold,
                 backend=backend_descriptor.name,
-                inference_device=inference_device,
+                inference_device=resolved_device,
                 include_shadows=include_shadows,
                 valid_mask=valid_mask,
             )
@@ -623,38 +676,53 @@ def _run_cloud_inference_tiled(
                 channels=channels,
                 threshold=threshold,
                 backend=backend_descriptor.name,
-                inference_device=inference_device,
+                inference_device=resolved_device,
                 include_shadows=include_shadows,
             )
-        cloud_arr[0, row_start:row_stop, col_start:col_stop] = result.mask
-        cloud_prob_arr[0, row_start:row_stop, col_start:col_stop] = result.probability
-        cloud_pixels += int(np.asarray(result.mask, dtype=np.uint64).sum())
-        tile_pixels = max(
-            1,
-            int(result.summary.get("valid_pixels") or 0)
-            or (row_stop - row_start) * (col_stop - col_start),
-        )
-        valid_pixels_total += tile_pixels
-        shadow_pixels += int(round(float(result.summary.get("shadow_fraction") or 0.0) * tile_pixels))
-        cloud_only_pixels += int(round(float(result.summary.get("cloud_only_fraction") or 0.0) * tile_pixels))
-        confidence_available = confidence_available or bool(result.summary.get("confidence_available"))
-        mask_source = str(result.summary.get("mask_source") or mask_source)
-        probability_source = str(result.summary.get("probability_source") or probability_source)
-        for key, value in dict(result.summary.get("class_histogram") or {}).items():
-            class_histogram[str(key)] = int(class_histogram.get(str(key), 0)) + int(value)
+        return window, result
 
-        if stage_callback is not None and (tile_index == 1 or tile_index == total_tiles or tile_index % 8 == 0):
-            stage_callback(
-                "cloud_masking_progress",
-                {
-                    "zarr_uri": source_zarr_uri,
-                    "output_zarr_uri": target_zarr_uri,
-                    "scene_id": scene_id,
-                    "tiles_completed": tile_index,
-                    "tiles_total": total_tiles,
-                    "progress": round(tile_index / max(1, total_tiles), 4),
-                },
+    if tile_workers <= 1 or len(windows) <= 1:
+        results_iter = map(process_window, windows)
+    else:
+        executor = ThreadPoolExecutor(max_workers=tile_workers, thread_name_prefix="cloud-mask")
+        results_iter = executor.map(process_window, windows)
+
+    try:
+        for window, result in results_iter:
+            row_start, row_stop, col_start, col_stop = window
+            tile_index += 1
+            cloud_arr[0, row_start:row_stop, col_start:col_stop] = result.mask
+            cloud_prob_arr[0, row_start:row_stop, col_start:col_stop] = result.probability
+            cloud_pixels += int(np.asarray(result.mask, dtype=np.uint64).sum())
+            tile_pixels = max(
+                1,
+                int(result.summary.get("valid_pixels") or 0)
+                or (row_stop - row_start) * (col_stop - col_start),
             )
+            valid_pixels_total += tile_pixels
+            shadow_pixels += int(round(float(result.summary.get("shadow_fraction") or 0.0) * tile_pixels))
+            cloud_only_pixels += int(round(float(result.summary.get("cloud_only_fraction") or 0.0) * tile_pixels))
+            confidence_available = confidence_available or bool(result.summary.get("confidence_available"))
+            mask_source = str(result.summary.get("mask_source") or mask_source)
+            probability_source = str(result.summary.get("probability_source") or probability_source)
+            for key, value in dict(result.summary.get("class_histogram") or {}).items():
+                class_histogram[str(key)] = int(class_histogram.get(str(key), 0)) + int(value)
+
+            if stage_callback is not None and (tile_index == 1 or tile_index == total_tiles or tile_index % 8 == 0):
+                stage_callback(
+                    "cloud_masking_progress",
+                    {
+                        "zarr_uri": source_zarr_uri,
+                        "output_zarr_uri": target_zarr_uri,
+                        "scene_id": scene_id,
+                        "tiles_completed": tile_index,
+                        "tiles_total": total_tiles,
+                        "progress": round(tile_index / max(1, total_tiles), 4),
+                    },
+                )
+    finally:
+        if tile_workers > 1 and len(windows) > 1:
+            executor.shutdown(wait=True)
 
     total_pixels = max(1, valid_pixels_total or total_pixels)
     cloud_fraction = float(cloud_pixels / total_pixels)
@@ -674,8 +742,9 @@ def _run_cloud_inference_tiled(
             "cloud_only_fraction": float(cloud_only_pixels / total_pixels),
             "shadow_fraction": float(shadow_pixels / total_pixels),
             "includes_shadows": bool(include_shadows),
-            "tile_size": _cloud_tile_size(),
+            "tile_size": tile_size,
             "tiles_total": total_tiles,
+            "tile_workers": tile_workers,
             "confidence_available": confidence_available,
             "class_histogram": class_histogram,
             "mask_source": mask_source,
@@ -693,8 +762,9 @@ def _run_cloud_inference_tiled(
             "cloud_only_fraction": float(cloud_only_pixels / total_pixels),
             "shadow_fraction": float(shadow_pixels / total_pixels),
             "includes_shadows": bool(include_shadows),
-            "tile_size": _cloud_tile_size(),
+            "tile_size": tile_size,
             "tiles_total": total_tiles,
+            "tile_workers": tile_workers,
             "confidence_available": confidence_available,
             "class_histogram": class_histogram,
             "mask_source": mask_source,
@@ -797,12 +867,20 @@ def _safe_component(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(value).strip()).strip("._") or "unknown"
 
 
-def _cloud_tile_size() -> int:
+def _effective_cloud_backend_request(*, backend: str | None, inference_device: str | None) -> str:
+    del inference_device
+    requested = str(backend or "auto").strip().lower()
+    if requested in {"", "auto"}:
+        return "omnicloudmask"
+    return requested
+
+
+def _cloud_tile_size(*, backend_name: str | None = None) -> int:
     raw = str(os.getenv("NIMBUS_CLOUDMASK_TILE_SIZE") or "").strip()
     try:
-        value = int(raw) if raw else 2048
+        value = int(raw) if raw else 1024
     except ValueError:
-        value = 2048
+        value = 1024
     return max(256, min(value, 2048))
 
 

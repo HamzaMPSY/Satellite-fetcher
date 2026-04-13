@@ -8,11 +8,19 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class CloudMaskOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    backend: Literal["auto", "heuristic", "omnicloudmask"] = "auto"
+    backend: Literal["auto", "omnicloudmask"] = "auto"
     threshold: float = Field(default=0.45, ge=0.0, le=1.0)
     overwrite: bool = True
     inference_device: str | None = None
     include_shadows: bool = True
+
+    @field_validator("backend", mode="before")
+    @classmethod
+    def _normalize_legacy_backend(cls, value: str | None) -> str:
+        candidate = str(value or "auto").strip().lower()
+        if candidate in {"heuristic", "default", "fallback"}:
+            return "omnicloudmask"
+        return candidate or "auto"
 
 
 class WaterMaskOptions(BaseModel):
@@ -38,7 +46,7 @@ class MaskApplyRequest(BaseModel):
     fail_on_error: bool = False
     cloud: CloudMaskOptions = Field(default_factory=CloudMaskOptions)
     water: WaterMaskOptions = Field(default_factory=WaterMaskOptions)
-    backend: Literal["auto", "heuristic", "omnicloudmask"] | None = None
+    backend: Literal["auto", "omnicloudmask"] | None = None
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     overwrite: bool | None = None
     inference_device: str | None = None
@@ -90,6 +98,16 @@ class MaskApplyRequest(BaseModel):
         if not normalized:
             raise ValueError("mask_types cannot be empty.")
         return normalized
+
+    @field_validator("backend", mode="before")
+    @classmethod
+    def _normalize_legacy_top_level_backend(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = str(value or "").strip().lower()
+        if candidate in {"heuristic", "default", "fallback"}:
+            return "omnicloudmask"
+        return candidate or None
 
     @model_validator(mode="after")
     def _merge_legacy_top_level_fields(self) -> "MaskApplyRequest":

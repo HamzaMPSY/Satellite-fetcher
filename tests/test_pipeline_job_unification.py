@@ -61,7 +61,21 @@ class FakeZarrConverter:
         raw_uri: str,
         output_uri: str,
         product_type: str | None = None,
+        progress_callback=None,
     ) -> tuple[str, str, dict[str, object], dict[str, object]]:
+        if progress_callback is not None:
+            for index, fraction in enumerate((0.2, 0.5, 0.8, 1.0), start=1):
+                progress_callback(
+                    {
+                        "stage": "writing_chunks",
+                        "array_name": "product",
+                        "source_array_name": "imagery",
+                        "fraction": fraction,
+                        "blocks_written": index,
+                        "total_blocks": 4,
+                        "band_name": "B04",
+                    }
+                )
         store_path = Path(output_uri)
         store_path.mkdir(parents=True, exist_ok=True)
         (store_path / "zarr.json").write_text(
@@ -361,21 +375,22 @@ def _wait_for_completion(client: NimbusFetcherClient, job_id: str, timeout_secon
     pytest.fail(f"Job {job_id} did not finish in time. Last status: {last_status}")
 
 
-def _request_payload() -> SearchDownloadRequest:
-    return SearchDownloadRequest.model_validate(
-        {
-            "job_type": "search_download",
-            "provider": ProviderName.copernicus,
-            "collection": "SENTINEL-2",
-            "product_type": "S2MSI2A",
-            "start_date": date(2026, 1, 1),
-            "end_date": date(2026, 1, 2),
-            "aoi": {
-                "wkt": "POLYGON((2.30 48.80, 2.30 48.90, 2.40 48.90, 2.40 48.80, 2.30 48.80))"
-            },
-            "output_dir": "integration/unified-pipeline",
-        }
-    )
+def _request_payload(mask_types: list[str] | None = None) -> SearchDownloadRequest:
+    payload = {
+        "job_type": "search_download",
+        "provider": ProviderName.copernicus,
+        "collection": "SENTINEL-2",
+        "product_type": "S2MSI2A",
+        "start_date": date(2026, 1, 1),
+        "end_date": date(2026, 1, 2),
+        "aoi": {
+            "wkt": "POLYGON((2.30 48.80, 2.30 48.90, 2.40 48.90, 2.40 48.80, 2.30 48.80))"
+        },
+        "output_dir": "integration/unified-pipeline",
+    }
+    if mask_types:
+        payload["mask_types"] = mask_types
+    return SearchDownloadRequest.model_validate(payload)
 
 
 def _write_local_zarr_store(
@@ -461,6 +476,40 @@ def test_single_job_runs_download_and_zarr_in_one_pipeline(pipeline_runtime) -> 
     assert "job.zarr_written" in event_types
 
 
+def test_single_job_can_continue_with_integrated_masking(pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+
+    fetcher._mask_service = RemoteLikeMaskService(fetcher)
+
+    job_id = client.submit_job(_request_payload(mask_types=["water", "cloud"]))
+    final_status = _wait_for_completion(client, job_id)
+    result = client.get_result(job_id)
+
+    assert final_status.state == JobState.succeeded
+    assert final_status.pipeline_state == PipelineState.masked_zarr_written
+    assert final_status.raw_outputs
+    assert final_status.zarr_outputs
+    assert final_status.masked_zarr_outputs == []
+
+    assert result.job_id == job_id
+    assert result.raw_outputs == final_status.raw_outputs
+    assert result.zarr_outputs == final_status.zarr_outputs
+    assert result.masked_zarr_outputs == []
+    assert result.metadata["mask"]["status"] == "written"
+    assert result.metadata["mask"]["mask_types"] == ["water", "cloud"]
+    assert result.pipeline_metadata["mask_mode"] == "integrated"
+    assert result.pipeline_metadata["mask_status"] == "written"
+
+    jobs = client.list_jobs(page=1, page_size=20)
+    assert jobs.total == 1, "Integrated masking must stay on the original fetch job."
+
+    event_types = {row["type"] for row in fetcher.store.list_events(job_id, None, 200)}
+    assert "job.zarr_written" in event_types
+    assert "job.mask_completed" in event_types
+    assert "job.succeeded" in event_types
+
+
 def test_download_progress_updates_are_throttled_to_coarser_intervals() -> None:
     assert NimbusFetcher._should_emit_download_progress(
         delta=1024,
@@ -494,6 +543,55 @@ def test_download_progress_updates_are_throttled_to_coarser_intervals() -> None:
         last_progress=0.1,
         bytes_total=1024 * 1024 * 1024,
     )
+
+
+def test_zarr_conversion_defaults_to_single_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NIMBUS_ZARR_CONVERT_MAX_WORKERS", raising=False)
+    assert NimbusFetcher._zarr_convert_max_workers(total=4) == 1
+
+    monkeypatch.setenv("NIMBUS_ZARR_CONVERT_MAX_WORKERS", "2")
+    assert NimbusFetcher._zarr_convert_max_workers(total=4) == 2
+
+
+def test_zarr_conversion_emits_incremental_pipeline_progress(
+    pipeline_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+    settings = pipeline_runtime["settings"]
+
+    progress_samples: list[tuple[str | None, float | None]] = []
+
+    def _capture_update(_job_id: str, **kwargs) -> None:
+        progress_samples.append(
+            (
+                kwargs.get("pipeline_step"),
+                kwargs.get("pipeline_progress"),
+            )
+        )
+
+    monkeypatch.setattr(fetcher, "_update_pipeline", _capture_update)
+    monkeypatch.setattr(fetcher, "_register_zarr_artifact", lambda **_kwargs: None)
+    monkeypatch.delenv("NIMBUS_ZARR_CONVERT_MAX_WORKERS", raising=False)
+
+    raw_uri = str(settings.nimbus_data_dir / "raw" / "S2A_MSIL2A_FAKE_SCENE.SAFE.zip")
+    zarr_outputs, metadata = fetcher._convert_raw_outputs(
+        job_id="job-progress",
+        provider_name="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        raw_outputs=[raw_uri],
+        is_cancelled=lambda: False,
+    )
+
+    assert zarr_outputs
+    assert metadata["parallel_workers"] == 1
+    chunk_progress_values = [
+        progress
+        for step, progress in progress_samples
+        if step == "writing_chunks" and progress is not None
+    ]
+    assert any(0.0 < float(progress) < 85.0 for progress in chunk_progress_values)
 
 
 def test_manual_conversion_route_reuses_existing_job_lineage(pipeline_runtime) -> None:

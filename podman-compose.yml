@@ -24,6 +24,7 @@ x-runtime-env: &runtime-env
 
 x-runtime-volumes: &runtime-volumes
   - ./data:/data
+  - ./docs:/app/docs:ro
   - ./src:/app/src
 
 services:

@@ -6,7 +6,7 @@ from email.utils import parsedate_to_datetime
 import re
 from pathlib import Path
 from time import monotonic
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import unquote
 
 import aiohttp
@@ -16,9 +16,10 @@ class DownloadCancelled(Exception):
     """Raised when a download batch is cancelled."""
 
 
-ProgressCallback = Callable[[str, int, int, int | None], None]
+ProgressContext = dict[str, Any]
+ProgressCallback = Callable[[str, int, int, int | None, ProgressContext | None], None]
 CancelChecker = Callable[[], bool]
-RetryCallback = Callable[[str, int, str, float | None], None]
+RetryCallback = Callable[[str, int, str, float | None, ProgressContext | None], None]
 
 
 class DownloadManager:
@@ -27,16 +28,16 @@ class DownloadManager:
     def __init__(
         self,
         *,
-        max_concurrent: int = 4,
+        max_concurrent: int = 2,
         max_retries: int = 5,
-        initial_delay: float = 1.5,
-        backoff_factor: float = 1.7,
+        initial_delay: float = 2.0,
+        backoff_factor: float = 1.5,
         max_retry_delay: float = 120.0,
-        connect_timeout: float = 20,
+        connect_timeout: float = 30,
         read_timeout: float | None = None,
-        chunk_size: int = 1024 * 1024,
-        max_connections: int | None = None,
-        max_connections_per_host: int | None = None,
+        chunk_size: int = 128 * 1024,
+        max_connections: int | None = 50,
+        max_connections_per_host: int | None = 2,
         enable_resume: bool = True,
         min_resume_size: int = 1024 * 1024,
         gateway_timeout_retries: int = 3,
@@ -68,8 +69,13 @@ class DownloadManager:
     def download_products(self, product_ids: dict, output_dir: str = "downloads") -> list[str]:
         urls: list[str] = product_ids.get("urls", [])
         file_names: list[str] = product_ids.get("file_names", [])
+        contexts: list[ProgressContext | None] = product_ids.get("contexts", [])
         if not urls or len(urls) != len(file_names):
             raise ValueError("Invalid product_ids payload: urls/file_names mismatch.")
+        if contexts and len(contexts) != len(file_names):
+            raise ValueError("Invalid product_ids payload: contexts/file_names mismatch.")
+        if not contexts:
+            contexts = [None for _ in file_names]
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -105,6 +111,7 @@ class DownloadManager:
         headers = dict(product_ids.get("headers", {}))
         urls: list[str] = product_ids["urls"]
         file_names: list[str] = product_ids["file_names"]
+        contexts: list[ProgressContext | None] = list(product_ids.get("contexts", [None for _ in file_names]))
         refresh_token_callback = product_ids.get("refresh_token_callback")
 
         async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=True) as session:
@@ -114,11 +121,12 @@ class DownloadManager:
                     semaphore=semaphore,
                     url=url,
                     file_name=file_name,
+                    context=context,
                     output_dir=output_dir,
                     headers=headers,
                     refresh_token_callback=refresh_token_callback,
                 )
-                for url, file_name in zip(urls, file_names)
+                for url, file_name, context in zip(urls, file_names, contexts)
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -152,6 +160,7 @@ class DownloadManager:
         semaphore: asyncio.Semaphore,
         url: str,
         file_name: str,
+        context: ProgressContext | None,
         output_dir: Path,
         headers: dict,
         refresh_token_callback: Callable[[], str] | None,
@@ -171,6 +180,7 @@ class DownloadManager:
                         session=session,
                         url=url,
                         file_name=file_name,
+                        context=context,
                         output_dir=output_dir,
                         headers=headers,
                     )
@@ -179,7 +189,7 @@ class DownloadManager:
             except _RetryableHttpError as exc:
                 last_error = exc
                 if self.retry_callback is not None:
-                    self.retry_callback(file_name, attempt, f"http_{exc.status}", exc.retry_after)
+                    self.retry_callback(file_name, attempt, f"http_{exc.status}", exc.retry_after, context)
                 if exc.status == 401 and refresh_token_callback is not None:
                     new_token = refresh_token_callback()
                     headers["Authorization"] = f"Bearer {new_token}"
@@ -200,7 +210,7 @@ class DownloadManager:
                 last_error = exc
                 status = exc.status
                 if self.retry_callback is not None and (status in {401, 429, 500, 502, 503, 504}):
-                    self.retry_callback(file_name, attempt, f"http_{status}", None)
+                    self.retry_callback(file_name, attempt, f"http_{status}", None, context)
                 if status == 401 and refresh_token_callback is not None:
                     new_token = refresh_token_callback()
                     headers["Authorization"] = f"Bearer {new_token}"
@@ -220,7 +230,7 @@ class DownloadManager:
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_error = exc
                 if self.retry_callback is not None:
-                    self.retry_callback(file_name, attempt, exc.__class__.__name__.lower(), None)
+                    self.retry_callback(file_name, attempt, exc.__class__.__name__.lower(), None, context)
                 if attempt < self.max_retries:
                     await asyncio.sleep(min(delay, self.max_retry_delay))
                     delay = self._next_delay(delay, None)
@@ -250,7 +260,7 @@ class DownloadManager:
             base_wait = float(current_delay)
 
         if int(status) == 429:
-            return min(max(base_wait, 10.0), self.max_retry_delay)
+            return min(max(base_wait, self.initial_delay), self.max_retry_delay)
         if int(status) == 504:
             # Copernicus download endpoints can take a while to become ready.
             return min(max(base_wait, self.gateway_timeout_floor_delay), self.max_retry_delay)
@@ -270,6 +280,7 @@ class DownloadManager:
         session: aiohttp.ClientSession,
         url: str,
         file_name: str,
+        context: ProgressContext | None,
         output_dir: Path,
         headers: dict,
     ) -> Path:
@@ -290,8 +301,20 @@ class DownloadManager:
                 raise _RetryableHttpError(response.status, retry_after=self._retry_after_seconds(response))
             if response.status == 416:
                 if self.progress_callback and initial_resume_position > 0:
-                    self.progress_callback(requested_name, initial_resume_position, initial_resume_position, initial_resume_position)
-                    self.progress_callback(requested_name, 0, initial_resume_position, initial_resume_position)
+                    self.progress_callback(
+                        requested_name,
+                        initial_resume_position,
+                        initial_resume_position,
+                        initial_resume_position,
+                        context,
+                    )
+                    self.progress_callback(
+                        requested_name,
+                        0,
+                        initial_resume_position,
+                        initial_resume_position,
+                        context,
+                    )
                 return initial_path
 
             response.raise_for_status()
@@ -318,7 +341,7 @@ class DownloadManager:
             total = self._resolve_total_size(response, resume_position)
             downloaded = resume_position
             if self.progress_callback and resume_position > 0:
-                self.progress_callback(resolved_name, resume_position, downloaded, total)
+                self.progress_callback(resolved_name, resume_position, downloaded, total, context)
 
             started = monotonic()
             with file_path.open(file_mode) as handle:
@@ -330,7 +353,7 @@ class DownloadManager:
                     handle.write(chunk)
                     downloaded += len(chunk)
                     if self.progress_callback:
-                        self.progress_callback(resolved_name, len(chunk), downloaded, total)
+                        self.progress_callback(resolved_name, len(chunk), downloaded, total, context)
 
             if total is not None and file_path.exists():
                 final_size = file_path.stat().st_size
@@ -339,7 +362,7 @@ class DownloadManager:
 
             elapsed = max(0.001, monotonic() - started)
             if self.progress_callback:
-                self.progress_callback(resolved_name, 0, downloaded, total)
+                self.progress_callback(resolved_name, 0, downloaded, total, context)
 
             _ = elapsed
             return file_path

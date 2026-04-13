@@ -323,6 +323,65 @@ def test_manual_omniwater_tiles_existing_zarr_and_writes_masks_in_place(
     assert Path(str(result["output_zarr_uri"])).exists()
 
 
+def test_manual_omniwater_forwards_requested_inference_device_to_model_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    module = types.ModuleType("omniwatermask")
+    module.__version__ = "test"
+
+    def make_water_mask(*, scene_paths, band_order, output_dir, **kwargs):
+        captured.update(kwargs)
+        outputs = []
+        for scene in scene_paths:
+            scene_path = Path(scene)
+            mask_path = Path(output_dir) / f"{scene_path.stem}_water_mask.tif"
+            with rasterio.open(scene_path) as src:
+                mask = np.ones((src.height, src.width), dtype=np.uint8)
+                profile = src.profile.copy()
+                profile.update(count=1, dtype="uint8")
+                with rasterio.open(mask_path, "w", **profile) as dst:
+                    dst.write(mask, 1)
+            outputs.append(mask_path)
+        return outputs
+
+    module.make_water_mask = make_water_mask
+    monkeypatch.setitem(sys.modules, "omniwatermask", module)
+    monkeypatch.setattr(
+        "nimbuschain_mask_service.omniwater.resolve_inference_device",
+        lambda **kwargs: "mps",
+    )
+
+    scene_id = "S2A_MSIL1C_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
+    raw_root = _build_s2_bundle(tmp_path / "raw", scene_id=scene_id)
+    output_uri = str((tmp_path / "out" / "gpu-device.zarr").resolve())
+
+    written_uri, _family, _summary, dataset_summary = ZarrConversionService().convert(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        scene_id=scene_id,
+        raw_uri=str(raw_root),
+        output_uri=output_uri,
+        product_type="S2MSI1C",
+    )
+
+    result = MaskService().apply_omniwater_to_zarr(
+        zarr_uri=written_uri,
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI1C",
+        scene_id=scene_id,
+        acquisition_datetime=dataset_summary.get("acquisition_datetime"),
+        dataset_summary=dataset_summary,
+        inference_device="mps",
+    )
+
+    assert result["status"] == "written"
+    assert captured["inference_device"] == "mps"
+    assert captured["mosaic_device"] == "mps"
+
+
 def test_manual_omniwater_failure_preserves_zarr_and_records_mask_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

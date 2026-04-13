@@ -26,10 +26,13 @@ wait_podman() {
 
 wait_podman
 
-if command -v podman-compose >/dev/null 2>&1; then
+if podman compose version >/dev/null 2>&1; then
+  COMPOSE_CMD=(podman compose)
+elif command -v podman-compose >/dev/null 2>&1; then
   COMPOSE_CMD=(podman-compose)
 else
-  COMPOSE_CMD=(podman compose)
+  echo "ERROR: neither 'podman compose' nor 'podman-compose' is available." >&2
+  exit 1
 fi
 
 "${COMPOSE_CMD[@]}" -f podman-compose.yml down --remove-orphans

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -249,6 +250,7 @@ def convert_landsat_to_zarr(
     scene_id: str,
     output_uri: str,
     product_type: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
     extracted = prepare_source(raw_uri, label="landsat")
     try:
@@ -324,6 +326,7 @@ def convert_landsat_to_zarr(
             target_pixel_size=target_pixel_size,
             ancillary_band_paths=ancillary_paths,
             ancillary_layer_names=ordered_ancillary,
+            progress_callback=progress_callback,
         )
         summary = _summarize_landsat_product(
             provider=provider,

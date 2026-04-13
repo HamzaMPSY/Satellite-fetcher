@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import requests
@@ -10,6 +11,8 @@ from nimbuschain_mask_service.schema import default_mask_model
 
 
 class MaskServiceClient:
+    REMOTE_PROGRESS_POLL_SECONDS = 2.0
+
     def __init__(self, *, service_url: str | None = None):
         self.service_url = str(service_url or "").strip().rstrip("/")
         self._session: requests.Session | None = None
@@ -21,7 +24,7 @@ class MaskServiceClient:
 
     @property
     def supports_stage_callbacks(self) -> bool:
-        return self._service is not None
+        return True
 
     def close(self) -> None:
         if self._session is not None:
@@ -108,13 +111,45 @@ class MaskServiceClient:
                 stage_callback=extras.get("stage_callback"),
             )
         assert self._session is not None
-        response = self._session.post(
-            f"{self.service_url}/apply",
-            json=request.model_dump(mode="json", exclude_none=True),
-            timeout=(30, None),
-        )
-        response.raise_for_status()
-        return dict(response.json())
+        progress_stop = threading.Event()
+        progress_thread: threading.Thread | None = None
+        remote_job_id = str(extras.get("job_id") or "").strip()
+        stage_callback = extras.get("stage_callback")
+        if remote_job_id and callable(stage_callback):
+            progress_thread = threading.Thread(
+                target=self._poll_remote_progress,
+                kwargs={
+                    "job_id": remote_job_id,
+                    "stage_callback": stage_callback,
+                    "stop_event": progress_stop,
+                },
+                name=f"mask-progress-{remote_job_id[:8]}",
+                daemon=True,
+            )
+            progress_thread.start()
+        try:
+            request_kwargs: dict[str, Any] = {
+                "json": request.model_dump(mode="json", exclude_none=True),
+                "timeout": (30, None),
+            }
+            if remote_job_id:
+                request_kwargs["params"] = {"job_id": remote_job_id}
+            response = self._session.post(
+                f"{self.service_url}/apply",
+                **request_kwargs,
+            )
+            response.raise_for_status()
+            return dict(response.json())
+        except requests.RequestException as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            raise RuntimeError(
+                "Mask service request failed. The remote mask process may have restarted, exhausted memory, "
+                f"or closed the connection unexpectedly. Original error: {detail}"
+            ) from exc
+        finally:
+            progress_stop.set()
+            if progress_thread is not None:
+                progress_thread.join(timeout=2.0)
 
     def health(self) -> dict[str, Any]:
         if self._service is not None:
@@ -131,3 +166,49 @@ class MaskServiceClient:
         response = self._session.get(f"{self.service_url}/schema", timeout=30)
         response.raise_for_status()
         return dict(response.json())
+
+    def _poll_remote_progress(
+        self,
+        *,
+        job_id: str,
+        stage_callback: Any,
+        stop_event: threading.Event,
+    ) -> None:
+        assert self._session is not None
+        poll_interval = float(self.REMOTE_PROGRESS_POLL_SECONDS)
+        last_sequence = -1
+        last_stage_name = ""
+        last_payload: dict[str, Any] = {}
+        while not stop_event.wait(poll_interval):
+            try:
+                response = self._session.get(
+                    f"{self.service_url}/progress/{job_id}",
+                    timeout=10,
+                )
+                if getattr(response, "status_code", None) == 404:
+                    continue
+                response.raise_for_status()
+                progress = dict(response.json() or {})
+            except requests.RequestException:
+                continue
+            stage_name = str(progress.get("stage_name") or "").strip()
+            payload = dict(progress.get("payload") or {})
+            try:
+                sequence = int(progress.get("sequence") or 0)
+            except (TypeError, ValueError):
+                sequence = 0
+            status = str(progress.get("status") or "").strip().lower()
+
+            if stage_name and callable(stage_callback):
+                if sequence > last_sequence or stage_name != last_stage_name or payload != last_payload:
+                    stage_callback(stage_name, payload)
+                    last_sequence = sequence
+                    last_stage_name = stage_name
+                    last_payload = dict(payload)
+                elif last_stage_name:
+                    heartbeat_payload = dict(last_payload)
+                    heartbeat_payload["heartbeat"] = True
+                    stage_callback(last_stage_name, heartbeat_payload)
+
+            if status in {"finished", "failed", "cancelled"}:
+                return

@@ -69,6 +69,8 @@ def build_job_payload(
     aoi_wkt: str,
     tile_id: str | None = None,
     output_dir: str | None = None,
+    mask_types: list[str] | None = None,
+    download_strategy: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "job_type": "search_download",
@@ -83,6 +85,16 @@ def build_job_payload(
         payload["tile_id"] = tile_id
     if output_dir:
         payload["output_dir"] = output_dir
+    normalized_mask_types = [
+        str(item).strip().lower()
+        for item in list(mask_types or [])
+        if str(item).strip().lower() in {"water", "cloud"}
+    ]
+    if normalized_mask_types:
+        payload["mask_types"] = normalized_mask_types
+    normalized_strategy = str(download_strategy or "").strip().lower()
+    if normalized_strategy in {"copernicus_account_pool"}:
+        payload["download_strategy"] = normalized_strategy
     return payload
 
 

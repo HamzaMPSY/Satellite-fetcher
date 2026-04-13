@@ -303,6 +303,8 @@ def _build_job_payload(
     aoi_wkt: str,
     tile_id: str | None = None,
     output_dir: str | None = None,
+    mask_types: list[str] | None = None,
+    download_strategy: str | None = None,
 ) -> dict[str, Any]:
     provider_api = PROVIDER_CLI_MAP[provider_label]
     return build_job_payload_runtime(
@@ -314,6 +316,8 @@ def _build_job_payload(
         aoi_wkt=aoi_wkt,
         tile_id=tile_id,
         output_dir=output_dir,
+        mask_types=mask_types,
+        download_strategy=download_strategy,
     )
 
 
@@ -489,15 +493,6 @@ def init_state():
         "zarr_artifact_query": "",
         "zarr_artifact_provider": "",
         "zarr_artifact_collection": "",
-        "watermask_selected_store": "",
-        "watermask_artifact_query": "",
-        "watermask_artifact_provider": "",
-        "watermask_artifact_collection": "",
-        "show_legacy_watermask_zarr": False,
-        "mask_hide_complete_stores": False,
-        "mask_mode": "water",
-        "preferred_mask_job_ids": {},
-        "mask_submission_notice": {},
         "zarr_chunk_time": 1,
         "zarr_chunk_y": 512,
         "zarr_chunk_x": 512,
@@ -932,6 +927,15 @@ def _mask_request_target_label(mask_types: list[str] | tuple[str, ...]) -> str:
     return "mask"
 
 
+def _mask_mode_to_types(mask_mode: str) -> list[str]:
+    normalized = str(mask_mode or "").strip().lower()
+    if normalized == "water + cloud":
+        return ["water", "cloud"]
+    if normalized in {"water", "cloud"}:
+        return [normalized]
+    return []
+
+
 def _mask_store_sort_key(entry: dict[str, Any]) -> tuple[int, int, float]:
     requested_status = str(dict(entry.get("requested_state") or {}).get("status") or "").strip().lower()
     visibility_status = str(entry.get("visibility_status") or "").strip().lower()
@@ -969,12 +973,20 @@ def _mask_types_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
     metadata = dict(payload.get("metadata") or {})
     pipeline_metadata = dict(payload.get("pipeline_metadata") or {})
     conversion_metadata = dict(payload.get("conversion_metadata") or {})
+    request_payload = dict(payload.get("request") or {})
     mask_payload = dict(metadata.get("mask") or {})
+    pipeline_mask_payload = dict(pipeline_metadata.get("mask") or {})
+    conversion_mask_payload = dict(conversion_metadata.get("mask") or {})
+    request_mask_payload = dict(request_payload.get("mask") or {})
     values = (
         payload.get("mask_types")
+        or request_payload.get("mask_types")
         or metadata.get("mask_types")
         or pipeline_metadata.get("mask_types")
         or conversion_metadata.get("mask_types")
+        or request_mask_payload.get("mask_types")
+        or pipeline_mask_payload.get("mask_types")
+        or conversion_mask_payload.get("mask_types")
         or mask_payload.get("mask_types")
         or []
     )
@@ -990,6 +1002,8 @@ def _mask_types_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
     water_payload = dict(
         conversion_metadata.get("water_mask")
         or pipeline_metadata.get("water_mask")
+        or conversion_mask_payload.get("water_mask")
+        or pipeline_mask_payload.get("water_mask")
         or metadata.get("water_mask")
         or mask_payload.get("water_mask")
         or {}
@@ -997,6 +1011,8 @@ def _mask_types_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
     cloud_payload = dict(
         conversion_metadata.get("cloud_mask")
         or pipeline_metadata.get("cloud_mask")
+        or conversion_mask_payload.get("cloud_mask")
+        or pipeline_mask_payload.get("cloud_mask")
         or metadata.get("cloud_mask")
         or mask_payload.get("cloud_mask")
         or {}
@@ -1353,6 +1369,227 @@ def _ensure_job_results_loaded(statuses: list[dict[str, Any]]) -> dict[str, dict
     return result_cache
 
 
+def _format_bytes_compact(value: Any) -> str:
+    return _human_size(max(0, int(value or 0)))
+
+
+def _format_rate_compact(value: Any) -> str:
+    try:
+        numeric = float(value or 0.0)
+    except Exception:
+        numeric = 0.0
+    if numeric <= 0:
+        return "-"
+    return f"{_human_size(int(numeric))}/s"
+
+
+def _format_eta_compact(value: Any) -> str:
+    try:
+        seconds = int(float(value))
+    except Exception:
+        return "-"
+    if seconds <= 0:
+        return "<1m"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _download_status_style(status: str) -> tuple[str, str]:
+    normalized = str(status or "").strip().lower()
+    if normalized == "completed":
+        return ("#22c55e", "rgba(34,197,94,0.18)")
+    if normalized == "rate_limited":
+        return ("#f59e0b", "rgba(245,158,11,0.18)")
+    if normalized == "retrying":
+        return ("#fb923c", "rgba(251,146,60,0.18)")
+    if normalized == "running":
+        return ("#22d3ee", "rgba(34,211,238,0.16)")
+    if normalized == "cancelled":
+        return ("#c084fc", "rgba(192,132,252,0.18)")
+    if normalized == "failed":
+        return ("#f87171", "rgba(248,113,113,0.18)")
+    return ("#94a3b8", "rgba(148,163,184,0.14)")
+
+
+def _job_download_telemetry(item: dict[str, Any]) -> dict[str, Any] | None:
+    pipeline_meta = dict(item.get("pipeline_metadata") or {})
+    telemetry = dict(pipeline_meta.get("download_telemetry") or {})
+    if not telemetry:
+        progress_pct = float(item.get("progress", 0.0) or 0.0)
+        bytes_downloaded = int(item.get("bytes_downloaded", 0) or 0)
+        bytes_total = max(int(item.get("bytes_total", 0) or 0), bytes_downloaded)
+        if bytes_downloaded <= 0 and bytes_total <= 0 and not pipeline_meta.get("account_pool_assignments"):
+            return None
+        telemetry = {
+            "status": "completed" if progress_pct >= 100.0 else "running",
+            "strategy": str(pipeline_meta.get("download_strategy") or "default").strip().lower() or "default",
+            "selected_accounts": int(pipeline_meta.get("account_pool_selected_accounts", 0) or 0),
+            "pool_size": int(pipeline_meta.get("account_pool_size", 0) or 0),
+            "per_account_concurrency": int(pipeline_meta.get("account_pool_per_account_concurrency", 0) or 0),
+            "products_found": int(pipeline_meta.get("products_found", 0) or pipeline_meta.get("products_requested", 0) or 0),
+            "products_downloaded": int(pipeline_meta.get("products_downloaded", 0) or 0),
+            "files_known": 0,
+            "files_completed": 0,
+            "bytes_downloaded": bytes_downloaded,
+            "bytes_total": bytes_total,
+            "progress_pct": progress_pct,
+            "speed_bps": 0.0,
+            "eta_seconds": None,
+            "last_file": None,
+            "retry_count_total": int(item.get("retry_count", 0) or 0),
+            "rate_limited_accounts": 0,
+            "accounts": [],
+        }
+    accounts = list(telemetry.get("accounts") or [])
+    if not accounts and list(pipeline_meta.get("account_pool_assignments") or []):
+        accounts = []
+        for assignment in list(pipeline_meta.get("account_pool_assignments") or []):
+            label = str((assignment or {}).get("account_label") or "").strip()
+            if not label:
+                continue
+            accounts.append(
+                {
+                    "account_label": label,
+                    "status": "completed" if float(telemetry.get("progress_pct", 0.0) or 0.0) >= 100.0 else "queued",
+                    "product_count_assigned": int((assignment or {}).get("product_count") or 0),
+                    "files_completed": 0,
+                    "active_file_count": 0,
+                    "bytes_downloaded": 0,
+                    "bytes_total": 0,
+                    "progress_pct": 0.0,
+                    "retry_count": 0,
+                    "current_file": None,
+                    "last_retry_reason": None,
+                }
+            )
+        telemetry["accounts"] = accounts
+    return telemetry
+
+
+def _render_job_download_telemetry(item: dict[str, Any]) -> bool:
+    telemetry = _job_download_telemetry(item)
+    if telemetry is None:
+        return False
+
+    pipeline_state = _job_pipeline_state(item)
+    status = str(telemetry.get("status") or "running").strip().lower() or "running"
+    overall_progress = max(0.0, min(100.0, float(telemetry.get("progress_pct", item.get("progress", 0.0)) or 0.0)))
+    bytes_downloaded = int(telemetry.get("bytes_downloaded", item.get("bytes_downloaded", 0)) or 0)
+    bytes_total = max(int(telemetry.get("bytes_total", item.get("bytes_total", 0)) or 0), bytes_downloaded)
+    speed_bps = float(telemetry.get("speed_bps", 0.0) or 0.0)
+    eta_seconds = telemetry.get("eta_seconds")
+    selected_accounts = int(telemetry.get("selected_accounts", 0) or 0)
+    pool_size = int(telemetry.get("pool_size", 0) or 0)
+    per_account_concurrency = int(telemetry.get("per_account_concurrency", 0) or 0)
+    products_found = int(telemetry.get("products_found", 0) or 0)
+    products_downloaded = int(telemetry.get("products_downloaded", 0) or 0)
+    retry_count_total = int(telemetry.get("retry_count_total", item.get("retry_count", 0)) or 0)
+    accounts = list(telemetry.get("accounts") or [])
+    color, tint = _download_status_style(status)
+
+    summary_parts = [
+        ("Parallel download", f"{selected_accounts}/{pool_size}" if pool_size > 0 else ("1" if bytes_total > 0 else "-")),
+        ("Products", f"{products_downloaded}/{products_found}" if products_found > 0 else str(products_downloaded or "-")),
+        ("Volume", f"{_format_bytes_compact(bytes_downloaded)} / {_format_bytes_compact(bytes_total)}"),
+        ("Throughput", _format_rate_compact(speed_bps)),
+        ("ETA", _format_eta_compact(eta_seconds) if eta_seconds is not None and pipeline_state == "downloading" else ("done" if status == "completed" or pipeline_state not in {"searching", "downloading"} else "-")),
+    ]
+    if per_account_concurrency > 0:
+        summary_parts.append(("Per account", str(per_account_concurrency)))
+    if retry_count_total > 0:
+        summary_parts.append(("Retries", str(retry_count_total)))
+
+    summary_html = "".join(
+        (
+            "<div style='min-width:110px;display:flex;flex-direction:column;gap:2px;'>"
+            f"<span style='font-size:.66rem;color:#64748b;text-transform:uppercase;'>{html.escape(label)}</span>"
+            f"<span style='font-size:1rem;color:#e5e7eb;font-weight:700;'>{html.escape(value)}</span>"
+            "</div>"
+        )
+        for label, value in summary_parts
+    )
+    st.markdown(
+        (
+            "<div style='margin-top:10px;'>"
+            "<div style='display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;'>"
+            f"<div style='display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start;'>{summary_html}</div>"
+            f"<span style='display:inline-flex;align-items:center;border-radius:6px;padding:4px 8px;font-size:.72rem;"
+            f"font-weight:700;color:{color};background:{tint};text-transform:uppercase;'>{html.escape(status.replace('_', ' '))}</span>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        (
+            "<div style='margin-top:8px;margin-bottom:6px;'>"
+            f"<div style='height:10px;background:#172033;border-radius:6px;overflow:hidden;'>"
+            f"<div style='height:100%;width:{overall_progress:.2f}%;background:{color};border-radius:6px;transition:width .25s ease;'></div>"
+            "</div>"
+            f"<div style='display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:4px;font-size:.72rem;color:#94a3b8;'>"
+            f"<span>Download {overall_progress:.2f}%</span>"
+            f"<span>{html.escape(_format_bytes_compact(bytes_downloaded))} of {html.escape(_format_bytes_compact(bytes_total))}</span>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    if not accounts:
+        return True
+
+    rows_html = []
+    for account in accounts:
+        account_label = str(account.get("account_label") or "account").strip() or "account"
+        account_status = str(account.get("status") or "queued").strip().lower() or "queued"
+        lane_color, lane_tint = _download_status_style(account_status)
+        files_completed = int(account.get("files_completed", 0) or 0)
+        products_assigned = int(account.get("product_count_assigned", 0) or 0)
+        active_file_count = int(account.get("active_file_count", 0) or 0)
+        retry_count = int(account.get("retry_count", 0) or 0)
+        account_bytes_done = int(account.get("bytes_downloaded", 0) or 0)
+        account_bytes_total = max(int(account.get("bytes_total", 0) or 0), account_bytes_done)
+        account_progress = max(0.0, min(100.0, float(account.get("progress_pct", 0.0) or 0.0)))
+        current_file = str(account.get("current_file") or "").strip()
+        meta_bits = [f"{files_completed}/{products_assigned} files" if products_assigned > 0 else f"{files_completed} files"]
+        if active_file_count > 0:
+            meta_bits.append(f"{active_file_count} active")
+        if retry_count > 0:
+            meta_bits.append(f"{retry_count} retries")
+        retry_reason = str(account.get("last_retry_reason") or "").strip().lower()
+        if retry_reason == "http_429":
+            meta_bits.append("rate limited")
+
+        rows_html.append(
+            (
+                "<div style='padding:8px 0;border-top:1px solid rgba(148,163,184,0.12);'>"
+                "<div style='display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;'>"
+                "<div style='display:flex;gap:10px;flex-wrap:wrap;align-items:center;'>"
+                f"<span style='font-size:.84rem;font-weight:700;color:#e5e7eb;'>{html.escape(account_label)}</span>"
+                f"<span style='display:inline-flex;align-items:center;border-radius:6px;padding:3px 8px;font-size:.68rem;font-weight:700;color:{lane_color};background:{lane_tint};text-transform:uppercase;'>{html.escape(account_status.replace('_', ' '))}</span>"
+                f"<span style='font-size:.70rem;color:#94a3b8;'>{html.escape(' · '.join(meta_bits))}</span>"
+                "</div>"
+                f"<span style='font-size:.72rem;color:#cbd5e1;'>{html.escape(_format_bytes_compact(account_bytes_done))} / {html.escape(_format_bytes_compact(account_bytes_total))}</span>"
+                "</div>"
+                f"<div style='height:6px;background:#172033;border-radius:6px;overflow:hidden;margin-top:6px;'>"
+                f"<div style='height:100%;width:{account_progress:.2f}%;background:{lane_color};border-radius:6px;transition:width .25s ease;'></div>"
+                "</div>"
+                f"<div style='display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:4px;font-size:.68rem;color:#64748b;'>"
+                f"<span>{account_progress:.2f}%</span>"
+                f"<span>{html.escape(Path(current_file).name) if current_file else ''}</span>"
+                "</div>"
+                "</div>"
+            )
+        )
+    st.markdown("".join(rows_html), unsafe_allow_html=True)
+    return True
+
+
 def _render_job_cards(
     statuses: list[dict[str, Any]],
     *,
@@ -1376,7 +1613,9 @@ def _render_job_cards(
         if errors:
             first_error = str(errors[0]).strip()
             error_text = first_error.lower()
-            if "504" in error_text:
+            if "429" in error_text or "rate limit" in error_text or "too many requests" in error_text:
+                error_summary = "Copernicus download endpoint rate-limited this job (HTTP 429). The provider asked for retries before the first byte."
+            elif "504" in error_text:
                 error_summary = "Copernicus download endpoint timed out (HTTP 504) before the first byte. Retry later."
             elif "catalogue.dataspace.copernicus.eu" in first_error and "503" in first_error:
                 error_summary = "Copernicus catalogue is temporarily unavailable (HTTP 503). Retry later."
@@ -1388,14 +1627,7 @@ def _render_job_cards(
             state_label, state_fg, state_bg, state_icon = _job_state_style(state)
             pipeline_label, pipeline_fg, pipeline_bg, pipeline_icon = _job_pipeline_style(item)
             provider_issue = _job_provider_issue_badge(item)
-            job_kind = "mask" if _job_is_mask_job(item) else "fetch"
-            if job_kind == "mask":
-                kind_fg, kind_bg, kind_icon = "#c084fc", "rgba(192,132,252,0.16)", "▣"
-            else:
-                kind_fg, kind_bg, kind_icon = "#38bdf8", "rgba(56,189,248,0.14)", "⬇"
             badge_chunks = [
-                f"<span style='display:inline-flex;align-items:center;border-radius:999px;padding:4px 10px;"
-                f"font-size:.72rem;font-weight:700;color:{kind_fg};background:{kind_bg};text-transform:uppercase;'>{kind_icon} {job_kind}</span>",
                 f"<span style='display:inline-flex;align-items:center;border-radius:999px;padding:4px 10px;"
                 f"font-size:.72rem;font-weight:700;color:{state_fg};background:{state_bg};text-transform:uppercase;'>{state_icon} {state_label}</span>",
                 f"<span style='display:inline-flex;align-items:center;border-radius:999px;padding:4px 10px;"
@@ -1433,30 +1665,25 @@ def _render_job_cards(
                 f" · Download progress: {download_progress:.2f}%"
                 f" · Updated: {item.get('updated_at', '-')}"
             )
+            rendered_download_panel = _render_job_download_telemetry(item)
             pipeline_summary = _job_pipeline_summary(item)
             if pipeline_summary:
                 st.caption(pipeline_summary)
-            if job_kind == "mask":
-                st.caption("Mask job: derived outputs are linked back to the source fetch job lineage.")
             pipeline_substate = _job_pipeline_substate(item)
             if pipeline_substate:
                 st.caption(pipeline_substate)
             _render_job_pipeline_paths(item)
-            if job_kind == "mask":
-                mask_types = _normalize_mask_types(_mask_types_from_payload(item))
-                masked_outputs = len(item.get("masked_zarr_outputs") or item.get("zarr_outputs") or [])
-                water_outputs = len(item.get("watermask_outputs") or [])
-                cloud_outputs = len(item.get("cloudmask_outputs") or [])
+            pipeline_mask_types = _normalize_mask_types(_mask_types_from_payload(item))
+            pipeline_mask_mode = str(dict(item.get("pipeline_metadata") or {}).get("mask_mode") or "").strip().lower()
+            if pipeline_mask_types and pipeline_mask_mode == "integrated":
                 st.caption(
-                    f"Mask types: {', '.join(mask_types) or '-'}"
-                    f" · Masked target outputs: {masked_outputs}"
-                    f" · Water artifacts: {water_outputs}"
-                    f" · Cloud artifacts: {cloud_outputs}"
+                    f"Integrated masking: {', '.join(pipeline_mask_types)}"
+                    " · Writes happen in-place in the same Zarr produced by the pipeline."
                 )
-            else:
+            if not rendered_download_panel:
                 st.caption(
-                    f"Downloaded bytes: {int(item.get('bytes_downloaded', 0) or 0)} / "
-                    f"{int(item.get('bytes_total', 0) or 0)}"
+                    f"Downloaded volume: {_format_bytes_compact(item.get('bytes_downloaded', 0))} / "
+                    f"{_format_bytes_compact(item.get('bytes_total', 0))}"
                 )
             queued_reason = _job_queued_reason(item)
             if queued_reason:
@@ -1535,6 +1762,13 @@ def _job_pipeline_state(item: dict[str, Any]) -> str:
         ):
             return "masked_zarr_written"
         return state or "queued"
+    mask_types = _mask_types_from_payload(item)
+    pipeline_meta = dict(item.get("pipeline_metadata") or {})
+    if state == "succeeded" and (
+        str(pipeline_meta.get("mask_status") or "").strip().lower() == "written"
+        or (mask_types and str(pipeline_meta.get("mask_mode") or "").strip().lower() == "integrated")
+    ):
+        return "masked_zarr_written"
     if state == "succeeded" and list(item.get("zarr_outputs") or []):
         return "zarr_written"
     return state or "queued"
@@ -1555,12 +1789,8 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
             return ("cloud inference", "#38bdf8", "rgba(56,189,248,0.16)", "☁")
         if pipeline_state == "running_water_inference":
             return ("water inference", "#22d3ee", "rgba(34,211,238,0.16)", "≈")
-        if pipeline_state == "writing_mask_artifacts":
-            return ("writing masks", "#fbbf24", "rgba(251,191,36,0.16)", "✎")
-        if pipeline_state == "writing_masked_zarr":
+        if pipeline_state in {"writing_mask_artifacts", "writing_masked_zarr", "registering_artifacts"}:
             return ("finalizing masks", "#38bdf8", "rgba(56,189,248,0.16)", "⬢")
-        if pipeline_state == "registering_artifacts":
-            return ("registering", "#fbbf24", "rgba(251,191,36,0.16)", "⚙")
         if pipeline_state == "masked_zarr_written":
             return ("mask ready", "#4ade80", "rgba(74,222,128,0.14)", "✓")
         if pipeline_state == "cancelled":
@@ -1580,6 +1810,12 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
         return ("zarr converting", "#38bdf8", "rgba(56,189,248,0.16)", "⚙")
     if pipeline_state == "zarr_written":
         return ("zarr ready", "#4ade80", "rgba(74,222,128,0.14)", "⬢")
+    if pipeline_state == "running_cloud_inference":
+        return ("cloud inference", "#38bdf8", "rgba(56,189,248,0.16)", "☁")
+    if pipeline_state == "running_water_inference":
+        return ("water inference", "#22d3ee", "rgba(34,211,238,0.16)", "≈")
+    if pipeline_state == "masked_zarr_written":
+        return ("pipeline ready", "#4ade80", "rgba(74,222,128,0.14)", "✓")
     if pipeline_state == "zarr_failed":
         return ("zarr failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
     if pipeline_state == "cancelled":
@@ -1607,6 +1843,7 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
     pipeline_step = str(item.get("pipeline_step", "") or "").strip().lower()
     pipeline_meta = dict(item.get("pipeline_metadata") or {})
     conversion_meta = dict(item.get("conversion_metadata") or {})
+    error_texts = [str(err).strip().lower() for err in (item.get("errors", []) or []) if str(err).strip()]
     if _job_is_mask_job(item):
         mask_types = _normalize_mask_types(
             item.get("mask_types")
@@ -1623,12 +1860,8 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
             return "Running cloud and shadow inference directly on the selected Zarr store."
         if pipeline_state == "running_water_inference":
             return "Running water inference directly on the selected Zarr store."
-        if pipeline_state == "writing_mask_artifacts":
-            return "Finalizing cloud/water mask arrays and metadata inside the selected Zarr store."
-        if pipeline_state == "writing_masked_zarr":
+        if pipeline_state in {"writing_mask_artifacts", "writing_masked_zarr", "registering_artifacts"}:
             return "Finalizing in-place mask metadata on the selected Zarr store."
-        if pipeline_state == "registering_artifacts":
-            return "Registering the completed mask job and updated Zarr in the backend."
         if pipeline_state == "masked_zarr_written":
             return "Masks are written and the selected Zarr is ready."
         if pipeline_state == "failed":
@@ -1640,6 +1873,8 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
     raw_count = len(item.get("raw_outputs") or []) or int(pipeline_meta.get("raw_output_count", 0) or 0)
     zarr_count = len(item.get("zarr_outputs") or []) or int(pipeline_meta.get("zarr_output_count", 0) or 0)
     products_found = int(pipeline_meta.get("products_found", 0) or 0)
+    mask_types = _mask_types_from_payload(item)
+    integrated_mask = bool(mask_types) and str(pipeline_meta.get("mask_mode") or "").strip().lower() == "integrated"
     suffix_parts: list[str] = []
     if raw_count:
         suffix_parts.append(f"raw outputs: {raw_count}")
@@ -1661,10 +1896,28 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
             return f"Download complete. Zarr data is written. Registering the store{suffix}."
         return f"Download complete. Zarr conversion is running{suffix}."
     if pipeline_state == "zarr_written":
+        if integrated_mask:
+            return f"Download complete. Zarr output is ready and the same job will continue with {' + '.join(mask_types)} masking{suffix}."
         return f"Download complete. Zarr output is ready{suffix}."
+    if pipeline_state == "running_cloud_inference":
+        return f"Download and conversion completed. Running cloud masking in-place on the resulting Zarr{suffix}."
+    if pipeline_state == "running_water_inference":
+        return f"Download and conversion completed. Running water masking in-place on the resulting Zarr{suffix}."
+    if pipeline_state == "masked_zarr_written":
+        return f"Download complete. Zarr output and requested masks are ready{suffix}."
     if pipeline_state == "zarr_failed":
         return f"Download completed, but Zarr conversion failed{suffix}."
     if pipeline_state == "failed":
+        if integrated_mask and zarr_count > 0:
+            return f"Fetch and Zarr conversion succeeded, but the in-place masking phase failed{suffix}."
+        if products_found > 0 and bytes_downloaded <= 0 and any(
+            "429" in text or "rate limit" in text or "too many requests" in text
+            for text in error_texts
+        ):
+            return (
+                f"Search succeeded ({products_found} products found), but the provider rate-limited "
+                "the download endpoint before the first byte."
+            )
         if products_found > 0 and bytes_downloaded <= 0:
             return f"Search succeeded ({products_found} products found), but the provider download failed before the first byte."
         return "Pipeline failed before reaching a usable Zarr output."
@@ -1677,6 +1930,7 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
     pipeline_state = _job_pipeline_state(item)
     pipeline_step = str(item.get("pipeline_step", "") or "").strip().lower()
     conversion_meta = dict(item.get("conversion_metadata") or {})
+    pipeline_meta = dict(item.get("pipeline_metadata") or {})
     if _job_is_mask_job(item):
         mask_types = _normalize_mask_types(
             item.get("mask_types")
@@ -1693,6 +1947,25 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
         if pipeline_state == "writing_masked_zarr":
             return "Consolidating metadata and finalizing the selected Zarr after in-place mask writes."
         return None
+    mask_types = _mask_types_from_payload(item)
+    integrated_mask = bool(mask_types) and str(pipeline_meta.get("mask_mode") or "").strip().lower() == "integrated"
+    download_strategy = str(pipeline_meta.get("download_strategy") or "default").strip().lower()
+    if download_strategy == "copernicus_account_pool" and pipeline_state in {
+        "searching",
+        "downloading",
+        "downloaded",
+    }:
+        selected_accounts = int(pipeline_meta.get("account_pool_selected_accounts", 0) or 0)
+        pool_size = int(pipeline_meta.get("account_pool_size", 0) or 0)
+        per_account = int(pipeline_meta.get("account_pool_per_account_concurrency", 0) or 0)
+        fallback_reason = str(pipeline_meta.get("account_pool_fallback_reason") or "").strip().lower()
+        if selected_accounts > 0 and pool_size > 0 and per_account > 0:
+            return (
+                f"Copernicus account pool active: {selected_accounts}/{pool_size} accounts selected"
+                f" · target {per_account} downloads per account."
+            )
+        if fallback_reason == "insufficient_accounts":
+            return "Copernicus account pool was requested, but the backend fell back to the primary account because no extra accounts were available."
     current_index = int(conversion_meta.get("current_index", 0) or 0)
     total = int(conversion_meta.get("total", 0) or 0)
     item_suffix = f" ({current_index}/{total})" if current_index > 0 and total > 0 else ""
@@ -1706,6 +1979,12 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
         return f"Zarr conversion is active{item_suffix}."
     if pipeline_state == "downloaded":
         return "Raw product is available locally. The backend is about to start the Zarr stage."
+    if integrated_mask and pipeline_state == "zarr_written":
+        return f"Mask orchestration requested: {', '.join(mask_types)}."
+    if integrated_mask and pipeline_state == "running_cloud_inference":
+        return "Cloud layers will be written into `masks/cloud` and `masks/cloud_probability` in the same Zarr store."
+    if integrated_mask and pipeline_state == "running_water_inference":
+        return "Water layers will be written into `masks/water` and `masks/water_probability` in the same Zarr store."
     return None
 
 
@@ -1775,26 +2054,29 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
             steps.append(("running_cloud_inference", "Cloud"))
         if "water" in mask_types:
             steps.append(("running_water_inference", "Water"))
-        steps.extend(
-            [
-                ("writing_mask_artifacts", "Artifacts"),
-                ("registering_artifacts", "Register"),
-                ("masked_zarr_written", "Ready"),
-            ]
-        )
+        steps.append(("masked_zarr_written", "Ready"))
     else:
+        mask_types = _normalize_mask_types(_mask_types_from_payload(item))
         steps = [
             ("searching", "Search"),
             ("downloading", "Download"),
-            ("downloaded", "Downloaded"),
-            ("zarr_queued", "Zarr queued"),
             ("zarr_converting", "Convert"),
-            ("zarr_written", "Ready"),
         ]
+        if "cloud" in mask_types:
+            steps.append(("running_cloud_inference", "Cloud"))
+        if "water" in mask_types:
+            steps.append(("running_water_inference", "Water"))
+        steps.append(("masked_zarr_written" if mask_types else "zarr_written", "Ready"))
     order = {key: idx for idx, (key, _label) in enumerate(steps)}
     anchor_state = pipeline_state
     if pipeline_state == "queued":
         anchor_state = steps[0][0]
+    elif not _job_is_mask_job(item) and pipeline_state in {"downloaded", "zarr_queued", "zarr_converting", "zarr_written"}:
+        anchor_state = "zarr_converting" if "zarr_converting" in order else anchor_state
+    elif not _job_is_mask_job(item) and pipeline_state in {"writing_mask_artifacts", "writing_masked_zarr", "registering_artifacts"}:
+        anchor_state = "running_water_inference" if "running_water_inference" in order else "running_cloud_inference"
+    elif _job_is_mask_job(item) and pipeline_state in {"writing_mask_artifacts", "writing_masked_zarr", "registering_artifacts"}:
+        anchor_state = "running_water_inference" if "running_water_inference" in order else "running_cloud_inference"
     elif pipeline_state == "failed":
         anchor_state = "running_water_inference" if _job_is_mask_job(item) and "running_water_inference" in order else steps[max(0, len(steps) - 2)][0]
     elif pipeline_state == "zarr_failed":
@@ -1909,7 +2191,7 @@ def _job_provider_issue_badge(item: dict[str, Any]) -> tuple[str, str, str, str]
     ):
         return ("provider unavailable", "#f87171", "rgba(248,113,113,0.14)", "⚠")
     if any("429" in text or "retry later" in text or "rate limit" in text or "too many requests" in text for text in error_texts):
-        return ("provider retrying", "#fbbf24", "rgba(251,191,36,0.16)", "↻")
+        return ("provider rate-limited", "#fbbf24", "rgba(251,191,36,0.16)", "↻")
 
     worker_snapshot = _ss("worker_status_snapshot")
     if isinstance(worker_snapshot, dict):
@@ -1923,7 +2205,7 @@ def _job_retry_details(
     item: dict[str, Any],
     provider_issue: tuple[str, str, str, str] | None,
 ) -> str | None:
-    if provider_issue is None or provider_issue[0] != "provider retrying":
+    if provider_issue is None or provider_issue[0] != "provider rate-limited":
         return None
     retry_count = int(item.get("retry_count", 0) or 0)
     last_retry_at = item.get("last_retry_at")
@@ -1942,20 +2224,7 @@ def _job_is_mask_job(item: dict[str, Any]) -> bool:
     if job_kind == "mask":
         return True
     job_type = str(item.get("job_type") or "").strip().lower()
-    if job_type == "mask_existing_zarr":
-        return True
-    if len(list(item.get("watermask_outputs") or [])) > 0:
-        return True
-    if len(list(item.get("cloudmask_outputs") or [])) > 0:
-        return True
-    conversion_meta = dict(item.get("conversion_metadata") or {})
-    pipeline_meta = dict(item.get("pipeline_metadata") or {})
-    for meta in (conversion_meta, pipeline_meta):
-        for key in ("masked_zarr_uri", "water_mask_output_zarr_uri", "water_mask_artifact_uri", "cloud_mask_output_zarr_uri", "cloud_mask_artifact_uri"):
-            value = str(meta.get(key) or "").strip()
-            if value:
-                return True
-    return False
+    return job_type == "mask_existing_zarr"
 
 
 def _provider_runtime_badge(
@@ -1989,7 +2258,7 @@ def _provider_runtime_badge(
         "429" in text or "retry later" in text or "rate limit" in text or "too many requests" in text
         for text in error_texts
     ):
-        return ("retrying", f"{provider_label} is retrying after transient provider errors.", "#f59e0b")
+        return ("rate-limited", f"{provider_label} is rate-limiting downloads and the backend is backing off.", "#f59e0b")
     if isinstance(provider_state, dict) and bool(provider_state.get("blocked_by_limit")):
         limit_total = int(provider_state.get("limit_total", 0) or 0)
         running = int(provider_state.get("running", 0) or 0)
@@ -2032,14 +2301,16 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
         page=1,
         page_size=RECENT_JOBS_FETCH_LIMIT,
     )
-    statuses = _filter_recent_job_rows(
+    all_statuses = _filter_recent_job_rows(
         _merge_job_rows(active_statuses, recent_statuses),
         hours=RECENT_JOBS_WINDOW_HOURS,
         limit=RECENT_JOBS_FETCH_LIMIT,
     )
+    statuses = [row for row in all_statuses if not _job_is_mask_job(row)]
     st.session_state["active_job_ids"] = [
         str(item.get("job_id", "")).strip()
         for item in active_statuses
+        if not _job_is_mask_job(item)
         if str(item.get("job_id", "")).strip()
     ]
     provider_scope_value = str(_ss("dl_job_provider_filter", "all"))
@@ -2065,7 +2336,7 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
 
     k1, k2, k3, k4, k5 = st.columns(5)
     with k1:
-        st.metric("Jobs", total_jobs)
+        st.metric("Pipelines", total_jobs)
     with k2:
         st.metric("Active", running_jobs)
     with k3:
@@ -2075,11 +2346,14 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
     with k5:
         st.metric("Cancelled", cancelled_jobs)
     st.progress(max(0.0, min(1.0, progress_pct / 100.0)))
-    st.caption(f"Global progress: {progress_pct:.2f}% ({bytes_done}/{bytes_total} bytes)")
+    st.caption(
+        f"Global progress: {progress_pct:.2f}%"
+        f" · {_format_bytes_compact(bytes_done)} / {_format_bytes_compact(bytes_total)}"
+    )
     st.caption(
         f"Summary is computed from the current filtered scope inside recent activity (last {RECENT_JOBS_WINDOW_HOURS}h) plus active jobs."
     )
-    st.caption("This panel separates fetch jobs and mask jobs and keeps live cancel controls in one place.")
+    st.caption("This panel shows the unified pipeline only: search, download, Zarr conversion, and optional in-place masking.")
     _render_provider_runtime_badge(download_provider_api, scoped_statuses)
 
     active_ids = [
@@ -2091,12 +2365,12 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
     cancel_clicked = False
     if active_ids:
         cancel_clicked = st.button(
-            f"⏹ Cancel active jobs ({len(active_ids)})",
+            f"⏹ Cancel active pipelines ({len(active_ids)})",
             width="stretch",
             key="jobs_cancel_active_btn",
         )
     else:
-        st.caption("No active jobs in the current scope.")
+        st.caption("No active pipeline is running in the current scope.")
 
     filter_col1, filter_col2 = st.columns([2, 4])
     with filter_col1:
@@ -2106,7 +2380,7 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
             active_states=ACTIVE_JOB_STATES,
         )
         job_view = st.radio(
-            "Visible jobs",
+            "Visible pipeline runs",
             options=["all", "active", "succeeded", "failed", "cancelled", "recent"],
             horizontal=True,
             key="dl_job_view",
@@ -2182,16 +2456,11 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
         recent_minutes=RECENT_JOB_CATEGORY_MINUTES,
         active_states=ACTIVE_JOB_STATES,
     )
-    fetch_visible_statuses = [row for row in visible_statuses if not _job_is_mask_job(row)]
-    mask_visible_statuses = [row for row in visible_statuses if _job_is_mask_job(row)]
     st.caption("Changing provider, mission, or product in the form only affects new submissions.")
     visible_total = len(base_visible_statuses)
     if job_view == "recent":
-        st.caption(f"Showing jobs updated in the last {RECENT_JOB_CATEGORY_MINUTES} minutes inside the recent activity window.")
-    st.caption(
-        f"Showing {len(visible_statuses)} / {visible_total} matching jobs "
-        f"(fetch: {len(fetch_visible_statuses)} · mask: {len(mask_visible_statuses)})."
-    )
+        st.caption(f"Showing pipeline runs updated in the last {RECENT_JOB_CATEGORY_MINUTES} minutes inside the recent activity window.")
+    st.caption(f"Showing {len(visible_statuses)} / {visible_total} matching pipeline runs.")
     if refresh_jobs_clicked:
         st.caption("Jobs list refreshed.")
 
@@ -2210,23 +2479,14 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
                     cancelled += 1
             except Exception:
                 continue
-        st.info(f"Cancel requested for {cancelled}/{len(active_ids)} active jobs in the current scope.")
+        st.info(f"Cancel requested for {cancelled}/{len(active_ids)} active pipelines in the current scope.")
 
     result_cache = _ensure_job_results_loaded(visible_statuses)
-    mask_header = f"Mask jobs ({len(mask_visible_statuses)})"
-    with st.expander(mask_header, expanded=bool(mask_visible_statuses)):
-        _render_job_cards(
-            mask_visible_statuses,
-            result_cache=result_cache,
-            empty_message="No mask jobs match the selected filter.",
-        )
-    fetch_header = f"Fetch jobs ({len(fetch_visible_statuses)})"
-    with st.expander(fetch_header, expanded=bool(fetch_visible_statuses) and not bool(mask_visible_statuses)):
-        _render_job_cards(
-            fetch_visible_statuses,
-            result_cache=result_cache,
-            empty_message="No fetch jobs match the selected filter.",
-        )
+    _render_job_cards(
+        visible_statuses,
+        result_cache=result_cache,
+        empty_message="No pipeline runs match the selected filter.",
+    )
 
 
 @st.fragment(run_every=JOB_MONITOR_REFRESH_EVERY)
@@ -2275,12 +2535,20 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_
         if selected_provider_status is not None:
             status_label = provider_auth_state_label(selected_provider_status)
             detail = str(selected_provider_status.get("message") or "-")
+            pool_line = ""
+            if str(selected_provider_status.get("provider") or "").strip().lower() == "copernicus":
+                pool_line = (
+                    f" · account pool: "
+                    f"{int(selected_provider_status.get('account_pool_size', 0) or 0)} account(s)"
+                    f" · per-account concurrency: "
+                    f"{int(selected_provider_status.get('account_pool_concurrency', 0) or 0)}"
+                )
             st.markdown(
                 "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:10px;margin-top:8px;'>"
                 f"<div style='display:flex;justify-content:space-between;align-items:center;gap:8px;'><span style='font-size:.78rem;color:#94a3b8;font-weight:600;'>{str(selected_provider_status.get('provider') or '').upper()} auth</span>"
                 f"<span style='font-size:.72rem;color:{'#22c55e' if status_label == 'valid' else '#ef4444' if status_label in {'missing', 'credentials invalid', 'credentials missing'} else '#f59e0b'};font-weight:700;text-transform:uppercase;'>{status_label}</span></div>"
                 f"<div style='font-size:.72rem;color:#cbd5e1;margin-top:6px;'>{detail}</div>"
-                f"<div style='font-size:.65rem;color:#64748b;margin-top:4px;'>Runtime env · username present: {'yes' if selected_provider_status.get('username_present') else 'no'} · token present: {'yes' if selected_provider_status.get('token_present') or selected_provider_status.get('password_present') else 'no'}</div>"
+                f"<div style='font-size:.65rem;color:#64748b;margin-top:4px;'>Runtime env · username present: {'yes' if selected_provider_status.get('username_present') else 'no'} · token present: {'yes' if selected_provider_status.get('token_present') or selected_provider_status.get('password_present') else 'no'}{pool_line}</div>"
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -2599,8 +2867,8 @@ def main():
         unsafe_allow_html=True,
     )
 
-    tab_map, tab_dl, tab_mask, tab_jobs, tab_res, tab_set = st.tabs(
-        ["🗺️ Map", "⬇️ Download", "🧪 Mask", "📋 Jobs", "📂 Results", "🔧 Settings"]
+    tab_map, tab_dl, tab_jobs, tab_res, tab_set = st.tabs(
+        ["🗺️ Map", "⬇️ Download", "📋 Jobs", "📂 Results", "🔧 Settings"]
     )
 
     with tab_map:
@@ -2711,7 +2979,7 @@ def main():
             )
 
         st.markdown(
-            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>⬇️</span><span style="font-weight:600;font-size:.94rem;">Download Manager</span></div>',
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>⬇️</span><span style="font-weight:600;font-size:.94rem;">Pipeline Launcher</span></div>',
             unsafe_allow_html=True,
         )
         c1, c2, c3 = st.columns(3)
@@ -2879,17 +3147,62 @@ def main():
             elif _ss("preview_fetched", False):
                 st.info("Aucun produit trouvé pour cette AOI et cette période.")
 
-        mode_text = "single job"
+        mode_text = "single pipeline run"
         if provider == "Copernicus" and len(selected_tiles_for_cmd) > 1:
-            mode_text = f"batch by tile ({len(selected_tiles_for_cmd)} jobs)"
+            mode_text = f"pipeline batch by tile ({len(selected_tiles_for_cmd)} runs)"
         elif provider == "Copernicus" and len(selected_tiles_for_cmd) == 1:
-            mode_text = "single job with tile filter"
+            mode_text = "single pipeline run with tile filter"
         st.caption(f"Submit mode: {mode_text}")
+
+        download_strategy = "default"
+        if provider == "Copernicus":
+            pool_size = int((current_provider_status or {}).get("account_pool_size", 0) or 0)
+            pool_concurrency = int((current_provider_status or {}).get("account_pool_concurrency", 0) or 0)
+            pool_available = bool((current_provider_status or {}).get("account_pool_configured"))
+            download_strategy = st.radio(
+                "Download execution",
+                options=["default", "copernicus_account_pool"],
+                horizontal=True,
+                key="download_execution_mode",
+                format_func=lambda value: {
+                    "default": "Stable single account",
+                    "copernicus_account_pool": "Account pool test",
+                }[value],
+            )
+            if download_strategy == "copernicus_account_pool":
+                if pool_available:
+                    st.caption(
+                        f"Account pool test mode is enabled. Available accounts: {pool_size} · per-account concurrency target: {pool_concurrency}."
+                    )
+                else:
+                    st.caption(
+                        "Account pool test mode was selected, but no extra Copernicus accounts are configured yet. The job will fall back to the primary account."
+                    )
+
+        download_mask_mode = st.radio(
+            "Pipeline final stage",
+            options=["none", "water", "cloud", "water + cloud"],
+            horizontal=True,
+            key="download_mask_mode",
+            format_func=lambda value: {
+                "none": "Zarr only",
+                "water": "Zarr + water",
+                "cloud": "Zarr + cloud",
+                "water + cloud": "Zarr + cloud + water",
+            }[value],
+        )
+        requested_download_mask_types = _mask_mode_to_types(download_mask_mode)
+        if requested_download_mask_types:
+            st.caption(
+                "This pipeline will continue after Zarr conversion and write the requested masks directly into the same Zarr store."
+            )
+        else:
+            st.caption("This pipeline stops at the Zarr stage.")
 
         d1, d2 = st.columns([2, 1])
         with d1:
             start_clicked = st.button(
-                "🚀 Start Download",
+                "🚀 Start Pipeline",
                 width="stretch",
                 type="primary",
                 disabled=provider_blocked,
@@ -2899,7 +3212,7 @@ def main():
                 "<div style='background:#0f172a;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:12px;'>"
                 "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Monitoring</div>"
                 "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Use the Jobs tab</div>"
-                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Live job progress, fetch/mask separation, and cancel controls are shown there.</div>"
+                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Live pipeline progress and cancel controls are shown there.</div>"
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -2977,6 +3290,8 @@ def main():
                                 end_date=st.session_state["end_date"],
                                 aoi_wkt=aoi_text_for_download,
                                 tile_id=tile_id,
+                                mask_types=requested_download_mask_types,
+                                download_strategy=download_strategy,
                             )
                             for tile_id in selected_tiles_for_cmd
                         ]
@@ -2990,7 +3305,7 @@ def main():
                         if response.ok:
                             created = [str(job_id) for job_id in response.json().get("job_ids", [])]
                             _upsert_known_jobs(created, active_job_ids=created)
-                            st.success(f"Created {len(created)} jobs.")
+                            st.success(f"Created {len(created)} pipeline runs.")
                         else:
                             st.error(f"{response.status_code}: {response.text}")
                     else:
@@ -3003,6 +3318,8 @@ def main():
                             end_date=st.session_state["end_date"],
                             aoi_wkt=aoi_text_for_download,
                             tile_id=tile_id,
+                            mask_types=requested_download_mask_types,
+                            download_strategy=download_strategy,
                         )
                         response = _api_request(
                             "POST",
@@ -3014,7 +3331,7 @@ def main():
                         if response.ok:
                             job_id = str(response.json().get("job_id", ""))
                             _upsert_known_jobs([job_id], active_job_ids=[job_id])
-                            st.success(f"Created job: {job_id}")
+                            st.success(f"Created pipeline run: {job_id}")
                         else:
                             st.error(f"{response.status_code}: {response.text}")
                 except Exception as exc:
@@ -3032,517 +3349,19 @@ def main():
             if unlock_clicked:
                 st.success("Tracker unlocked.")
 
-        st.caption("Download tab is launch-only. Live activity is monitored in the Jobs tab.")
+        st.caption("This tab launches new pipeline runs only. Live activity is monitored in the Jobs tab.")
 
     with tab_jobs:
         st.markdown(
             '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>📋</span><span style="font-weight:600;font-size:.94rem;">Jobs</span></div>',
             unsafe_allow_html=True,
         )
-        st.caption("Fetch jobs cover search/download/Zarr conversion. Mask jobs cover derived masking actions on existing Zarr stores.")
+        st.caption("A single pipeline job now covers search, download, Zarr conversion, and optional in-place masking.")
         if bool(_ss("dl_auto_refresh", True)):
             _render_download_jobs_panel_live(download_provider_api)
         else:
             _render_download_jobs_panel_static(download_provider_api)
 
-    with tab_mask:
-        st.markdown(
-            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>🧪</span><span style="font-weight:600;font-size:.94rem;">Mask</span></div>',
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            "The automatic pipeline stops at Zarr. Each launch here creates a separate mask job, trackable in `📋 Jobs`, and writes the requested masks directly into the selected Zarr store."
-        )
-
-        summary1, summary2, summary3 = st.columns(3)
-        with summary1:
-            st.markdown(
-                "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
-                "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 1</div>"
-                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Choose a Zarr store</div>"
-                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Pick an existing store registered by the pipeline or discovered on disk.</div>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-        with summary2:
-            st.markdown(
-                "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
-                "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 2</div>"
-                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Review context</div>"
-                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Confirm the scene, provider, job lineage, and local mask status before running.</div>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-        with summary3:
-            st.markdown(
-                "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:14px;'>"
-                "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Step 3</div>"
-                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Launch tracked mask job</div>"
-                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>The action submits a separate mask job that writes masks directly into the selected Zarr instead of restarting the fetch pipeline.</div>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-
-        mask_mode = st.radio(
-            "Mask mode",
-            options=["water", "cloud", "water + cloud"],
-            horizontal=True,
-            key="mask_mode",
-            format_func=lambda value: {
-                "water": "Water",
-                "cloud": "Cloud",
-                "water + cloud": "Water + cloud",
-            }[value],
-        )
-        cloud_include_shadows = True
-        st.info(
-            "Mask runs now use the single model-first mask service. The UI no longer exposes backend or threshold choices. "
-            "Choose only the mask mode: `water`, `cloud`, or `water + cloud`."
-        )
-        if mask_mode in {"water", "water + cloud"}:
-            st.caption(
-                "Water writes `masks/water` and `masks/water_probability` directly into the selected Zarr. "
-                "In combined runs, cloud/shadow obstruction is applied before water."
-            )
-        if mask_mode in {"cloud", "water + cloud"}:
-            st.caption(
-                "Cloud writes `masks/cloud` as the final obstruction mask and `masks/cloud_probability` as a debug/confidence layer. "
-                "Cloud shadows are included automatically in the final cloud obstruction mask."
-            )
-
-        st.markdown("---")
-        w1, w2, w3 = st.columns([2, 2, 3])
-        with w1:
-            artifact_provider = st.selectbox(
-                "Zarr provider",
-                options=["", "copernicus", "usgs"],
-                key="watermask_artifact_provider",
-                format_func=lambda value: "All providers" if not value else value,
-            )
-        with w2:
-            artifact_collection = st.text_input(
-                "Zarr mission",
-                key="watermask_artifact_collection",
-                placeholder="e.g. SENTINEL-2",
-            ).strip()
-        with w3:
-            artifact_query = st.text_input(
-                "Zarr path / scene search",
-                key="watermask_artifact_query",
-                placeholder="scene id or store path fragment",
-            ).strip()
-        show_legacy_stores = st.checkbox(
-            "Show legacy or unregistered local Zarr stores",
-            value=bool(_ss("show_legacy_watermask_zarr", False)),
-            key="show_legacy_watermask_zarr",
-            help="Legacy stores are visible for inspection, but manual masking works best on stores linked to a backend job.",
-        )
-
-        artifacts, artifacts_total = _list_artifacts(
-            _ss("api_url"),
-            _ss("api_key"),
-            artifact_type="zarr",
-            provider=artifact_provider or None,
-            collection=artifact_collection or None,
-            uri_query=artifact_query or None,
-            include_local=True,
-            page=1,
-            page_size=120,
-        )
-        visible_artifacts, hidden_legacy_count = _filter_visible_artifacts(
-            artifacts,
-            include_legacy=show_legacy_stores,
-        )
-        selected_mask_types = ["water", "cloud"] if mask_mode == "water + cloud" else [mask_mode]
-        mask_target_label = _mask_request_target_label(selected_mask_types)
-        hide_complete_stores = st.checkbox(
-            f"Show only stores that still need `{mask_target_label}`",
-            value=bool(_ss("mask_hide_complete_stores", False)),
-            key="mask_hide_complete_stores",
-            help="Use the actual local Zarr contents (`masks/...`) as the source of truth when deciding whether a store already satisfies the selected mask mode.",
-        )
-
-        if not visible_artifacts:
-            st.info("No existing Zarr store was found in the registry or on local disk.")
-        else:
-            store_catalog: list[dict[str, Any]] = []
-            for item in visible_artifacts:
-                artifact_uri = str(item.get("artifact_uri") or "").strip()
-                if not artifact_uri:
-                    continue
-                local_store_summary = _inspect_local_zarr_store(artifact_uri, artifact=item)
-                requested_state = _requested_mask_state(local_store_summary, selected_mask_types)
-                associated_job_id = _find_pipeline_job_for_zarr_uri(
-                    _ss("api_url"),
-                    _ss("api_key"),
-                    artifact_uri,
-                    artifacts=visible_artifacts,
-                )
-                catalog_entry = {
-                    **item,
-                    **local_store_summary,
-                    "associated_job_id": associated_job_id,
-                    "requested_state": requested_state,
-                    "visibility_status": str(
-                        item.get("_visibility_status", _artifact_visibility_status(item))
-                    ).strip().lower(),
-                    "updated_at": item.get("updated_at"),
-                    "selection_label": "",
-                }
-                catalog_entry["selection_label"] = _mask_store_option_label(catalog_entry)
-                store_catalog.append(catalog_entry)
-
-            store_catalog.sort(key=_mask_store_sort_key)
-            if hide_complete_stores:
-                filtered_catalog = [
-                    item
-                    for item in store_catalog
-                    if str(dict(item.get("requested_state") or {}).get("status") or "").strip().lower() != "written"
-                ]
-            else:
-                filtered_catalog = list(store_catalog)
-
-            if not filtered_catalog:
-                st.info(
-                    f"Every visible Zarr already contains `{mask_target_label}`. "
-                    "Disable the filter above if you want to inspect or re-run a masked store."
-                )
-                filtered_catalog = list(store_catalog)
-
-            needs_mask_count = sum(
-                1
-                for item in store_catalog
-                if str(dict(item.get("requested_state") or {}).get("status") or "").strip().lower() == "not_written"
-            )
-            complete_count = sum(
-                1
-                for item in store_catalog
-                if str(dict(item.get("requested_state") or {}).get("status") or "").strip().lower() == "written"
-            )
-            partial_count = sum(
-                1
-                for item in store_catalog
-                if str(dict(item.get("requested_state") or {}).get("status") or "").strip().lower() == "partial"
-            )
-            untracked_count = sum(1 for item in store_catalog if not item.get("associated_job_id"))
-
-            caption = f"Showing {len(filtered_catalog)} / {artifacts_total} Zarr stores."
-            if hidden_legacy_count:
-                caption += f" Hidden legacy stores: {hidden_legacy_count}."
-            st.caption(caption)
-
-            overview_cols = st.columns(4)
-            with overview_cols[0]:
-                st.metric("Matching Zarrs", len(filtered_catalog))
-            with overview_cols[1]:
-                st.metric("Need selected masks", needs_mask_count)
-            with overview_cols[2]:
-                st.metric("Already complete", complete_count)
-            with overview_cols[3]:
-                st.metric("Partial / untracked", f"{partial_count} / {untracked_count}")
-
-            preview_rows = []
-            for item in filtered_catalog[:20]:
-                requested_state = dict(item.get("requested_state") or {})
-                preview_rows.append(
-                    {
-                        "scene": str(item.get("scene_id") or item.get("store_name") or "-"),
-                        "provider": item.get("provider", "-"),
-                        "collection": item.get("collection", "-"),
-                        "bands": int(item.get("band_count") or 0),
-                        "store_masks": item.get("mask_state_label", "-"),
-                        "selected_request": requested_state.get("label", "-"),
-                        "tracked": "yes" if item.get("associated_job_id") else "no",
-                        "visibility": str(item.get("visibility_status") or "-").upper(),
-                    }
-                )
-            st.dataframe(preview_rows, width="stretch", hide_index=True)
-
-            store_options = [str(item["artifact_uri"]) for item in filtered_catalog]
-            if store_options and str(_ss("watermask_selected_store", "")).strip() not in store_options:
-                st.session_state["watermask_selected_store"] = store_options[0]
-            selected_store = st.selectbox(
-                "Choose source Zarr",
-                options=store_options,
-                key="watermask_selected_store",
-                format_func=lambda value: next(
-                    (item["selection_label"] for item in filtered_catalog if str(item["artifact_uri"]) == value),
-                    value,
-                ),
-            )
-            selected_store_meta = next(
-                (item for item in filtered_catalog if str(item["artifact_uri"]) == selected_store),
-                filtered_catalog[0],
-            )
-            selected_store_uri = str(selected_store_meta.get("artifact_uri") or "").strip()
-            selected_host_hint = str(selected_store_meta.get("host_path") or _container_to_host_path_hint(selected_store_uri)).strip()
-            selected_job_id = str(selected_store_meta.get("associated_job_id") or "").strip()
-            mask_request_key = _mask_request_key(selected_store_uri, selected_mask_types)
-            preferred_mask_job_id = str(
-                dict(_ss("preferred_mask_job_ids", {})).get(mask_request_key) or ""
-            ).strip()
-            backend_mask_snapshot = _latest_mask_backend_snapshot(
-                _ss("api_url"),
-                _ss("api_key"),
-                source_zarr_uri=selected_store_uri,
-                source_job_id=selected_job_id,
-                selected_mask_types=selected_mask_types,
-                preferred_mask_job_id=preferred_mask_job_id,
-            )
-            scene_id = str(selected_store_meta.get("scene_id") or Path(selected_store_uri).stem).strip()
-            provider_api = str(selected_store_meta.get("provider") or "").strip()
-            collection_api = str(selected_store_meta.get("collection") or "").strip()
-            product_type = str((selected_store_meta.get("metadata") or {}).get("product_type") or "").strip()
-            backend_water_mask = dict(backend_mask_snapshot.get("water_mask") or {})
-            backend_cloud_mask = dict(backend_mask_snapshot.get("cloud_mask") or {})
-            requested_store_state = dict(selected_store_meta.get("requested_state") or {})
-            local_store_masks_label = str(selected_store_meta.get("mask_state_label") or "Unknown").strip()
-            quality_snapshot = dict(backend_mask_snapshot.get("quality") or {})
-            backend_job_state = str(dict(backend_mask_snapshot.get("job") or {}).get("state") or "").strip().lower()
-            backend_job_id = str(dict(backend_mask_snapshot.get("job") or {}).get("job_id") or "").strip()
-            current_request_complete = str(requested_store_state.get("status") or "").strip().lower() == "written"
-            current_request_partial = str(requested_store_state.get("status") or "").strip().lower() == "partial"
-            selected_reference_pixel_size = list(selected_store_meta.get("reference_pixel_size") or [])
-
-            meta_cols = st.columns(4)
-            with meta_cols[0]:
-                st.metric("Provider", provider_api or "-")
-            with meta_cols[1]:
-                st.metric("Collection", collection_api or "-")
-            with meta_cols[2]:
-                st.metric("Bands", int(selected_store_meta.get("band_count") or len(selected_store_meta.get("band_names") or [])))
-            with meta_cols[3]:
-                st.metric("Store masks", local_store_masks_label or "Unknown")
-
-            status_cols = st.columns(4)
-            with status_cols[0]:
-                st.metric("Selected request", requested_store_state.get("label") or "Unknown")
-            with status_cols[1]:
-                st.metric("Latest mask job", backend_job_state or "-")
-            with status_cols[2]:
-                st.metric("Tracking", "tracked" if selected_job_id else "local only")
-            with status_cols[3]:
-                pixel_size_label = (
-                    f"{float(selected_reference_pixel_size[0]):.1f} m"
-                    if len(selected_reference_pixel_size) >= 2
-                    else "-"
-                )
-                st.metric("Pixel size", pixel_size_label)
-
-            details_lines = [
-                f"Scene: {scene_id or '-'}",
-                f"Container path: {selected_store_uri or '-'}",
-                f"Host path: {selected_host_hint or '-'}",
-                f"Associated job: {selected_job_id or '-'}",
-                f"Visibility status: {str(selected_store_meta.get('visibility_status') or '-').upper()}",
-                f"Data family: {selected_store_meta.get('data_family', '-')}",
-                f"Dimensions: {', '.join([str(v) for v in (selected_store_meta.get('dimensions') or [])]) or '-'}",
-                f"Shape: {selected_store_meta.get('shape', []) or '-'}",
-                f"Bands: {', '.join([str(v) for v in (selected_store_meta.get('band_names') or [])]) or '-'}",
-                f"Store masks present: {_store_mask_layers_label(selected_store_meta)}",
-                f"Selected request status: {requested_store_state.get('label') or '-'}",
-                f"Water status: {backend_water_mask.get('status') or '-'}",
-                f"Cloud status: {backend_cloud_mask.get('status') or '-'}",
-                f"Latest mask job id: {backend_job_id or '-'}",
-                f"Target Zarr store: {selected_store_uri or '-'}",
-                f"Updated: {selected_store_meta.get('updated_at', '-')}",
-                f"Size: {_human_size(selected_store_meta.get('size_bytes'))}",
-            ]
-            st.code("\n".join(details_lines), language="text")
-
-            if current_request_complete:
-                st.success(
-                    f"The selected Zarr already contains `{mask_target_label}` in `masks/...`."
-                )
-            elif current_request_partial:
-                st.warning(
-                    requested_store_state.get("reason")
-                    or "The selected Zarr already contains a partial set of the requested mask layers."
-                )
-            else:
-                st.info(
-                    f"The selected Zarr does not yet contain `{mask_target_label}`."
-                )
-
-            if backend_job_state in {"queued", "running", "cancel_requested"}:
-                st.info(
-                    f"The latest mask job is `{backend_job_state}`. "
-                    "Track progress in `📋 Jobs`."
-                )
-            elif backend_job_state in {"failed", "error"}:
-                failure_reason = str(backend_water_mask.get("reason") or backend_cloud_mask.get("reason") or "").strip()
-                st.error(failure_reason or "The latest mask job failed for this store.")
-
-            submission_notice = dict(_ss("mask_submission_notice", {}))
-            if (
-                str(submission_notice.get("source_zarr_uri") or "").strip() == selected_store_uri
-                and _normalize_mask_types(list(submission_notice.get("mask_types") or [])) == _normalize_mask_types(selected_mask_types)
-            ):
-                submitted_job_id = str(submission_notice.get("job_id") or "").strip()
-                submitted_state = str(submission_notice.get("job_state") or "queued").strip().lower() or "queued"
-                st.success(
-                    f"Mask job `{submitted_job_id}` submitted for `{Path(selected_store_uri).name}`. "
-                    "Track progress in `📋 Jobs`."
-                )
-                st.code(
-                    "\n".join(
-                        [
-                            f"Source Zarr: {selected_store_uri}",
-                            f"Mask types: {', '.join(selected_mask_types)}",
-                            f"Job id: {submitted_job_id or '-'}",
-                            f"Job state: {submitted_state or '-'}",
-                        ]
-                    ),
-                    language="text",
-                )
-                st.session_state["mask_submission_notice"] = {}
-
-            if quality_snapshot:
-                diag_cols = st.columns(4)
-                with diag_cols[0]:
-                    st.metric("Cloud engine", quality_snapshot.get("cloud_backend") or "-")
-                with diag_cols[1]:
-                    st.metric("Cloud/shadow", f"{float(quality_snapshot.get('cloud_fraction', 0.0)) * 100:.1f}%")
-                with diag_cols[2]:
-                    st.metric("Shadow fraction", f"{float(quality_snapshot.get('cloud_shadow_fraction', 0.0)) * 100:.1f}%")
-                with diag_cols[3]:
-                    st.metric("Water fraction", f"{float(quality_snapshot.get('water_fraction', 0.0)) * 100:.1f}%")
-                quality_lines = [
-                    f"Cloud engine used: {quality_snapshot.get('cloud_backend') or '-'}",
-                    f"Cloud includes shadows: {'yes' if quality_snapshot.get('cloud_includes_shadows') else 'no'}",
-                    f"Cloud mask source: {quality_snapshot.get('cloud_mask_source') or '-'}",
-                    f"Cloud probability source: {quality_snapshot.get('cloud_probability_source') or '-'}",
-                    f"Cloud sensor recipe: {quality_snapshot.get('cloud_sensor_recipe') or '-'}",
-                    f"Cloud mask layer: {quality_snapshot.get('cloud_mask_path') or '-'}",
-                    f"Cloud confidence/debug layer: {quality_snapshot.get('cloud_probability_path') or '-'}",
-                    f"Cloud-only fraction: {float(quality_snapshot.get('cloud_only_fraction', 0.0)) * 100:.1f}%",
-                    f"Shadow fraction: {float(quality_snapshot.get('cloud_shadow_fraction', 0.0)) * 100:.1f}%",
-                    f"Water runtime: {quality_snapshot.get('water_runtime_mode') or '-'}",
-                    f"Water probability/debug layer: {quality_snapshot.get('water_probability_path') or '-'}",
-                    f"Water threshold used: {quality_snapshot.get('water_threshold_used') if quality_snapshot.get('water_threshold_used') is not None else '-'}",
-                    f"Water sensor recipe: {quality_snapshot.get('water_sensor_recipe') or '-'}",
-                ]
-                st.code("\n".join(quality_lines), language="text")
-
-            if backend_water_mask.get("mask_path") or backend_cloud_mask.get("mask_path"):
-                extra_lines = [
-                    f"Latest mask job: {backend_job_id or '-'}",
-                    f"Latest mask job state: {backend_job_state or '-'}",
-                    f"Water mask layer: {backend_water_mask.get('mask_path') or '-'}",
-                    f"Cloud mask layer: {backend_cloud_mask.get('mask_path') or '-'}",
-                    f"Target Zarr store: {selected_store_uri or '-'}",
-                ]
-                st.code("\n".join(extra_lines), language="text")
-
-            if selected_store_uri:
-                _render_local_path_actions(
-                    title="Selected Zarr store",
-                    path_value=selected_store_uri,
-                    open_label="Open Zarr folder",
-                    copy_label="Copy Zarr path",
-                )
-
-            action_col1, action_col2 = st.columns([3, 2])
-            with action_col1:
-                action_label = "Create mask job"
-                if current_request_complete:
-                    action_label = "Re-run mask job"
-                run_mask = st.button(
-                    action_label,
-                    type="primary",
-                    width="stretch",
-                    disabled=not selected_job_id,
-                )
-            with action_col2:
-                st.markdown(
-                    "<div style='background:#0f172a;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:12px;'>"
-                    "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Execution mode</div>"
-                    "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Separate tracked mask job</div>"
-                    "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>This action creates a separate mask job and writes the requested masks directly into the selected Zarr.</div>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-
-            if not selected_job_id:
-                st.warning(
-                    "This Zarr store is not linked to a known backend job yet. "
-                    "Use a registered pipeline output to run manual masking."
-                )
-
-            if run_mask:
-                try:
-                    mask_endpoint = f"/v1/jobs/{selected_job_id}/mask"
-                    payload = {
-                        "zarr_uri": selected_store_uri,
-                        "scene_id": scene_id or None,
-                        "product_type": product_type or None,
-                        "mask_types": selected_mask_types,
-                        "overwrite": True,
-                    }
-                    if "cloud" in selected_mask_types:
-                        payload["include_shadows"] = bool(cloud_include_shadows)
-                    response = _api_request(
-                        "POST",
-                        _ss("api_url"),
-                        mask_endpoint,
-                        api_key=_ss("api_key"),
-                        payload=payload,
-                        timeout=1800,
-                    )
-                    if response.ok:
-                        body = response.json()
-                        manual_job_id = str(body.get("job_id") or selected_job_id)
-                        cache = dict(_ss("job_status_cache", {}))
-                        cache[manual_job_id] = dict(body.get("job") or {})
-                        st.session_state["job_status_cache"] = cache
-                        _upsert_known_jobs([manual_job_id], active_job_ids=[manual_job_id])
-                        body_mask_types = [
-                            str(item).strip().lower()
-                            for item in list(body.get("mask_types") or selected_mask_types)
-                        ]
-                        job_state = str((body.get("job") or {}).get("state") or "").strip().lower()
-                        preferred_jobs = dict(_ss("preferred_mask_job_ids", {}))
-                        preferred_jobs[mask_request_key] = manual_job_id
-                        st.session_state["preferred_mask_job_ids"] = preferred_jobs
-                        st.session_state["mask_submission_notice"] = {
-                            "source_zarr_uri": selected_store_uri,
-                            "mask_types": body_mask_types,
-                            "job_id": manual_job_id,
-                            "job_state": job_state or "queued",
-                        }
-                        st.rerun()
-                    else:
-                        st.error(f"{response.status_code}: {_response_error_message(response)}")
-                except Exception as exc:
-                    st.error(str(exc))
-
-        st.markdown("---")
-        with st.expander("Recent Zarr pipeline outputs", expanded=False):
-            recent_rows, _ = _list_jobs(
-                _ss("api_url"),
-                _ss("api_key"),
-                updated_from=_recent_jobs_cutoff(RECENT_JOBS_WINDOW_HOURS),
-                page=1,
-                page_size=40,
-            )
-            zarr_rows = [
-                row for row in recent_rows
-                if list(row.get("zarr_outputs") or [])
-                or str(row.get("pipeline_state") or "") in {"zarr_written", "zarr_failed"}
-            ]
-            if not zarr_rows:
-                st.info("No recent Zarr-producing pipeline job was found.")
-            else:
-                for item in zarr_rows[:20]:
-                    with st.container(border=True):
-                        st.markdown(f"**{item.get('job_id', '-') }**")
-                        st.caption(
-                            f"{item.get('provider', '-')}/{item.get('collection', '-')}"
-                            f" · pipeline state: {item.get('pipeline_state', '-')}"
-                        )
-                        if item.get("zarr_outputs"):
-                            for output_path in list(item.get("zarr_outputs") or [])[:5]:
-                                st.code(str(output_path), language="text")
 
     with tab_res:
         render_results_tab(api_url=_ss("api_url"), api_key=_ss("api_key"))

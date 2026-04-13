@@ -25,7 +25,13 @@ from nimbuschain_fetch_ui.jobs_helpers import (
     _list_jobs,
     _recent_jobs_cutoff,
 )
-from nimbuschain_fetch_ui.zarr_utils import list_artifacts as _list_artifacts
+
+
+PIPELINE_VISIBLE_STATES = {
+    JobState.queued.value,
+    JobState.running.value,
+    JobState.cancel_requested.value,
+}
 
 
 def _fmt_mb(value: Any) -> float:
@@ -52,29 +58,28 @@ def _fmt_timestamp(value: Any) -> str:
         return str(value)
 
 
-def _render_job_summary_cards(rows: list[dict[str, Any]]) -> None:
-    summary_jobs = len(rows)
+def _row_is_pipeline_run(row: dict[str, Any]) -> bool:
+    return str(row.get("job_kind") or row.get("job_type") or "").strip().lower() not in {
+        "mask",
+        "mask_existing_zarr",
+    }
+
+
+def _render_pipeline_summary_cards(rows: list[dict[str, Any]]) -> None:
+    summary_runs = len(rows)
     summary_success = sum(1 for row in rows if str(row.get("state")) == JobState.succeeded.value)
     summary_failed = sum(1 for row in rows if str(row.get("state")) == JobState.failed.value)
-    summary_running = sum(
-        1
-        for row in rows
-        if str(row.get("state")) in {
-            JobState.queued.value,
-            JobState.running.value,
-            JobState.cancel_requested.value,
-        }
-    )
+    summary_running = sum(1 for row in rows if str(row.get("state")) in PIPELINE_VISIBLE_STATES)
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Visible jobs", summary_jobs)
+        st.metric("Visible pipeline runs", summary_runs)
     with col2:
         st.metric("Running / queued", summary_running)
     with col3:
         st.metric("Succeeded / failed", f"{summary_success} / {summary_failed}")
 
 
-def _render_jobs_table(rows: list[dict[str, Any]]) -> None:
+def _render_pipeline_runs_table(rows: list[dict[str, Any]]) -> None:
     compact_rows = []
     for row in rows:
         compact_rows.append(
@@ -84,6 +89,7 @@ def _render_jobs_table(rows: list[dict[str, Any]]) -> None:
                 "mission": row.get("collection", "-"),
                 "product": row.get("product_type", "-"),
                 "state": row.get("state", "-"),
+                "pipeline": row.get("pipeline_state", "-"),
                 "progress": _fmt_progress(row.get("progress")),
                 "downloaded_mb": _fmt_mb(row.get("bytes_downloaded")),
                 "total_mb": _fmt_mb(row.get("bytes_total")),
@@ -93,9 +99,9 @@ def _render_jobs_table(rows: list[dict[str, Any]]) -> None:
     st.dataframe(compact_rows, width="stretch", hide_index=True)
 
 
-def _render_job_details(rows: list[dict[str, Any]]) -> None:
+def _render_pipeline_run_details(rows: list[dict[str, Any]]) -> None:
     selected_job_id = st.selectbox(
-        "Inspect job",
+        "Inspect pipeline run",
         options=[str(row.get("job_id", "")) for row in rows],
         format_func=lambda job_id: f"{job_id[:12]}...",
         index=0,
@@ -106,7 +112,7 @@ def _render_job_details(rows: list[dict[str, Any]]) -> None:
     )
     if selected_job is None:
         return
-    with st.expander("Job details", expanded=False):
+    with st.expander("Pipeline run details", expanded=False):
         st.code(
             json.dumps(
                 {
@@ -155,51 +161,6 @@ def _merge_output_values(*collections: Any) -> list[str]:
             if text and text not in merged:
                 merged.append(text)
     return merged
-
-
-def _artifact_runtime_exists(item: dict[str, Any]) -> bool:
-    metadata = dict(item.get("metadata") or {})
-    return bool(metadata.get("runtime_exists", True))
-
-
-def _row_is_mask_job(row: dict[str, Any]) -> bool:
-    return str(row.get("job_kind") or row.get("job_type") or "").strip().lower() in {
-        "mask",
-        "mask_existing_zarr",
-    }
-
-
-def _row_has_final_mask_success(row: dict[str, Any]) -> bool:
-    if not _row_is_mask_job(row):
-        return True
-    state = str(row.get("state") or "").strip().lower()
-    pipeline_state = str(row.get("pipeline_state") or "").strip().lower()
-    return state == JobState.succeeded.value and pipeline_state == "masked_zarr_written"
-
-
-def _render_masked_zarr_relations(masked_artifacts: list[dict[str, Any]]) -> None:
-    relation_rows: list[dict[str, str]] = []
-    for item in masked_artifacts:
-        masked_uri = str(item.get("artifact_uri") or "").strip()
-        source_uri = str(item.get("source_uri") or "").strip()
-        metadata = dict(item.get("metadata") or {})
-        if not source_uri:
-            source_uri = str(metadata.get("source_zarr_uri") or "").strip()
-        if not masked_uri:
-            continue
-        relation_rows.append(
-            {
-                "source_zarr": source_uri or "-",
-                "masked_zarr": masked_uri,
-            }
-        )
-    if not relation_rows:
-        st.caption("No source to masked Zarr lineage is recorded for this job.")
-        return
-    with st.container(border=True):
-        st.markdown("**Masked Zarr lineage**")
-        st.caption("Source Zarr -> masked Zarr store")
-        st.dataframe(relation_rows, width="stretch", hide_index=True)
 
 
 def _mask_quality_snapshot(
@@ -277,7 +238,7 @@ def _render_mask_quality_block(
         return
 
     with st.container(border=True):
-        st.markdown("**Mask quality summary**")
+        st.markdown("**In-place mask summary**")
         cols = st.columns(4)
         with cols[0]:
             st.metric("Cloud fraction", f"{summary['cloud_fraction'] * 100:.1f}%")
@@ -287,7 +248,7 @@ def _render_mask_quality_block(
             st.metric("Water fraction", f"{summary['water_fraction'] * 100:.1f}%")
         with cols[3]:
             runtime_label = summary["water_runtime_mode"] or summary["cloud_backend"] or "-"
-            st.metric("Runtime", runtime_label)
+            st.metric("Mask runtime", runtime_label)
 
         lines = [
             f"Cloud status: {summary['cloud_status'] or '-'}",
@@ -307,17 +268,44 @@ def _render_mask_quality_block(
         st.code("\n".join(lines), language="text")
 
 
+def _pipeline_mask_layer_outputs(
+    *,
+    pipeline_metadata: dict[str, Any],
+    conversion_metadata: dict[str, Any],
+    target_zarr_uri: str,
+) -> list[str]:
+    water = dict(conversion_metadata.get("water_mask") or pipeline_metadata.get("water_mask") or {})
+    cloud = dict(conversion_metadata.get("cloud_mask") or pipeline_metadata.get("cloud_mask") or {})
+    entries: list[str] = []
+
+    def add_entry(label: str, layer_path: str) -> None:
+        text = str(layer_path or "").strip()
+        if not text:
+            return
+        rendered = f"{label}: {text}"
+        if target_zarr_uri:
+            rendered = f"{target_zarr_uri} :: {rendered}"
+        if rendered not in entries:
+            entries.append(rendered)
+
+    add_entry("Water mask", str(water.get("mask_path") or ""))
+    add_entry("Water probability", str(water.get("probability_path") or ""))
+    add_entry("Cloud mask", str(cloud.get("mask_path") or ""))
+    add_entry("Cloud probability", str(cloud.get("probability_path") or ""))
+    return entries
+
+
 def _render_pipeline_result_section(
     api_url: str,
     api_key: str,
     rows: list[dict[str, Any]],
     *,
-    artifact_type_filter: str | None = None,
+    output_type_filter: str | None = None,
 ) -> None:
     st.markdown("---")
     st.markdown("**Pipeline outputs**")
     selected_job_id = st.selectbox(
-        "Inspect pipeline job",
+        "Inspect pipeline run outputs",
         options=[str(row.get("job_id", "")) for row in rows],
         format_func=lambda job_id: f"{job_id[:12]}...",
         index=0,
@@ -326,7 +314,6 @@ def _render_pipeline_result_section(
     selected_row = next((row for row in rows if str(row.get("job_id", "")) == selected_job_id), None)
     if selected_row is None:
         return
-    allow_mask_outputs = _row_has_final_mask_success(selected_row)
 
     result_payload: dict[str, Any] = {}
     try:
@@ -338,103 +325,25 @@ def _render_pipeline_result_section(
 
     raw_outputs = list(result_payload.get("raw_outputs") or selected_row.get("raw_outputs") or [])
     zarr_outputs = list(result_payload.get("zarr_outputs") or selected_row.get("zarr_outputs") or [])
-    watermask_outputs = list(result_payload.get("watermask_outputs") or selected_row.get("watermask_outputs") or [])
     pipeline_metadata = dict(result_payload.get("pipeline_metadata") or selected_row.get("pipeline_metadata") or {})
     conversion_metadata = dict(result_payload.get("conversion_metadata") or selected_row.get("conversion_metadata") or {})
     result_metadata = dict(result_payload.get("metadata") or {})
-    masked_artifacts, _masked_total = _list_artifacts(
-        api_url,
-        api_key,
-        artifact_type="zarr_masked",
-        job_id=selected_job_id,
-        page=1,
-        page_size=100,
-    )
-    masked_artifacts = [item for item in masked_artifacts if _artifact_runtime_exists(item)]
-    masked_zarr_result_outputs = _merge_output_values(
-        result_payload.get("masked_zarr_outputs"),
-        result_payload.get("masked_zarr_uri"),
-        result_metadata.get("masked_zarr_uri"),
-        pipeline_metadata.get("masked_zarr_uri"),
-        conversion_metadata.get("masked_zarr_uri"),
-    )
-    artifact_masked_outputs = [
-        str(item.get("artifact_uri") or "").strip()
-        for item in masked_artifacts
-        if str(item.get("artifact_uri") or "").strip()
-    ]
-    masked_zarr_outputs = _merge_output_values(
-        artifact_masked_outputs,
-        masked_zarr_result_outputs if allow_mask_outputs else [],
-    )
-    if allow_mask_outputs and masked_zarr_result_outputs:
-        source_uri = str(
-            result_metadata.get("source_zarr_uri")
-            or pipeline_metadata.get("source_zarr_uri")
-            or conversion_metadata.get("source_zarr_uri")
-            or ""
-        ).strip()
-        known_artifact_uris = {str(item.get("artifact_uri") or "").strip() for item in masked_artifacts}
-        for artifact_uri in masked_zarr_result_outputs:
-            if artifact_uri in known_artifact_uris:
-                continue
-            masked_artifacts.append(
-                {
-                    "artifact_uri": artifact_uri,
-                    "source_uri": source_uri,
-                    "metadata": {
-                        "source_zarr_uri": source_uri,
-                    },
-                }
-            )
-    watermask_artifacts, _watermask_total = _list_artifacts(
-        api_url,
-        api_key,
-        artifact_type="watermask",
-        job_id=selected_job_id,
-        page=1,
-        page_size=100,
-    )
-    watermask_artifacts = [item for item in watermask_artifacts if _artifact_runtime_exists(item)]
-    cloudmask_artifacts, _cloudmask_total = _list_artifacts(
-        api_url,
-        api_key,
-        artifact_type="cloudmask",
-        job_id=selected_job_id,
-        page=1,
-        page_size=100,
-    )
-    cloudmask_artifacts = [item for item in cloudmask_artifacts if _artifact_runtime_exists(item)]
-    watermask_outputs_combined = _merge_output_values(
-        watermask_outputs if allow_mask_outputs else [],
-        [
-            str(dict(conversion_metadata.get("water_mask") or {}).get("artifact_uri") or "").strip(),
-            str(dict(pipeline_metadata.get("water_mask") or {}).get("artifact_uri") or "").strip(),
-        ] if allow_mask_outputs else [],
-        [
-            str(item.get("artifact_uri") or "").strip()
-            for item in watermask_artifacts
-            if str(item.get("artifact_uri") or "").strip()
-        ],
-    )
-    cloudmask_outputs = _merge_output_values(
-        result_payload.get("cloudmask_outputs") if allow_mask_outputs else [],
-        [
-            str(dict(conversion_metadata.get("cloud_mask") or {}).get("artifact_uri") or "").strip(),
-            str(dict(pipeline_metadata.get("cloud_mask") or {}).get("artifact_uri") or "").strip(),
-        ] if allow_mask_outputs else [],
-        [
-        str(item.get("artifact_uri") or "").strip()
-        for item in cloudmask_artifacts
-        if str(item.get("artifact_uri") or "").strip()
-        ],
+
+    target_zarr_uri = str(
+        result_metadata.get("source_zarr_uri")
+        or pipeline_metadata.get("source_zarr_uri")
+        or conversion_metadata.get("source_zarr_uri")
+        or (zarr_outputs[0] if zarr_outputs else "")
+    ).strip()
+    mask_layer_outputs = _pipeline_mask_layer_outputs(
+        pipeline_metadata=pipeline_metadata,
+        conversion_metadata=conversion_metadata,
+        target_zarr_uri=target_zarr_uri,
     )
 
-    visible_raw_outputs = raw_outputs if artifact_type_filter in {None, "", "raw"} else []
-    visible_zarr_outputs = zarr_outputs if artifact_type_filter in {None, "", "zarr"} else []
-    visible_masked_zarr_outputs = masked_zarr_outputs if artifact_type_filter in {None, "", "zarr_masked"} else []
-    visible_watermask_outputs = watermask_outputs_combined if artifact_type_filter in {None, "", "watermask"} else []
-    visible_cloudmask_outputs = cloudmask_outputs if artifact_type_filter in {None, "", "cloudmask"} else []
+    visible_raw_outputs = raw_outputs if output_type_filter in {None, "", "raw"} else []
+    visible_zarr_outputs = zarr_outputs if output_type_filter in {None, "", "zarr"} else []
+    visible_mask_layer_outputs = mask_layer_outputs if output_type_filter in {None, "", "mask_layers"} else []
 
     top1, top2, top3, top4, top5 = st.columns(5)
     with top1:
@@ -444,9 +353,9 @@ def _render_pipeline_result_section(
     with top3:
         st.metric("Raw outputs", len(raw_outputs))
     with top4:
-        st.metric("Zarr outputs", len(zarr_outputs))
+        st.metric("Zarr stores", len(zarr_outputs))
     with top5:
-        st.metric("Masked Zarr", len(masked_zarr_outputs))
+        st.metric("Mask layers", len(mask_layer_outputs))
 
     meta1, meta2, meta3 = st.columns(3)
     with meta1:
@@ -468,19 +377,28 @@ def _render_pipeline_result_section(
         )
         st.caption(f"Scene: `{scene_hint}`")
 
-    if _row_is_mask_job(selected_row) and not allow_mask_outputs:
-        st.caption("Mask outputs stay hidden here until the job reaches `masked_zarr_written`. Legacy or lagging artifact rows are ignored.")
+    if target_zarr_uri:
+        st.caption(f"Target Zarr: `{target_zarr_uri}`")
 
     out1, out2, out3 = st.columns(3)
     with out1:
-        _render_outputs_block("Raw outputs", visible_raw_outputs, "No raw outputs match the selected artifact filter for this job.")
+        _render_outputs_block(
+            "Raw outputs",
+            visible_raw_outputs,
+            "No raw outputs match the selected output filter for this pipeline run.",
+        )
     with out2:
-        _render_outputs_block("Zarr outputs", visible_zarr_outputs, "No Zarr outputs match the selected artifact filter for this job.")
+        _render_outputs_block(
+            "Zarr stores",
+            visible_zarr_outputs,
+            "No Zarr stores match the selected output filter for this pipeline run.",
+        )
     with out3:
-        _render_outputs_block("Masked Zarr outputs", visible_masked_zarr_outputs, "No masked Zarr outputs match the selected artifact filter for this job.")
-
-    if artifact_type_filter in {None, "", "zarr_masked"}:
-        _render_masked_zarr_relations(masked_artifacts)
+        _render_outputs_block(
+            "In-place mask layers",
+            visible_mask_layer_outputs,
+            "No in-place mask layers match the selected output filter for this pipeline run.",
+        )
 
     _render_mask_quality_block(
         pipeline_metadata=pipeline_metadata,
@@ -596,6 +514,7 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
         '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>📂</span><span style="font-weight:600;font-size:.94rem;">Results</span></div>',
         unsafe_allow_html=True,
     )
+    st.caption("This view shows pipeline outputs only: raw downloads, Zarr stores, and in-place mask layers written by the same pipeline run.")
 
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1, 1, 1, 1.2])
     with filter_col1:
@@ -607,13 +526,13 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
     with filter_col2:
         provider_filter = st.selectbox("Provider", ["", "copernicus", "usgs"], index=0)
     with filter_col3:
-        artifact_type_filter = st.selectbox(
-            "Artifact type",
-            ["", "raw", "zarr", "zarr_masked"],
+        output_type_filter = st.selectbox(
+            "Output type",
+            ["", "raw", "zarr", "mask_layers"],
             index=0,
         )
     with filter_col4:
-        result_job_query = st.text_input("Job search", value="", placeholder="job id fragment")
+        result_job_query = st.text_input("Pipeline search", value="", placeholder="job id, scene, or product")
 
     jobs_rows, jobs_total = _list_jobs(
         api_url,
@@ -629,6 +548,7 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
         hours=RECENT_JOBS_WINDOW_HOURS,
         limit=RECENT_JOBS_FETCH_LIMIT,
     )
+    jobs_rows = [row for row in jobs_rows if _row_is_pipeline_run(row)]
 
     if result_job_query.strip():
         needle = result_job_query.strip().lower()
@@ -641,21 +561,21 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
         ]
 
     st.caption(
-        f"Showing recent jobs only (last {RECENT_JOBS_WINDOW_HOURS}h + active). "
+        f"Showing recent pipeline runs only (last {RECENT_JOBS_WINDOW_HOURS}h + active). "
         f"{len(jobs_rows)} / {jobs_total} rows."
     )
     if jobs_rows:
-        _render_job_summary_cards(jobs_rows)
-        _render_jobs_table(jobs_rows)
+        _render_pipeline_summary_cards(jobs_rows)
+        _render_pipeline_runs_table(jobs_rows)
         _render_pipeline_result_section(
             api_url,
             api_key,
             jobs_rows,
-            artifact_type_filter=artifact_type_filter or None,
+            output_type_filter=output_type_filter or None,
         )
-        _render_job_details(jobs_rows)
+        _render_pipeline_run_details(jobs_rows)
     else:
-        st.info("No jobs for selected filters.")
+        st.info("No pipeline runs for selected filters.")
 
     st.markdown("---")
     _render_files_section(DOWNLOADS_DIR)

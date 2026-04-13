@@ -14,6 +14,7 @@ pytest.importorskip("zarr")
 import zarr
 
 from nimbuschain_fetch_service.api.converter import router as converter_router
+import nimbuschain_mask_service.inference as inference_module
 import nimbuschain_mask_service.service as mask_service_module
 from nimbuschain_mask_service.inference import run_cloud_inference
 from nimbuschain_mask_service.service import MaskService
@@ -285,6 +286,7 @@ def test_mask_route_transports_water_backend_fields() -> None:
     assert captured["job_id"] == "job-321"
     assert captured["request"]["water_backend"] == "omniwatermask"
     assert captured["request"]["mask_types"] == ["water", "cloud"]
+    assert captured["request"]["backend"] == "omnicloudmask"
     assert captured["request"]["overwrite"] is True
 
 
@@ -452,3 +454,68 @@ def test_omnicloudmask_calls_model_once_when_confidence_export_is_disabled(
     assert len(calls) == 1
     assert "export_confidence" not in calls[0]
     assert result.summary["probability_source"] == "class_map"
+
+
+def test_omnicloudmask_reuses_preloaded_models_between_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predict_calls: list[dict[str, object]] = []
+    collect_calls: list[dict[str, object]] = []
+
+    class _FakeModule:
+        @staticmethod
+        def predict_from_array(_array, **kwargs):
+            predict_calls.append(dict(kwargs))
+            return np.ones((4, 4), dtype=np.uint8)
+
+    fake_cloud_mask = types.SimpleNamespace(
+        collect_models=lambda **kwargs: collect_calls.append(dict(kwargs)) or [object()]
+    )
+    fake_torch = types.SimpleNamespace(device=lambda value: value, float32="float32")
+    original_import_module = inference_module.importlib.import_module
+
+    def _fake_import_module(name: str):
+        if name == "omnicloudmask.cloud_mask":
+            return fake_cloud_mask
+        if name == "torch":
+            return fake_torch
+        return original_import_module(name)
+
+    inference_module._OMNICLOUDMASK_MODEL_CACHE.clear()
+    monkeypatch.delenv("NIMBUS_CLOUDMASK_EXPORT_CONFIDENCE", raising=False)
+    monkeypatch.delenv("NIMBUS_CLOUDMASK_BATCH_SIZE", raising=False)
+    monkeypatch.setitem(sys.modules, "omnicloudmask", _FakeModule)
+    monkeypatch.setattr(inference_module.importlib, "import_module", _fake_import_module)
+
+    sensor = mask_service_module.resolve_sensor_mask_spec(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+    )
+    channels = {
+        "B04": np.full((4, 4), 5000.0, dtype=np.float32),
+        "B03": np.full((4, 4), 4500.0, dtype=np.float32),
+        "B08": np.full((4, 4), 3500.0, dtype=np.float32),
+    }
+
+    first = run_cloud_inference(
+        sensor=sensor,
+        channels=channels,
+        threshold=0.45,
+        backend="omnicloudmask",
+        include_shadows=True,
+    )
+    second = run_cloud_inference(
+        sensor=sensor,
+        channels=channels,
+        threshold=0.45,
+        backend="omnicloudmask",
+        include_shadows=True,
+    )
+
+    assert len(collect_calls) == 1
+    assert len(predict_calls) == 2
+    assert predict_calls[0]["custom_models"] is not None
+    assert len(predict_calls[0]["custom_models"]) == 1
+    assert first.summary["preloaded_models"] is True
+    assert second.summary["preloaded_models"] is True

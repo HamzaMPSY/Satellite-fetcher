@@ -606,6 +606,8 @@ class SQLiteJobStore:
                     UPDATE jobs
                     SET state = 'queued',
                         pipeline_step = 'resume_after_restart',
+                        started_at = NULL,
+                        finished_at = NULL,
                         worker_id = NULL,
                         errors_json = '[]',
                         updated_at = ?
@@ -633,7 +635,8 @@ class SQLiteJobStore:
                 """
                 UPDATE jobs
                 SET state = 'running',
-                    started_at = COALESCE(started_at, ?),
+                    started_at = ?,
+                    finished_at = NULL,
                     updated_at = ?,
                     worker_id = ?,
                     errors_json = '[]'
@@ -671,6 +674,8 @@ class SQLiteJobStore:
                 UPDATE jobs
                 SET state = 'queued',
                     pipeline_step = 'resume_after_restart',
+                    started_at = NULL,
+                    finished_at = NULL,
                     worker_id = NULL,
                     errors_json = '[]',
                     updated_at = ?

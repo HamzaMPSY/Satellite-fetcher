@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from nimbuschain_mask_service.io import local_path_for_uri
 from nimbuschain_mask_service.schema import (
     CLOUD_MASK_CLASSES,
     CLOUD_MASK_NAME,
@@ -15,13 +16,7 @@ from nimbuschain_mask_service.schema import (
     WATER_MASK_PATH,
     WATER_PROBABILITY_PATH,
 )
-from nimbuschain_zarr_service.core import (
-    ChunkShape,
-    ConversionDependencyError,
-    ConversionError,
-    _coerce_timestamp,
-    _open_existing_output_store,
-)
+from nimbuschain_zarr_service.core import ChunkShape, ConversionDependencyError, ConversionError, _coerce_timestamp
 
 
 def _storage_mode_from_metadata(*, metadata: dict[str, Any] | None, output_uri: str) -> str:
@@ -73,8 +68,10 @@ def write_binary_mask_to_zarr(
             f"Binary mask '{mask_name}' must contain only values 0 or 1, got {sorted(unique_values)}."
         )
 
-    output_store = _open_existing_output_store(output_uri)
-    root = zarr.open_group(output_store, mode="a", zarr_format=2)
+    output_path = local_path_for_uri(output_uri)
+    if not output_path.exists():
+        raise ConversionError(f"Output store does not exist yet: {output_path}")
+    root = zarr.open_group(str(output_path), mode="a", zarr_format=2)
     imagery = root.get("imagery")
     if imagery is None:
         raise ConversionError("The target Zarr store does not contain an imagery array.")
@@ -137,7 +134,7 @@ def write_binary_mask_to_zarr(
     root.attrs[f"{mask_name}_mask_source_zarr_uri"] = input_zarr_uri
     root.attrs[f"{mask_name}_mask_output_zarr_uri"] = output_zarr_uri
     root.attrs[f"{mask_name}_mask_storage_mode"] = storage_mode
-    zarr.consolidate_metadata(output_store)
+    zarr.consolidate_metadata(root.store)
     return {
         "mask_name": mask_name,
         "mask_path": mask_path,
@@ -203,8 +200,10 @@ def write_water_mask_to_zarr(
                 f"Water mask/probability shape mismatch: {mask_data.shape} vs {probability_data.shape}."
             )
 
-    output_store = _open_existing_output_store(output_uri)
-    root = zarr.open_group(output_store, mode="a", zarr_format=2)
+    output_path = local_path_for_uri(output_uri)
+    if not output_path.exists():
+        raise ConversionError(f"Output store does not exist yet: {output_path}")
+    root = zarr.open_group(str(output_path), mode="a", zarr_format=2)
     imagery = root.get("imagery")
     if imagery is None:
         raise ConversionError("The target Zarr store does not contain an imagery array.")
@@ -268,7 +267,7 @@ def write_water_mask_to_zarr(
             "input_bands": list(input_bands or []),
         }
     )
-    zarr.consolidate_metadata(output_store)
+    zarr.consolidate_metadata(root.store)
     return {
         "mask_name": WATER_MASK_NAME,
         "mask_path": WATER_MASK_PATH,
@@ -704,8 +703,10 @@ def write_water_mask_tiles_to_zarr(
             f"Water-mask tile mismatch: got {len(tiles)} tiles and {len(mask_paths)} mask raster(s)."
         )
 
-    output_store = _open_existing_output_store(output_uri)
-    root = zarr.open_group(output_store, mode="a", zarr_format=2)
+    output_path = local_path_for_uri(output_uri)
+    if not output_path.exists():
+        raise ConversionError(f"Output store does not exist yet: {output_path}")
+    root = zarr.open_group(str(output_path), mode="a", zarr_format=2)
     imagery = root.get("imagery")
     if imagery is None:
         raise ConversionError("The target Zarr store does not contain an imagery array.")
@@ -784,7 +785,7 @@ def write_water_mask_tiles_to_zarr(
     root.attrs["water_mask_source_zarr_uri"] = input_zarr_uri
     root.attrs["water_mask_output_zarr_uri"] = output_zarr_uri
     root.attrs["water_mask_storage_mode"] = storage_mode
-    zarr.consolidate_metadata(output_store)
+    zarr.consolidate_metadata(root.store)
     return {
         "mask_name": WATER_MASK_NAME,
         "mask_path": WATER_MASK_PATH,

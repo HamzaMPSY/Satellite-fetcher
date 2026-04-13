@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import importlib.util
+import importlib
 import os
+import threading
 from typing import Any
 
 import numpy as np
 
+from nimbuschain_mask_service.runtime import batch_size_for_device, resolve_inference_device
 from nimbuschain_mask_service.sensor_mapping import SensorMaskSpec
 
 
@@ -15,6 +17,10 @@ class CloudMaskResult:
     probability: np.ndarray
     mask: np.ndarray
     summary: dict[str, Any]
+
+
+_OMNICLOUDMASK_MODEL_CACHE: dict[tuple[str, int, str, bool, str, str], tuple[Any, ...]] = {}
+_OMNICLOUDMASK_MODEL_CACHE_LOCK = threading.Lock()
 
 
 def run_cloud_inference(
@@ -226,10 +232,28 @@ def _run_omnicloudmask(
 
     rgbnir = _select_omnicloudmask_rgbnir(sensor=sensor, channels=channels)
     device = _configured_device(explicit=inference_device)
-    class_map = _invoke_omnicloudmask(omnicloudmask, rgbnir=rgbnir, device=device)
+    batch_size = _omnicloudmask_batch_size(device=device)
+    preloaded_models = _omnicloudmask_preloaded_models(
+        omnicloudmask_module=omnicloudmask,
+        device=device,
+        batch_size=batch_size,
+    )
+    class_map = _invoke_omnicloudmask(
+        omnicloudmask,
+        rgbnir=rgbnir,
+        device=device,
+        batch_size=batch_size,
+        preloaded_models=preloaded_models,
+    )
     confidence_cube = None
     if _cloud_confidence_enabled():
-        confidence_cube = _invoke_omnicloudmask_confidence(omnicloudmask, rgbnir=rgbnir, device=device)
+        confidence_cube = _invoke_omnicloudmask_confidence(
+            omnicloudmask,
+            rgbnir=rgbnir,
+            device=device,
+            batch_size=batch_size,
+            preloaded_models=preloaded_models,
+        )
     cloud_only_mask = _omnicloudmask_cloud_only_mask(class_map)
     shadow_mask = _omnicloudmask_shadow_mask(class_map)
     obstruction_mask = _omnicloudmask_obstruction_mask(
@@ -286,6 +310,8 @@ def _run_omnicloudmask(
             "threshold_for_mask": None,
             "requested_threshold": float(threshold),
             "valid_pixels": int(valid_pixels),
+            "batch_size": int(batch_size),
+            "preloaded_models": bool(preloaded_models),
         },
     )
 
@@ -293,7 +319,7 @@ def _run_omnicloudmask(
 def _resolve_backend_name(backend: str | None) -> str:
     value = str(backend or "auto").strip().lower()
     if value in {"", "auto"}:
-        return "omnicloudmask" if importlib.util.find_spec("omnicloudmask") is not None else "heuristic"
+        return "omnicloudmask"
     return value
 
 
@@ -304,7 +330,14 @@ def _effective_heuristic_threshold(*, sensor: SensorMaskSpec, threshold: float) 
     return requested
 
 
-def _invoke_omnicloudmask(module: Any, *, rgbnir: np.ndarray, device: str | None) -> np.ndarray:
+def _invoke_omnicloudmask(
+    module: Any,
+    *,
+    rgbnir: np.ndarray,
+    device: str | None,
+    batch_size: int,
+    preloaded_models: tuple[Any, ...] | None,
+) -> np.ndarray:
     predict = getattr(module, "predict_from_array", None)
     if not callable(predict):
         available = sorted(name for name in dir(module) if not name.startswith("_"))
@@ -315,15 +348,24 @@ def _invoke_omnicloudmask(module: Any, *, rgbnir: np.ndarray, device: str | None
 
     output = predict(
         rgbnir,
+        batch_size=batch_size,
         inference_device=device,
         mosaic_device=device,
         apply_no_data_mask=True,
         model_download_source=os.getenv("NIMBUS_OMNICLOUDMASK_MODEL_SOURCE", "hugging_face"),
+        custom_models=list(preloaded_models) if preloaded_models else None,
     )
     return _coerce_class_map(output)
 
 
-def _invoke_omnicloudmask_confidence(module: Any, *, rgbnir: np.ndarray, device: str | None) -> np.ndarray | None:
+def _invoke_omnicloudmask_confidence(
+    module: Any,
+    *,
+    rgbnir: np.ndarray,
+    device: str | None,
+    batch_size: int,
+    preloaded_models: tuple[Any, ...] | None,
+) -> np.ndarray | None:
     predict = getattr(module, "predict_from_array", None)
     if not callable(predict):
         return None
@@ -331,12 +373,14 @@ def _invoke_omnicloudmask_confidence(module: Any, *, rgbnir: np.ndarray, device:
     try:
         output = predict(
             rgbnir,
+            batch_size=batch_size,
             inference_device=device,
             mosaic_device=device,
             apply_no_data_mask=True,
             export_confidence=True,
             softmax_output=True,
             model_download_source=os.getenv("NIMBUS_OMNICLOUDMASK_MODEL_SOURCE", "hugging_face"),
+            custom_models=list(preloaded_models) if preloaded_models else None,
         )
     except TypeError:
         return None
@@ -403,12 +447,88 @@ def _as_2d(value: Any) -> np.ndarray:
 
 
 def _configured_device(*, explicit: str | None) -> str | None:
-    value = str(explicit or "").strip().lower()
-    if value in {"", "auto"}:
-        value = str(os.getenv("NIMBUS_CLOUDMASK_DEVICE", "")).strip().lower()
-    if value in {"", "auto"}:
+    return resolve_inference_device(explicit=explicit, env_var="NIMBUS_CLOUDMASK_DEVICE")
+
+
+def _omnicloudmask_batch_size(*, device: str | None) -> int:
+    return batch_size_for_device(
+        device=device,
+        env_var="NIMBUS_CLOUDMASK_BATCH_SIZE",
+        cpu_default=1,
+        gpu_default=2,
+        hard_limit=8,
+    )
+
+
+def _omnicloudmask_preloaded_models(
+    *,
+    omnicloudmask_module: Any,
+    device: str | None,
+    batch_size: int,
+) -> tuple[Any, ...] | None:
+    try:
+        cloud_mask_module = importlib.import_module("omnicloudmask.cloud_mask")
+    except Exception:
         return None
-    return value
+
+    collect_models = getattr(cloud_mask_module, "collect_models", None)
+    if not callable(collect_models):
+        return None
+
+    try:
+        torch = importlib.import_module("torch")
+    except Exception:
+        return None
+
+    compile_models = _omnicloudmask_compile_enabled()
+    compile_mode = _omnicloudmask_compile_mode()
+    source = os.getenv("NIMBUS_OMNICLOUDMASK_MODEL_SOURCE", "hugging_face")
+    model_version = str(os.getenv("NIMBUS_OMNICLOUDMASK_MODEL_VERSION") or "").strip() or ""
+    normalized_device = str(device or "cpu")
+    cache_key = (
+        normalized_device,
+        int(batch_size),
+        source,
+        bool(compile_models),
+        compile_mode,
+        model_version,
+    )
+    with _OMNICLOUDMASK_MODEL_CACHE_LOCK:
+        cached = _OMNICLOUDMASK_MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    try:
+        inference_device = torch.device(normalized_device)
+        models = collect_models(
+            custom_models=None,
+            inference_device=inference_device,
+            inference_dtype=torch.float32,
+            source=source,
+            destination_model_dir=os.getenv("NIMBUS_OMNICLOUDMASK_MODEL_DIR") or None,
+            model_version=float(model_version) if model_version else None,
+            compile_models=compile_models,
+            patch_size=1000,
+            batch_size=int(batch_size),
+            compile_mode=compile_mode,
+        )
+    except Exception:
+        return None
+
+    frozen_models = tuple(models)
+    with _OMNICLOUDMASK_MODEL_CACHE_LOCK:
+        _OMNICLOUDMASK_MODEL_CACHE[cache_key] = frozen_models
+    return frozen_models
+
+
+def _omnicloudmask_compile_enabled() -> bool:
+    raw = str(os.getenv("NIMBUS_OMNICLOUDMASK_COMPILE_MODELS") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _omnicloudmask_compile_mode() -> str:
+    raw = str(os.getenv("NIMBUS_OMNICLOUDMASK_COMPILE_MODE") or "").strip()
+    return raw or "default"
 
 
 def _cloud_confidence_enabled() -> bool:

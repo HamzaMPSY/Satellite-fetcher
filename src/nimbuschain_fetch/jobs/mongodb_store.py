@@ -433,6 +433,8 @@ class MongoJobStore:
                     "pipeline_state": "queued",
                     "pipeline_step": "queued",
                     "pipeline_progress": 0.0,
+                    "started_at": None,
+                    "finished_at": None,
                     "updated_at": now,
                 }
             },
@@ -453,6 +455,7 @@ class MongoJobStore:
                 "$set": {
                     "state": "running",
                     "started_at": now,
+                    "finished_at": None,
                     "updated_at": now,
                     "worker_id": worker_id,
                 }
@@ -486,6 +489,8 @@ class MongoJobStore:
                     "pipeline_state": "queued",
                     "pipeline_step": "queued",
                     "pipeline_progress": 0.0,
+                    "started_at": None,
+                    "finished_at": None,
                     "updated_at": now,
                 }
             },

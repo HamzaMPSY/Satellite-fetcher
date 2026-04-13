@@ -21,6 +21,51 @@ Do not commit `.env`.
 
 At minimum, configure provider credentials before testing downloads.
 
+### Optional: Copernicus account-pool test mode
+
+The default Copernicus path stays on the primary account.
+
+To test the experimental multi-account downloader alongside the stable path:
+
+1. Keep the primary account in:
+   - `NIMBUS_COPERNICUS_USERNAME`
+   - `NIMBUS_COPERNICUS_PASSWORD`
+2. Add extra accounts in either:
+   - `NIMBUS_COPERNICUS_ACCOUNT_POOL_FILE`
+   - or `NIMBUS_COPERNICUS_ACCOUNT_POOL_JSON`
+3. Set the per-account concurrency target with:
+   - `NIMBUS_COPERNICUS_ACCOUNT_POOL_CONCURRENCY=4`
+
+Example file format:
+
+```json
+{
+  "accounts": [
+    {
+      "label": "secondary-1",
+      "username": "copernicus-user-2@example.com",
+      "password": "replace-me"
+    },
+    {
+      "label": "secondary-2",
+      "username": "copernicus-user-3@example.com",
+      "password": "replace-me"
+    }
+  ]
+}
+```
+
+An example file is available at:
+- `/Users/mehdidinari/Desktop/backend nimbus/docs/copernicus_account_pool.example.json`
+
+In the UI, choose:
+- `Download execution -> Account pool test`
+
+The backend will then:
+- keep the stable single-account mode untouched unless you explicitly select the test mode
+- estimate how many accounts are needed from the number of products found
+- distribute downloads across the available accounts
+
 ## 3. Start locally with Podman
 
 ```bash
@@ -31,6 +76,51 @@ The script:
 - starts the Podman machine on macOS when available
 - launches the compose stack
 - waits briefly for API, UI and Zarr health endpoints
+
+## 3.1 GPU modes
+
+### Linux + NVIDIA GPU in the `nimbus-mask` container
+
+Use Docker Compose with the GPU override:
+
+```bash
+./scripts/10_up_stack_gpu.sh
+```
+
+This uses:
+- `/Users/mehdidinari/Desktop/backend nimbus/docker-compose.yml`
+- `/Users/mehdidinari/Desktop/backend nimbus/docker-compose.gpu.yml`
+
+Expected runtime:
+- `NIMBUS_CLOUDMASK_DEVICE=cuda`
+- `NIMBUS_WATERMASK_DEVICE=cuda`
+
+### macOS + Apple Silicon / Metal (`mps`)
+
+`mps` is not available inside the Linux container runtime, so `nimbus-mask` must run on the host.
+
+Start the stack in external-mask mode:
+
+```bash
+./scripts/10_up_stack_external_mask.sh
+```
+
+Then start the host-native mask service:
+
+```bash
+./scripts/12_up_mask_service_native.sh
+```
+
+In that mode:
+- the containers use `NIMBUS_MASK_SERVICE_URL=http://host.containers.internal:8020`
+- `nimbus-mask` does not run as a container
+- the host service defaults to:
+  - `NIMBUS_CLOUDMASK_DEVICE=mps`
+  - `NIMBUS_WATERMASK_DEVICE=mps`
+
+Important:
+- a Linux container on macOS cannot see Metal/MPS directly
+- if you keep `nimbus-mask` inside the container on macOS, it will run on CPU
 
 ## 4. Local URLs
 
@@ -114,6 +204,19 @@ Check:
 - collection and product type match the source
 - Zarr `/readiness` endpoint is `ready`
 - converter logs for missing bands or unsupported inputs
+
+### Cloud masking is still CPU-only
+
+Check the current mode first:
+
+```bash
+podman exec backendnimbus_nimbus-mask_1 python -c "import torch; print(torch.cuda.is_available()); print(bool(getattr(getattr(torch,'backends',None),'mps',None) and torch.backends.mps.is_available()))"
+```
+
+Interpretation:
+- `False / False` in the container means no accelerator is exposed to `nimbus-mask`
+- on macOS, switch to the external host-native mask service if you want `mps`
+- on Linux/NVIDIA, use `./scripts/10_up_stack_gpu.sh`
 
 ### Port conflict
 

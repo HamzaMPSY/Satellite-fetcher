@@ -24,9 +24,11 @@ def test_requeue_incomplete_jobs_preserves_completed_download_outputs(tmp_path: 
     store = SQLiteJobStore(tmp_path / "jobs.db")
     job_id = "job-requeue-complete-download"
     _seed_job(store, job_id)
+    original_started_at = "2026-03-17T09:30:00+00:00"
     store.update_job(
         job_id,
         state="running",
+        started_at=original_started_at,
         worker_id="worker-a",
         pipeline_state="zarr_converting",
         pipeline_step="water_masking",
@@ -65,6 +67,8 @@ def test_requeue_incomplete_jobs_preserves_completed_download_outputs(tmp_path: 
     assert row["last_retry_at"] == "2026-03-17T10:00:00+00:00"
     assert row["errors"] == []
     assert row["worker_id"] is None
+    assert row["started_at"] is None
+    assert row["finished_at"] is None
 
 
 def test_requeue_incomplete_jobs_resumes_partial_download_without_clearing_raws(tmp_path: Path) -> None:
@@ -160,9 +164,11 @@ def test_claim_job_for_execution_keeps_resume_fields(tmp_path: Path) -> None:
     store = SQLiteJobStore(tmp_path / "jobs.db")
     job_id = "job-claim-resume"
     _seed_job(store, job_id)
+    stale_started_at = "2026-03-17T09:00:00+00:00"
     store.update_job(
         job_id,
         state="queued",
+        started_at=stale_started_at,
         pipeline_state="downloaded",
         pipeline_step="resume_after_restart",
         pipeline_progress=70.0,
@@ -194,6 +200,7 @@ def test_claim_job_for_execution_keeps_resume_fields(tmp_path: Path) -> None:
     assert row["bytes_total"] == 1000
     assert row["retry_count"] == 2
     assert row["errors"] == []
+    assert row["started_at"] not in {None, stale_started_at}
 
 
 def test_requeue_incomplete_jobs_preserves_searching_stage_without_outputs(tmp_path: Path) -> None:
@@ -259,6 +266,7 @@ def test_requeue_stale_running_jobs_preserves_conversion_outputs(tmp_path: Path)
     store.update_job(
         job_id,
         state="running",
+        started_at="2026-03-01T00:00:00+00:00",
         worker_id="worker-a",
         pipeline_state="zarr_converting",
         pipeline_step="water_masking",
@@ -307,3 +315,5 @@ def test_requeue_stale_running_jobs_preserves_conversion_outputs(tmp_path: Path)
     assert row["watermask_outputs"] == ["/download/watermask/test/water_mask_status.json"]
     assert row["conversion_metadata"]["stage"] == "water_masking"
     assert row["worker_id"] is None
+    assert row["started_at"] is None
+    assert row["finished_at"] is None

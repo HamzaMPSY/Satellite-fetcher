@@ -19,9 +19,9 @@ from nimbuschain_zarr_viewer.cli import (
 
 PRESET_LABELS = {
     "rgb": "RGB only",
-    "rgb-masks": "RGB + masks",
-    "all-bands": "All bands + masks",
-    "masks-only": "Masks only",
+    "rgb-masks": "RGB + in-place masks",
+    "all-bands": "All bands + in-place masks",
+    "masks-only": "In-place masks only",
 }
 
 
@@ -46,6 +46,7 @@ def _load_store_catalog(root: str) -> list[dict[str, Any]]:
                     "band_count": 0,
                     "ancillary_count": 0,
                     "mask_layers": [],
+                    "mask_state_label": "Unreadable",
                     "shape": (),
                     "error": str(exc),
                 }
@@ -55,10 +56,14 @@ def _load_store_catalog(root: str) -> list[dict[str, Any]]:
             {
                 "path": str(summary.path),
                 "name": summary.path.name,
+                "provider": summary.provider or "",
+                "collection": summary.collection or "",
+                "product_type": summary.product_type or "",
                 "updated_at": dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
                 "band_count": len(summary.band_names),
                 "ancillary_count": len(summary.ancillary_names),
                 "mask_layers": list(summary.mask_layers),
+                "mask_state_label": summary.mask_state_label,
                 "shape": summary.imagery_shape,
                 "error": "",
             }
@@ -68,10 +73,12 @@ def _load_store_catalog(root: str) -> list[dict[str, Any]]:
 
 def _option_label(entry: dict[str, Any]) -> str:
     masks = ", ".join(entry.get("mask_layers") or []) or "none"
+    mask_state = str(entry.get("mask_state_label") or "Zarr only")
     return (
         f"{entry.get('name', '-')}"
         f" | bands={entry.get('band_count', 0)}"
         f" | ancillary={entry.get('ancillary_count', 0)}"
+        f" | state={mask_state}"
         f" | masks={masks}"
     )
 
@@ -98,9 +105,9 @@ def _launch_store(path: str, *, preset: str, step: int, grid: bool) -> list[str]
 
 
 def main() -> None:
-    st.set_page_config(page_title="Nimbus Zarr Viewer", layout="wide")
-    st.title("Nimbus Zarr Viewer")
-    st.caption("Standalone Napari launcher for local Zarr stores.")
+    st.set_page_config(page_title="Nimbus Pipeline Zarr Viewer", layout="wide")
+    st.title("Nimbus Pipeline Zarr Viewer")
+    st.caption("Standalone Napari launcher for pipeline Zarr outputs and their in-place mask layers.")
 
     top_left, top_mid, top_right = st.columns([3, 2, 1])
     with top_left:
@@ -129,6 +136,30 @@ def main() -> None:
             if query in str(item.get("name", "")).lower() or query in str(item.get("path", "")).lower()
         ]
 
+    status_filter = st.radio(
+        "Catalog scope",
+        options=["all", "zarr-only", "with-masks", "partial"],
+        horizontal=True,
+        format_func=lambda value: {
+            "all": "All stores",
+            "zarr-only": "Zarr only",
+            "with-masks": "With in-place masks",
+            "partial": "Partial / irregular",
+        }[value],
+    )
+    if status_filter == "zarr-only":
+        catalog = [item for item in catalog if str(item.get("mask_state_label") or "") == "Zarr only"]
+    elif status_filter == "with-masks":
+        catalog = [
+            item
+            for item in catalog
+            if str(item.get("mask_state_label") or "") in {"Water only", "Cloud only", "Water + cloud"}
+        ]
+    elif status_filter == "partial":
+        catalog = [
+            item for item in catalog if str(item.get("mask_state_label") or "") in {"Probability layers only", "Partial / irregular"}
+        ]
+
     if not catalog:
         st.warning("No local Zarr store found under the selected root.")
         return
@@ -137,7 +168,14 @@ def main() -> None:
     with overview_cols[0]:
         st.metric("Local Zarr stores", len(catalog))
     with overview_cols[1]:
-        st.metric("With masks", sum(1 for item in catalog if item.get("mask_layers")))
+        st.metric(
+            "With in-place masks",
+            sum(
+                1
+                for item in catalog
+                if str(item.get("mask_state_label") or "") in {"Water only", "Cloud only", "Water + cloud"}
+            ),
+        )
     with overview_cols[2]:
         st.metric("With ancillary", sum(1 for item in catalog if int(item.get("ancillary_count", 0)) > 0))
     with overview_cols[3]:
@@ -146,8 +184,12 @@ def main() -> None:
     table_rows = [
         {
             "name": item.get("name", "-"),
+            "provider": item.get("provider", "-"),
+            "collection": item.get("collection", "-"),
+            "product_type": item.get("product_type", "-"),
             "bands": item.get("band_count", 0),
             "ancillary": item.get("ancillary_count", 0),
+            "mask_state": item.get("mask_state_label", "-"),
             "masks": ", ".join(item.get("mask_layers") or []) or "none",
             "shape": _format_shape(tuple(item.get("shape") or ())),
             "updated_at": str(item.get("updated_at") or "-")[:19].replace("T", " "),
@@ -176,9 +218,9 @@ def main() -> None:
     )
     st.caption(
         "`RGB only` opens the RGB composite only. "
-        "`RGB + masks` opens RGB plus cloud/water layers. "
-        "`All bands + masks` opens imagery bands, RGB, ancillary, and masks. "
-        "`Masks only` opens cloud/water layers and probabilities."
+        "`RGB + in-place masks` opens RGB plus cloud/water layers. "
+        "`All bands + in-place masks` opens imagery bands, RGB, ancillary, and masks. "
+        "`In-place masks only` opens cloud/water layers and probabilities."
     )
     step = int(
         st.number_input(
@@ -193,9 +235,13 @@ def main() -> None:
 
     details_lines = [
         f"Path: {selected_entry.get('path', '-')}",
+        f"Provider: {selected_entry.get('provider', '-')}",
+        f"Collection: {selected_entry.get('collection', '-')}",
+        f"Product type: {selected_entry.get('product_type', '-')}",
         f"Bands: {selected_entry.get('band_count', 0)}",
         f"Ancillary layers: {selected_entry.get('ancillary_count', 0)}",
-        f"Masks: {', '.join(selected_entry.get('mask_layers') or []) or '-'}",
+        f"Mask state: {selected_entry.get('mask_state_label', '-')}",
+        f"In-place mask layers: {', '.join(selected_entry.get('mask_layers') or []) or '-'}",
         f"Shape: {_format_shape(tuple(selected_entry.get('shape') or ()))}",
         f"Updated: {str(selected_entry.get('updated_at') or '-')[:19].replace('T', ' ')}",
     ]

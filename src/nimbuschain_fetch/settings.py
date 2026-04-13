@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -84,6 +86,20 @@ class Settings(BaseSettings):
     nimbus_copernicus_password: str | None = Field(
         default=None, alias="NIMBUS_COPERNICUS_PASSWORD"
     )
+    nimbus_copernicus_account_pool_json: str | None = Field(
+        default=None,
+        alias="NIMBUS_COPERNICUS_ACCOUNT_POOL_JSON",
+    )
+    nimbus_copernicus_account_pool_file: Path | None = Field(
+        default=None,
+        alias="NIMBUS_COPERNICUS_ACCOUNT_POOL_FILE",
+    )
+    nimbus_copernicus_account_pool_concurrency: int = Field(
+        default=4,
+        alias="NIMBUS_COPERNICUS_ACCOUNT_POOL_CONCURRENCY",
+        ge=1,
+        le=8,
+    )
 
     nimbus_usgs_service_url: str = Field(
         default="https://m2m.cr.usgs.gov/api/api/json/stable/",
@@ -110,6 +126,7 @@ class Settings(BaseSettings):
         "nimbus_api_key",
         "nimbus_copernicus_username",
         "nimbus_copernicus_password",
+        "nimbus_copernicus_account_pool_json",
         "nimbus_usgs_username",
         "nimbus_usgs_token",
         mode="before",
@@ -155,6 +172,91 @@ class Settings(BaseSettings):
         if value in {"all", "api", "worker"}:
             return value
         return "all"
+
+    @staticmethod
+    def _normalize_copernicus_account_entry(
+        item: Any,
+        *,
+        default_label: str,
+    ) -> dict[str, str] | None:
+        if not isinstance(item, dict):
+            return None
+        username = str(item.get("username") or "").strip()
+        password = str(item.get("password") or "").strip()
+        if not username or not password:
+            return None
+        label = str(item.get("label") or default_label).strip() or default_label
+        return {
+            "username": username,
+            "password": password,
+            "label": label,
+        }
+
+    def _load_copernicus_account_pool_entries(self) -> list[dict[str, str]]:
+        raw_payload = str(self.nimbus_copernicus_account_pool_json or "").strip()
+        if self.nimbus_copernicus_account_pool_file:
+            try:
+                if self.nimbus_copernicus_account_pool_file.exists():
+                    raw_payload = self.nimbus_copernicus_account_pool_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                raw_payload = ""
+        if not raw_payload:
+            return []
+        try:
+            parsed = json.loads(raw_payload)
+        except Exception:
+            return []
+        if isinstance(parsed, dict):
+            items = parsed.get("accounts")
+            if not isinstance(items, list):
+                return []
+        elif isinstance(parsed, list):
+            items = parsed
+        else:
+            return []
+
+        entries: list[dict[str, str]] = []
+        for index, item in enumerate(items, start=1):
+            normalized = self._normalize_copernicus_account_entry(
+                item,
+                default_label=f"pool-{index}",
+            )
+            if normalized is not None:
+                entries.append(normalized)
+        return entries
+
+    @property
+    def copernicus_account_pool_accounts(self) -> list[dict[str, str]]:
+        accounts: list[dict[str, str]] = []
+        seen_usernames: set[str] = set()
+
+        primary = self._normalize_copernicus_account_entry(
+            {
+                "username": self.nimbus_copernicus_username,
+                "password": self.nimbus_copernicus_password,
+                "label": "primary",
+            },
+            default_label="primary",
+        )
+        if primary is not None:
+            accounts.append(primary)
+            seen_usernames.add(primary["username"].lower())
+
+        for item in self._load_copernicus_account_pool_entries():
+            key = item["username"].lower()
+            if key in seen_usernames:
+                continue
+            accounts.append(item)
+            seen_usernames.add(key)
+        return accounts
+
+    @property
+    def copernicus_account_pool_size(self) -> int:
+        return len(self.copernicus_account_pool_accounts)
+
+    @property
+    def copernicus_account_pool_available(self) -> bool:
+        return self.copernicus_account_pool_size > 1
 
     def ensure_runtime_dirs(self) -> None:
         self.nimbus_data_dir.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -583,6 +584,7 @@ def stream_raster_stack_to_zarr(
     output_mode: str = "w",
     array_name: str = "imagery",
     coord_name: str = "band",
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     try:
         import rasterio
@@ -619,6 +621,11 @@ def stream_raster_stack_to_zarr(
         min(chunk_spec.band, len(band_names)),
         min(chunk_spec.y, height),
         min(chunk_spec.x, width),
+    )
+    total_blocks = (
+        len(band_names)
+        * max(1, (height + chunks[2] - 1) // chunks[2])
+        * max(1, (width + chunks[3] - 1) // chunks[3])
     )
     if output_mode == "w":
         output_store, public_uri = _prepare_output_store(output_uri)
@@ -696,6 +703,30 @@ def stream_raster_stack_to_zarr(
             }
         )
 
+    blocks_written = 0
+
+    def _emit_chunk_progress(*, band_index: int | None, band_name: str | None) -> None:
+        if progress_callback is None:
+            return
+        fraction = (
+            min(1.0, max(0.0, blocks_written / total_blocks))
+            if total_blocks > 0
+            else 1.0
+        )
+        progress_callback(
+            {
+                "stage": "writing_chunks",
+                "array_name": array_name,
+                "coord_name": coord_name,
+                "band_index": band_index,
+                "band_name": band_name,
+                "blocks_written": blocks_written,
+                "total_blocks": total_blocks,
+                "fraction": fraction,
+            }
+        )
+
+    _emit_chunk_progress(band_index=None, band_name=None)
     for band_index, band_name in enumerate(band_names):
         band_info = band_metadata[band_name]
         band_path = Path(str(band_info["path"]))
@@ -724,6 +755,11 @@ def stream_raster_stack_to_zarr(
                         window = Window(x0, y0, block_w, block_h)
                         block = read_handle.read(source_band_index, window=window)
                         imagery[0, band_index, y0 : y0 + block_h, x0 : x0 + block_w] = block
+                        blocks_written += 1
+                        _emit_chunk_progress(
+                            band_index=band_index + 1,
+                            band_name=band_name,
+                        )
             finally:
                 if vrt is not None:
                     vrt.close()
@@ -761,7 +797,26 @@ def stream_raster_product_to_zarr(
     ancillary_band_paths: dict[str, Path] | None = None,
     ancillary_layer_names: list[str] | None = None,
     ancillary_categorical_layers: set[str] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    has_ancillary = bool(ancillary_band_paths and ancillary_layer_names)
+    imagery_span = 0.9 if has_ancillary else 1.0
+
+    def _forward_progress(*, offset: float, span: float) -> Callable[[dict[str, Any]], None] | None:
+        if progress_callback is None:
+            return None
+
+        def _callback(payload: dict[str, Any]) -> None:
+            fraction = float(payload.get("fraction") or 0.0)
+            bounded_fraction = min(1.0, max(0.0, fraction))
+            forwarded = dict(payload)
+            forwarded["source_array_name"] = str(payload.get("array_name") or "")
+            forwarded["array_name"] = "product"
+            forwarded["fraction"] = min(1.0, max(0.0, offset + span * bounded_fraction))
+            progress_callback(forwarded)
+
+        return _callback
+
     written_uri, imagery_summary = stream_raster_stack_to_zarr(
         band_paths=imagery_band_paths,
         ordered_bands=imagery_layer_names,
@@ -774,6 +829,7 @@ def stream_raster_product_to_zarr(
         output_mode="w",
         array_name="imagery",
         coord_name="band",
+        progress_callback=_forward_progress(offset=0.0, span=imagery_span),
     )
     target_grid = TargetGrid(
         height=int(imagery_summary["shape"][2]),
@@ -804,11 +860,26 @@ def stream_raster_product_to_zarr(
             output_mode="a",
             array_name="ancillary",
             coord_name="ancillary_layer",
+            progress_callback=_forward_progress(
+                offset=imagery_span,
+                span=max(0.0, 1.0 - imagery_span),
+            ),
         )
         product_summary["ancillary_layer_names"] = list(ancillary_summary["band_names"])
         product_summary["ancillary_dimensions"] = list(ancillary_summary["dimensions"])
         product_summary["ancillary_shape"] = list(ancillary_summary["shape"])
         product_summary["ancillary_metadata"] = dict(ancillary_summary.get("band_metadata") or {})
+    elif progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "writing_chunks",
+                "array_name": "product",
+                "source_array_name": "imagery",
+                "fraction": 1.0,
+                "blocks_written": 0,
+                "total_blocks": 0,
+            }
+        )
 
     return written_uri, product_summary
 

@@ -203,6 +203,11 @@ def _build_copernicus_status(settings: Settings) -> dict[str, Any]:
         username_present=bool(username),
         password_present=bool(password),
     )
+    payload.update(
+        account_pool_configured=settings.copernicus_account_pool_available,
+        account_pool_size=int(settings.copernicus_account_pool_size),
+        account_pool_concurrency=int(settings.nimbus_copernicus_account_pool_concurrency),
+    )
     if not username or not password:
         payload.update(
             configured=False,

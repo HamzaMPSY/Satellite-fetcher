@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from pathlib import Path
 import uuid
 import shutil
 import subprocess
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 
-from nimbuschain_zarr_service.core import ConversionError, _open_existing_output_store
+from nimbuschain_zarr_service.core import ConversionError
 
 
 @dataclass(frozen=True)
@@ -24,14 +26,115 @@ class ZarrMaskContext:
     imagery_shape: tuple[int, ...]
 
 
+_CONTAINER_DATA_PREFIXES = (
+    "/data/downloads",
+    "/app/data/downloads",
+    "/download",
+    "/downloads",
+    "/app/download",
+    "/app/downloads",
+)
+
+
+def _project_data_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "data" / "downloads"
+
+
+def _resolve_candidate(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except TypeError:  # pragma: no cover - compatibility guard
+        return path.expanduser().resolve()
+
+
+def _host_data_root_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for raw in (
+        os.getenv("NIMBUS_HOST_DATA_DIR"),
+        os.getenv("NIMBUS_DATA_DIR"),
+        str(_project_data_root()),
+    ):
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+    return candidates
+
+
+def _map_container_data_uri(raw_value: str, *, allow_missing: bool) -> Path | None:
+    for prefix in _CONTAINER_DATA_PREFIXES:
+        if raw_value == prefix or raw_value.startswith(prefix + "/"):
+            suffix = raw_value[len(prefix) :].lstrip("/")
+            fallback: Path | None = None
+            for root in _host_data_root_candidates():
+                mapped = root / suffix if suffix else root
+                if mapped.exists():
+                    return _resolve_candidate(mapped)
+                if allow_missing and fallback is None:
+                    fallback = _resolve_candidate(mapped)
+            return fallback
+    return None
+
+
+def _map_data_downloads_suffix(candidate: Path, *, allow_missing: bool) -> Path | None:
+    parts = list(candidate.parts)
+    for idx in range(len(parts) - 1):
+        if parts[idx] == "data" and parts[idx + 1] == "downloads":
+            suffix = parts[idx + 2 :]
+            fallback: Path | None = None
+            for root in _host_data_root_candidates():
+                mapped = root.joinpath(*suffix)
+                if mapped.exists():
+                    return _resolve_candidate(mapped)
+                if allow_missing and fallback is None:
+                    fallback = _resolve_candidate(mapped)
+            return fallback
+    return None
+
+
+def local_path_for_uri(uri: str, *, allow_missing: bool = True) -> Path:
+    raw_value = str(uri or "").strip()
+    if not raw_value:
+        return _resolve_candidate(Path("."))
+
+    parsed = urlparse(raw_value)
+    if parsed.scheme and parsed.scheme.lower() not in {"", "file"}:
+        raise ConversionError(f"Unsupported local path URI for masking: {uri}")
+
+    if parsed.scheme.lower() == "file":
+        raw_value = unquote(parsed.path)
+
+    mapped = _map_container_data_uri(raw_value, allow_missing=allow_missing)
+    if mapped is not None:
+        return mapped
+
+    candidate = Path(raw_value).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+
+    mapped = _map_data_downloads_suffix(candidate, allow_missing=allow_missing)
+    if mapped is not None:
+        return mapped
+
+    return _resolve_candidate(candidate)
+
+
 def open_zarr_group(zarr_uri: str, *, mode: str = "r") -> Any:
     try:
         import zarr
     except ImportError as exc:  # pragma: no cover - dependency/runtime guard
         raise RuntimeError(f"Masking requires zarr runtime support ({exc}).") from exc
 
-    store = _open_existing_output_store(zarr_uri)
-    return zarr.open_group(store, mode=mode, zarr_format=2)
+    store_path = local_path_for_uri(zarr_uri)
+    if not store_path.exists():
+        raise ConversionError(f"Output store does not exist yet: {store_path}")
+    return zarr.open_group(str(store_path), mode=mode, zarr_format=2)
 
 
 def delete_mask_layers(zarr_uri: str, *, layer_names: tuple[str, ...]) -> None:
@@ -217,8 +320,8 @@ def read_required_channels_window(
 
 
 def copy_source_zarr(*, source_zarr_uri: str, output_zarr_uri: str) -> str:
-    source_path = Path(str(source_zarr_uri).strip())
-    output_path = Path(str(output_zarr_uri).strip())
+    source_path = local_path_for_uri(source_zarr_uri)
+    output_path = local_path_for_uri(output_zarr_uri)
     if not source_path.exists():
         raise ConversionError(f"Source Zarr store not found: {source_zarr_uri}")
     if not source_path.is_dir():
@@ -247,7 +350,7 @@ def copy_source_zarr(*, source_zarr_uri: str, output_zarr_uri: str) -> str:
 
 
 def cleanup_derived_zarr(output_zarr_uri: str) -> None:
-    target = Path(str(output_zarr_uri).strip())
+    target = local_path_for_uri(output_zarr_uri)
     try:
         if target.exists():
             shutil.rmtree(target)
@@ -256,15 +359,15 @@ def cleanup_derived_zarr(output_zarr_uri: str) -> None:
 
 
 def temporary_derived_zarr_uri(output_zarr_uri: str) -> str:
-    target = Path(str(output_zarr_uri).strip())
+    target = local_path_for_uri(output_zarr_uri)
     suffix = target.suffix
     tmp_name = f".{target.stem}.tmp-{uuid.uuid4().hex}{suffix}"
     return str(target.with_name(tmp_name))
 
 
 def promote_derived_zarr(*, temp_zarr_uri: str, final_zarr_uri: str, overwrite: bool = True) -> str:
-    temp_path = Path(str(temp_zarr_uri).strip())
-    final_path = Path(str(final_zarr_uri).strip())
+    temp_path = local_path_for_uri(temp_zarr_uri)
+    final_path = local_path_for_uri(final_zarr_uri)
     if not temp_path.exists():
         raise ConversionError(f"Temporary masked Zarr store not found: {temp_zarr_uri}")
     if temp_path.resolve() == final_path.resolve():

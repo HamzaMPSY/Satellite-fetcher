@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import inspect
 import json
@@ -8,6 +9,7 @@ import re
 import os
 import shutil
 import socket
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -53,6 +55,7 @@ from nimbuschain_fetch.jobs.store_factory import create_job_store
 from nimbuschain_fetch.settings import Settings, get_settings
 from nimbuschain_fetch.usgs_product_type import canonicalize_usgs_product_type
 from nimbuschain_mask_service.client import MaskServiceClient
+from nimbuschain_mask_service.runtime import normalize_device_name, resolve_inference_device
 from nimbuschain_zarr_service.service import ZarrConversionService
 
 
@@ -72,6 +75,8 @@ class NimbusFetcher:
     DOWNLOAD_PROGRESS_MAX_INTERVAL_SECONDS = 3.0
     DOWNLOAD_PROGRESS_MIN_BYTES = 16 * 1024 * 1024
     DOWNLOAD_PROGRESS_MIN_PERCENT = 1.0
+    ZARR_PROGRESS_MIN_INTERVAL_SECONDS = 0.5
+    ZARR_PROGRESS_MIN_PERCENT = 1.0
 
     def __init__(
         self,
@@ -671,6 +676,378 @@ class NimbusFetcher:
             job=self.get_job(mask_job_id),
         )
 
+    @staticmethod
+    def _normalized_mask_types(values: list[str] | tuple[str, ...] | None) -> list[str]:
+        normalized: list[str] = []
+        for value in list(values or []):
+            candidate = str(value or "").strip().lower()
+            if candidate not in {"water", "cloud"}:
+                continue
+            if candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+    @staticmethod
+    def _build_mask_progress_plan(
+        *,
+        mask_types: list[str],
+        stage_start_progress: float,
+        stage_end_progress: float,
+    ) -> dict[str, float]:
+        start = max(0.0, float(stage_start_progress))
+        end = max(start, float(stage_end_progress))
+        span = max(1.0, end - start)
+        has_cloud = "cloud" in mask_types
+        has_water = "water" in mask_types
+        if has_cloud and has_water:
+            cloud_end = min(end, start + (span * 0.48))
+            water_start = min(end, start + (span * 0.58))
+            return {
+                "cloud_start": start,
+                "cloud_end": cloud_end,
+                "water_start": water_start,
+                "water_end": end,
+            }
+        if has_cloud:
+            return {
+                "cloud_start": start,
+                "cloud_end": end,
+                "water_start": end,
+                "water_end": end,
+            }
+        return {
+            "cloud_start": start,
+            "cloud_end": start,
+            "water_start": start,
+            "water_end": end,
+        }
+
+    def _run_in_place_mask_pipeline(
+        self,
+        *,
+        job_id: str,
+        source_job_id: str,
+        selected_zarr_uri: str,
+        zarr_context: dict[str, Any],
+        mask_types: list[str],
+        backend_name: str,
+        threshold: float,
+        inference_device: str | None,
+        include_shadows: bool,
+        overwrite: bool,
+        water_backend_name: str,
+        water_overwrite: bool,
+        water_inference_device: str | None,
+        fail_on_error: bool,
+        mask_mode: str,
+        include_resolve_stage: bool,
+        resolve_progress: float | None,
+        stage_start_progress: float,
+        stage_end_progress: float,
+        expose_masked_outputs: bool,
+        register_masked_artifact: bool,
+        pipeline_progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        progress_plan = self._build_mask_progress_plan(
+            mask_types=mask_types,
+            stage_start_progress=stage_start_progress,
+            stage_end_progress=stage_end_progress,
+        )
+        base_mask_metadata = {
+            "source_job_id": source_job_id,
+            "source_zarr_uri": selected_zarr_uri,
+            "scene_id": zarr_context["scene_id"],
+            "mask_types": mask_types,
+            "backend": backend_name,
+            "threshold": threshold,
+            "include_shadows": include_shadows,
+            "water_backend": water_backend_name,
+            "mask_mode": mask_mode,
+        }
+
+        def emit_pipeline_update(
+            *,
+            pipeline_state: PipelineState,
+            pipeline_step: str,
+            pipeline_progress: float,
+            event_type: str,
+            event_payload: dict[str, Any],
+            pipeline_metadata: dict[str, Any],
+        ) -> None:
+            item_span = max(1e-6, float(stage_end_progress) - float(stage_start_progress))
+            item_fraction = min(
+                1.0,
+                max(0.0, (float(pipeline_progress) - float(stage_start_progress)) / item_span),
+            )
+            payload = {
+                "job_id": job_id,
+                "pipeline_state": pipeline_state,
+                "pipeline_step": pipeline_step,
+                "pipeline_progress": float(pipeline_progress),
+                "pipeline_metadata": dict(pipeline_metadata),
+                "event_type": event_type,
+                "event_payload": dict(event_payload),
+                "item_fraction": item_fraction,
+                "scene_id": zarr_context["scene_id"],
+                "zarr_uri": selected_zarr_uri,
+            }
+            if pipeline_progress_callback is not None:
+                pipeline_progress_callback(payload)
+                return
+            self._update_pipeline(
+                job_id,
+                pipeline_state=pipeline_state,
+                pipeline_step=pipeline_step,
+                pipeline_progress=pipeline_progress,
+                pipeline_metadata=pipeline_metadata,
+                event_type=event_type,
+                event_payload=event_payload,
+            )
+
+        def stage_callback(stage_name: str, payload: dict[str, Any]) -> None:
+            current_pipeline = dict((self.store.get_job(job_id) or {}).get("pipeline_metadata") or {})
+            current_pipeline.update(base_mask_metadata)
+            if stage_name == "cloud_masking_progress":
+                fraction = float(payload.get("progress") or 0.0)
+                fraction = max(0.0, min(fraction, 1.0))
+                start = progress_plan["cloud_start"]
+                end = progress_plan["cloud_end"]
+                pipeline_progress = start + (fraction * max(0.0, end - start))
+                emit_pipeline_update(
+                    pipeline_state=PipelineState.running_cloud_inference,
+                    pipeline_step="running_cloud_inference",
+                    pipeline_progress=pipeline_progress,
+                    event_type="job.cloud_masking_progress",
+                    event_payload=payload,
+                    pipeline_metadata=current_pipeline,
+                )
+                return
+            if stage_name == "water_masking_progress":
+                fraction = float(payload.get("progress") or 0.0)
+                fraction = max(0.0, min(fraction, 1.0))
+                start = progress_plan["water_start"]
+                end = progress_plan["water_end"]
+                pipeline_progress = start + (fraction * max(0.0, end - start))
+                emit_pipeline_update(
+                    pipeline_state=PipelineState.running_water_inference,
+                    pipeline_step="running_water_inference",
+                    pipeline_progress=pipeline_progress,
+                    event_type="job.water_masking_progress",
+                    event_payload=payload,
+                    pipeline_metadata=current_pipeline,
+                )
+                return
+
+            stage_map: dict[str, tuple[PipelineState, str, float]] = {
+                "water_masking_started": (
+                    PipelineState.running_water_inference,
+                    "running_water_inference",
+                    progress_plan["water_start"],
+                ),
+                "water_masking_finished": (
+                    PipelineState.running_water_inference,
+                    "running_water_inference",
+                    progress_plan["water_end"],
+                ),
+                "water_masking_failed": (PipelineState.failed, "failed", min(99.0, progress_plan["water_end"])),
+                "cloud_masking_started": (
+                    PipelineState.running_cloud_inference,
+                    "running_cloud_inference",
+                    progress_plan["cloud_start"],
+                ),
+                "cloud_masking_finished": (
+                    PipelineState.running_cloud_inference,
+                    "running_cloud_inference",
+                    progress_plan["cloud_end"],
+                ),
+                "cloud_masking_failed": (PipelineState.failed, "failed", min(99.0, progress_plan["cloud_end"])),
+            }
+            mapped = stage_map.get(stage_name)
+            if not mapped:
+                return
+            pipeline_state, pipeline_step, pipeline_progress = mapped
+            emit_pipeline_update(
+                pipeline_state=pipeline_state,
+                pipeline_step=pipeline_step,
+                pipeline_progress=pipeline_progress,
+                event_type=f"job.{stage_name}",
+                event_payload=payload,
+                pipeline_metadata=current_pipeline,
+            )
+
+        if include_resolve_stage:
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.resolving_source_zarr,
+                pipeline_step="resolving_source_zarr",
+                pipeline_progress=resolve_progress,
+                pipeline_metadata=base_mask_metadata,
+                event_type="job.mask_started",
+                event_payload=base_mask_metadata,
+            )
+
+        masker = self._masker()
+        if not bool(getattr(masker, "supports_stage_callbacks", True)):
+            if "cloud" in mask_types:
+                stage_callback(
+                    "cloud_masking_started",
+                    {
+                        "zarr_uri": selected_zarr_uri,
+                        "output_zarr_uri": selected_zarr_uri,
+                        "scene_id": zarr_context["scene_id"],
+                    },
+                )
+            elif "water" in mask_types:
+                stage_callback(
+                    "water_masking_started",
+                    {
+                        "zarr_uri": selected_zarr_uri,
+                        "output_zarr_uri": selected_zarr_uri,
+                        "scene_id": zarr_context["scene_id"],
+                    },
+                )
+
+        if hasattr(masker, "apply_masks_to_zarr"):
+            mask_response = self._invoke_mask_method(
+                masker.apply_masks_to_zarr,
+                job_id=job_id,
+                zarr_uri=selected_zarr_uri,
+                provider=zarr_context["provider"],
+                collection=zarr_context["collection"],
+                product_type=zarr_context["product_type"],
+                scene_id=zarr_context["scene_id"],
+                acquisition_datetime=zarr_context["acquisition_datetime"],
+                dataset_summary=zarr_context["dataset_summary"],
+                mask_types=mask_types,
+                backend=backend_name,
+                threshold=threshold,
+                overwrite=overwrite,
+                inference_device=inference_device,
+                include_shadows=include_shadows,
+                water_backend=water_backend_name,
+                water_overwrite=water_overwrite,
+                water_inference_device=water_inference_device,
+                fail_on_error=fail_on_error,
+                stage_callback=stage_callback,
+            )
+        elif mask_types == ["water"] and hasattr(masker, "apply_omniwater_to_zarr"):
+            water_mask = self._invoke_mask_method(
+                masker.apply_omniwater_to_zarr,
+                job_id=job_id,
+                zarr_uri=selected_zarr_uri,
+                provider=zarr_context["provider"],
+                collection=zarr_context["collection"],
+                product_type=zarr_context["product_type"],
+                scene_id=zarr_context["scene_id"],
+                acquisition_datetime=zarr_context["acquisition_datetime"],
+                dataset_summary=zarr_context["dataset_summary"],
+                fail_on_error=fail_on_error,
+                stage_callback=stage_callback,
+            )
+            masked_zarr_uri = str(water_mask.get("output_zarr_uri") or selected_zarr_uri).strip()
+            mask_response = {
+                "status": str(water_mask.get("status") or ""),
+                "mask_types": ["water"],
+                "input_zarr_uri": selected_zarr_uri,
+                "output_zarr_uri": masked_zarr_uri,
+                "masked_zarr_uri": masked_zarr_uri or None,
+                "masked_zarr_outputs": [masked_zarr_uri] if masked_zarr_uri else [],
+                "water_mask": water_mask,
+                "cloud_mask": {},
+                "watermask_outputs": [],
+                "cloudmask_outputs": [],
+            }
+        else:
+            raise RuntimeError("Configured mask service does not expose apply_masks_to_zarr.")
+
+        masked_zarr_uri = str(
+            mask_response.get("masked_zarr_uri")
+            or mask_response.get("output_zarr_uri")
+            or selected_zarr_uri
+        ).strip()
+        masked_zarr_outputs = [
+            item for item in list(mask_response.get("masked_zarr_outputs") or []) if str(item).strip()
+        ]
+        water_mask = dict(mask_response.get("water_mask") or {})
+        cloud_mask = dict(mask_response.get("cloud_mask") or {})
+        final_status = str(mask_response.get("status") or "").strip().lower()
+        mask_job_succeeded = final_status == "written"
+        visible_masked_zarr_outputs = masked_zarr_outputs if mask_job_succeeded and expose_masked_outputs else []
+        if (
+            mask_job_succeeded
+            and expose_masked_outputs
+            and not visible_masked_zarr_outputs
+            and masked_zarr_uri
+        ):
+            visible_masked_zarr_outputs = [masked_zarr_uri]
+        quality_fields = self._mask_quality_fields(water_mask=water_mask, cloud_mask=cloud_mask)
+        quality_scalars = {
+            "water_fraction": float(quality_fields.get("water_fraction") or 0.0),
+            "cloud_fraction": float(quality_fields.get("cloud_fraction") or 0.0),
+            "cloud_only_fraction": float(quality_fields.get("cloud_only_fraction") or 0.0),
+            "shadow_fraction": float(quality_fields.get("shadow_fraction") or 0.0),
+        }
+        pipeline_metadata = {
+            "mask_contract_version": "v2",
+            **base_mask_metadata,
+            "masked_zarr_uri": masked_zarr_uri if mask_job_succeeded else "",
+            "status": str(mask_response.get("status") or ""),
+            "mask_quality": quality_fields,
+            "water_mask": water_mask,
+            "cloud_mask": cloud_mask,
+            **quality_scalars,
+        }
+        conversion_metadata = {
+            "mask_contract_version": "v2",
+            "mask_types": mask_types,
+            "source_zarr_uri": selected_zarr_uri,
+            "masked_zarr_uri": masked_zarr_uri if mask_job_succeeded else "",
+            "backend": backend_name,
+            "threshold": threshold,
+            "include_shadows": include_shadows,
+            "water_backend": water_backend_name,
+            "status": str(mask_response.get("status") or ""),
+            "water_mask": water_mask,
+            "cloud_mask": cloud_mask,
+            "mask_quality": quality_fields,
+            **quality_scalars,
+        }
+        if mask_job_succeeded and register_masked_artifact and masked_zarr_uri:
+            self._register_masked_zarr_artifact(
+                job_id=job_id,
+                source_job_id=source_job_id,
+                provider_name=zarr_context["provider"],
+                collection=zarr_context["collection"],
+                scene_id=zarr_context["scene_id"],
+                source_zarr_uri=selected_zarr_uri,
+                masked_zarr_uri=masked_zarr_uri,
+                mask_payload=mask_response,
+                dataset_summary=zarr_context["dataset_summary"],
+            )
+
+        errors: list[str] = []
+        if not mask_job_succeeded:
+            for payload in (water_mask, cloud_mask):
+                reason = str(payload.get("reason") or "").strip()
+                if reason and reason not in errors:
+                    errors.append(reason)
+            if not errors:
+                errors.append(f"Mask execution failed with status '{final_status or 'unknown'}'.")
+
+        return {
+            "status": final_status,
+            "succeeded": mask_job_succeeded,
+            "masked_zarr_uri": masked_zarr_uri,
+            "masked_zarr_outputs": visible_masked_zarr_outputs,
+            "watermask_outputs": [],
+            "cloudmask_outputs": [],
+            "water_mask": water_mask,
+            "cloud_mask": cloud_mask,
+            "pipeline_metadata": pipeline_metadata,
+            "conversion_metadata": conversion_metadata,
+            "errors": errors,
+        }
+
     def _execute_mask_existing_zarr_job(
         self,
         *,
@@ -726,223 +1103,41 @@ class NimbusFetcher:
         water_overwrite = bool(request_payload.get("water_overwrite", overwrite))
         water_inference_device = str(request_payload.get("water_inference_device") or "").strip() or None
         fail_on_error = bool(request_payload.get("fail_on_error", False))
-
-        def stage_callback(stage_name: str, payload: dict[str, Any]) -> None:
-            if stage_name == "cloud_masking_progress":
-                fraction = float(payload.get("progress") or 0.0)
-                fraction = max(0.0, min(fraction, 1.0))
-                progress_span = 20.0 if "water" in mask_types else 45.0
-                pipeline_progress = min(89.0, 35.0 + (fraction * progress_span))
-                current_pipeline = dict((self.store.get_job(job_id) or {}).get("pipeline_metadata") or {})
-                current_pipeline.update(
-                    {
-                        "source_job_id": source_job_id,
-                        "source_zarr_uri": selected_zarr_uri,
-                        "scene_id": zarr_context["scene_id"],
-                        "mask_types": mask_types,
-                        "backend": backend_name,
-                        "threshold": threshold,
-                        "include_shadows": include_shadows,
-                        "water_backend": water_backend_name,
-                    }
-                )
-                self._update_pipeline(
-                    job_id,
-                    pipeline_state=PipelineState.running_cloud_inference,
-                    pipeline_step="running_cloud_inference",
-                    pipeline_progress=pipeline_progress,
-                    pipeline_metadata=current_pipeline,
-                    event_type="job.cloud_masking_progress",
-                    event_payload=payload,
-                )
-                return
-            stage_map: dict[str, tuple[PipelineState, str, float]] = {
-                "water_masking_started": (PipelineState.running_water_inference, "running_water_inference", 60.0),
-                "water_masking_finished": (PipelineState.writing_mask_artifacts, "writing_mask_artifacts", 80.0),
-                "water_masking_failed": (PipelineState.failed, "failed", 70.0),
-                "cloud_masking_started": (PipelineState.running_cloud_inference, "running_cloud_inference", 35.0),
-                "cloud_masking_finished": (PipelineState.writing_mask_artifacts, "writing_mask_artifacts", 55.0),
-                "cloud_masking_failed": (PipelineState.failed, "failed", 78.0),
-            }
-            mapped = stage_map.get(stage_name)
-            if not mapped:
-                return
-            pipeline_state, pipeline_step, pipeline_progress = mapped
-            current_pipeline = dict((self.store.get_job(job_id) or {}).get("pipeline_metadata") or {})
-            current_pipeline.update(
-                {
-                    "source_job_id": source_job_id,
-                    "source_zarr_uri": selected_zarr_uri,
-                    "scene_id": zarr_context["scene_id"],
-                    "mask_types": mask_types,
-                    "backend": backend_name,
-                    "threshold": threshold,
-                    "include_shadows": include_shadows,
-                    "water_backend": water_backend_name,
-                }
-            )
-            self._update_pipeline(
-                job_id,
-                pipeline_state=pipeline_state,
-                pipeline_step=pipeline_step,
-                pipeline_progress=pipeline_progress,
-                pipeline_metadata=current_pipeline,
-                event_type=f"job.{stage_name}",
-                event_payload=payload,
-            )
-
-        self._update_pipeline(
-            job_id,
-            pipeline_state=PipelineState.resolving_source_zarr,
-            pipeline_step="resolving_source_zarr",
-            pipeline_progress=5.0,
-            pipeline_metadata={
-                "source_job_id": source_job_id,
-                "source_zarr_uri": selected_zarr_uri,
-                "scene_id": zarr_context["scene_id"],
-                "mask_types": mask_types,
-                "backend": backend_name,
-                "threshold": threshold,
-                "include_shadows": include_shadows,
-                "water_backend": water_backend_name,
-            },
-            event_type="job.mask_started",
-            event_payload={
-                "source_job_id": source_job_id,
-                "source_zarr_uri": selected_zarr_uri,
-                "scene_id": zarr_context["scene_id"],
-                "mask_types": mask_types,
-                "backend": backend_name,
-                "threshold": threshold,
-                "include_shadows": include_shadows,
-                "water_backend": water_backend_name,
-            },
-        )
         if is_cancelled_now():
             raise JobCancelledError("Mask job cancellation requested before execution.")
 
-        masker = self._masker()
-        if not bool(getattr(masker, "supports_stage_callbacks", True)):
-            if "cloud" in mask_types:
-                stage_callback(
-                    "cloud_masking_started",
-                    {
-                        "zarr_uri": selected_zarr_uri,
-                        "output_zarr_uri": selected_zarr_uri,
-                        "scene_id": zarr_context["scene_id"],
-                    },
-                )
-            elif "water" in mask_types:
-                stage_callback(
-                    "water_masking_started",
-                    {
-                        "zarr_uri": selected_zarr_uri,
-                        "output_zarr_uri": selected_zarr_uri,
-                        "scene_id": zarr_context["scene_id"],
-                    },
-                )
-        if hasattr(masker, "apply_masks_to_zarr"):
-            mask_response = self._invoke_mask_method(
-                masker.apply_masks_to_zarr,
-                job_id=job_id,
-                zarr_uri=selected_zarr_uri,
-                provider=zarr_context["provider"],
-                collection=zarr_context["collection"],
-                product_type=zarr_context["product_type"],
-                scene_id=zarr_context["scene_id"],
-                acquisition_datetime=zarr_context["acquisition_datetime"],
-                dataset_summary=zarr_context["dataset_summary"],
-                mask_types=mask_types,
-                backend=backend_name,
-                threshold=threshold,
-                overwrite=overwrite,
-                inference_device=inference_device,
-                include_shadows=include_shadows,
-                water_backend=water_backend_name,
-                water_overwrite=water_overwrite,
-                water_inference_device=water_inference_device,
-                fail_on_error=fail_on_error,
-                stage_callback=stage_callback,
-            )
-        elif mask_types == ["water"] and hasattr(masker, "apply_omniwater_to_zarr"):
-            water_mask = self._invoke_mask_method(
-                masker.apply_omniwater_to_zarr,
-                job_id=job_id,
-                zarr_uri=selected_zarr_uri,
-                provider=zarr_context["provider"],
-                collection=zarr_context["collection"],
-                product_type=zarr_context["product_type"],
-                scene_id=zarr_context["scene_id"],
-                acquisition_datetime=zarr_context["acquisition_datetime"],
-                dataset_summary=zarr_context["dataset_summary"],
-                fail_on_error=fail_on_error,
-                stage_callback=stage_callback,
-            )
-            masked_zarr_uri = str(water_mask.get("output_zarr_uri") or selected_zarr_uri).strip()
-            mask_response = {
-                "status": str(water_mask.get("status") or ""),
-                "mask_types": ["water"],
-                "input_zarr_uri": selected_zarr_uri,
-                "output_zarr_uri": masked_zarr_uri,
-                "masked_zarr_uri": masked_zarr_uri or None,
-                "masked_zarr_outputs": [masked_zarr_uri] if masked_zarr_uri else [],
-                "water_mask": water_mask,
-                "cloud_mask": {},
-                "watermask_outputs": [],
-                "cloudmask_outputs": [],
-            }
-        else:
-            raise RuntimeError("Configured mask service does not expose apply_masks_to_zarr.")
-
-        masked_zarr_uri = str(mask_response.get("masked_zarr_uri") or mask_response.get("output_zarr_uri") or selected_zarr_uri).strip()
-        masked_zarr_outputs = [item for item in list(mask_response.get("masked_zarr_outputs") or []) if str(item).strip()]
-        water_mask = dict(mask_response.get("water_mask") or {})
-        cloud_mask = dict(mask_response.get("cloud_mask") or {})
-        watermask_outputs: list[str] = []
-        cloudmask_outputs: list[str] = []
-        final_status = str(mask_response.get("status") or "").strip().lower()
-        mask_job_succeeded = final_status == "written"
-        visible_masked_zarr_outputs = masked_zarr_outputs if mask_job_succeeded else []
-        if mask_job_succeeded and not visible_masked_zarr_outputs and masked_zarr_uri:
-            visible_masked_zarr_outputs = [masked_zarr_uri]
-        visible_watermask_outputs = watermask_outputs if mask_job_succeeded else []
-        visible_cloudmask_outputs = cloudmask_outputs if mask_job_succeeded else []
-        quality_fields = self._mask_quality_fields(water_mask=water_mask, cloud_mask=cloud_mask)
-        quality_scalars = {
-            "water_fraction": float(quality_fields.get("water_fraction") or 0.0),
-            "cloud_fraction": float(quality_fields.get("cloud_fraction") or 0.0),
-            "cloud_only_fraction": float(quality_fields.get("cloud_only_fraction") or 0.0),
-            "shadow_fraction": float(quality_fields.get("shadow_fraction") or 0.0),
-        }
-        pipeline_metadata = {
-            "mask_contract_version": "v2",
-            "source_job_id": source_job_id,
-            "source_zarr_uri": selected_zarr_uri,
-            "masked_zarr_uri": masked_zarr_uri if mask_job_succeeded else "",
-            "scene_id": zarr_context["scene_id"],
-            "mask_types": mask_types,
-            "backend": backend_name,
-            "threshold": threshold,
-            "include_shadows": include_shadows,
-            "water_backend": water_backend_name,
-            "status": str(mask_response.get("status") or ""),
-            "mask_quality": quality_fields,
-            **quality_scalars,
-        }
-        conversion_metadata = {
-            "mask_contract_version": "v2",
-            "mask_types": mask_types,
-            "source_zarr_uri": selected_zarr_uri,
-            "masked_zarr_uri": masked_zarr_uri if mask_job_succeeded else "",
-            "backend": backend_name,
-            "threshold": threshold,
-            "include_shadows": include_shadows,
-            "water_backend": water_backend_name,
-            "water_mask": water_mask,
-            "cloud_mask": cloud_mask,
-            "mask_quality": quality_fields,
-            **quality_scalars,
-        }
+        mask_execution = self._run_in_place_mask_pipeline(
+            job_id=job_id,
+            source_job_id=source_job_id,
+            selected_zarr_uri=selected_zarr_uri,
+            zarr_context=zarr_context,
+            mask_types=mask_types,
+            backend_name=backend_name,
+            threshold=threshold,
+            inference_device=inference_device,
+            include_shadows=include_shadows,
+            overwrite=overwrite,
+            water_backend_name=water_backend_name,
+            water_overwrite=water_overwrite,
+            water_inference_device=water_inference_device,
+            fail_on_error=fail_on_error,
+            mask_mode="standalone",
+            include_resolve_stage=True,
+            resolve_progress=5.0,
+            stage_start_progress=35.0,
+            stage_end_progress=88.0,
+            expose_masked_outputs=True,
+            register_masked_artifact=False,
+        )
+        mask_job_succeeded = bool(mask_execution["succeeded"])
+        masked_zarr_uri = str(mask_execution["masked_zarr_uri"] or "").strip()
+        visible_masked_zarr_outputs = list(mask_execution["masked_zarr_outputs"] or [])
+        visible_watermask_outputs = list(mask_execution["watermask_outputs"] or [])
+        visible_cloudmask_outputs = list(mask_execution["cloudmask_outputs"] or [])
+        water_mask = dict(mask_execution["water_mask"] or {})
+        cloud_mask = dict(mask_execution["cloud_mask"] or {})
+        pipeline_metadata = dict(mask_execution["pipeline_metadata"] or {})
+        conversion_metadata = dict(mask_execution["conversion_metadata"] or {})
         result_payload = {
             "job_id": job_id,
             "job_type": "mask_existing_zarr",
@@ -964,48 +1159,22 @@ class NimbusFetcher:
                 "threshold": threshold,
                 "include_shadows": include_shadows,
                 "water_backend": water_backend_name,
-                "mask_quality": quality_fields,
-                **quality_scalars,
+                "mask_quality": dict(conversion_metadata.get("mask_quality") or {}),
+                "water_mask": water_mask,
+                "cloud_mask": cloud_mask,
+                "water_fraction": float(conversion_metadata.get("water_fraction") or 0.0),
+                "cloud_fraction": float(conversion_metadata.get("cloud_fraction") or 0.0),
+                "cloud_only_fraction": float(conversion_metadata.get("cloud_only_fraction") or 0.0),
+                "shadow_fraction": float(conversion_metadata.get("shadow_fraction") or 0.0),
             },
             "manifest_entry": {},
             "pipeline_metadata": pipeline_metadata,
             "conversion_metadata": conversion_metadata,
         }
         self.store.set_result(job_id, result_payload)
-        if mask_job_succeeded:
-            self._update_pipeline(
-                job_id,
-                pipeline_state=PipelineState.registering_artifacts,
-                pipeline_step="registering_artifacts",
-                pipeline_progress=90.0,
-                pipeline_metadata=pipeline_metadata,
-                conversion_metadata=conversion_metadata,
-                zarr_outputs=visible_masked_zarr_outputs,
-                event_type="job.registering_artifacts",
-                event_payload={"masked_zarr_uri": masked_zarr_uri},
-            )
-            self._register_masked_zarr_artifact(
-                job_id=job_id,
-                source_job_id=source_job_id,
-                provider_name=zarr_context["provider"],
-                collection=zarr_context["collection"],
-                scene_id=zarr_context["scene_id"],
-                source_zarr_uri=selected_zarr_uri,
-                masked_zarr_uri=masked_zarr_uri,
-                mask_payload=mask_response,
-                dataset_summary=zarr_context["dataset_summary"],
-            )
-
         terminal_pipeline_state = PipelineState.masked_zarr_written if mask_job_succeeded else PipelineState.failed
         terminal_state = JobState.succeeded if terminal_pipeline_state == PipelineState.masked_zarr_written else JobState.failed
-        errors = []
-        if terminal_state == JobState.failed:
-            for payload in (water_mask, cloud_mask):
-                reason = str(payload.get("reason") or "").strip()
-                if reason and reason not in errors:
-                    errors.append(reason)
-            if not errors:
-                errors.append(f"Mask execution failed with status '{final_status or 'unknown'}'.")
+        errors = list(mask_execution.get("errors") or [])
         self.store.update_job(
             job_id,
             state=terminal_state.value,
@@ -1748,6 +1917,16 @@ class NimbusFetcher:
             )
         return self._mask_service
 
+    def _remote_mask_runtime(self) -> dict[str, Any]:
+        service_url = str(self.settings.nimbus_mask_service_url or "").strip()
+        if not service_url:
+            return {}
+        try:
+            health = dict(self._masker().health() or {})
+        except Exception:
+            return {}
+        return dict(health.get("runtime") or {})
+
     @staticmethod
     def _invoke_mask_method(method: Callable[..., Any], **kwargs: Any) -> Any:
         try:
@@ -1999,6 +2178,91 @@ class NimbusFetcher:
                 outputs.append(derived_zarr_uri)
         return outputs
 
+    @staticmethod
+    def _zarr_convert_max_workers(*, total: int) -> int:
+        raw = str(os.getenv("NIMBUS_ZARR_CONVERT_MAX_WORKERS") or "").strip()
+        try:
+            configured = int(raw) if raw else None
+        except ValueError:
+            configured = None
+        default_value = 1
+        value = configured if configured is not None else default_value
+        return max(1, min(int(value), max(1, total), 4))
+
+    @staticmethod
+    def _integrated_mask_max_workers(
+        *,
+        total: int,
+        inference_device: str | None,
+        water_inference_device: str | None,
+        remote_runtime: dict[str, Any] | None = None,
+    ) -> int:
+        raw = str(os.getenv("NIMBUS_MASK_SCENE_MAX_WORKERS") or "").strip()
+        try:
+            configured = int(raw) if raw else None
+        except ValueError:
+            configured = None
+        resolved_cloud = resolve_inference_device(
+            explicit=inference_device,
+            env_var="NIMBUS_CLOUDMASK_DEVICE",
+        )
+        resolved_water = resolve_inference_device(
+            explicit=water_inference_device,
+            env_var="NIMBUS_WATERMASK_DEVICE",
+        )
+        runtime_payload = dict(remote_runtime or {})
+        remote_cloud = normalize_device_name(
+            dict(runtime_payload.get("cloud") or {}).get("resolved")
+        )
+        remote_water = normalize_device_name(
+            dict(runtime_payload.get("water") or {}).get("resolved")
+        )
+        if remote_cloud not in {"", "auto"}:
+            resolved_cloud = remote_cloud
+        if remote_water not in {"", "auto"}:
+            resolved_water = remote_water
+        has_accelerator = any(device in {"cuda", "mps"} for device in {resolved_cloud, resolved_water})
+        default_value = 2 if total > 1 and has_accelerator else 1
+        value = configured if configured is not None else default_value
+        return max(1, min(int(value), max(1, total), 4))
+
+    def _convert_single_raw_output(
+        self,
+        *,
+        provider_name: str,
+        collection: str,
+        product_type: str | None,
+        raw_uri: str,
+        scene_id: str,
+        output_uri: str,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        converter = self._converter()
+        convert_kwargs: dict[str, Any] = {
+            "provider": provider_name,
+            "collection": self._normalize_collection_for_zarr(provider_name, collection),
+            "scene_id": scene_id,
+            "raw_uri": raw_uri,
+            "output_uri": output_uri,
+            "product_type": self._normalize_product_type_for_zarr(product_type),
+        }
+        if progress_callback is not None:
+            try:
+                signature = inspect.signature(converter.convert)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None and "progress_callback" in signature.parameters:
+                convert_kwargs["progress_callback"] = progress_callback
+        written_uri, data_family, conversion_summary, dataset_summary = converter.convert(**convert_kwargs)
+        return {
+            "raw_uri": raw_uri,
+            "scene_id": scene_id,
+            "zarr_uri": written_uri,
+            "data_family": data_family,
+            "summary": conversion_summary,
+            "dataset_summary": dataset_summary,
+        }
+
     def _convert_raw_outputs(
         self,
         *,
@@ -2014,9 +2278,10 @@ class NimbusFetcher:
         if not raw_outputs:
             return [], {"status": "skipped", "reason": "no_raw_outputs"}
 
+        total = max(1, len(raw_outputs))
         zarr_outputs: list[str] = []
         conversions: list[dict[str, Any]] = []
-        total = max(1, len(raw_outputs))
+        prepared_items: list[dict[str, Any]] = []
         self._update_pipeline(
             job_id,
             pipeline_state=PipelineState.zarr_queued,
@@ -2045,97 +2310,217 @@ class NimbusFetcher:
                 if index == 1 and output_uri_override
                 else self._default_zarr_output_uri(scene_id)
             )
-            per_item_progress = ((index - 1) / total) * 100.0
-            self._update_pipeline(
-                job_id,
-                pipeline_state=PipelineState.zarr_converting,
-                pipeline_step="writing_chunks",
-                pipeline_progress=per_item_progress,
-                raw_outputs=raw_outputs,
-                zarr_outputs=zarr_outputs,
-                conversion_metadata={
-                    "status": "running",
-                    "stage": "writing_chunks",
-                    "current_raw_uri": raw_uri,
-                    "current_scene_id": scene_id,
-                    "current_output_uri": output_uri,
-                    "current_index": index,
-                    "total": total,
-                },
-                event_type="job.zarr_converting",
-                event_payload={
+            prepared_items.append(
+                {
+                    "index": index,
                     "raw_uri": raw_uri,
                     "scene_id": scene_id,
                     "output_uri": output_uri,
-                    "index": index,
-                    "total": total,
-                    "stage": "writing_chunks",
-                },
-            )
-            written_uri, data_family, conversion_summary, dataset_summary = self._converter().convert(
-                provider=provider_name,
-                collection=self._normalize_collection_for_zarr(provider_name, collection),
-                scene_id=scene_id,
-                raw_uri=raw_uri,
-                output_uri=output_uri,
-                product_type=self._normalize_product_type_for_zarr(product_type),
-            )
-            zarr_outputs.append(written_uri)
-            conversions.append(
-                {
-                    "raw_uri": raw_uri,
-                    "scene_id": scene_id,
-                    "zarr_uri": written_uri,
-                    "data_family": data_family,
-                    "summary": conversion_summary,
-                    "dataset_summary": dataset_summary,
                 }
             )
-            register_progress = min(
-                99.0,
-                ((index - 1) / total) * 100.0 + (100.0 / total) * 0.85,
-            )
-            self._update_pipeline(
-                job_id,
-                pipeline_state=PipelineState.zarr_converting,
-                pipeline_step="registering_artifact",
-                pipeline_progress=register_progress,
-                raw_outputs=raw_outputs,
-                zarr_outputs=zarr_outputs,
-                conversion_metadata={
-                    "status": "running",
-                    "stage": "registering_artifact",
-                    "current_raw_uri": raw_uri,
-                    "current_scene_id": scene_id,
-                    "current_output_uri": written_uri,
-                    "current_index": index,
-                    "total": total,
-                },
-                event_type="job.zarr_converting",
-                event_payload={
-                    "raw_uri": raw_uri,
-                    "scene_id": scene_id,
-                    "output_uri": written_uri,
-                    "index": index,
-                    "total": total,
-                    "stage": "registering_artifact",
-                },
-            )
-            self._register_zarr_artifact(
-                job_id=job_id,
-                provider_name=provider_name,
-                collection=collection,
-                scene_id=scene_id,
-                raw_uri=raw_uri,
-                zarr_uri=written_uri,
-                data_family=data_family,
-                conversion_summary=conversion_summary,
-                dataset_summary=dataset_summary,
-            )
+
+        max_workers = self._zarr_convert_max_workers(total=total)
+        if max_workers <= 1:
+            for item in prepared_items:
+                if is_cancelled():
+                    raise JobCancelledError("Job cancellation requested.")
+                index = int(item["index"])
+                raw_uri = str(item["raw_uri"])
+                scene_id = str(item["scene_id"])
+                output_uri = str(item["output_uri"])
+                per_item_progress = ((index - 1) / total) * 100.0
+                self._update_pipeline(
+                    job_id,
+                    pipeline_state=PipelineState.zarr_converting,
+                    pipeline_step="writing_chunks",
+                    pipeline_progress=per_item_progress,
+                    raw_outputs=raw_outputs,
+                    zarr_outputs=zarr_outputs,
+                    conversion_metadata={
+                        "status": "running",
+                        "stage": "writing_chunks",
+                        "current_raw_uri": raw_uri,
+                        "current_scene_id": scene_id,
+                        "current_output_uri": output_uri,
+                        "current_index": index,
+                        "total": total,
+                        "parallel_workers": 1,
+                    },
+                    event_type="job.zarr_converting",
+                    event_payload={
+                        "raw_uri": raw_uri,
+                        "scene_id": scene_id,
+                        "output_uri": output_uri,
+                        "index": index,
+                        "total": total,
+                        "stage": "writing_chunks",
+                        "parallel_workers": 1,
+                    },
+                )
+                progress_callback = self._build_zarr_progress_callback(
+                    job_id=job_id,
+                    raw_outputs=raw_outputs,
+                    zarr_outputs=zarr_outputs,
+                    raw_uri=raw_uri,
+                    scene_id=scene_id,
+                    output_uri=output_uri,
+                    index=index,
+                    total=total,
+                )
+                converted = self._convert_single_raw_output(
+                    provider_name=provider_name,
+                    collection=collection,
+                    product_type=product_type,
+                    raw_uri=raw_uri,
+                    scene_id=scene_id,
+                    output_uri=output_uri,
+                    progress_callback=progress_callback,
+                )
+                zarr_outputs.append(str(converted["zarr_uri"]))
+                conversions.append(converted)
+                register_progress = min(
+                    99.0,
+                    ((index - 1) / total) * 100.0 + (100.0 / total) * 0.85,
+                )
+                self._update_pipeline(
+                    job_id,
+                    pipeline_state=PipelineState.zarr_converting,
+                    pipeline_step="registering_artifact",
+                    pipeline_progress=register_progress,
+                    raw_outputs=raw_outputs,
+                    zarr_outputs=zarr_outputs,
+                    conversion_metadata={
+                        "status": "running",
+                        "stage": "registering_artifact",
+                        "current_raw_uri": raw_uri,
+                        "current_scene_id": scene_id,
+                        "current_output_uri": converted["zarr_uri"],
+                        "current_index": index,
+                        "total": total,
+                        "parallel_workers": 1,
+                    },
+                    event_type="job.zarr_converting",
+                    event_payload={
+                        "raw_uri": raw_uri,
+                        "scene_id": scene_id,
+                        "output_uri": converted["zarr_uri"],
+                        "index": index,
+                        "total": total,
+                        "stage": "registering_artifact",
+                        "parallel_workers": 1,
+                    },
+                )
+                self._register_zarr_artifact(
+                    job_id=job_id,
+                    provider_name=provider_name,
+                    collection=collection,
+                    scene_id=scene_id,
+                    raw_uri=raw_uri,
+                    zarr_uri=str(converted["zarr_uri"]),
+                    data_family=str(converted["data_family"]),
+                    conversion_summary=dict(converted["summary"]),
+                    dataset_summary=dict(converted["dataset_summary"]),
+                )
+            return zarr_outputs, {
+                "status": "written",
+                "count": len(zarr_outputs),
+                "items": conversions,
+                "parallel_workers": 1,
+            }
+
+        self._update_pipeline(
+            job_id,
+            pipeline_state=PipelineState.zarr_converting,
+            pipeline_step="writing_chunks",
+            pipeline_progress=0.0,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+            conversion_metadata={
+                "status": "running",
+                "stage": "writing_chunks",
+                "current_index": 0,
+                "total": total,
+                "parallel_workers": max_workers,
+            },
+            event_type="job.zarr_converting",
+            event_payload={
+                "raw_output_count": len(raw_outputs),
+                "stage": "writing_chunks",
+                "parallel_workers": max_workers,
+            },
+        )
+        completed_by_index: dict[int, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="zarr-convert") as executor:
+            future_to_item = {
+                executor.submit(
+                    self._convert_single_raw_output,
+                    provider_name=provider_name,
+                    collection=collection,
+                    product_type=product_type,
+                    raw_uri=str(item["raw_uri"]),
+                    scene_id=str(item["scene_id"]),
+                    output_uri=str(item["output_uri"]),
+                ): item
+                for item in prepared_items
+            }
+            for future in as_completed(future_to_item):
+                if is_cancelled():
+                    raise JobCancelledError("Job cancellation requested.")
+                item = future_to_item[future]
+                converted = future.result()
+                index = int(item["index"])
+                completed_by_index[index] = converted
+                ordered_indices = sorted(completed_by_index)
+                zarr_outputs = [str(completed_by_index[current]["zarr_uri"]) for current in ordered_indices]
+                conversions = [completed_by_index[current] for current in ordered_indices]
+                register_progress = min(
+                    99.0,
+                    (len(completed_by_index) / total) * 85.0,
+                )
+                self._update_pipeline(
+                    job_id,
+                    pipeline_state=PipelineState.zarr_converting,
+                    pipeline_step="registering_artifact",
+                    pipeline_progress=register_progress,
+                    raw_outputs=raw_outputs,
+                    zarr_outputs=zarr_outputs,
+                    conversion_metadata={
+                        "status": "running",
+                        "stage": "registering_artifact",
+                        "current_raw_uri": item["raw_uri"],
+                        "current_scene_id": item["scene_id"],
+                        "current_output_uri": converted["zarr_uri"],
+                        "current_index": len(completed_by_index),
+                        "total": total,
+                        "parallel_workers": max_workers,
+                    },
+                    event_type="job.zarr_converting",
+                    event_payload={
+                        "raw_uri": item["raw_uri"],
+                        "scene_id": item["scene_id"],
+                        "output_uri": converted["zarr_uri"],
+                        "index": len(completed_by_index),
+                        "total": total,
+                        "stage": "registering_artifact",
+                        "parallel_workers": max_workers,
+                    },
+                )
+                self._register_zarr_artifact(
+                    job_id=job_id,
+                    provider_name=provider_name,
+                    collection=collection,
+                    scene_id=str(item["scene_id"]),
+                    raw_uri=str(item["raw_uri"]),
+                    zarr_uri=str(converted["zarr_uri"]),
+                    data_family=str(converted["data_family"]),
+                    conversion_summary=dict(converted["summary"]),
+                    dataset_summary=dict(converted["dataset_summary"]),
+                )
         return zarr_outputs, {
             "status": "written",
             "count": len(zarr_outputs),
             "items": conversions,
+            "parallel_workers": max_workers,
         }
 
     def convert_existing_job(self, job_id: str, request: JobConvertRequest) -> JobStatusResponse:
@@ -2157,7 +2542,13 @@ class NimbusFetcher:
         product_type = str(request.product_type or row.get("product_type") or "").strip() or None
         output_uri = str(request.output_uri or self._default_zarr_output_uri(scene_id)).strip()
 
-        self.store.update_job(job_id, state=JobState.running.value, finished_at=None, errors=[])
+        self.store.update_job(
+            job_id,
+            state=JobState.running.value,
+            started_at=self._now_iso(),
+            finished_at=None,
+            errors=[],
+        )
         zarr_outputs, conversion_metadata = self._convert_raw_outputs(
             job_id=job_id,
             provider_name=provider_name,
@@ -2299,6 +2690,7 @@ class NimbusFetcher:
             "product_type": getattr(request, "product_type", None),
             "output_dir": str(output_dir),
             "job_type": request.job_type,
+            "download_strategy": str(getattr(request, "download_strategy", "default") or "default"),
         }
         if isinstance(request, SearchDownloadRequest):
             base_pipeline_metadata["tile_id"] = request.tile_id
@@ -2327,7 +2719,9 @@ class NimbusFetcher:
                 event_payload={"products_requested": len(requested_ids)},
             )
 
-        file_progress: dict[str, dict[str, int | None]] = {}
+        file_progress: dict[str, dict[str, Any]] = {}
+        account_retry_state: dict[str, dict[str, Any]] = {}
+        progress_lock = threading.Lock()
         aggregate = {
             "bytes_downloaded": 0,
             "bytes_total": 0,
@@ -2335,90 +2729,192 @@ class NimbusFetcher:
             "last_bytes": 0,
             "last_progress": 0.0,
             "last_time": time.monotonic(),
+            "last_speed_bps": 0.0,
+            "last_file": "",
         }
 
-        def emit_progress(file_name: str, delta: int, downloaded: int, total: int | None) -> None:
+        def _current_download_pipeline_metadata() -> dict[str, Any]:
+            row_now = self.store.get_job(job_id) or {}
+            return {
+                **base_pipeline_metadata,
+                **dict(row_now.get("pipeline_metadata") or {}),
+            }
+
+        def emit_progress(
+            file_name: str,
+            delta: int,
+            downloaded: int,
+            total: int | None,
+            context: dict[str, Any] | None = None,
+        ) -> None:
             if is_cancelled_now():
                 raise JobCancelledError("Job cancellation requested.")
-
-            aggregate["bytes_downloaded"] += max(0, int(delta))
-            file_progress[file_name] = {"downloaded": downloaded, "total": total}
-            known_total = sum(
-                int(item["total"])
-                for item in file_progress.values()
-                if item.get("total") is not None
-            )
-            aggregate["bytes_total"] = max(int(aggregate["bytes_total"]), known_total)
-
-            now_mono = time.monotonic()
-            elapsed = max(0.001, now_mono - float(aggregate["last_time"]))
-            delta_bytes = int(aggregate["bytes_downloaded"]) - int(aggregate["last_bytes"])
-            speed = max(0.0, delta_bytes / elapsed)
-
-            progress_pct = 0.0
-            if aggregate["bytes_total"] > 0:
-                progress_pct = min(
-                    99.0,
-                    100.0 * int(aggregate["bytes_downloaded"]) / int(aggregate["bytes_total"]),
+            with progress_lock:
+                context_payload = dict(context or {})
+                account_label = self._download_account_label(context_payload)
+                file_key = (
+                    str(context_payload.get("product_id") or "").strip()
+                    or str(file_name).strip()
+                    or f"file-{len(file_progress) + 1}"
                 )
-            pipeline_progress = min(69.0, 5.0 + (progress_pct * 0.64))
+                aggregate["bytes_downloaded"] += max(0, int(delta))
+                aggregate["last_file"] = str(file_name or "").strip()
+                file_progress[file_key] = {
+                    "file_name": str(file_name or "").strip(),
+                    "product_id": str(context_payload.get("product_id") or "").strip(),
+                    "account_label": account_label,
+                    "downloaded": int(downloaded or 0),
+                    "total": int(total) if total is not None else None,
+                    "completed": bool(total is not None and int(downloaded or 0) >= int(total or 0) > 0),
+                    "last_update_mono": time.monotonic(),
+                }
+                retry_entry = account_retry_state.setdefault(account_label, {})
+                if int(delta or 0) > 0:
+                    retry_entry["status"] = "running"
+                known_total = sum(
+                    int(item["total"])
+                    for item in file_progress.values()
+                    if item.get("total") is not None
+                )
+                aggregate["bytes_total"] = max(int(aggregate["bytes_total"]), known_total)
 
-            if self._should_emit_download_progress(
-                delta=int(delta),
-                now_mono=now_mono,
-                last_emit=float(aggregate["last_emit"]),
-                bytes_downloaded=int(aggregate["bytes_downloaded"]),
-                last_bytes=int(aggregate["last_bytes"]),
-                progress_pct=float(progress_pct),
-                last_progress=float(aggregate["last_progress"]),
-                bytes_total=int(aggregate["bytes_total"]),
-            ):
-                self.store.update_job(
-                    job_id,
-                    progress=progress_pct,
+                now_mono = time.monotonic()
+                elapsed = max(0.001, now_mono - float(aggregate["last_time"]))
+                delta_bytes = int(aggregate["bytes_downloaded"]) - int(aggregate["last_bytes"])
+                speed = max(0.0, delta_bytes / elapsed)
+
+                progress_pct = 0.0
+                if aggregate["bytes_total"] > 0:
+                    progress_pct = min(
+                        99.0,
+                        100.0 * int(aggregate["bytes_downloaded"]) / int(aggregate["bytes_total"]),
+                    )
+                pipeline_progress = min(69.0, 5.0 + (progress_pct * 0.64))
+                aggregate["last_speed_bps"] = speed
+
+                if self._should_emit_download_progress(
+                    delta=int(delta),
+                    now_mono=now_mono,
+                    last_emit=float(aggregate["last_emit"]),
+                    bytes_downloaded=int(aggregate["bytes_downloaded"]),
+                    last_bytes=int(aggregate["last_bytes"]),
+                    progress_pct=float(progress_pct),
+                    last_progress=float(aggregate["last_progress"]),
+                    bytes_total=int(aggregate["bytes_total"]),
+                ):
+                    current_pipeline_metadata = _current_download_pipeline_metadata()
+                    download_telemetry = self._build_download_telemetry(
+                        pipeline_metadata=current_pipeline_metadata,
+                        file_progress=file_progress,
+                        bytes_downloaded=int(aggregate["bytes_downloaded"]),
+                        bytes_total=int(aggregate["bytes_total"]),
+                        progress_pct=float(progress_pct),
+                        speed_bps=float(speed),
+                        retry_state=account_retry_state,
+                        phase="running",
+                        last_file=str(aggregate["last_file"] or file_name or "").strip() or None,
+                    )
+                    self.store.update_job(
+                        job_id,
+                        progress=progress_pct,
+                        bytes_downloaded=int(aggregate["bytes_downloaded"]),
+                        bytes_total=int(aggregate["bytes_total"]),
+                        pipeline_state=PipelineState.downloading.value,
+                        pipeline_step="downloading",
+                        pipeline_progress=pipeline_progress,
+                        pipeline_metadata={
+                            **current_pipeline_metadata,
+                            "download_telemetry": download_telemetry,
+                        },
+                    )
+                    self.store.append_event(
+                        job_id,
+                        "job.progress",
+                        {
+                            "file": file_name,
+                            "account_label": account_label,
+                            "bytes": int(aggregate["bytes_downloaded"]),
+                            "bytes_total": int(aggregate["bytes_total"]),
+                            "speed": speed,
+                            "status": JobState.running.value,
+                        },
+                    )
+                    aggregate["last_emit"] = now_mono
+                    aggregate["last_time"] = now_mono
+                    aggregate["last_bytes"] = int(aggregate["bytes_downloaded"])
+                    aggregate["last_progress"] = float(progress_pct)
+
+        def emit_retry(
+            file_name: str,
+            attempt: int,
+            reason: str,
+            retry_after: float | None,
+            context: dict[str, Any] | None = None,
+        ) -> None:
+            with progress_lock:
+                context_payload = dict(context or {})
+                account_label = self._download_account_label(context_payload)
+                row_now = self.store.get_job(job_id) or {}
+                retry_count = int(row_now.get("retry_count", 0) or 0) + 1
+                last_retry_at = self._now_iso()
+                retry_entry = account_retry_state.setdefault(account_label, {})
+                retry_entry["retry_count"] = int(retry_entry.get("retry_count", 0) or 0) + 1
+                retry_entry["last_retry_at"] = last_retry_at
+                retry_entry["last_reason"] = str(reason or "").strip()
+                retry_entry["status"] = (
+                    "rate_limited"
+                    if str(reason or "").strip().lower() == "http_429"
+                    else "retrying"
+                )
+                current_pipeline_metadata = {
+                    **base_pipeline_metadata,
+                    **dict(row_now.get("pipeline_metadata") or {}),
+                }
+                progress_pct = 0.0
+                if int(aggregate["bytes_total"]) > 0:
+                    progress_pct = min(
+                        99.0,
+                        100.0
+                        * int(aggregate["bytes_downloaded"])
+                        / max(1, int(aggregate["bytes_total"])),
+                    )
+                download_telemetry = self._build_download_telemetry(
+                    pipeline_metadata=current_pipeline_metadata,
+                    file_progress=file_progress,
                     bytes_downloaded=int(aggregate["bytes_downloaded"]),
                     bytes_total=int(aggregate["bytes_total"]),
-                    pipeline_state=PipelineState.downloading.value,
-                    pipeline_step="downloading",
-                    pipeline_progress=pipeline_progress,
+                    progress_pct=float(progress_pct),
+                    speed_bps=float(aggregate["last_speed_bps"]),
+                    retry_state=account_retry_state,
+                    phase=(
+                        "rate_limited"
+                        if str(reason or "").strip().lower() == "http_429"
+                        else "retrying"
+                    ),
+                    last_file=str(file_name or "").strip() or None,
+                )
+                self.store.update_job(
+                    job_id,
+                    retry_count=retry_count,
+                    last_retry_at=last_retry_at,
+                    pipeline_metadata={
+                        **current_pipeline_metadata,
+                        "download_telemetry": download_telemetry,
+                    },
                 )
                 self.store.append_event(
                     job_id,
-                    "job.progress",
+                    "job.retrying",
                     {
                         "file": file_name,
-                        "bytes": int(aggregate["bytes_downloaded"]),
-                        "bytes_total": int(aggregate["bytes_total"]),
-                        "speed": speed,
-                        "status": JobState.running.value,
+                        "account_label": account_label,
+                        "attempt": int(attempt),
+                        "reason": reason,
+                        "retry_after": retry_after,
+                        "retry_count": retry_count,
+                        "last_retry_at": last_retry_at,
                     },
                 )
-                aggregate["last_emit"] = now_mono
-                aggregate["last_time"] = now_mono
-                aggregate["last_bytes"] = int(aggregate["bytes_downloaded"])
-                aggregate["last_progress"] = float(progress_pct)
-
-        def emit_retry(file_name: str, attempt: int, reason: str, retry_after: float | None) -> None:
-            row_now = self.store.get_job(job_id) or {}
-            retry_count = int(row_now.get("retry_count", 0) or 0) + 1
-            last_retry_at = self._now_iso()
-            self.store.update_job(
-                job_id,
-                retry_count=retry_count,
-                last_retry_at=last_retry_at,
-            )
-            self.store.append_event(
-                job_id,
-                "job.retrying",
-                {
-                    "file": file_name,
-                    "attempt": int(attempt),
-                    "reason": reason,
-                    "retry_after": retry_after,
-                    "retry_count": retry_count,
-                    "last_retry_at": last_retry_at,
-                },
-            )
 
         try:
             result = await anyio.to_thread.run_sync(
@@ -2437,12 +2933,40 @@ class NimbusFetcher:
 
             raw_outputs = self._filter_manifest_paths(list(result["paths"]))
             metadata = dict(result["metadata"])
+            current_pipeline_metadata = {
+                **base_pipeline_metadata,
+                **dict((self.store.get_job(job_id) or {}).get("pipeline_metadata") or {}),
+            }
+            final_download_progress_pct = 0.0
+            if max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"])) > 0:
+                final_download_progress_pct = min(
+                    100.0,
+                    100.0
+                    * int(aggregate["bytes_downloaded"])
+                    / max(1, max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"]))),
+                )
+            final_download_telemetry = self._build_download_telemetry(
+                pipeline_metadata={
+                    **current_pipeline_metadata,
+                    **metadata,
+                },
+                file_progress=file_progress,
+                bytes_downloaded=int(aggregate["bytes_downloaded"]),
+                bytes_total=max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"])),
+                progress_pct=float(final_download_progress_pct),
+                speed_bps=float(aggregate["last_speed_bps"]),
+                retry_state=account_retry_state,
+                phase="completed",
+                last_file=str(aggregate["last_file"] or "").strip() or None,
+            )
             pipeline_metadata = {
+                **current_pipeline_metadata,
                 **base_pipeline_metadata,
                 **metadata,
                 "products_found": int(metadata.get("products_found", len(raw_outputs)) or len(raw_outputs)),
                 "products_downloaded": int(metadata.get("products_downloaded", len(raw_outputs)) or len(raw_outputs)),
                 "raw_output_count": len(raw_outputs),
+                "download_telemetry": final_download_telemetry,
             }
             self._update_pipeline(
                 job_id,
@@ -2500,11 +3024,15 @@ class NimbusFetcher:
             final_pipeline_step = (
                 "zarr_written" if final_pipeline_state == PipelineState.zarr_written else "downloaded"
             )
+            requested_mask_types = self._normalized_mask_types(getattr(request, "mask_types", []))
             final_pipeline_metadata = {
                 **pipeline_metadata,
                 "zarr_output_count": len(zarr_outputs),
                 "manual_conversion": False,
             }
+            if requested_mask_types:
+                final_pipeline_metadata["mask_types"] = requested_mask_types
+                final_pipeline_metadata["mask_mode"] = "integrated"
 
             self.store.set_result(
                 job_id,
@@ -2520,6 +3048,359 @@ class NimbusFetcher:
                     "conversion_metadata": conversion_metadata,
                 },
             )
+            if final_pipeline_state == PipelineState.zarr_written:
+                self.store.update_job(
+                    job_id,
+                    state=JobState.running.value if requested_mask_types else JobState.succeeded.value,
+                    started_at=(
+                        str((self.store.get_job(job_id) or {}).get("started_at") or "").strip()
+                        or self._now_iso()
+                    ),
+                    progress=100.0,
+                    finished_at=None if requested_mask_types else self._now_iso(),
+                    bytes_downloaded=int(aggregate["bytes_downloaded"]),
+                    bytes_total=max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"])),
+                    pipeline_state=final_pipeline_state.value,
+                    pipeline_step=final_pipeline_step,
+                    pipeline_progress=72.0 if requested_mask_types else 100.0,
+                    pipeline_metadata=final_pipeline_metadata,
+                    conversion_metadata=conversion_metadata,
+                    raw_outputs=raw_outputs,
+                    zarr_outputs=zarr_outputs,
+                )
+                self.store.append_event(
+                    job_id,
+                    "job.zarr_written",
+                    {
+                        "pipeline_state": final_pipeline_state.value,
+                        "zarr_outputs": zarr_outputs,
+                    },
+                )
+                if requested_mask_types:
+                    total_mask_outputs = max(1, len(zarr_outputs))
+                    mask_inference_device = str(getattr(request, "inference_device", "") or "").strip() or None
+                    water_inference_device = (
+                        str(getattr(request, "water_inference_device", "") or "").strip() or None
+                    )
+                    remote_mask_runtime = self._remote_mask_runtime()
+                    mask_workers = self._integrated_mask_max_workers(
+                        total=len(zarr_outputs),
+                        inference_device=mask_inference_device,
+                        water_inference_device=water_inference_device,
+                        remote_runtime=remote_mask_runtime,
+                    )
+                    mask_items: list[dict[str, Any] | None] = [None] * len(zarr_outputs)
+                    mask_errors: list[str] = []
+                    last_mask_execution: dict[str, Any] | None = None
+
+                    progress_lock = threading.Lock()
+                    progress_by_index: dict[int, float] = {
+                        item_index: 0.0 for item_index in range(len(zarr_outputs))
+                    }
+                    stage_by_index: dict[int, PipelineState] = {}
+                    scene_count = max(1, len(zarr_outputs))
+
+                    def _normalize_pipeline_state(value: Any) -> PipelineState:
+                        if isinstance(value, PipelineState):
+                            return value
+                        try:
+                            return PipelineState(str(value or "").strip())
+                        except Exception:
+                            return PipelineState.running_cloud_inference
+
+                    def _aggregate_pipeline_state() -> tuple[PipelineState, str]:
+                        states = set(stage_by_index.values())
+                        if PipelineState.failed in states:
+                            return PipelineState.failed, "failed"
+                        if PipelineState.running_water_inference in states:
+                            return (
+                                PipelineState.running_water_inference,
+                                "running_water_inference",
+                            )
+                        if PipelineState.running_cloud_inference in states:
+                            return (
+                                PipelineState.running_cloud_inference,
+                                "running_cloud_inference",
+                            )
+                        if "water" in requested_mask_types:
+                            return (
+                                PipelineState.running_water_inference,
+                                "running_water_inference",
+                            )
+                        return (
+                            PipelineState.running_cloud_inference,
+                            "running_cloud_inference",
+                        )
+
+                    def _make_item_progress_callback(item_index: int) -> Callable[[dict[str, Any]], None]:
+                        def _callback(payload: dict[str, Any]) -> None:
+                            item_fraction = min(
+                                1.0,
+                                max(0.0, float(payload.get("item_fraction") or 0.0)),
+                            )
+                            with progress_lock:
+                                progress_by_index[item_index] = max(
+                                    progress_by_index.get(item_index, 0.0),
+                                    item_fraction,
+                                )
+                                stage_by_index[item_index] = _normalize_pipeline_state(
+                                    payload.get("pipeline_state")
+                                )
+                                aggregate_fraction = sum(progress_by_index.values()) / scene_count
+                                aggregate_progress = 76.0 + (aggregate_fraction * 22.0)
+                                aggregate_state, aggregate_step = _aggregate_pipeline_state()
+                                aggregate_metadata = {
+                                    **final_pipeline_metadata,
+                                    **dict(payload.get("pipeline_metadata") or {}),
+                                    "mask_parallel_workers": mask_workers,
+                                    "mask_total_scenes": scene_count,
+                                }
+                                aggregate_event_payload = {
+                                    **dict(payload.get("event_payload") or {}),
+                                    "scene_index": item_index + 1,
+                                    "scene_total": scene_count,
+                                    "item_fraction": item_fraction,
+                                    "aggregate_fraction": aggregate_fraction,
+                                }
+                                self._update_pipeline(
+                                    job_id,
+                                    pipeline_state=aggregate_state,
+                                    pipeline_step=aggregate_step,
+                                    pipeline_progress=aggregate_progress,
+                                    pipeline_metadata=aggregate_metadata,
+                                    event_type=str(payload.get("event_type") or "").strip() or None,
+                                    event_payload=aggregate_event_payload,
+                                )
+
+                        return _callback
+
+                    def _mark_item_completion(
+                        item_index: int,
+                        *,
+                        mask_execution: dict[str, Any],
+                    ) -> None:
+                        item_succeeded = bool(mask_execution.get("succeeded"))
+                        with progress_lock:
+                            progress_by_index[item_index] = max(progress_by_index.get(item_index, 0.0), 1.0)
+                            if not item_succeeded:
+                                stage_by_index[item_index] = PipelineState.failed
+                            elif "water" in requested_mask_types:
+                                stage_by_index[item_index] = PipelineState.running_water_inference
+                            else:
+                                stage_by_index[item_index] = PipelineState.running_cloud_inference
+                            aggregate_fraction = sum(progress_by_index.values()) / scene_count
+                            aggregate_progress = 76.0 + (aggregate_fraction * 22.0)
+                            aggregate_state, aggregate_step = _aggregate_pipeline_state()
+                            self._update_pipeline(
+                                job_id,
+                                pipeline_state=aggregate_state,
+                                pipeline_step=aggregate_step,
+                                pipeline_progress=aggregate_progress,
+                                pipeline_metadata={
+                                    **final_pipeline_metadata,
+                                    "mask_parallel_workers": mask_workers,
+                                    "mask_total_scenes": scene_count,
+                                },
+                            )
+
+                    def _run_mask_item(item_index: int, zarr_uri: str) -> tuple[int, str, dict[str, Any]]:
+                        if is_cancelled_now():
+                            raise JobCancelledError(
+                                "Job cancellation requested during integrated masking."
+                            )
+                        zarr_context = self._resolve_zarr_context(
+                            job_id=job_id,
+                            row=row,
+                            result={"conversion_metadata": conversion_metadata},
+                            zarr_uri=zarr_uri,
+                            scene_id_override=None,
+                            product_type_override=getattr(request, "product_type", None),
+                        )
+                        item_start = 76.0 + (item_index * (22.0 / total_mask_outputs))
+                        item_end = 76.0 + ((item_index + 1) * (22.0 / total_mask_outputs))
+                        mask_execution = self._run_in_place_mask_pipeline(
+                            job_id=job_id,
+                            source_job_id=job_id,
+                            selected_zarr_uri=zarr_uri,
+                            zarr_context=zarr_context,
+                            mask_types=requested_mask_types,
+                            backend_name="auto",
+                            threshold=0.62,
+                            inference_device=mask_inference_device,
+                            include_shadows=True,
+                            overwrite=True,
+                            water_backend_name="auto",
+                            water_overwrite=True,
+                            water_inference_device=water_inference_device,
+                            fail_on_error=False,
+                            mask_mode="integrated",
+                            include_resolve_stage=False,
+                            resolve_progress=None,
+                            stage_start_progress=item_start,
+                            stage_end_progress=item_end,
+                            expose_masked_outputs=False,
+                            register_masked_artifact=False,
+                            pipeline_progress_callback=_make_item_progress_callback(item_index),
+                        )
+                        return item_index, zarr_uri, mask_execution
+
+                    if mask_workers <= 1 or len(zarr_outputs) <= 1:
+                        for item_index, zarr_uri in enumerate(zarr_outputs):
+                            item_index, zarr_uri, mask_execution = _run_mask_item(item_index, zarr_uri)
+                            item_pipeline = dict(mask_execution.get("pipeline_metadata") or {})
+                            item_conversion = dict(mask_execution.get("conversion_metadata") or {})
+                            mask_items[item_index] = {
+                                "zarr_uri": zarr_uri,
+                                "status": str(mask_execution.get("status") or ""),
+                                "pipeline_metadata": item_pipeline,
+                                "conversion_metadata": item_conversion,
+                                "errors": list(mask_execution.get("errors") or []),
+                            }
+                            _mark_item_completion(item_index, mask_execution=mask_execution)
+                            last_mask_execution = mask_execution
+                            mask_errors.extend(
+                                error
+                                for error in list(mask_execution.get("errors") or [])
+                                if error not in mask_errors
+                            )
+                            if not bool(mask_execution.get("succeeded")):
+                                break
+                    else:
+                        with ThreadPoolExecutor(
+                            max_workers=mask_workers,
+                            thread_name_prefix="mask-scene",
+                        ) as executor:
+                            future_map = {
+                                executor.submit(_run_mask_item, item_index, zarr_uri): (item_index, zarr_uri)
+                                for item_index, zarr_uri in enumerate(zarr_outputs)
+                            }
+                            for future in as_completed(future_map):
+                                item_index, zarr_uri = future_map[future]
+                                item_index, zarr_uri, mask_execution = future.result()
+                                item_pipeline = dict(mask_execution.get("pipeline_metadata") or {})
+                                item_conversion = dict(mask_execution.get("conversion_metadata") or {})
+                                mask_items[item_index] = {
+                                    "zarr_uri": zarr_uri,
+                                    "status": str(mask_execution.get("status") or ""),
+                                    "pipeline_metadata": item_pipeline,
+                                    "conversion_metadata": item_conversion,
+                                    "errors": list(mask_execution.get("errors") or []),
+                                }
+                                _mark_item_completion(item_index, mask_execution=mask_execution)
+                                mask_errors.extend(
+                                    error
+                                    for error in list(mask_execution.get("errors") or [])
+                                    if error not in mask_errors
+                                )
+                                if item_index == len(zarr_outputs) - 1:
+                                    last_mask_execution = mask_execution
+                    mask_items = [item for item in mask_items if item is not None]
+                    final_pipeline_metadata["mask_parallel_workers"] = mask_workers
+
+                    mask_succeeded = bool(last_mask_execution and last_mask_execution.get("succeeded")) and not mask_errors
+                    mask_summary = {
+                        "status": "written" if mask_succeeded else "failed",
+                        "mask_types": requested_mask_types,
+                        "mask_mode": "integrated",
+                        "items": mask_items,
+                    }
+                    if last_mask_execution is not None:
+                        item_pipeline = dict(last_mask_execution.get("pipeline_metadata") or {})
+                        item_conversion = dict(last_mask_execution.get("conversion_metadata") or {})
+                        if len(mask_items) == 1:
+                            mask_summary.update(
+                                {
+                                    "masked_zarr_uri": item_pipeline.get("masked_zarr_uri") or zarr_outputs[0],
+                                    "water_mask": item_conversion.get("water_mask") or {},
+                                    "cloud_mask": item_conversion.get("cloud_mask") or {},
+                                    "mask_quality": item_conversion.get("mask_quality") or {},
+                                }
+                            )
+                    final_pipeline_metadata = {
+                        **final_pipeline_metadata,
+                        "mask_status": mask_summary["status"],
+                        "mask_items": mask_items,
+                        "mask_types": requested_mask_types,
+                        "mask_mode": "integrated",
+                    }
+                    if len(mask_items) == 1 and last_mask_execution is not None:
+                        item_pipeline = dict(last_mask_execution.get("pipeline_metadata") or {})
+                        item_conversion = dict(last_mask_execution.get("conversion_metadata") or {})
+                        final_pipeline_metadata.update(
+                            {
+                                "masked_zarr_uri": item_pipeline.get("masked_zarr_uri") or zarr_outputs[0],
+                                "water_mask": item_conversion.get("water_mask") or {},
+                                "cloud_mask": item_conversion.get("cloud_mask") or {},
+                                "mask_quality": item_conversion.get("mask_quality") or {},
+                            }
+                        )
+                    combined_conversion_metadata = {
+                        **conversion_metadata,
+                        "mask": mask_summary,
+                    }
+                    combined_metadata = {
+                        **metadata,
+                        "mask": mask_summary,
+                    }
+                    self.store.set_result(
+                        job_id,
+                        {
+                            "job_id": job_id,
+                            "paths": final_paths,
+                            "raw_outputs": raw_outputs,
+                            "zarr_outputs": zarr_outputs,
+                            "checksums": checksums,
+                            "metadata": combined_metadata,
+                            "manifest_entry": manifest_entry,
+                            "pipeline_metadata": final_pipeline_metadata,
+                            "conversion_metadata": combined_conversion_metadata,
+                        },
+                    )
+                    terminal_pipeline_state = (
+                        PipelineState.masked_zarr_written if mask_succeeded else PipelineState.failed
+                    )
+                    terminal_state = (
+                        JobState.succeeded if terminal_pipeline_state == PipelineState.masked_zarr_written else JobState.failed
+                    )
+                    self.store.update_job(
+                        job_id,
+                        state=terminal_state.value,
+                        progress=100.0 if terminal_state == JobState.succeeded else 0.0,
+                        finished_at=self._now_iso(),
+                        bytes_downloaded=int(aggregate["bytes_downloaded"]),
+                        bytes_total=max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"])),
+                        pipeline_state=terminal_pipeline_state.value,
+                        pipeline_step=terminal_pipeline_state.value,
+                        pipeline_progress=100.0 if terminal_state == JobState.succeeded else 95.0,
+                        pipeline_metadata=final_pipeline_metadata,
+                        conversion_metadata=combined_conversion_metadata,
+                        raw_outputs=raw_outputs,
+                        zarr_outputs=zarr_outputs,
+                        errors=mask_errors,
+                    )
+                    self.store.append_event(
+                        job_id,
+                        "job.mask_completed" if terminal_state == JobState.succeeded else "job.mask_failed",
+                        {
+                            "status": terminal_state.value,
+                            "source_job_id": job_id,
+                            "mask_types": requested_mask_types,
+                            "zarr_outputs": zarr_outputs,
+                            "pipeline_state": terminal_pipeline_state.value,
+                            "errors": mask_errors,
+                        },
+                    )
+                    self.store.append_event(
+                        job_id,
+                        "job.succeeded" if terminal_state == JobState.succeeded else "job.failed",
+                        {
+                            "status": terminal_state.value,
+                            "paths": final_paths,
+                            "pipeline_state": terminal_pipeline_state.value,
+                            "error": mask_errors[0] if mask_errors else "",
+                        },
+                    )
+                    return
             self.store.update_job(
                 job_id,
                 state=JobState.succeeded.value,
@@ -2535,15 +3416,6 @@ class NimbusFetcher:
                 raw_outputs=raw_outputs,
                 zarr_outputs=zarr_outputs,
             )
-            if final_pipeline_state == PipelineState.zarr_written:
-                self.store.append_event(
-                    job_id,
-                    "job.zarr_written",
-                    {
-                        "pipeline_state": final_pipeline_state.value,
-                        "zarr_outputs": zarr_outputs,
-                    },
-                )
             self.store.append_event(
                 job_id,
                 "job.succeeded",
@@ -2618,6 +3490,7 @@ class NimbusFetcher:
         is_cancelled,
     ) -> dict[str, Any]:
         provider_name = self._provider_name(request.provider)
+        download_strategy = str(getattr(request, "download_strategy", "default") or "default").strip().lower() or "default"
         provider_limit = self.settings.provider_limits_map.get(provider_name, 1)
 
         download_manager_kwargs: dict[str, Any] = dict(
@@ -2627,16 +3500,17 @@ class NimbusFetcher:
             retry_callback=retry_callback,
         )
         if provider_name == "copernicus":
-            # Copernicus download endpoints can intermittently return 504 before
-            # the first byte. Use a longer retry window inspired by the legacy
-            # downloader behavior.
+            # Keep Copernicus aligned with the older downloader profile that
+            # proved stable in the previous project version.
             download_manager_kwargs.update(
-                max_retries=6,
-                initial_delay=3.0,
-                backoff_factor=2.0,
-                max_retry_delay=300.0,
-                gateway_timeout_retries=4,
-                gateway_timeout_floor_delay=10.0,
+                max_concurrent=min(provider_limit, 2),
+                max_retries=5,
+                initial_delay=2.0,
+                backoff_factor=1.5,
+                connect_timeout=30.0,
+                chunk_size=128 * 1024,
+                max_connections=50,
+                max_connections_per_host=2,
             )
         elif provider_name == "usgs":
             # Keep USGS closer to the older conservative downloader profile to
@@ -2653,6 +3527,8 @@ class NimbusFetcher:
 
         download_manager = DownloadManager(**download_manager_kwargs)
         provider = self._build_provider(provider_name, download_manager)
+        if provider_name == "copernicus":
+            setattr(provider, "download_strategy", download_strategy)
 
         if isinstance(request, SearchDownloadRequest):
             if is_cancelled():
@@ -2670,6 +3546,7 @@ class NimbusFetcher:
                     "products_found": 0,
                     "output_dir": str(output_dir),
                     "job_type": request.job_type,
+                    "download_strategy": download_strategy,
                 },
                 event_type="job.searching",
                 event_payload={"provider": provider_name, "collection": request.collection},
@@ -2703,6 +3580,12 @@ class NimbusFetcher:
                     "products_requested": len(product_ids),
                     "output_dir": str(output_dir),
                     "job_type": request.job_type,
+                    "download_strategy": download_strategy,
+                    **(
+                        dict(provider.plan_download_metadata(len(product_ids)))
+                        if hasattr(provider, "plan_download_metadata")
+                        else {}
+                    ),
                 },
                 event_type="job.downloading",
                 event_payload={"products_found": len(product_ids)},
@@ -2725,6 +3608,7 @@ class NimbusFetcher:
                 }
 
             paths = provider.download_products(product_ids=product_ids, output_dir=str(output_dir))
+            provider_download_metadata = dict(getattr(provider, "last_download_metadata", {}) or {})
             return {
                 "paths": paths,
                 "metadata": {
@@ -2735,6 +3619,8 @@ class NimbusFetcher:
                     "products_found": len(product_ids),
                     "products_downloaded": len(paths),
                     "output_dir": str(output_dir),
+                    "download_strategy": download_strategy,
+                    **provider_download_metadata,
                 },
             }
 
@@ -2753,11 +3639,18 @@ class NimbusFetcher:
                 "products_found": len(request.product_ids),
                 "output_dir": str(output_dir),
                 "job_type": request.job_type,
+                "download_strategy": download_strategy,
+                **(
+                    dict(provider.plan_download_metadata(len(request.product_ids)))
+                    if hasattr(provider, "plan_download_metadata")
+                    else {}
+                ),
             },
             event_type="job.downloading",
             event_payload={"products_requested": len(request.product_ids)},
         )
         paths = provider.download_products(product_ids=request.product_ids, output_dir=str(output_dir))
+        provider_download_metadata = dict(getattr(provider, "last_download_metadata", {}) or {})
         return {
             "paths": paths,
             "metadata": {
@@ -2767,6 +3660,8 @@ class NimbusFetcher:
                 "products_requested": len(request.product_ids),
                 "products_downloaded": len(paths),
                 "output_dir": str(output_dir),
+                "download_strategy": download_strategy,
+                **provider_download_metadata,
             },
         }
 
@@ -2856,12 +3751,15 @@ class NimbusFetcher:
         return normalized
 
     def _to_status_response(self, row: dict[str, Any]) -> JobStatusResponse:
-        started_at = self._parse_iso(row.get("started_at"))
+        started_at = self._effective_started_at_for_row(row)
         finished_at = self._parse_iso(row.get("finished_at"))
-        duration_seconds: float | None = None
-        if started_at is not None:
-            end_time = finished_at or datetime.now(timezone.utc)
-            duration_seconds = max(0.0, (end_time - started_at).total_seconds())
+        updated_at = self._parse_iso(row.get("updated_at"))
+        duration_seconds = self._duration_seconds_for_row(
+            state=str(row.get("state") or ""),
+            started_at=started_at,
+            finished_at=finished_at,
+            updated_at=updated_at,
+        )
         job_type = row.get("job_type")
         job_kind = self._job_kind_for_type(job_type)
         service_name = self._service_name_for_type(job_type)
@@ -2902,7 +3800,7 @@ class NimbusFetcher:
             product_type=row.get("product_type"),
             tile_id=row.get("tile_id"),
             created_at=self._parse_iso(row.get("created_at")),
-            updated_at=self._parse_iso(row.get("updated_at")),
+            updated_at=updated_at,
             started_at=started_at,
             finished_at=finished_at,
             duration_seconds=duration_seconds,
@@ -2910,6 +3808,78 @@ class NimbusFetcher:
             provider=ProviderName(row["provider"]),
             collection=str(row["collection"]),
         )
+
+    @staticmethod
+    def _duration_seconds_for_row(
+        *,
+        state: str,
+        started_at: datetime | None,
+        finished_at: datetime | None,
+        updated_at: datetime | None,
+    ) -> float | None:
+        if started_at is None:
+            return None
+
+        state_value = str(state or "").strip().lower()
+        if state_value == JobState.queued.value:
+            return None
+
+        if state_value in {JobState.running.value, JobState.cancel_requested.value}:
+            end_time = datetime.now(timezone.utc)
+        elif state_value in {
+            JobState.succeeded.value,
+            JobState.failed.value,
+            JobState.cancelled.value,
+        }:
+            end_time = finished_at or updated_at
+        else:
+            end_time = finished_at or updated_at
+
+        if end_time is None:
+            return None
+        return max(0.0, (end_time - started_at).total_seconds())
+
+    def _effective_started_at_for_row(self, row: dict[str, Any]) -> datetime | None:
+        started_at = self._parse_iso(row.get("started_at"))
+        if started_at is not None:
+            return started_at
+
+        state_value = str(row.get("state") or "").strip().lower()
+        if state_value == JobState.queued.value:
+            return None
+
+        preferred_types = {
+            "job.started",
+            "job.searching",
+            "job.downloading",
+            "job.downloaded",
+            "job.zarr_queued",
+            "job.zarr_converting",
+            "job.zarr_written",
+            "job.mask_started",
+            "job.cloud_masking_started",
+            "job.water_masking_started",
+        }
+        ignored_types = {
+            "job.queued",
+            "job.requeued_after_restart",
+            "job.requeued_stale",
+        }
+        fallback_event_ts: datetime | None = None
+        try:
+            events = self.store.list_events(str(row.get("job_id") or ""), None, 200)
+        except Exception:
+            events = []
+        for event in events:
+            event_type = str(event.get("type") or "").strip()
+            event_ts = self._parse_iso(event.get("timestamp"))
+            if event_ts is None:
+                continue
+            if event_type in preferred_types:
+                return event_ts
+            if fallback_event_ts is None and event_type not in ignored_types:
+                fallback_event_ts = event_ts
+        return fallback_event_ts or self._parse_iso(row.get("created_at"))
 
     @staticmethod
     def _parse_iso(value: str | datetime | None) -> datetime | None:
@@ -2929,6 +3899,151 @@ class NimbusFetcher:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _download_account_label(context: dict[str, Any] | None) -> str:
+        label = str((context or {}).get("account_label") or "primary").strip()
+        return label or "primary"
+
+    @classmethod
+    def _build_download_telemetry(
+        cls,
+        *,
+        pipeline_metadata: dict[str, Any],
+        file_progress: dict[str, dict[str, Any]],
+        bytes_downloaded: int,
+        bytes_total: int,
+        progress_pct: float,
+        speed_bps: float,
+        retry_state: dict[str, dict[str, Any]],
+        phase: str,
+        last_file: str | None = None,
+    ) -> dict[str, Any]:
+        metadata = dict(pipeline_metadata or {})
+        assignments = list(metadata.get("account_pool_assignments") or [])
+        planned_counts: dict[str, int] = {}
+        ordered_labels: list[str] = []
+        for entry in assignments:
+            label = str((entry or {}).get("account_label") or "").strip()
+            if not label:
+                continue
+            if label not in ordered_labels:
+                ordered_labels.append(label)
+            planned_counts[label] = max(0, int((entry or {}).get("product_count") or 0))
+
+        for file_state in file_progress.values():
+            label = cls._download_account_label(file_state)
+            if label not in ordered_labels:
+                ordered_labels.append(label)
+            planned_counts.setdefault(label, 0)
+
+        for label in retry_state:
+            normalized = str(label or "").strip()
+            if not normalized:
+                continue
+            if normalized not in ordered_labels:
+                ordered_labels.append(normalized)
+            planned_counts.setdefault(normalized, 0)
+
+        products_found = int(metadata.get("products_found") or metadata.get("products_requested") or 0)
+        products_downloaded = int(metadata.get("products_downloaded") or 0)
+        total_known_files = len(file_progress)
+        total_completed_files = sum(1 for entry in file_progress.values() if bool(entry.get("completed")))
+        if str(phase).strip().lower() == "completed" and products_downloaded > 0:
+            total_completed_files = max(total_completed_files, products_downloaded)
+
+        account_rows: list[dict[str, Any]] = []
+        for label in ordered_labels:
+            observed = [
+                dict(item)
+                for item in file_progress.values()
+                if cls._download_account_label(item) == label
+            ]
+            assigned = max(int(planned_counts.get(label, 0) or 0), len(observed))
+            bytes_done = sum(max(0, int(item.get("downloaded") or 0)) for item in observed)
+            bytes_known_total = sum(
+                int(item.get("total") or 0)
+                for item in observed
+                if item.get("total") is not None
+            )
+            files_completed = sum(1 for item in observed if bool(item.get("completed")))
+            if str(phase).strip().lower() == "completed" and assigned > 0:
+                files_completed = max(files_completed, assigned)
+            active_items = [item for item in observed if not bool(item.get("completed"))]
+            latest_items = sorted(
+                observed,
+                key=lambda item: float(item.get("last_update_mono") or 0.0),
+                reverse=True,
+            )
+            current_item = (active_items or latest_items or [None])[0]
+            retry_info = dict(retry_state.get(label) or {})
+            retry_status = str(retry_info.get("status") or "").strip().lower()
+            rate_limited = str(retry_info.get("last_reason") or "").strip().lower() == "http_429"
+            if str(phase).strip().lower() == "completed" and assigned > 0:
+                account_status = "completed"
+            elif retry_status == "rate_limited" and not active_items:
+                account_status = "rate_limited"
+            elif retry_status == "retrying" and not active_items:
+                account_status = "retrying"
+            elif files_completed >= assigned > 0:
+                account_status = "completed"
+            elif bytes_done > 0 or observed:
+                account_status = "running"
+            else:
+                account_status = "queued"
+
+            account_progress = 0.0
+            if bytes_known_total > 0:
+                account_progress = min(100.0, 100.0 * bytes_done / bytes_known_total)
+            elif account_status == "completed" and assigned > 0:
+                account_progress = 100.0
+
+            account_rows.append(
+                {
+                    "account_label": label,
+                    "status": account_status,
+                    "product_count_assigned": assigned,
+                    "files_observed": len(observed),
+                    "files_completed": files_completed,
+                    "active_file_count": len(active_items),
+                    "bytes_downloaded": bytes_done,
+                    "bytes_total": bytes_known_total,
+                    "progress_pct": round(account_progress, 2),
+                    "retry_count": int(retry_info.get("retry_count", 0) or 0),
+                    "rate_limited": rate_limited,
+                    "last_retry_at": retry_info.get("last_retry_at"),
+                    "last_retry_reason": retry_info.get("last_reason"),
+                    "current_file": (
+                        str((current_item or {}).get("file_name") or "").strip() or None
+                    ),
+                }
+            )
+
+        total_bytes = max(int(bytes_total or 0), int(bytes_downloaded or 0))
+        eta_seconds: float | None = None
+        if speed_bps > 0 and total_bytes > int(bytes_downloaded or 0):
+            eta_seconds = max(0.0, (total_bytes - int(bytes_downloaded or 0)) / max(speed_bps, 1.0))
+
+        return {
+            "status": str(phase or "running").strip().lower() or "running",
+            "strategy": str(metadata.get("download_strategy") or "default").strip().lower() or "default",
+            "selected_accounts": int(metadata.get("account_pool_selected_accounts", 0) or 0),
+            "pool_size": int(metadata.get("account_pool_size", 0) or 0),
+            "per_account_concurrency": int(metadata.get("account_pool_per_account_concurrency", 0) or 0),
+            "products_found": products_found,
+            "products_downloaded": products_downloaded,
+            "files_known": total_known_files,
+            "files_completed": total_completed_files,
+            "bytes_downloaded": int(bytes_downloaded or 0),
+            "bytes_total": total_bytes,
+            "progress_pct": round(float(progress_pct or 0.0), 2),
+            "speed_bps": float(speed_bps or 0.0),
+            "eta_seconds": eta_seconds,
+            "last_file": str(last_file or "").strip() or None,
+            "retry_count_total": sum(int((entry or {}).get("retry_count", 0) or 0) for entry in retry_state.values()),
+            "rate_limited_accounts": sum(1 for row in account_rows if bool(row.get("rate_limited"))),
+            "accounts": account_rows,
+        }
 
     @classmethod
     def _should_emit_download_progress(
@@ -2958,6 +4073,103 @@ class NimbusFetcher:
         if max(0.0, progress_pct - last_progress) >= cls.DOWNLOAD_PROGRESS_MIN_PERCENT:
             return True
         return False
+
+    @classmethod
+    def _should_emit_zarr_progress(
+        cls,
+        *,
+        now_mono: float,
+        last_emit: float,
+        progress_pct: float,
+        last_progress: float,
+    ) -> bool:
+        if last_emit <= 0 or last_progress < 0.0:
+            return True
+        if progress_pct >= 100.0:
+            return True
+        if max(0.0, progress_pct - last_progress) >= cls.ZARR_PROGRESS_MIN_PERCENT:
+            return True
+        return max(0.0, now_mono - last_emit) >= cls.ZARR_PROGRESS_MIN_INTERVAL_SECONDS
+
+    def _build_zarr_progress_callback(
+        self,
+        *,
+        job_id: str,
+        raw_outputs: list[str],
+        zarr_outputs: list[str],
+        raw_uri: str,
+        scene_id: str,
+        output_uri: str,
+        index: int,
+        total: int,
+    ) -> Callable[[dict[str, Any]], None]:
+        last_emit = {"mono": 0.0, "progress": -1.0}
+        base_progress = ((index - 1) / total) * 100.0
+        progress_span = (100.0 / total) * 0.85
+
+        def _callback(payload: dict[str, Any]) -> None:
+            fraction = min(1.0, max(0.0, float(payload.get("fraction") or 0.0)))
+            pipeline_progress = min(99.0, base_progress + progress_span * fraction)
+            now_mono = time.monotonic()
+            if not self._should_emit_zarr_progress(
+                now_mono=now_mono,
+                last_emit=float(last_emit["mono"]),
+                progress_pct=pipeline_progress,
+                last_progress=float(last_emit["progress"]),
+            ):
+                return
+            last_emit["mono"] = now_mono
+            last_emit["progress"] = pipeline_progress
+            blocks_written = int(payload.get("blocks_written") or 0)
+            total_blocks = int(payload.get("total_blocks") or 0)
+            source_array_name = str(payload.get("source_array_name") or payload.get("array_name") or "").strip()
+            band_name = str(payload.get("band_name") or "").strip()
+            metadata = {
+                "status": "running",
+                "stage": "writing_chunks",
+                "current_raw_uri": raw_uri,
+                "current_scene_id": scene_id,
+                "current_output_uri": output_uri,
+                "current_index": index,
+                "total": total,
+                "parallel_workers": 1,
+                "chunk_fraction": round(fraction, 6),
+                "blocks_written": blocks_written,
+                "total_blocks": total_blocks,
+            }
+            if source_array_name:
+                metadata["current_array"] = source_array_name
+            if band_name:
+                metadata["current_band"] = band_name
+            event_payload = {
+                "raw_uri": raw_uri,
+                "scene_id": scene_id,
+                "output_uri": output_uri,
+                "index": index,
+                "total": total,
+                "stage": "writing_chunks",
+                "parallel_workers": 1,
+                "chunk_fraction": round(fraction, 6),
+                "blocks_written": blocks_written,
+                "total_blocks": total_blocks,
+            }
+            if source_array_name:
+                event_payload["array_name"] = source_array_name
+            if band_name:
+                event_payload["band_name"] = band_name
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.zarr_converting,
+                pipeline_step="writing_chunks",
+                pipeline_progress=pipeline_progress,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+                conversion_metadata=metadata,
+                event_type="job.zarr_converting",
+                event_payload=event_payload,
+            )
+
+        return _callback
 
     def _publish_worker_heartbeat(self) -> dict[str, Any] | None:
         if not self._execution_enabled:

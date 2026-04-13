@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from datetime import datetime, timedelta, timezone
+
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.jobs.sqlite_store import SQLiteJobStore
 from nimbuschain_fetch.models import ArtifactType, ArtifactUpsertRequest, JobState, PipelineState, ProviderName
@@ -237,6 +239,91 @@ def test_artifact_api_normalizes_app_data_downloads_paths(tmp_path: Path) -> Non
     assert record.artifact_uri == f"{downloads_root}/zarr/legacy/file.zarr"
     assert record.source_uri == f"{downloads_root}/raw/legacy/file.SAFE.zip"
     assert record.metadata["current_output_uri"] == f"{downloads_root}/zarr/legacy/file.zarr"
+
+
+def test_queued_job_requeued_after_restart_has_no_execution_duration(tmp_path: Path) -> None:
+    fetcher, store = _build_fetcher(tmp_path)
+    job_id = "legacy-requeued-no-duration"
+    _seed_terminal_job(store, job_id=job_id, state=JobState.queued.value)
+    store.update_job(
+        job_id,
+        state=JobState.queued.value,
+        pipeline_state=PipelineState.downloading.value,
+        pipeline_step="resume_after_restart",
+        started_at="2026-04-06T00:00:00+00:00",
+        finished_at=None,
+        progress=83.57,
+        bytes_downloaded=123,
+        bytes_total=456,
+    )
+
+    status = fetcher.get_job(job_id)
+
+    assert status.state == JobState.queued
+    assert status.duration_seconds is None
+
+
+def test_terminal_job_duration_uses_finished_at_when_available(tmp_path: Path) -> None:
+    fetcher, store = _build_fetcher(tmp_path)
+    job_id = "legacy-terminal-duration"
+    _seed_terminal_job(store, job_id=job_id, state=JobState.succeeded.value)
+    store.update_job(
+        job_id,
+        state=JobState.succeeded.value,
+        started_at="2026-04-07T09:00:00+00:00",
+        finished_at="2026-04-07T09:02:30+00:00",
+        updated_at="2026-04-07T09:05:00+00:00",
+        preserve_updated_at=True,
+    )
+
+    status = fetcher.get_job(job_id)
+
+    assert status.duration_seconds == 150.0
+
+
+def test_running_job_duration_uses_current_time(tmp_path: Path) -> None:
+    fetcher, store = _build_fetcher(tmp_path)
+    job_id = "legacy-running-duration"
+    _seed_terminal_job(store, job_id=job_id, state=JobState.running.value)
+    started_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=5)
+    store.update_job(
+        job_id,
+        state=JobState.running.value,
+        started_at=started_at.isoformat(),
+        finished_at=None,
+        updated_at=(started_at + timedelta(seconds=2)).isoformat(),
+        preserve_updated_at=True,
+    )
+
+    status = fetcher.get_job(job_id)
+
+    assert status.duration_seconds is not None
+    assert status.duration_seconds >= 0.0
+
+
+def test_running_job_missing_started_at_uses_first_execution_event(tmp_path: Path) -> None:
+    fetcher, store = _build_fetcher(tmp_path)
+    job_id = "legacy-running-missing-started-at"
+    _seed_terminal_job(store, job_id=job_id, state=JobState.running.value)
+    store.update_job(
+        job_id,
+        state=JobState.running.value,
+        started_at=None,
+        finished_at=None,
+        updated_at="2026-04-10T09:00:20+00:00",
+        preserve_updated_at=True,
+    )
+    store.append_event(
+        job_id,
+        "job.started",
+        {"state": JobState.running.value},
+        timestamp=datetime(2026, 4, 10, 9, 0, 5, tzinfo=timezone.utc),
+    )
+
+    status = fetcher.get_job(job_id)
+
+    assert status.started_at == datetime(2026, 4, 10, 9, 0, 5, tzinfo=timezone.utc)
+    assert status.duration_seconds is not None
 
 
 def test_artifact_api_normalizes_data_downloads_paths(tmp_path: Path) -> None:

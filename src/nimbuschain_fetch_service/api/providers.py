@@ -24,6 +24,9 @@ class ProviderStatusItem(BaseModel):
     username_present: bool = False
     token_present: bool = False
     password_present: bool = False
+    account_pool_configured: bool = False
+    account_pool_size: int = 0
+    account_pool_concurrency: int = 0
 
 
 class ProviderStatusResponse(BaseModel):

@@ -12,14 +12,14 @@ class _FakeUpdateResult:
 
 class _FakeJobsCollection:
     def __init__(self) -> None:
-        self.calls: list[tuple[dict, list[dict]]] = []
+        self.calls: list[tuple[dict, dict]] = []
 
     def update_one(self, query, update):
         self.calls.append((query, update))
         return _FakeUpdateResult()
 
 
-def test_claim_job_for_execution_keeps_existing_started_at_in_mongo_update_pipeline() -> None:
+def test_claim_job_for_execution_resets_started_at_in_mongo_update() -> None:
     store = MongoJobStore.__new__(MongoJobStore)
     store._jobs = _FakeJobsCollection()
     store._utc_now = lambda: "2026-03-19T12:00:00+00:00"  # type: ignore[method-assign]
@@ -30,8 +30,9 @@ def test_claim_job_for_execution_keeps_existing_started_at_in_mongo_update_pipel
     assert len(store._jobs.calls) == 1
     query, update = store._jobs.calls[0]
     assert query == {"job_id": "job-123", "state": "queued"}
-    assert isinstance(update, list)
-    stage = update[0]["$set"]
+    assert isinstance(update, dict)
+    stage = update["$set"]
     assert stage["state"] == "running"
-    assert stage["started_at"] == {"$ifNull": ["$started_at", "2026-03-19T12:00:00+00:00"]}
+    assert stage["started_at"] == "2026-03-19T12:00:00+00:00"
+    assert stage["finished_at"] is None
     assert stage["worker_id"] == "worker-1"
