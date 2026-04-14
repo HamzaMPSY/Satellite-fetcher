@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import math
 import hashlib
+import json
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import geopandas as gpd
@@ -13,6 +16,9 @@ from shapely import wkt as shapely_wkt
 from shapely.ops import unary_union
 
 from nimbuschain_fetch_ui.aoi_utils import parse_aoi_text
+
+
+COUNTRY_CATALOG_PATH = Path(__file__).resolve().parent / "assets" / "countries_110m.json"
 
 
 def ensure_4326(gdf: Optional[gpd.GeoDataFrame]) -> Optional[gpd.GeoDataFrame]:
@@ -63,6 +69,49 @@ def safe_union(geoms):
 
 def parse_geometry(text: str):
     return parse_aoi_text(text)
+
+
+@lru_cache(maxsize=1)
+def load_country_catalog() -> List[Dict[str, Any]]:
+    if not COUNTRY_CATALOG_PATH.exists():
+        return []
+    try:
+        payload = json.loads(COUNTRY_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for raw in payload:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        continent = str(raw.get("continent") or "").strip() or "Other"
+        iso_a3 = str(raw.get("iso_a3") or "").strip()
+        center_raw = list(raw.get("center") or [])
+        bounds_raw = list(raw.get("bounds") or [])
+        wkt = str(raw.get("wkt") or "").strip()
+        if len(center_raw) != 2 or len(bounds_raw) != 4 or not wkt:
+            continue
+        try:
+            center = [float(center_raw[0]), float(center_raw[1])]
+            bounds = tuple(float(value) for value in bounds_raw)
+        except Exception:
+            continue
+        records.append(
+            {
+                "name": name,
+                "continent": continent,
+                "iso_a3": iso_a3,
+                "center": center,
+                "bounds": bounds,
+                "wkt": wkt,
+            }
+        )
+    return sorted(records, key=lambda item: (str(item["continent"]), str(item["name"])))
 
 
 def make_square_wkt(lat, lng, km):
@@ -234,6 +283,7 @@ __all__ = [
     "compute_intersections",
     "find_tiles",
     "_md5",
+    "load_country_catalog",
     "_compact_rings",
     "selected_tiles_to_wkt",
     "selected_tiles_to_geometry",

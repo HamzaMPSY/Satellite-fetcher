@@ -72,6 +72,7 @@ from nimbuschain_fetch_ui.geo_utils import (
     get_name_col,
     safe_union,
     parse_geometry,
+    load_country_catalog,
     make_square_wkt,
     zoom_for_bounds,
     compute_intersections,
@@ -469,6 +470,8 @@ def init_state():
         "colorize": True,
         "opacity": 0.04,
         "click_sel": True,
+        "country_continent_filter": "All",
+        "country_name": "",
         "api_url": DEFAULT_API_URL,
         "api_key": DEFAULT_API_KEY,
         "provider": "Copernicus",
@@ -2658,7 +2661,7 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_
     st.sidebar.markdown('<hr style="border-color:rgba(56,120,200,0.10)">', unsafe_allow_html=True)
 
     st.sidebar.markdown('<div style="display:flex;align-items:center;gap:6px;padding-top:.3rem"><span>📐</span><span style="font-weight:600;font-size:.88rem;">Area of Interest</span></div>', unsafe_allow_html=True)
-    aoi_choices = ["Draw on map", "Preset square", "Paste WKT / GeoJSON"]
+    aoi_choices = ["Draw on map", "Preset square", "Country", "Paste WKT / GeoJSON"]
     aoi_mode = st.sidebar.radio("AOI", aoi_choices, horizontal=False, label_visibility="collapsed", index=aoi_choices.index(_ss("aoi_mode", "Draw on map")))
     st.session_state["aoi_mode"] = aoi_mode
 
@@ -2674,6 +2677,77 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_
             st.session_state["map_center"] = [sq_lat, sq_lng]
             st.session_state["fly_to"] = json.dumps([sq_lat, sq_lng, 10])
             st.rerun()
+    elif aoi_mode == "Country":
+        country_catalog = load_country_catalog()
+        if not country_catalog:
+            st.sidebar.warning("Country catalog unavailable.")
+        else:
+            continents = ["All"] + sorted(
+                {str(item.get("continent") or "Other") for item in country_catalog}
+            )
+            selected_continent = str(_ss("country_continent_filter", "All") or "All")
+            if selected_continent not in continents:
+                selected_continent = "All"
+            selected_continent = st.sidebar.selectbox(
+                "Continent",
+                continents,
+                index=continents.index(selected_continent),
+                key="country_continent_filter",
+            )
+            filtered_countries = [
+                item
+                for item in country_catalog
+                if selected_continent == "All" or item.get("continent") == selected_continent
+            ]
+            country_names = [str(item.get("name") or "") for item in filtered_countries]
+            if not country_names:
+                st.sidebar.caption("No country available for this filter.")
+                country_names = [""]
+            selected_country = str(_ss("country_name", "") or "")
+            if selected_country not in country_names:
+                selected_country = country_names[0] if country_names else ""
+                st.session_state["country_name"] = selected_country
+            selected_country = st.sidebar.selectbox(
+                "Country",
+                country_names,
+                index=country_names.index(selected_country) if selected_country in country_names else 0,
+                key="country_name",
+            )
+            selected_record = next(
+                (item for item in filtered_countries if item.get("name") == selected_country),
+                None,
+            )
+            if selected_record is not None:
+                subtitle = str(selected_record.get("continent") or "").strip()
+                iso_a3 = str(selected_record.get("iso_a3") or "").strip()
+                if iso_a3:
+                    subtitle = f"{subtitle} · {iso_a3}" if subtitle else iso_a3
+                if subtitle:
+                    st.sidebar.caption(subtitle)
+
+                center = list(selected_record.get("center") or st.session_state["map_center"])
+                bounds = tuple(selected_record.get("bounds") or ())
+                zoom = zoom_for_bounds(bounds) if len(bounds) == 4 else int(st.session_state["map_zoom"])
+
+                action_cols = st.sidebar.columns(2)
+                with action_cols[0]:
+                    if st.button("✅ Apply", width="stretch", key="apply_country_aoi"):
+                        st.session_state["geometry_text"] = str(selected_record.get("wkt") or "")
+                        st.session_state["map_center"] = [float(center[0]), float(center[1])]
+                        st.session_state["map_zoom"] = int(zoom)
+                        st.session_state["fly_to"] = json.dumps(
+                            [float(center[0]), float(center[1]), int(zoom)]
+                        )
+                        st.rerun()
+                with action_cols[1]:
+                    if st.button("🎯 Focus", width="stretch", key="focus_country_aoi"):
+                        st.session_state["map_center"] = [float(center[0]), float(center[1])]
+                        st.session_state["map_zoom"] = int(zoom)
+                        st.session_state["fly_to"] = json.dumps(
+                            [float(center[0]), float(center[1]), int(zoom)]
+                        )
+                        st.rerun()
+            st.sidebar.caption("Select a country to use its boundary as AOI.")
     elif aoi_mode == "Paste WKT / GeoJSON":
         st.session_state["geometry_text"] = st.sidebar.text_area(
             "WKT/GeoJSON",
