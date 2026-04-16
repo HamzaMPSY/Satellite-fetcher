@@ -124,6 +124,7 @@ from nimbuschain_fetch_ui.runtime_status import (
     format_status_timestamp as _format_status_timestamp,
     refresh_api_runtime_statuses as _collect_api_runtime_statuses,
     refresh_zarr_runtime_statuses as _collect_zarr_runtime_statuses,
+    render_download_coordinator_dashboard as _render_download_coordinator_dashboard,
     render_status_block as _render_status_block,
 )
 from nimbuschain_fetch_ui.settings_tab import render_settings_tab
@@ -539,6 +540,7 @@ def init_state():
         "api_health_snapshot": None,
         "api_readiness_snapshot": None,
         "worker_status_snapshot": None,
+        "download_coordinator_snapshot": None,
         "provider_status_snapshot": None,
         "service_status_checked_at": "",
         "last_api_status_url": "",
@@ -624,6 +626,207 @@ def _refresh_zarr_runtime_statuses() -> None:
     api_url = str(_ss("api_url", DEFAULT_API_URL)).strip()
     api_key = str(_ss("api_key", DEFAULT_API_KEY)).strip()
     st.session_state.update(_collect_zarr_runtime_statuses(api_url=api_url, api_key=api_key))
+
+
+def _ensure_api_runtime_statuses(*, force: bool = False, max_age_seconds: float | None = None) -> None:
+    current_api_url = str(_ss("api_url", DEFAULT_API_URL)).strip()
+    snapshot_keys = (
+        "api_health_snapshot",
+        "api_readiness_snapshot",
+        "worker_status_snapshot",
+        "download_coordinator_snapshot",
+        "provider_status_snapshot",
+    )
+    snapshots_missing = any(_ss(key) is None for key in snapshot_keys)
+    checked_at = _parse_iso_datetime(_ss("service_status_checked_at"))
+    stale = False
+    if max_age_seconds is not None:
+        stale = checked_at is None or (
+            dt.datetime.now(dt.timezone.utc) - checked_at
+        ).total_seconds() >= max_age_seconds
+    if (
+        force
+        or _ss("last_api_status_url", "") != current_api_url
+        or snapshots_missing
+        or stale
+    ):
+        _refresh_api_runtime_statuses()
+
+
+def _provider_status_color(status_label: str) -> str:
+    normalized = str(status_label or "").strip().lower()
+    if normalized == "valid":
+        return "#22c55e"
+    if normalized in {"missing", "credentials invalid", "credentials missing"}:
+        return "#ef4444"
+    return "#f59e0b"
+
+
+def _render_provider_auth_panel(selected_provider_api: str | None) -> dict[str, Any] | None:
+    selected_provider_status = select_provider_status(
+        _ss("provider_status_snapshot"),
+        selected_provider_api or "",
+    )
+    if selected_provider_status is None:
+        st.caption("Provider auth snapshot unavailable.")
+        return None
+
+    status_label = provider_auth_state_label(selected_provider_status)
+    detail = str(selected_provider_status.get("message") or "-")
+    pool_line = ""
+    if str(selected_provider_status.get("provider") or "").strip().lower() == "copernicus":
+        pool_line = (
+            f" · account pool: "
+            f"{int(selected_provider_status.get('account_pool_size', 0) or 0)} account(s)"
+            f" · per-account concurrency: "
+            f"{int(selected_provider_status.get('account_pool_concurrency', 0) or 0)}"
+        )
+    st.markdown(
+        "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:10px;margin-top:8px;'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;gap:8px;'><span style='font-size:.78rem;color:#94a3b8;font-weight:600;'>{str(selected_provider_status.get('provider') or '').upper()} auth</span>"
+        f"<span style='font-size:.72rem;color:{_provider_status_color(status_label)};font-weight:700;text-transform:uppercase;'>{status_label}</span></div>"
+        f"<div style='font-size:.72rem;color:#cbd5e1;margin-top:6px;'>{detail}</div>"
+        f"<div style='font-size:.65rem;color:#64748b;margin-top:4px;'>Runtime env · username present: {'yes' if selected_provider_status.get('username_present') else 'no'} · token present: {'yes' if selected_provider_status.get('token_present') or selected_provider_status.get('password_present') else 'no'}{pool_line}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    return selected_provider_status
+
+
+def _render_download_runtime_panel(download_provider_api: str | None) -> None:
+    refresh_clicked = st.button(
+        "Refresh runtime status",
+        key="downloads_runtime_refresh_btn",
+        width="stretch",
+    )
+    _ensure_api_runtime_statuses(
+        force=refresh_clicked,
+        max_age_seconds=8.0 if bool(_ss("dl_auto_refresh", True)) else None,
+    )
+    st.caption(f"Last checked: {_format_status_timestamp(_ss('service_status_checked_at'))}")
+
+    row1 = st.columns(2)
+    with row1[0]:
+        _render_status_block("API health", _ss("api_health_snapshot"), kind="service")
+    with row1[1]:
+        _render_status_block("API readiness", _ss("api_readiness_snapshot"), kind="service")
+    row2 = st.columns(2)
+    with row2[0]:
+        _render_status_block("Worker execution", _ss("worker_status_snapshot"), kind="worker")
+    with row2[1]:
+        _render_status_block("Download coordinator", _ss("download_coordinator_snapshot"), kind="coordinator")
+
+    selected_provider_status = _render_provider_auth_panel(download_provider_api)
+    provider_status_snapshot = _ss("provider_status_snapshot")
+    provider_guidance = provider_action_guidance(download_provider_api or "", provider_status_snapshot)
+    provider_blocked = provider_actions_disabled(download_provider_api or "", provider_status_snapshot)
+
+    worker_snapshot = _ss("worker_status_snapshot")
+    if not isinstance(worker_snapshot, dict) or worker_snapshot.get("_error"):
+        st.warning("Worker status unavailable. If jobs stay queued, refresh service status in Connection.")
+        if provider_blocked and provider_guidance:
+            st.warning(f"Download blocked: {provider_guidance}")
+        return
+
+    workers_alive = int(worker_snapshot.get("workers_alive", 0) or 0)
+    queued_jobs = int(worker_snapshot.get("queued_jobs", 0) or 0)
+    running_jobs = int(worker_snapshot.get("running_jobs", 0) or 0)
+    capacity_available = int(worker_snapshot.get("capacity_available", 0) or 0)
+    capacity_total = int(worker_snapshot.get("capacity_total", 0) or 0)
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Workers alive", workers_alive)
+    metric_cols[1].metric("Running jobs", running_jobs)
+    metric_cols[2].metric("Queued jobs", queued_jobs)
+    metric_cols[3].metric("Free slots", f"{capacity_available}/{capacity_total}")
+
+    if workers_alive <= 0:
+        st.error("No worker alive. Jobs will stay queued until the worker service is running.")
+    elif queued_jobs > 0 and capacity_available <= 0:
+        st.info(
+            f"Worker saturated: {running_jobs} running, {queued_jobs} queued, {capacity_available}/{capacity_total} slots free."
+        )
+    else:
+        st.caption(
+            f"Worker alive: {workers_alive} · running: {running_jobs} · queued: {queued_jobs} · free slots: {capacity_available}/{capacity_total}"
+        )
+
+    provider_capacity = worker_snapshot.get("provider_capacity") or {}
+    provider_state = provider_capacity.get(download_provider_api or "")
+    if isinstance(provider_state, dict) and download_provider_api:
+        provider_limit_total = int(provider_state.get("limit_total", 0) or 0)
+        provider_running = int(provider_state.get("running", 0) or 0)
+        provider_queued = int(provider_state.get("queued", 0) or 0)
+        provider_available = int(provider_state.get("available", 0) or 0)
+        provider_label = download_provider_api.capitalize()
+        if bool(provider_state.get("blocked_by_limit")):
+            st.info(
+                f"{provider_label} provider limit reached: {provider_running}/{provider_limit_total} running for this provider, {provider_queued} queued waiting on the provider throttle."
+            )
+        else:
+            st.caption(
+                f"{provider_label} provider limit: {provider_running}/{provider_limit_total} used · queued for provider: {provider_queued} · free provider slots: {provider_available}"
+            )
+
+    pruned_workers = int(worker_snapshot.get("workers_pruned", 0) or 0)
+    if pruned_workers > 0:
+        st.caption(f"Cleaned {pruned_workers} stale worker heartbeat(s) automatically.")
+
+    if provider_blocked and provider_guidance:
+        st.warning(f"Download blocked: {provider_guidance}")
+    elif selected_provider_status is None:
+        st.caption("Provider auth guidance unavailable for the selected provider.")
+
+
+def _render_download_coordinator_panel() -> None:
+    refresh_clicked = st.button(
+        "Refresh coordinator",
+        key="downloads_coordinator_refresh_btn",
+        width="stretch",
+    )
+    _ensure_api_runtime_statuses(
+        force=refresh_clicked,
+        max_age_seconds=8.0 if bool(_ss("dl_auto_refresh", True)) else None,
+    )
+    coordinator_snapshot = _ss("download_coordinator_snapshot")
+    if isinstance(coordinator_snapshot, dict) and not coordinator_snapshot.get("_error"):
+        _render_download_coordinator_dashboard(coordinator_snapshot)
+    else:
+        st.warning("Download coordinator snapshot unavailable.")
+
+
+def _render_downloads_overview(download_provider_api: str | None) -> None:
+    worker_snapshot = _ss("worker_status_snapshot")
+    coordinator_snapshot = _ss("download_coordinator_snapshot")
+    coordinator_summary = {}
+    if isinstance(coordinator_snapshot, dict):
+        coordinator_summary = dict(coordinator_snapshot.get("summary") or {})
+
+    jobs = dict(coordinator_summary.get("jobs") or {})
+    machine = dict(coordinator_summary.get("machine") or {})
+    providers = dict(coordinator_summary.get("providers") or {})
+
+    workers_alive = int(worker_snapshot.get("workers_alive", 0) or 0) if isinstance(worker_snapshot, dict) else 0
+    running_jobs = int(worker_snapshot.get("running_jobs", 0) or 0) if isinstance(worker_snapshot, dict) else 0
+    active_downloads = int(machine.get("active_downloads", 0) or 0)
+    pending_tasks = int(jobs.get("pending_tasks_total", 0) or 0)
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Workers", workers_alive)
+    summary_cols[1].metric("Running jobs", running_jobs)
+    summary_cols[2].metric("Active downloads", active_downloads)
+    summary_cols[3].metric("Pending tasks", pending_tasks)
+
+    if download_provider_api:
+        provider_summary = dict(providers.get(download_provider_api) or {})
+        provider_counts = dict(provider_summary.get("counts") or {})
+        provider_label = download_provider_api.capitalize()
+        st.caption(
+            f"{provider_label} snapshot · pending {int(provider_summary.get('pending_tasks', 0) or 0)}"
+            f" · downloading {int(provider_counts.get('downloading', 0) or 0)}"
+            f" · ready {int(provider_counts.get('ready', 0) or 0)}"
+            f" · failed {int(provider_counts.get('failed', 0) or 0)}"
+        )
 
 
 def _raw_uri_candidates(raw_uri: str) -> set[str]:
@@ -1421,6 +1624,33 @@ def _format_eta_compact(value: Any) -> str:
     return f"{secs}s"
 
 
+def _format_duration_compact(value: Any) -> str:
+    try:
+        seconds = max(0, int(round(float(value))))
+    except Exception:
+        return "-"
+    if seconds <= 0:
+        return "<1s"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _download_strategy_label(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "copernicus_account_pool":
+        return "Account pool"
+    if normalized == "adaptive_local":
+        return "Adaptive local"
+    if not normalized:
+        return "Default"
+    return normalized.replace("_", " ").title()
+
+
 def _download_status_style(status: str) -> tuple[str, str]:
     normalized = str(status or "").strip().lower()
     if normalized == "completed":
@@ -1462,6 +1692,9 @@ def _job_download_telemetry(item: dict[str, Any]) -> dict[str, Any] | None:
             "progress_pct": progress_pct,
             "speed_bps": 0.0,
             "eta_seconds": None,
+            "started_at": str(pipeline_meta.get("download_started_at") or "").strip() or None,
+            "finished_at": str(pipeline_meta.get("download_finished_at") or "").strip() or None,
+            "duration_seconds": pipeline_meta.get("download_window_seconds"),
             "last_file": None,
             "retry_count_total": int(item.get("retry_count", 0) or 0),
             "rate_limited_accounts": 0,
@@ -1490,6 +1723,17 @@ def _job_download_telemetry(item: dict[str, Any]) -> dict[str, Any] | None:
                 }
             )
         telemetry["accounts"] = accounts
+    telemetry.setdefault("started_at", str(pipeline_meta.get("download_started_at") or "").strip() or None)
+    telemetry.setdefault("finished_at", str(pipeline_meta.get("download_finished_at") or "").strip() or None)
+    telemetry.setdefault("duration_seconds", pipeline_meta.get("download_window_seconds"))
+    if int(telemetry.get("selected_accounts", 0) or 0) <= 0 and accounts:
+        telemetry["selected_accounts"] = len(
+            {
+                str((account or {}).get("account_label") or "").strip()
+                for account in accounts
+                if str((account or {}).get("account_label") or "").strip()
+            }
+        )
     return telemetry
 
 
@@ -1500,6 +1744,7 @@ def _render_job_download_telemetry(item: dict[str, Any]) -> bool:
 
     pipeline_state = _job_pipeline_state(item)
     status = str(telemetry.get("status") or "running").strip().lower() or "running"
+    strategy = str(telemetry.get("strategy") or "default").strip().lower() or "default"
     overall_progress = max(0.0, min(100.0, float(telemetry.get("progress_pct", item.get("progress", 0.0)) or 0.0)))
     bytes_downloaded = int(telemetry.get("bytes_downloaded", item.get("bytes_downloaded", 0)) or 0)
     bytes_total = max(int(telemetry.get("bytes_total", item.get("bytes_total", 0)) or 0), bytes_downloaded)
@@ -1510,19 +1755,39 @@ def _render_job_download_telemetry(item: dict[str, Any]) -> bool:
     per_account_concurrency = int(telemetry.get("per_account_concurrency", 0) or 0)
     products_found = int(telemetry.get("products_found", 0) or 0)
     products_downloaded = int(telemetry.get("products_downloaded", 0) or 0)
+    download_window_seconds = telemetry.get("duration_seconds")
     retry_count_total = int(telemetry.get("retry_count_total", item.get("retry_count", 0)) or 0)
     accounts = list(telemetry.get("accounts") or [])
+    account_rows_used = len(
+        {
+            str((account or {}).get("account_label") or "").strip()
+            for account in accounts
+            if str((account or {}).get("account_label") or "").strip()
+        }
+    )
+    accounts_used = max(selected_accounts, account_rows_used)
+    if accounts_used <= 0 and bytes_total > 0:
+        accounts_used = 1
     color, tint = _download_status_style(status)
 
-    summary_parts = [
-        ("Parallel download", f"{selected_accounts}/{pool_size}" if pool_size > 0 else ("1" if bytes_total > 0 else "-")),
-        ("Products", f"{products_downloaded}/{products_found}" if products_found > 0 else str(products_downloaded or "-")),
-        ("Volume", f"{_format_bytes_compact(bytes_downloaded)} / {_format_bytes_compact(bytes_total)}"),
-        ("Throughput", _format_rate_compact(speed_bps)),
-        ("ETA", _format_eta_compact(eta_seconds) if eta_seconds is not None and pipeline_state == "downloading" else ("done" if status == "completed" or pipeline_state not in {"searching", "downloading"} else "-")),
-    ]
+    summary_parts = [("Strategy", _download_strategy_label(strategy))]
+    if pool_size > 0 or accounts_used > 0:
+        if pool_size > 0:
+            summary_parts.append(("Accounts used", f"{accounts_used}/{pool_size}"))
+        else:
+            summary_parts.append(("Accounts used", str(accounts_used or "-")))
+    summary_parts.extend(
+        [
+            ("Products", f"{products_downloaded}/{products_found}" if products_found > 0 else str(products_downloaded or "-")),
+            ("Volume", f"{_format_bytes_compact(bytes_downloaded)} / {_format_bytes_compact(bytes_total)}"),
+            ("Throughput", _format_rate_compact(speed_bps)),
+            ("ETA", _format_eta_compact(eta_seconds) if eta_seconds is not None and pipeline_state == "downloading" else ("done" if status == "completed" or pipeline_state not in {"searching", "downloading"} else "-")),
+        ]
+    )
+    if download_window_seconds is not None:
+        summary_parts.append(("Download window", _format_duration_compact(download_window_seconds)))
     if per_account_concurrency > 0:
-        summary_parts.append(("Per account", str(per_account_concurrency)))
+        summary_parts.append(("Per account cap", str(per_account_concurrency)))
     if retry_count_total > 0:
         summary_parts.append(("Retries", str(retry_count_total)))
 
@@ -2656,43 +2921,15 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_
             value=bool(_ss("dl_auto_refresh", True)),
             key="job_auto_refresh",
         )
-        current_api_url = str(_ss("api_url", DEFAULT_API_URL)).strip()
-        if (
-            _ss("last_api_status_url", "") != current_api_url
-            or _ss("api_health_snapshot") is None
-            or _ss("api_readiness_snapshot") is None
-            or _ss("worker_status_snapshot") is None
-            or _ss("provider_status_snapshot") is None
-        ):
-            _refresh_api_runtime_statuses()
-        if st.button("Refresh service status", width="stretch", key="refresh_service_status_btn"):
-            _refresh_api_runtime_statuses()
+        refresh_clicked = st.button("Refresh service status", width="stretch", key="refresh_service_status_btn")
+        _ensure_api_runtime_statuses(force=refresh_clicked)
         st.caption(f"Last checked: {_format_status_timestamp(_ss('service_status_checked_at'))}")
         _render_status_block("API health", _ss("api_health_snapshot"), kind="service")
         _render_status_block("API readiness", _ss("api_readiness_snapshot"), kind="service")
         _render_status_block("Worker execution", _ss("worker_status_snapshot"), kind="worker")
+        _render_status_block("Download coordinator", _ss("download_coordinator_snapshot"), kind="coordinator")
         selected_provider_api = PROVIDER_CLI_MAP.get(str(_ss("provider", "Copernicus")))
-        selected_provider_status = select_provider_status(_ss("provider_status_snapshot"), selected_provider_api or "")
-        if selected_provider_status is not None:
-            status_label = provider_auth_state_label(selected_provider_status)
-            detail = str(selected_provider_status.get("message") or "-")
-            pool_line = ""
-            if str(selected_provider_status.get("provider") or "").strip().lower() == "copernicus":
-                pool_line = (
-                    f" · account pool: "
-                    f"{int(selected_provider_status.get('account_pool_size', 0) or 0)} account(s)"
-                    f" · per-account concurrency: "
-                    f"{int(selected_provider_status.get('account_pool_concurrency', 0) or 0)}"
-                )
-            st.markdown(
-                "<div style='background:#111827;border:1px solid rgba(56,120,200,0.10);border-radius:10px;padding:10px;margin-top:8px;'>"
-                f"<div style='display:flex;justify-content:space-between;align-items:center;gap:8px;'><span style='font-size:.78rem;color:#94a3b8;font-weight:600;'>{str(selected_provider_status.get('provider') or '').upper()} auth</span>"
-                f"<span style='font-size:.72rem;color:{'#22c55e' if status_label == 'valid' else '#ef4444' if status_label in {'missing', 'credentials invalid', 'credentials missing'} else '#f59e0b'};font-weight:700;text-transform:uppercase;'>{status_label}</span></div>"
-                f"<div style='font-size:.72rem;color:#cbd5e1;margin-top:6px;'>{detail}</div>"
-                f"<div style='font-size:.65rem;color:#64748b;margin-top:4px;'>Runtime env · username present: {'yes' if selected_provider_status.get('username_present') else 'no'} · token present: {'yes' if selected_provider_status.get('token_present') or selected_provider_status.get('password_present') else 'no'}{pool_line}</div>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
+        _render_provider_auth_panel(selected_provider_api)
 
     st.sidebar.markdown('<div style="display:flex;align-items:center;gap:6px;padding-top:.3rem"><span>📡</span><span style="font-weight:600;font-size:.88rem;">Data Source</span></div>', unsafe_allow_html=True)
     provider = st.sidebar.selectbox("Provider", list(PROVIDERS.keys()), index=list(PROVIDERS.keys()).index(_ss("provider", "Copernicus")), key="sb_prov")
@@ -3079,8 +3316,10 @@ def main():
         unsafe_allow_html=True,
     )
 
-    tab_map, tab_dl, tab_jobs, tab_res, tab_set = st.tabs(
-        ["🗺️ Map", "⬇️ Download", "📋 Jobs", "📂 Results", "🔧 Settings"]
+    download_provider_api = PROVIDER_CLI_MAP.get(provider)
+
+    tab_map, tab_launch, tab_downloads, tab_res, tab_set = st.tabs(
+        ["🗺️ AOI & Tiles", "🚀 Preview & Launch", "⬇️ Downloads & Queue", "📂 Results", "🔧 Settings"]
     )
 
     with tab_map:
@@ -3182,7 +3421,7 @@ def main():
             unsafe_allow_html=True,
         )
 
-    with tab_dl:
+    with tab_launch:
         effective_product_type = str(product)
         if provider == "USGS":
             effective_product_type = _resolve_usgs_product_type(
@@ -3191,7 +3430,7 @@ def main():
             )
 
         st.markdown(
-            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>⬇️</span><span style="font-weight:600;font-size:.94rem;">Pipeline Launcher</span></div>',
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>🚀</span><span style="font-weight:600;font-size:.94rem;">Preview & Pipeline Launch</span></div>',
             unsafe_allow_html=True,
         )
         c1, c2, c3 = st.columns(3)
@@ -3219,7 +3458,9 @@ def main():
             preview_geom.wkt if (preview_geom is not None and not getattr(preview_geom, "is_empty", True)) else ""
         )
         collection = str(satellite).split(" ")[0]
-        download_provider_api = PROVIDER_CLI_MAP.get(provider)
+        _ensure_api_runtime_statuses(
+            max_age_seconds=8.0 if bool(_ss("dl_auto_refresh", True)) else None,
+        )
         provider_status_snapshot = _ss("provider_status_snapshot")
         current_provider_status = select_provider_status(provider_status_snapshot, download_provider_api or "")
         provider_blocked = provider_actions_disabled(download_provider_api or "", provider_status_snapshot)
@@ -3480,8 +3721,8 @@ def main():
             st.markdown(
                 "<div style='background:#0f172a;border:1px solid rgba(56,120,200,0.10);border-radius:12px;padding:12px;'>"
                 "<div style='font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;'>Monitoring</div>"
-                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Use the Jobs tab</div>"
-                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Live pipeline progress and cancel controls are shown there.</div>"
+                "<div style='font-size:1rem;font-weight:700;color:#e2e8f0;margin-top:2px;'>Use Downloads & Queue</div>"
+                "<div style='font-size:.74rem;color:#94a3b8;margin-top:6px;'>Live pipelines, provider throttling, coordinator state and queue fairness are grouped there.</div>"
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -3493,54 +3734,6 @@ def main():
             with adv2:
                 unlock_clicked = st.button("🔓 Unlock tracker", width="stretch")
 
-        if bool(_ss("dl_auto_refresh", True)):
-            checked_at = _parse_iso_datetime(_ss("service_status_checked_at"))
-            if (
-                _ss("last_api_status_url", "") != str(_ss("api_url", DEFAULT_API_URL)).strip()
-                or _ss("worker_status_snapshot") is None
-                or checked_at is None
-                or (dt.datetime.now(dt.timezone.utc) - checked_at).total_seconds() >= 8.0
-            ):
-                _refresh_api_runtime_statuses()
-
-        worker_snapshot = _ss("worker_status_snapshot")
-        if not isinstance(worker_snapshot, dict) or worker_snapshot.get("_error"):
-            st.warning("Worker status unavailable. If jobs stay queued, refresh service status in Connection.")
-        else:
-            workers_alive = int(worker_snapshot.get("workers_alive", 0) or 0)
-            queued_jobs = int(worker_snapshot.get("queued_jobs", 0) or 0)
-            running_jobs = int(worker_snapshot.get("running_jobs", 0) or 0)
-            capacity_available = int(worker_snapshot.get("capacity_available", 0) or 0)
-            capacity_total = int(worker_snapshot.get("capacity_total", 0) or 0)
-            if workers_alive <= 0:
-                st.error("No worker alive. Jobs will stay queued until the worker service is running.")
-            elif queued_jobs > 0 and capacity_available <= 0:
-                st.info(
-                    f"Worker saturated: {running_jobs} running, {queued_jobs} queued, {capacity_available}/{capacity_total} slots free."
-                )
-            else:
-                st.caption(
-                    f"Worker alive: {workers_alive} · running: {running_jobs} · queued: {queued_jobs} · free slots: {capacity_available}/{capacity_total}"
-                )
-            provider_capacity = worker_snapshot.get("provider_capacity") or {}
-            provider_state = provider_capacity.get(download_provider_api or "")
-            if isinstance(provider_state, dict) and download_provider_api:
-                provider_limit_total = int(provider_state.get("limit_total", 0) or 0)
-                provider_running = int(provider_state.get("running", 0) or 0)
-                provider_queued = int(provider_state.get("queued", 0) or 0)
-                provider_available = int(provider_state.get("available", 0) or 0)
-                provider_label = download_provider_api.capitalize()
-                if bool(provider_state.get("blocked_by_limit")):
-                    st.info(
-                        f"{provider_label} provider limit reached: {provider_running}/{provider_limit_total} running for this provider, {provider_queued} queued waiting on the provider throttle."
-                    )
-                else:
-                    st.caption(
-                        f"{provider_label} provider limit: {provider_running}/{provider_limit_total} used · queued for provider: {provider_queued} · free provider slots: {provider_available}"
-                    )
-            pruned_workers = int(worker_snapshot.get("workers_pruned", 0) or 0)
-            if pruned_workers > 0:
-                st.caption(f"Cleaned {pruned_workers} stale worker heartbeat(s) automatically.")
         if provider_blocked and provider_guidance:
             st.warning(f"Download blocked: {provider_guidance}")
 
@@ -3628,18 +3821,43 @@ def main():
             if unlock_clicked:
                 st.success("Tracker unlocked.")
 
-        st.caption("This tab launches new pipeline runs only. Live activity is monitored in the Jobs tab.")
+        st.caption("This tab is for preview and submission only. Live downloads and queue state are monitored in Downloads & Queue.")
 
-    with tab_jobs:
+    with tab_downloads:
         st.markdown(
-            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>📋</span><span style="font-weight:600;font-size:.94rem;">Jobs</span></div>',
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>⬇️</span><span style="font-weight:600;font-size:.94rem;">Downloads & Queue</span></div>',
             unsafe_allow_html=True,
         )
-        st.caption("A single pipeline job now covers search, download, Zarr conversion, and optional in-place masking.")
-        if bool(_ss("dl_auto_refresh", True)):
-            _render_download_jobs_panel_live(download_provider_api)
-        else:
-            _render_download_jobs_panel_static(download_provider_api)
+        st.caption("All live pipelines, downloads, provider throttling, runtime health and coordinator state are grouped here.")
+        refresh_downloads = st.button(
+            "Refresh downloads view",
+            key="downloads_overview_refresh_btn",
+            width="stretch",
+        )
+        _ensure_api_runtime_statuses(
+            force=refresh_downloads,
+            max_age_seconds=8.0 if bool(_ss("dl_auto_refresh", True)) else None,
+        )
+        _render_downloads_overview(download_provider_api)
+
+        dl_live_tab, dl_coord_tab, dl_runtime_tab = st.tabs(
+            ["📋 Live Pipelines", "🧠 Coordinator", "⚙️ Runtime"]
+        )
+
+        with dl_live_tab:
+            st.caption("Unified pipeline runs: search, raw download, Zarr conversion, and optional in-place masking.")
+            if bool(_ss("dl_auto_refresh", True)):
+                _render_download_jobs_panel_live(download_provider_api)
+            else:
+                _render_download_jobs_panel_static(download_provider_api)
+
+        with dl_coord_tab:
+            st.caption("Persistent local coordinator view: files by status, pending jobs, Copernicus workers, USGS adaptive window, and recent tasks.")
+            _render_download_coordinator_panel()
+
+        with dl_runtime_tab:
+            st.caption("Service health, worker capacity, provider auth and throttling state for the selected provider.")
+            _render_download_runtime_panel(download_provider_api)
 
 
     with tab_res:

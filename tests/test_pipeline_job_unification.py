@@ -22,7 +22,7 @@ from nimbuschain_fetch.models import (
     ProviderName,
     SearchDownloadRequest,
 )
-from nimbuschain_fetch.settings import get_settings
+from nimbuschain_fetch.settings import Settings, get_settings
 from nimbuschain_fetch_service.api.artifacts import router as artifacts_router
 from nimbuschain_fetch_service.api.converter import router as converter_router
 
@@ -556,6 +556,43 @@ def test_zarr_conversion_defaults_to_single_worker(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setenv("NIMBUS_ZARR_CONVERT_MAX_WORKERS", "2")
     assert NimbusFetcher._zarr_convert_max_workers(total=4) == 2
+
+
+def test_scene_parallelism_target_no_longer_penalizes_default_multi_scene_jobs(tmp_path: Path) -> None:
+    settings = Settings(
+        NIMBUS_RUNTIME_ROLE="api",
+        NIMBUS_DB_BACKEND="sqlite",
+        NIMBUS_DB_PATH=str(tmp_path / "nimbus.db"),
+        NIMBUS_DATA_DIR=str(tmp_path / "downloads"),
+        NIMBUS_MAX_JOBS=4,
+    )
+    fetcher = NimbusFetcher(settings=settings)
+
+    default_target = fetcher._scene_parallelism_target_from_download(
+        pipeline_metadata={
+            "download_strategy": "default",
+            "account_pool_selected_accounts": 1,
+            "account_pool_size": 4,
+        },
+        total=5,
+    )
+    pool_target = fetcher._scene_parallelism_target_from_download(
+        pipeline_metadata={
+            "download_strategy": "copernicus_account_pool",
+            "account_pool_selected_accounts": 4,
+            "account_pool_size": 4,
+            "account_pool_assignments": [
+                {"account_label": "primary", "product_count": 2},
+                {"account_label": "secondary-1", "product_count": 1},
+                {"account_label": "secondary-2", "product_count": 1},
+                {"account_label": "secondary-3", "product_count": 1},
+            ],
+        },
+        total=5,
+    )
+
+    assert default_target == 4
+    assert pool_target == 4
 
 
 def test_zarr_conversion_emits_incremental_pipeline_progress(

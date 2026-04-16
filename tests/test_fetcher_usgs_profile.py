@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -131,6 +132,35 @@ def test_download_manager_429_backoff_matches_legacy_profile() -> None:
     ) == 45.0
 
 
+def test_download_manager_avoids_deadlock_inside_running_event_loop(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    manager = DownloadManager()
+
+    async def _fake_download_all(product_ids: dict, output_dir: Path) -> list[str]:
+        return [str(output_dir / "scene.zip")]
+
+    monkeypatch.setattr(manager, "_download_all", _fake_download_all)
+    monkeypatch.setattr(
+        "nimbuschain_fetch.download.download_manager.asyncio.run_coroutine_threadsafe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("download_products should not use run_coroutine_threadsafe here")
+        ),
+    )
+
+    async def _invoke() -> list[str]:
+        return manager.download_products(
+            {
+                "urls": ["https://example.test/scene.zip"],
+                "file_names": ["scene.zip"],
+            },
+            str(tmp_path),
+        )
+
+    assert asyncio.run(_invoke()) == [str(tmp_path / "scene.zip")]
+
+
 def test_settings_parse_copernicus_account_pool(tmp_path: Path) -> None:
     pool_file = tmp_path / "copernicus_accounts.json"
     pool_file.write_text(
@@ -173,6 +203,7 @@ def test_copernicus_account_pool_selects_required_account_count(monkeypatch, tmp
                 {"label": "secondary-2", "username": "user-3@example.com", "password": "pw-3"},
             ]
         ),
+        NIMBUS_COPERNICUS_ACCOUNT_POOL_FILE=str(tmp_path / "copernicus-pool.inline.json"),
         NIMBUS_COPERNICUS_ACCOUNT_POOL_CONCURRENCY="4",
     )
     provider = CopernicusProvider(settings=settings, download_manager=DownloadManager(), download_strategy="copernicus_account_pool")
@@ -208,6 +239,7 @@ def test_copernicus_account_pool_plan_metadata_includes_assignment_counts(tmp_pa
                 {"label": "secondary-2", "username": "user-3@example.com", "password": "pw-3"},
             ]
         ),
+        NIMBUS_COPERNICUS_ACCOUNT_POOL_FILE=str(tmp_path / "copernicus-pool.inline.json"),
         NIMBUS_COPERNICUS_ACCOUNT_POOL_CONCURRENCY="4",
     )
     provider = CopernicusProvider(
@@ -226,6 +258,41 @@ def test_copernicus_account_pool_plan_metadata_includes_assignment_counts(tmp_pa
     ]
 
 
+def test_copernicus_account_pool_plan_metadata_uses_all_available_accounts_before_reuse(tmp_path: Path) -> None:
+    settings = Settings(
+        NIMBUS_RUNTIME_ROLE="api",
+        NIMBUS_DB_BACKEND="sqlite",
+        NIMBUS_DB_PATH=str(tmp_path / "nimbus.db"),
+        NIMBUS_DATA_DIR=str(tmp_path / "downloads"),
+        NIMBUS_COPERNICUS_USERNAME="user-1@example.com",
+        NIMBUS_COPERNICUS_PASSWORD="pw-1",
+        NIMBUS_COPERNICUS_ACCOUNT_POOL_JSON=json.dumps(
+            [
+                {"label": "secondary-1", "username": "user-2@example.com", "password": "pw-2"},
+                {"label": "secondary-2", "username": "user-3@example.com", "password": "pw-3"},
+                {"label": "secondary-3", "username": "user-4@example.com", "password": "pw-4"},
+            ]
+        ),
+        NIMBUS_COPERNICUS_ACCOUNT_POOL_FILE=str(tmp_path / "copernicus-pool.inline.json"),
+        NIMBUS_COPERNICUS_ACCOUNT_POOL_CONCURRENCY="4",
+    )
+    provider = CopernicusProvider(
+        settings=settings,
+        download_manager=DownloadManager(),
+        download_strategy="copernicus_account_pool",
+    )
+
+    metadata = provider.plan_download_metadata(5)
+
+    assert metadata["account_pool_selected_accounts"] == 4
+    assert metadata["account_pool_assignments"] == [
+        {"account_label": "primary", "product_count": 2},
+        {"account_label": "secondary-1", "product_count": 1},
+        {"account_label": "secondary-2", "product_count": 1},
+        {"account_label": "secondary-3", "product_count": 1},
+    ]
+
+
 def test_build_download_telemetry_groups_progress_by_account() -> None:
     telemetry = NimbusFetcher._build_download_telemetry(
         pipeline_metadata={
@@ -235,6 +302,9 @@ def test_build_download_telemetry_groups_progress_by_account() -> None:
             "account_pool_selected_accounts": 3,
             "account_pool_size": 3,
             "account_pool_per_account_concurrency": 4,
+            "download_started_at": "2026-04-15T11:35:20+00:00",
+            "download_finished_at": "2026-04-15T11:39:05+00:00",
+            "download_window_seconds": 225.0,
             "account_pool_assignments": [
                 {"account_label": "primary", "product_count": 4},
                 {"account_label": "secondary-1", "product_count": 4},
@@ -279,6 +349,8 @@ def test_build_download_telemetry_groups_progress_by_account() -> None:
     assert telemetry["progress_pct"] == 75.0
     assert telemetry["rate_limited_accounts"] == 1
     assert telemetry["files_completed"] == 1
+    assert telemetry["duration_seconds"] == 225.0
+    assert telemetry["started_at"] == "2026-04-15T11:35:20+00:00"
     assert telemetry["accounts"][0]["account_label"] == "primary"
     assert telemetry["accounts"][0]["progress_pct"] == 100.0
     assert telemetry["accounts"][1]["account_label"] == "secondary-1"

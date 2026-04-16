@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -55,8 +54,7 @@ class CopernicusProvider(ProviderBase):
         accounts = self._account_pool_accounts()
         if not accounts:
             return []
-        per_account = self._account_pool_concurrency()
-        needed = max(1, math.ceil(max(1, int(product_count)) / per_account))
+        needed = max(1, min(len(accounts), max(1, int(product_count))))
         return accounts[: min(len(accounts), needed)]
 
     def _build_download_manager_for_account(self) -> DownloadManager:
@@ -330,6 +328,7 @@ class CopernicusProvider(ProviderBase):
             "account_pool_requested": self._account_pool_requested(),
             "account_pool_configured": self.settings.copernicus_account_pool_available,
             "account_pool_size": int(self.settings.copernicus_account_pool_size),
+            "account_pool_per_account_concurrency": self._account_pool_concurrency(),
         }
         if not self._account_pool_requested():
             return base
@@ -350,7 +349,7 @@ class CopernicusProvider(ProviderBase):
             account_pool_per_account_concurrency=self._account_pool_concurrency(),
             account_pool_assignments=assignment_summary,
         )
-        if len(selected_accounts) <= 1:
+        if len(self._account_pool_accounts()) <= 1:
             base["account_pool_fallback_reason"] = "insufficient_accounts"
         return base
 
@@ -364,8 +363,9 @@ class CopernicusProvider(ProviderBase):
                 "account_pool_size": int(self.settings.copernicus_account_pool_size),
                 "account_pool_selected_accounts": len(selected_accounts),
                 "account_pool_per_account_concurrency": self._account_pool_concurrency(),
-                "account_pool_fallback_reason": "insufficient_accounts",
             }
+            if len(self._account_pool_accounts()) <= 1:
+                self.last_download_metadata["account_pool_fallback_reason"] = "insufficient_accounts"
             return self._download_products_single_account(product_ids, output_dir)
 
         batches = self._distribute_products(product_ids, account_count=len(selected_accounts))
@@ -423,6 +423,7 @@ class CopernicusProvider(ProviderBase):
             "account_pool_requested": self._account_pool_requested(),
             "account_pool_configured": self.settings.copernicus_account_pool_available,
             "account_pool_size": int(self.settings.copernicus_account_pool_size),
+            "account_pool_per_account_concurrency": self._account_pool_concurrency(),
         }
         if self._account_pool_requested():
             return self._download_products_with_account_pool(product_ids, output_dir)

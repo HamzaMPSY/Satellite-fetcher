@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_IMAGE="${API_IMAGE:-ghcr.io/nimbuschain/nimbus-api:latest}"
 UI_IMAGE="${UI_IMAGE:-ghcr.io/nimbuschain/nimbus-ui:latest}"
+PODMAN_DOCTOR="${PROJECT_ROOT}/scripts/09_podman_doctor.sh"
 
 if ! command -v kubectl >/dev/null 2>&1; then
   echo "ERROR: kubectl is not installed." >&2
@@ -23,11 +24,13 @@ if ! minikube status >/dev/null 2>&1; then
   exit 1
 fi
 
-if command -v podman >/dev/null 2>&1 && podman image exists "${API_IMAGE}" && podman image exists "${UI_IMAGE}"; then
+if [ -x "${PODMAN_DOCTOR}" ] \
+  && WAIT_SECONDS="${WAIT_SECONDS:-45}" "${PODMAN_DOCTOR}" image exists "${API_IMAGE}" \
+  && WAIT_SECONDS="${WAIT_SECONDS:-45}" "${PODMAN_DOCTOR}" image exists "${UI_IMAGE}"; then
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "${TMP_DIR}"' EXIT
-  podman save -o "${TMP_DIR}/nimbus-api.tar" "${API_IMAGE}"
-  podman save -o "${TMP_DIR}/nimbus-ui.tar" "${UI_IMAGE}"
+  WAIT_SECONDS="${WAIT_SECONDS:-45}" "${PODMAN_DOCTOR}" save -o "${TMP_DIR}/nimbus-api.tar" "${API_IMAGE}"
+  WAIT_SECONDS="${WAIT_SECONDS:-45}" "${PODMAN_DOCTOR}" save -o "${TMP_DIR}/nimbus-ui.tar" "${UI_IMAGE}"
   minikube image load "${TMP_DIR}/nimbus-api.tar"
   minikube image load "${TMP_DIR}/nimbus-ui.tar"
 fi

@@ -20,7 +20,14 @@ from typing import Any, cast
 import anyio
 from pydantic import TypeAdapter
 
-from nimbuschain_fetch.download.download_manager import DownloadCancelled, DownloadManager
+from nimbuschain_fetch.download.coordinator import DownloadBatchResult, DownloadCoordinator
+from nimbuschain_fetch.download.download_manager import (
+    CancelChecker,
+    DownloadCancelled,
+    DownloadManager,
+    ProgressCallback,
+    RetryCallback,
+)
 from nimbuschain_fetch.geometry.aoi import parse_aoi
 from nimbuschain_fetch.jobs.events import stream_events as stream_persisted_events
 from nimbuschain_fetch.jobs.executor_inprocess import InProcessExecutor
@@ -100,7 +107,7 @@ class NimbusFetcher:
                 store=self.store,
                 run_job=self._execute_job,
                 max_concurrent_jobs=self.settings.nimbus_max_jobs,
-                provider_limits=self.settings.provider_limits_map,
+                provider_limits=self.settings.provider_job_limits_map,
             )
             if self._execution_enabled
             else None
@@ -114,6 +121,7 @@ class NimbusFetcher:
         self._cancel_check_cache: dict[str, tuple[float, bool]] = {}
         self._zarr_converter: ZarrConversionService | None = None
         self._mask_service: Any | None = None
+        self._download_coordinator: DownloadCoordinator | None = None
         self._started = False
 
     async def start(self) -> None:
@@ -163,6 +171,9 @@ class NimbusFetcher:
         if self._mask_service is not None and hasattr(self._mask_service, "close"):
             self._mask_service.close()
             self._mask_service = None
+        if self._download_coordinator is not None:
+            self._download_coordinator.close()
+            self._download_coordinator = None
         self._started = False
 
     def _retire_legacy_mask_jobs(self) -> None:
@@ -1401,7 +1412,7 @@ class NimbusFetcher:
         queued_by_provider: dict[str, int] = {}
         configured_provider_limits = {
             str(name).strip().lower(): max(1, int(limit))
-            for name, limit in self.settings.provider_limits_map.items()
+            for name, limit in self.settings.provider_job_limits_map.items()
         }
 
         running_by_worker: dict[str, int] = {}
@@ -1523,9 +1534,195 @@ class NimbusFetcher:
             "capacity_used": capacity_used,
             "capacity_available": capacity_available,
             "can_accept_work": can_accept_work,
+            "provider_job_limits": configured_provider_limits,
+            "provider_control_plane_limits": self.settings.provider_control_plane_limits_map,
+            "provider_data_plane_limits": self.settings.provider_data_plane_limits_map,
+            "download_guardrails": {
+                "global_active_limit": int(self.settings.nimbus_download_global_limit),
+                "min_free_bytes": int(self.settings.nimbus_download_min_free_bytes or 0),
+                "global_max_bps": (
+                    int(self.settings.nimbus_download_global_max_bps)
+                    if self.settings.nimbus_download_global_max_bps
+                    else None
+                ),
+            },
             "provider_capacity": provider_capacity,
             "workers": worker_payloads,
         }
+
+    def _download_coordinator_placeholder_status(self, *, status: str = "not_initialized") -> dict[str, Any]:
+        configured_accounts = [
+            {
+                "account_label": str(item.get("label") or "primary").strip() or "primary",
+                "active_downloads": 0,
+                "cooldown_seconds": 0.0,
+                "max_concurrent_downloads": int(self.settings.nimbus_copernicus_account_pool_concurrency),
+            }
+            for item in self.settings.copernicus_account_pool_accounts
+        ]
+        return {
+            "status": status,
+            "started": False,
+            "closed": False,
+            "timestamp": self._now_iso(),
+            "db_path": str(self.settings.download_coordinator_db_path),
+            "limits": {
+                "job": dict(self.settings.provider_job_limits_map),
+                "control_plane": dict(self.settings.provider_control_plane_limits_map),
+                "data_plane": dict(self.settings.provider_data_plane_limits_map),
+            },
+            "machine": {
+                "active_downloads": 0,
+                "active_download_limit": int(self.settings.nimbus_download_global_limit),
+                "disk_path": str(self.settings.nimbus_data_dir),
+                "disk_free_bytes": None,
+                "min_free_bytes": int(self.settings.nimbus_download_min_free_bytes or 0),
+                "bandwidth_limit_bps": (
+                    int(self.settings.nimbus_download_global_max_bps)
+                    if self.settings.nimbus_download_global_max_bps
+                    else None
+                ),
+            },
+            "providers": {
+                "copernicus": {
+                    "job_limit": int(self.settings.provider_job_limits_map.get("copernicus", 1)),
+                    "control_plane_limit": int(self.settings.provider_control_plane_limits_map.get("copernicus", 1)),
+                    "data_plane_limit": int(self.settings.provider_data_plane_limits_map.get("copernicus", 1)),
+                    "active_downloads": 0,
+                    "pending_tasks": 0,
+                    "counts": {
+                        "queued": 0,
+                        "preparing": 0,
+                        "ready": 0,
+                        "downloading": 0,
+                        "done": 0,
+                        "failed": 0,
+                        "cancelled": 0,
+                    },
+                    "accounts_configured": len(configured_accounts),
+                    "accounts": configured_accounts,
+                },
+                "usgs": {
+                    "job_limit": int(self.settings.provider_job_limits_map.get("usgs", 1)),
+                    "control_plane_limit": int(self.settings.provider_control_plane_limits_map.get("usgs", 1)),
+                    "data_plane_limit": int(self.settings.provider_data_plane_limits_map.get("usgs", 1)),
+                    "active_prepares": 0,
+                    "active_downloads": 0,
+                    "adaptive_window_current": min(
+                        2,
+                        int(self.settings.provider_data_plane_limits_map.get("usgs", 1)),
+                    ),
+                    "adaptive_window_peak": min(
+                        2,
+                        int(self.settings.provider_data_plane_limits_map.get("usgs", 1)),
+                    ),
+                    "adaptive_window_max": int(self.settings.provider_data_plane_limits_map.get("usgs", 1)),
+                    "success_streak": 0,
+                    "cooldown_seconds": 0.0,
+                    "pending_tasks": 0,
+                    "counts": {
+                        "queued": 0,
+                        "preparing": 0,
+                        "ready": 0,
+                        "downloading": 0,
+                        "done": 0,
+                        "failed": 0,
+                        "cancelled": 0,
+                    },
+                },
+            },
+            "jobs": {
+                "pending_tasks_total": 0,
+                "pending_jobs_total": 0,
+                "pending_by_job": [],
+            },
+            "tasks": {
+                "active": [],
+                "recent_terminal": [],
+            },
+        }
+
+    def _local_download_coordinator_report(self) -> dict[str, Any]:
+        if self._download_coordinator is None:
+            return self._download_coordinator_placeholder_status()
+        return self._download_coordinator.snapshot()
+
+    @staticmethod
+    def _wrap_download_coordinator_reports(
+        *,
+        reports: list[dict[str, Any]],
+        source: str,
+        summary: dict[str, Any],
+        timestamp: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": str(summary.get("status") or ("unavailable" if not reports else "unknown")),
+            "source": source,
+            "timestamp": timestamp,
+            "workers_reporting": len(reports),
+            "summary": summary,
+            "workers": reports,
+        }
+
+    def get_download_coordinator_status(self) -> dict[str, Any]:
+        if self._execution_enabled or self._download_coordinator is not None:
+            local_report = {
+                "worker_id": self._worker_id,
+                "hostname": self._worker_hostname,
+                "pid": self._worker_pid,
+                "runtime_role": self._runtime_role,
+                "execution_enabled": self._execution_enabled,
+                "last_seen_at": self._now_iso(),
+                "snapshot": self._local_download_coordinator_report(),
+            }
+            return self._wrap_download_coordinator_reports(
+                reports=[local_report],
+                source="local_worker",
+                summary=dict(local_report["snapshot"]),
+                timestamp=self._now_iso(),
+            )
+
+        stale_after = max(5, int(self.settings.nimbus_worker_stale_seconds))
+        now = datetime.now(timezone.utc)
+        worker_reports: list[dict[str, Any]] = []
+        for worker in self.store.list_workers():
+            last_seen = self._parse_iso(worker.get("last_seen_at"))
+            if last_seen is None:
+                continue
+            age_seconds = max(0.0, (now - last_seen).total_seconds())
+            if age_seconds > stale_after or not bool(worker.get("execution_enabled", False)):
+                continue
+            metadata = dict(worker.get("metadata") or {})
+            snapshot = metadata.get("download_coordinator")
+            if not isinstance(snapshot, dict):
+                continue
+            worker_reports.append(
+                {
+                    "worker_id": str(worker.get("worker_id") or "").strip(),
+                    "hostname": str(worker.get("hostname") or "").strip(),
+                    "pid": worker.get("pid"),
+                    "runtime_role": str(worker.get("runtime_role") or "").strip(),
+                    "execution_enabled": bool(worker.get("execution_enabled", False)),
+                    "last_seen_at": worker.get("last_seen_at"),
+                    "snapshot": snapshot,
+                }
+            )
+
+        if worker_reports:
+            return self._wrap_download_coordinator_reports(
+                reports=worker_reports,
+                source="worker_heartbeats",
+                summary=dict(worker_reports[0]["snapshot"]),
+                timestamp=self._now_iso(),
+            )
+
+        placeholder = self._download_coordinator_placeholder_status(status="unavailable")
+        return self._wrap_download_coordinator_reports(
+            reports=[],
+            source="worker_heartbeats",
+            summary=placeholder,
+            timestamp=self._now_iso(),
+        )
 
     def _is_job_cancel_requested(self, job_id: str) -> bool:
         now = time.monotonic()
@@ -2462,18 +2659,20 @@ class NimbusFetcher:
         if total <= 1:
             return 1
         metadata = dict(pipeline_metadata or {})
-        strategy = str(metadata.get("download_strategy") or "").strip().lower()
-        if strategy != "copernicus_account_pool":
-            return 1
         selected_accounts = int(metadata.get("account_pool_selected_accounts", 0) or 0)
-        if selected_accounts <= 0:
-            selected_accounts = sum(
-                1
-                for item in list(metadata.get("account_pool_assignments") or [])
-                if str((item or {}).get("account_label") or "").strip()
-            )
-        if selected_accounts <= 0:
-            selected_accounts = int(metadata.get("account_pool_size", 0) or 0)
+        account_labels: set[str] = set()
+        for item in list(metadata.get("account_pool_assignments") or []):
+            label = str((item or {}).get("account_label") or "").strip()
+            if label:
+                account_labels.add(label)
+        for item in list(dict(metadata.get("download_telemetry") or {}).get("accounts") or []):
+            label = str((item or {}).get("account_label") or "").strip()
+            if label:
+                account_labels.add(label)
+        if account_labels:
+            selected_accounts = max(selected_accounts, len(account_labels))
+        if selected_accounts <= 1:
+            selected_accounts = min(total, 4)
         return max(
             1,
             min(
@@ -4067,10 +4266,10 @@ class NimbusFetcher:
     ) -> dict[str, Any]:
         provider_name = self._provider_name(request.provider)
         download_strategy = str(getattr(request, "download_strategy", "default") or "default").strip().lower() or "default"
-        provider_limit = self.settings.provider_limits_map.get(provider_name, 1)
+        data_plane_limit = self.settings.provider_data_plane_limits_map.get(provider_name, 1)
 
         download_manager_kwargs: dict[str, Any] = dict(
-            max_concurrent=provider_limit,
+            max_concurrent=data_plane_limit,
             progress_callback=progress_callback,
             cancel_checker=is_cancelled,
             retry_callback=retry_callback,
@@ -4079,7 +4278,7 @@ class NimbusFetcher:
             # Keep Copernicus aligned with the older downloader profile that
             # proved stable in the previous project version.
             download_manager_kwargs.update(
-                max_concurrent=min(provider_limit, 2),
+                max_concurrent=min(data_plane_limit, 2),
                 max_retries=5,
                 initial_delay=2.0,
                 backoff_factor=1.5,
@@ -4092,7 +4291,7 @@ class NimbusFetcher:
             # Keep USGS closer to the older conservative downloader profile to
             # reduce incomplete request churn and per-host pressure.
             download_manager_kwargs.update(
-                max_concurrent=min(provider_limit, 2),
+                max_concurrent=min(data_plane_limit, 2),
                 initial_delay=2.0,
                 backoff_factor=1.5,
                 connect_timeout=30.0,
@@ -4183,8 +4382,24 @@ class NimbusFetcher:
                     },
                 }
 
-            paths = provider.download_products(product_ids=product_ids, output_dir=str(output_dir))
-            provider_download_metadata = dict(getattr(provider, "last_download_metadata", {}) or {})
+            if self._supports_download_coordinator(provider_name, provider):
+                coordinator_result = self._download_with_coordinator(
+                    job_id=job_id,
+                    provider_name=provider_name,
+                    provider=provider,
+                    collection=request.collection,
+                    product_ids=product_ids,
+                    output_dir=Path(output_dir),
+                    progress_callback=progress_callback,
+                    retry_callback=retry_callback,
+                    cancel_checker=is_cancelled,
+                    download_strategy=download_strategy,
+                )
+                paths = list(coordinator_result.paths)
+                provider_download_metadata = dict(coordinator_result.metadata or {})
+            else:
+                paths = provider.download_products(product_ids=product_ids, output_dir=str(output_dir))
+                provider_download_metadata = dict(getattr(provider, "last_download_metadata", {}) or {})
             return {
                 "paths": paths,
                 "metadata": {
@@ -4225,8 +4440,24 @@ class NimbusFetcher:
             event_type="job.downloading",
             event_payload={"products_requested": len(request.product_ids)},
         )
-        paths = provider.download_products(product_ids=request.product_ids, output_dir=str(output_dir))
-        provider_download_metadata = dict(getattr(provider, "last_download_metadata", {}) or {})
+        if self._supports_download_coordinator(provider_name, provider):
+            coordinator_result = self._download_with_coordinator(
+                job_id=job_id,
+                provider_name=provider_name,
+                provider=provider,
+                collection=request.collection,
+                product_ids=list(request.product_ids),
+                output_dir=Path(output_dir),
+                progress_callback=progress_callback,
+                retry_callback=retry_callback,
+                cancel_checker=is_cancelled,
+                download_strategy=download_strategy,
+            )
+            paths = list(coordinator_result.paths)
+            provider_download_metadata = dict(coordinator_result.metadata or {})
+        else:
+            paths = provider.download_products(product_ids=request.product_ids, output_dir=str(output_dir))
+            provider_download_metadata = dict(getattr(provider, "last_download_metadata", {}) or {})
         return {
             "paths": paths,
             "metadata": {
@@ -4252,6 +4483,52 @@ class NimbusFetcher:
         if not provider_cls:
             raise ValueError(f"Unsupported provider '{provider_name}'.")
         return provider_cls(self.settings, download_manager)
+
+    def _download_coordinator_instance(self) -> DownloadCoordinator:
+        if self._download_coordinator is None:
+            self._download_coordinator = DownloadCoordinator(self.settings)
+        return self._download_coordinator
+
+    @staticmethod
+    def _supports_download_coordinator(
+        provider_name: str,
+        provider: Any,
+    ) -> bool:
+        if provider_name == "copernicus":
+            return isinstance(provider, CopernicusProvider)
+        if provider_name == "usgs":
+            return isinstance(provider, UsgsProvider)
+        return False
+
+    def _download_with_coordinator(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        provider: Any,
+        collection: str,
+        product_ids: list[str],
+        output_dir: Path,
+        progress_callback: ProgressCallback | None,
+        retry_callback: RetryCallback | None,
+        cancel_checker: CancelChecker | None,
+        download_strategy: str,
+    ) -> DownloadBatchResult:
+        coordinator = self._download_coordinator_instance()
+        result = coordinator.download_products(
+            job_id=job_id,
+            provider_name=provider_name,
+            provider=provider,
+            collection=collection,
+            product_ids=product_ids,
+            output_dir=str(output_dir),
+            progress_callback=progress_callback,
+            retry_callback=retry_callback,
+            cancel_checker=cancel_checker,
+            download_strategy=download_strategy,
+        )
+        setattr(provider, "last_download_metadata", dict(result.metadata or {}))
+        return result
 
     def _mark_cancelled(self, job_id: str, reason: str) -> None:
         current_row = self.store.get_job(job_id) or {}
@@ -4601,11 +4878,30 @@ class NimbusFetcher:
         eta_seconds: float | None = None
         if speed_bps > 0 and total_bytes > int(bytes_downloaded or 0):
             eta_seconds = max(0.0, (total_bytes - int(bytes_downloaded or 0)) / max(speed_bps, 1.0))
+        selected_accounts = int(metadata.get("account_pool_selected_accounts", 0) or 0)
+        if selected_accounts <= 0 and account_rows:
+            selected_accounts = len(
+                [
+                    row
+                    for row in account_rows
+                    if int(row.get("product_count_assigned", 0) or 0) > 0
+                    or int(row.get("files_observed", 0) or 0) > 0
+                    or int(row.get("bytes_downloaded", 0) or 0) > 0
+                ]
+            )
+        try:
+            download_window_seconds = (
+                float(metadata.get("download_window_seconds"))
+                if metadata.get("download_window_seconds") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            download_window_seconds = None
 
         return {
             "status": str(phase or "running").strip().lower() or "running",
             "strategy": str(metadata.get("download_strategy") or "default").strip().lower() or "default",
-            "selected_accounts": int(metadata.get("account_pool_selected_accounts", 0) or 0),
+            "selected_accounts": selected_accounts,
             "pool_size": int(metadata.get("account_pool_size", 0) or 0),
             "per_account_concurrency": int(metadata.get("account_pool_per_account_concurrency", 0) or 0),
             "products_found": products_found,
@@ -4617,6 +4913,9 @@ class NimbusFetcher:
             "progress_pct": round(float(progress_pct or 0.0), 2),
             "speed_bps": float(speed_bps or 0.0),
             "eta_seconds": eta_seconds,
+            "started_at": str(metadata.get("download_started_at") or "").strip() or None,
+            "finished_at": str(metadata.get("download_finished_at") or "").strip() or None,
+            "duration_seconds": download_window_seconds,
             "last_file": str(last_file or "").strip() or None,
             "retry_count_total": sum(int((entry or {}).get("retry_count", 0) or 0) for entry in retry_state.values()),
             "rate_limited_accounts": sum(1 for row in account_rows if bool(row.get("rate_limited"))),
@@ -4783,6 +5082,7 @@ class NimbusFetcher:
             )
         )
         _ = running_rows, cancel_rows, queued_rows
+        download_coordinator_report = self._local_download_coordinator_report()
         return self.store.upsert_worker_heartbeat(
             self._worker_id,
             {
@@ -4791,7 +5091,7 @@ class NimbusFetcher:
                 "max_concurrent_jobs": self.settings.nimbus_max_jobs,
                 "queue_poll_seconds": self.settings.nimbus_queue_poll_seconds,
                 "heartbeat_interval_seconds": self.settings.nimbus_worker_heartbeat_seconds,
-                "provider_limits": self.settings.provider_limits_map,
+                "provider_limits": self.settings.provider_job_limits_map,
                 "hostname": self._worker_hostname,
                 "pid": self._worker_pid,
                 "active_running_jobs": running_total,
@@ -4802,6 +5102,19 @@ class NimbusFetcher:
                 "metadata": {
                     "runtime_role": self._runtime_role,
                     "executor_present": self._executor is not None,
+                    "provider_job_limits": self.settings.provider_job_limits_map,
+                    "provider_control_plane_limits": self.settings.provider_control_plane_limits_map,
+                    "provider_data_plane_limits": self.settings.provider_data_plane_limits_map,
+                    "download_guardrails": {
+                        "global_active_limit": int(self.settings.nimbus_download_global_limit),
+                        "min_free_bytes": int(self.settings.nimbus_download_min_free_bytes or 0),
+                        "global_max_bps": (
+                            int(self.settings.nimbus_download_global_max_bps)
+                            if self.settings.nimbus_download_global_max_bps
+                            else None
+                        ),
+                    },
+                    "download_coordinator": download_coordinator_report,
                 },
             },
         )

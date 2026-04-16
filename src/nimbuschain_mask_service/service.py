@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import gc
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,12 @@ from nimbuschain_mask_service.io import (
     read_required_channels_window,
 )
 from nimbuschain_mask_service.inference import CloudMaskResult
-from nimbuschain_mask_service.runtime import parallel_worker_count, resolve_inference_device, runtime_device_status
+from nimbuschain_mask_service.runtime import (
+    normalize_device_name,
+    parallel_worker_count,
+    resolve_inference_device,
+    runtime_device_status,
+)
 from nimbuschain_mask_service.sensor_mapping import resolve_sensor_mask_spec
 from nimbuschain_mask_service.writer import (
     finalize_cloud_outputs,
@@ -582,17 +588,25 @@ def _run_cloud_inference_tiled(
     class_histogram: dict[str, int] = {}
     mask_source = "class_map" if backend_descriptor.name == "omnicloudmask" else "threshold"
     probability_source = "class_map" if backend_descriptor.name == "omnicloudmask" else "heuristic_score"
-    try:
-        tile_size = _cloud_tile_size(backend_name=str(backend_descriptor.name))
-    except TypeError as exc:
-        if "backend_name" not in str(exc):
-            raise
-        tile_size = _cloud_tile_size()
-    total_tiles = ((height + tile_size - 1) // tile_size) * ((width + tile_size - 1) // tile_size)
     resolved_device = resolve_inference_device(
         explicit=inference_device,
         env_var="NIMBUS_CLOUDMASK_DEVICE",
     )
+    try:
+        tile_size = _cloud_tile_size(
+            backend_name=str(backend_descriptor.name),
+            device=resolved_device,
+        )
+    except TypeError as exc:
+        if "backend_name" not in str(exc) and "device" not in str(exc):
+            raise
+        try:
+            tile_size = _cloud_tile_size(backend_name=str(backend_descriptor.name))
+        except TypeError as nested_exc:
+            if "backend_name" not in str(nested_exc):
+                raise
+            tile_size = _cloud_tile_size()
+    total_tiles = ((height + tile_size - 1) // tile_size) * ((width + tile_size - 1) // tile_size)
     tile_workers = parallel_worker_count(
         device=resolved_device,
         env_var="NIMBUS_CLOUDMASK_TILE_WORKERS",
@@ -601,6 +615,10 @@ def _run_cloud_inference_tiled(
         hard_limit=4,
     )
     windows = list(_iter_windows(height=height, width=width, tile_size=tile_size))
+    should_trim_memory = (
+        str(backend_descriptor.name) == "omnicloudmask"
+        and normalize_device_name(resolved_device) == "cpu"
+    )
 
     def process_window(window: tuple[int, int, int, int]) -> tuple[tuple[int, int, int, int], Any]:
         row_start, row_stop, col_start, col_stop = window
@@ -720,9 +738,13 @@ def _run_cloud_inference_tiled(
                         "progress": round(tile_index / max(1, total_tiles), 4),
                     },
                 )
+            if should_trim_memory and (tile_index == total_tiles or tile_index % 4 == 0):
+                gc.collect()
     finally:
         if tile_workers > 1 and len(windows) > 1:
             executor.shutdown(wait=True)
+        if should_trim_memory:
+            gc.collect()
 
     total_pixels = max(1, valid_pixels_total or total_pixels)
     cloud_fraction = float(cloud_pixels / total_pixels)
@@ -875,10 +897,18 @@ def _effective_cloud_backend_request(*, backend: str | None, inference_device: s
     return requested
 
 
-def _cloud_tile_size(*, backend_name: str | None = None) -> int:
+def _cloud_tile_size(*, backend_name: str | None = None, device: str | None = None) -> int:
     raw = str(os.getenv("NIMBUS_CLOUDMASK_TILE_SIZE") or "").strip()
     try:
-        value = int(raw) if raw else 1024
+        if raw:
+            value = int(raw)
+        else:
+            normalized_backend = str(backend_name or "").strip().lower()
+            normalized_device = normalize_device_name(device)
+            if normalized_backend == "omnicloudmask" and normalized_device not in {"cuda", "mps"}:
+                value = 512
+            else:
+                value = 1024
     except ValueError:
         value = 1024
     return max(256, min(value, 2048))

@@ -70,6 +70,14 @@ def worker_status(
     return JSONResponse(status_code=200, content=payload)
 
 
+@router.get("/worker/download-coordinator")
+def download_coordinator_status(
+    fetcher: NimbusFetcher = Depends(get_fetcher),
+) -> JSONResponse:
+    payload = fetcher.get_download_coordinator_status()
+    return JSONResponse(status_code=200, content=payload)
+
+
 def _health_payload(
     *,
     settings: Settings,

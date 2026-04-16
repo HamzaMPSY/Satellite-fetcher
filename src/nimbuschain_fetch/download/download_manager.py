@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import re
 from pathlib import Path
+import threading
 from time import monotonic
 from typing import Any, Callable
 from urllib.parse import unquote
@@ -45,6 +46,7 @@ class DownloadManager:
         progress_callback: ProgressCallback | None = None,
         cancel_checker: CancelChecker | None = None,
         retry_callback: RetryCallback | None = None,
+        bandwidth_limiter: Any | None = None,
     ):
         self.max_concurrent = max(1, int(max_concurrent))
         self.max_retries = max(1, int(max_retries))
@@ -65,6 +67,7 @@ class DownloadManager:
         self.progress_callback = progress_callback
         self.cancel_checker = cancel_checker
         self.retry_callback = retry_callback
+        self.bandwidth_limiter = bandwidth_limiter
 
     def download_products(self, product_ids: dict, output_dir: str = "downloads") -> list[str]:
         urls: list[str] = product_ids.get("urls", [])
@@ -81,12 +84,33 @@ class DownloadManager:
         output_path.mkdir(parents=True, exist_ok=True)
 
         try:
-            running_loop = asyncio.get_running_loop()
-            return asyncio.run_coroutine_threadsafe(
-                self._download_all(product_ids, output_path), running_loop
-            ).result()
+            asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(self._download_all(product_ids, output_path))
+        return self._run_coroutine_in_thread(self._download_all(product_ids, output_path))
+
+    @staticmethod
+    def _run_coroutine_in_thread(coro: Any) -> Any:
+        result: list[Any] = []
+        error: list[BaseException] = []
+
+        def _runner() -> None:
+            try:
+                result.append(asyncio.run(coro))
+            except BaseException as exc:  # pragma: no cover - forwarded to caller
+                error.append(exc)
+
+        thread = threading.Thread(
+            target=_runner,
+            name="nimbus-download-manager",
+            daemon=True,
+        )
+        thread.start()
+        thread.join()
+
+        if error:
+            raise error[0]
+        return result[0]
 
     async def _download_all(self, product_ids: dict, output_dir: Path) -> list[str]:
         timeout = aiohttp.ClientTimeout(
@@ -350,6 +374,8 @@ class DownloadManager:
                         raise DownloadCancelled("Download cancelled while streaming file.")
                     if not chunk:
                         continue
+                    if self.bandwidth_limiter is not None:
+                        await self.bandwidth_limiter.acquire(len(chunk))
                     handle.write(chunk)
                     downloaded += len(chunk)
                     if self.progress_callback:

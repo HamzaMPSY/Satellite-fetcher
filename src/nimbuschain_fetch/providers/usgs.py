@@ -208,9 +208,24 @@ class UsgsProvider(ProviderBase):
 
         return product_ids
 
-    def download_products(self, product_ids: list[str], output_dir: str) -> list[str]:
-        if not product_ids:
+    @staticmethod
+    def _available_downloads_from_request_result(request_result: Any) -> list[dict[str, Any]]:
+        if not isinstance(request_result, dict):
             return []
+        available = request_result.get("availableDownloads", [])
+        return [dict(item) for item in list(available or []) if isinstance(item, dict)]
+
+    @staticmethod
+    def _pending_downloads_from_request_result(request_result: Any) -> list[dict[str, Any]]:
+        if not isinstance(request_result, dict):
+            return []
+        pending: list[dict[str, Any]] = []
+        for key in ("preparingDownloads", "requestedDownloads", "duplicateDownloads"):
+            items = request_result.get(key, [])
+            pending.extend(dict(item) for item in list(items or []) if isinstance(item, dict))
+        return pending
+
+    def _resolve_bundle_downloads(self, product_ids: list[str]) -> list[dict[str, Any]]:
         if not self.dataset:
             raise RuntimeError("USGS dataset is not set. Call search_products first.")
         permission_hint = self._permission_hint()
@@ -231,7 +246,101 @@ class UsgsProvider(ProviderBase):
                 continue
             if item.get("entityId") and item.get("id"):
                 downloads.append({"entityId": item["entityId"], "productId": item["id"]})
+        return downloads
 
+    def _preferred_download_name(
+        self,
+        *,
+        entity_id: str,
+        url: str,
+        fallback_index: int = 0,
+    ) -> str:
+        preferred_name = self.scene_names.get(entity_id) or f"usgs_{self.dataset}_{fallback_index}"
+        path_name = Path(unquote(urlparse(url).path)).name.strip()
+        suffixes = "".join(Path(path_name).suffixes) if path_name else ""
+        if suffixes and "." not in Path(preferred_name).name:
+            return f"{preferred_name}{suffixes}"
+        if path_name and "." in path_name:
+            return path_name
+        return preferred_name
+
+    def prepare_download_product(self, entity_id: str) -> dict[str, Any]:
+        downloads = self._resolve_bundle_downloads([entity_id])
+        if not downloads:
+            return {
+                "status": "failed",
+                "entity_id": str(entity_id),
+                "reason": "No downloadable bundle is currently available for this scene.",
+            }
+
+        label = datetime.utcnow().strftime("dl_%Y%m%d_%H%M%S")
+        request_payload = {"downloads": downloads, "label": label}
+        request_result = self._send_request("download-request", request_payload)
+
+        available = self._available_downloads_from_request_result(request_result)
+        for index, item in enumerate(available):
+            current_entity_id = str(item.get("entityId") or "").strip()
+            if current_entity_id != str(entity_id).strip():
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            return {
+                "status": "ready",
+                "entity_id": current_entity_id,
+                "url": url,
+                "file_name": self._preferred_download_name(
+                    entity_id=current_entity_id,
+                    url=url,
+                    fallback_index=index,
+                ),
+            }
+
+        pending = self._pending_downloads_from_request_result(request_result)
+        if pending:
+            return {
+                "status": "preparing",
+                "entity_id": str(entity_id),
+                "retry_after_seconds": 30.0,
+                "reason": "USGS download is still being prepared.",
+            }
+
+        return {
+            "status": "preparing",
+            "entity_id": str(entity_id),
+            "retry_after_seconds": 30.0,
+            "reason": "USGS did not return an immediately available download URL.",
+        }
+
+    def download_prepared_product(self, prepared: dict[str, Any], output_dir: str) -> list[str]:
+        url = str(prepared.get("url") or "").strip()
+        if not url:
+            raise RuntimeError("Prepared USGS download is missing URL.")
+        entity_id = str(prepared.get("entity_id") or "").strip()
+        file_name = str(prepared.get("file_name") or "").strip() or self._preferred_download_name(
+            entity_id=entity_id,
+            url=url,
+        )
+        payload = {
+            "headers": {},
+            "urls": [url],
+            "file_names": [file_name],
+            "contexts": [
+                {
+                    "account_label": "primary",
+                    "product_id": entity_id,
+                    "file_name": file_name,
+                    "provider": "usgs",
+                }
+            ],
+            "refresh_token_callback": self.get_access_token,
+        }
+        return self.download_manager.download_products(payload, output_dir=output_dir)
+
+    def download_products(self, product_ids: list[str], output_dir: str) -> list[str]:
+        if not product_ids:
+            return []
+        downloads = self._resolve_bundle_downloads(product_ids)
         if not downloads:
             return []
 
@@ -239,33 +348,36 @@ class UsgsProvider(ProviderBase):
         request_payload = {"downloads": downloads, "label": label}
         request_result = self._send_request("download-request", request_payload)
 
-        available = (
-            request_result.get("availableDownloads", []) if isinstance(request_result, dict) else []
-        )
+        available = self._available_downloads_from_request_result(request_result)
         urls: list[str] = []
         file_names: list[str] = []
+        contexts: list[dict[str, Any]] = []
         for idx, item in enumerate(available):
-            url = item.get("url")
+            url = str(item.get("url") or "").strip()
             if not url:
                 continue
-            urls.append(str(url))
-
             entity_id = str(item.get("entityId") or "").strip()
-            preferred_name = self.scene_names.get(entity_id) or f"usgs_{self.dataset}_{idx}"
-
-            path_name = Path(unquote(urlparse(url).path)).name.strip()
-            suffixes = "".join(Path(path_name).suffixes) if path_name else ""
-            if suffixes and "." not in Path(preferred_name).name:
-                file_names.append(f"{preferred_name}{suffixes}")
-            elif path_name and "." in path_name:
-                file_names.append(path_name)
-            else:
-                file_names.append(preferred_name)
+            resolved_name = self._preferred_download_name(
+                entity_id=entity_id,
+                url=url,
+                fallback_index=idx,
+            )
+            urls.append(url)
+            file_names.append(resolved_name)
+            contexts.append(
+                {
+                    "account_label": "primary",
+                    "product_id": entity_id,
+                    "file_name": resolved_name,
+                    "provider": "usgs",
+                }
+            )
 
         payload = {
             "headers": {},
             "urls": urls,
             "file_names": file_names,
+            "contexts": contexts,
             "refresh_token_callback": self.get_access_token,
         }
         return self.download_manager.download_products(payload, output_dir=output_dir)

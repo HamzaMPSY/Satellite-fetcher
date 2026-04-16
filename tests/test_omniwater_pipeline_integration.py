@@ -530,3 +530,56 @@ def test_manual_omniwater_uses_internal_ndwi_fallback_when_module_is_missing(
     assert Path(str(result["output_zarr_uri"])).exists()
     masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
     assert "masks" in masked_group and "water_probability" in masked_group["masks"]
+
+
+def test_manual_omniwater_uses_heuristic_fail_open_when_mps_model_runtime_is_unstable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = types.ModuleType("omniwatermask")
+    module.__version__ = "test"
+
+    def make_water_mask(*, scene_paths, band_order, output_dir, **_kwargs):
+        raise RuntimeError(
+            "Sizes of tensors must match except in dimension 1. Expected size 2 but got size 1 for tensor number 1 in the list."
+        )
+
+    module.make_water_mask = make_water_mask
+    monkeypatch.setitem(sys.modules, "omniwatermask", module)
+    monkeypatch.setenv("NIMBUS_WATERMASK_TILE_SIZE", "3")
+    monkeypatch.setattr(
+        "nimbuschain_mask_service.omniwater.resolve_inference_device",
+        lambda **kwargs: "mps",
+    )
+
+    scene_id = "S2A_MSIL1C_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
+    raw_root = _build_s2_bundle(tmp_path / "raw", scene_id=scene_id)
+    output_uri = str((tmp_path / "out" / "fallback_mps.zarr").resolve())
+
+    written_uri, _family, _summary, dataset_summary = ZarrConversionService().convert(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        scene_id=scene_id,
+        raw_uri=str(raw_root),
+        output_uri=output_uri,
+        product_type="S2MSI1C",
+    )
+
+    result = MaskService().apply_omniwater_to_zarr(
+        zarr_uri=written_uri,
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI1C",
+        scene_id=scene_id,
+        acquisition_datetime=dataset_summary.get("acquisition_datetime"),
+        dataset_summary=dataset_summary,
+        inference_device="mps",
+    )
+
+    assert result["status"] == "written"
+    assert result["runtime_mode"] == "heuristic_fallback"
+    assert "MPS" in str(result["runtime_warning"])
+    assert result["model_attempt_count"] >= 1
+    masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
+    assert masked_group.attrs["water_mask_status"] == "written"
+    assert "water_probability" in masked_group["masks"]

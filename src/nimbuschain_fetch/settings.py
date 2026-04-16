@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Runtime settings loaded from environment variables."""
+
+    _explicit_setting_names: set[str] = PrivateAttr(default_factory=set)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -66,6 +69,38 @@ class Settings(BaseSettings):
     nimbus_provider_limits: str = Field(
         default="copernicus=2,usgs=4", alias="NIMBUS_PROVIDER_LIMITS"
     )
+    nimbus_provider_job_limits: str | None = Field(
+        default=None,
+        alias="NIMBUS_PROVIDER_JOB_LIMITS",
+    )
+    nimbus_provider_control_plane_limits: str | None = Field(
+        default=None,
+        alias="NIMBUS_PROVIDER_CONTROL_PLANE_LIMITS",
+    )
+    nimbus_provider_data_plane_limits: str | None = Field(
+        default=None,
+        alias="NIMBUS_PROVIDER_DATA_PLANE_LIMITS",
+    )
+    nimbus_download_global_limit: int = Field(
+        default=8,
+        alias="NIMBUS_DOWNLOAD_GLOBAL_LIMIT",
+        ge=1,
+        le=256,
+    )
+    nimbus_download_min_free_bytes: int = Field(
+        default=0,
+        alias="NIMBUS_DOWNLOAD_MIN_FREE_BYTES",
+        ge=0,
+    )
+    nimbus_download_global_max_bps: int | None = Field(
+        default=None,
+        alias="NIMBUS_DOWNLOAD_GLOBAL_MAX_BPS",
+        ge=1,
+    )
+    nimbus_download_coordinator_db_path: Path | None = Field(
+        default=None,
+        alias="NIMBUS_DOWNLOAD_COORDINATOR_DB_PATH",
+    )
 
     nimbus_copernicus_base_url: str = Field(
         default="https://catalogue.dataspace.copernicus.eu", alias="NIMBUS_COPERNICUS_BASE_URL"
@@ -108,6 +143,15 @@ class Settings(BaseSettings):
     nimbus_usgs_username: str | None = Field(default=None, alias="NIMBUS_USGS_USERNAME")
     nimbus_usgs_token: str | None = Field(default=None, alias="NIMBUS_USGS_TOKEN")
 
+    def __init__(self, **values: Any):
+        explicit_names: set[str] = set()
+        for field_name, field_info in type(self).model_fields.items():
+            alias = field_info.alias or field_name
+            if field_name in values or alias in values:
+                explicit_names.add(field_name)
+        super().__init__(**values)
+        self._explicit_setting_names = explicit_names
+
     @field_validator(
         "nimbus_copernicus_base_url",
         "nimbus_copernicus_token_url",
@@ -144,27 +188,84 @@ class Settings(BaseSettings):
             return []
         return [item.strip() for item in self.nimbus_cors_origins.split(",") if item.strip()]
 
-    @property
-    def provider_limits_map(self) -> dict[str, int]:
-        parsed: dict[str, int] = {"copernicus": 2, "usgs": 4}
-        raw = (self.nimbus_provider_limits or "").strip()
-        if not raw:
+    @staticmethod
+    def _parse_provider_limit_string(
+        raw: str | None,
+        *,
+        defaults: dict[str, int],
+    ) -> dict[str, int]:
+        parsed: dict[str, int] = {
+            str(name).strip().lower(): max(1, int(value))
+            for name, value in defaults.items()
+            if str(name).strip()
+        }
+        value = str(raw or "").strip()
+        if not value:
             return parsed
 
-        for chunk in raw.split(","):
+        for chunk in value.split(","):
             item = chunk.strip()
             if not item or "=" not in item:
                 continue
-            name, value = item.split("=", 1)
+            name, limit = item.split("=", 1)
             key = name.strip().lower()
             if not key:
                 continue
             try:
-                val = int(value.strip())
+                parsed[key] = max(1, int(limit.strip()))
             except ValueError:
                 continue
-            parsed[key] = max(1, val)
         return parsed
+
+    def _setting_is_explicit(self, field_name: str) -> bool:
+        if field_name in self._explicit_setting_names:
+            return True
+        field_info = type(self).model_fields.get(field_name)
+        alias = field_info.alias if field_info is not None else None
+        return bool(alias and alias in os.environ)
+
+    @property
+    def provider_limits_map(self) -> dict[str, int]:
+        return self.provider_job_limits_map
+
+    @property
+    def provider_job_limits_map(self) -> dict[str, int]:
+        raw: str | None = None
+        if self._setting_is_explicit("nimbus_provider_job_limits"):
+            raw = self.nimbus_provider_job_limits
+        elif self._setting_is_explicit("nimbus_provider_limits"):
+            raw = self.nimbus_provider_limits
+        return self._parse_provider_limit_string(
+            raw,
+            defaults={"copernicus": 2, "usgs": 4},
+        )
+
+    @property
+    def provider_control_plane_limits_map(self) -> dict[str, int]:
+        raw: str | None = None
+        if self._setting_is_explicit("nimbus_provider_control_plane_limits"):
+            raw = self.nimbus_provider_control_plane_limits
+        elif self._setting_is_explicit("nimbus_provider_limits"):
+            raw = self.nimbus_provider_limits
+        return self._parse_provider_limit_string(
+            raw,
+            defaults={"copernicus": 2, "usgs": 1},
+        )
+
+    @property
+    def provider_data_plane_limits_map(self) -> dict[str, int]:
+        raw = self.nimbus_provider_data_plane_limits if self._setting_is_explicit("nimbus_provider_data_plane_limits") else None
+        return self._parse_provider_limit_string(
+            raw,
+            defaults={"copernicus": 32, "usgs": 6},
+        )
+
+    @property
+    def download_coordinator_db_path(self) -> Path:
+        configured = self.nimbus_download_coordinator_db_path
+        if configured is not None:
+            return configured
+        return self.nimbus_data_dir / "download_coordinator.db"
 
     @property
     def runtime_role(self) -> str:
@@ -262,6 +363,7 @@ class Settings(BaseSettings):
         self.nimbus_data_dir.mkdir(parents=True, exist_ok=True)
         if self.nimbus_db_backend.strip().lower() == "sqlite":
             self.nimbus_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.download_coordinator_db_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache

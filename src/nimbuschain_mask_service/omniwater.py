@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -41,6 +42,8 @@ _S2_INPUT_BANDS = ["B04", "B03", "B02", "B08"]
 _LANDSAT_L1_INPUT_BANDS = ["B4", "B3", "B2", "B5"]
 _LANDSAT_L2_INPUT_BANDS = ["SR_B4", "SR_B3", "SR_B2", "SR_B5"]
 
+_LOGGER = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class OmniWaterPlan:
@@ -60,6 +63,15 @@ class OmniWaterTile:
     row_stop: int
     col_start: int
     col_stop: int
+
+
+@dataclass(frozen=True)
+class OmniWaterModelProfile:
+    name: str
+    batch_size: int
+    inference_patch_size: int
+    inference_overlap_size: int
+    optimise_model: bool
 
 
 def omniwater_support_status() -> dict[str, Any]:
@@ -137,6 +149,7 @@ def apply_omniwatermask_to_zarr(
             make_water_mask = None
 
     target_root: Any | None = None
+    runtime_warning = ""
 
     try:
         prepared_output_zarr_uri = (
@@ -180,7 +193,7 @@ def apply_omniwatermask_to_zarr(
                 )
                 tile_paths = [tile.path for tile in tile_manifest["tiles"]]
                 try:
-                    mask_output = _run_omniwater_model(
+                    mask_output, model_runtime = _run_omniwater_model(
                         make_water_mask=make_water_mask,
                         scene_paths=tile_paths,
                         output_dir=output_dir,
@@ -204,11 +217,19 @@ def apply_omniwatermask_to_zarr(
                         sensor=plan.sensor,
                         input_bands=tuple(plan.input_bands),
                     )
+                    runtime_summary.update(
+                        {
+                            "model_profile": str(model_runtime.get("profile") or ""),
+                            "model_attempt_count": int(model_runtime.get("attempt_count") or 0),
+                            "model_attempts": list(model_runtime.get("attempts") or []),
+                        }
+                    )
                     runtime_mode = "model"
                     input_bands = list(plan.input_bands)
                 except Exception as exc:
-                    if not _is_legacy_model_dependency_error(exc):
+                    if not _should_fail_open_model_runtime(exc=exc, device=resolved_device):
                         raise
+                    runtime_warning = _format_model_runtime_warning(exc=exc, device=resolved_device)
                     water_arr, water_prob_arr = prepare_water_output_arrays(target_root, overwrite=True)
                     runtime_summary = _run_water_fallback_tiled(
                         zarr_uri=prepared_output_zarr_uri,
@@ -221,6 +242,21 @@ def apply_omniwatermask_to_zarr(
                         source_zarr_uri=source_lineage_uri,
                         target_zarr_uri=prepared_output_zarr_uri,
                         scene_id=scene_id,
+                    )
+                    attempt_summaries = _model_attempt_summaries(exc)
+                    runtime_summary.update(
+                        {
+                            "model_profile": "",
+                            "model_attempt_count": len(attempt_summaries),
+                            "model_attempts": attempt_summaries,
+                            "runtime_warning": runtime_warning,
+                            "model_error": str(exc),
+                            "fallback_trigger": (
+                                "legacy_dependency"
+                                if _is_legacy_model_dependency_error(exc)
+                                else "mps_fail_open"
+                            ),
+                        }
                     )
                     runtime_mode = "heuristic_fallback"
                     input_bands = list(plan.fallback_bands)
@@ -264,6 +300,11 @@ def apply_omniwatermask_to_zarr(
                 "threshold_used": runtime_summary.get("threshold_used"),
                 "sensor_recipe": str(plan.sensor.sensor_key if plan.sensor is not None else "unknown"),
                 "probability_source": str(runtime_summary.get("probability_source") or "water_score"),
+                "model_profile": str(runtime_summary.get("model_profile") or ""),
+                "model_attempt_count": int(runtime_summary.get("model_attempt_count") or 0),
+                "model_attempts": list(runtime_summary.get("model_attempts") or []),
+                "runtime_warning": str(runtime_summary.get("runtime_warning") or runtime_warning),
+                "fallback_trigger": str(runtime_summary.get("fallback_trigger") or ""),
             },
             water_fraction=float(runtime_summary.get("water_fraction") or 0.0),
             water_arr=water_arr,
@@ -306,6 +347,9 @@ def apply_omniwatermask_to_zarr(
             "water_fraction": float(runtime_summary.get("water_fraction") or 0.0),
             "probability_source": str(runtime_summary.get("probability_source") or "water_score"),
             "cloud_blocked_fraction": float(runtime_summary.get("cloud_blocked_fraction") or 0.0),
+            "runtime_warning": str(runtime_summary.get("runtime_warning") or runtime_warning),
+            "model_profile": str(runtime_summary.get("model_profile") or ""),
+            "model_attempt_count": int(runtime_summary.get("model_attempt_count") or 0),
         }
         _sync_zarr_mask_attrs(zarr_uri=prepared_output_zarr_uri, payload=payload)
         if stage_callback is not None:
@@ -599,31 +643,11 @@ def _run_omniwater_model(
     scene_dir: Path,
     tile_size: int,
     inference_device: str | None,
-) -> Any:
+) -> tuple[Any, dict[str, Any]]:
     device = resolve_inference_device(
         explicit=inference_device,
         env_var="NIMBUS_WATERMASK_DEVICE",
     )
-    kwargs: dict[str, Any] = {
-        "scene_paths": scene_paths,
-        "band_order": [1, 2, 3, 4],
-        "output_dir": output_dir,
-        "overwrite": True,
-        "cache_dir": cache_dir,
-        "batch_size": batch_size_for_device(
-            device=device,
-            env_var="NIMBUS_WATERMASK_BATCH_SIZE",
-            cpu_default=1,
-            gpu_default=2,
-            hard_limit=8,
-        ),
-        "mosaic_device": device,
-        "inference_device": device,
-        "inference_patch_size": min(_watermask_inference_patch_size(), tile_size),
-        "inference_overlap_size": min(_watermask_inference_overlap_size(), max(0, tile_size - 1)),
-        "destination_model_dir": _watermask_model_dir(scene_dir),
-        "model_download_source": "hugging_face",
-    }
     signature = getattr(make_water_mask, "__signature__", None)
     inspect_module = None
     if signature is None:
@@ -648,19 +672,67 @@ def _run_omniwater_model(
             getattr(parameter, "kind", None) == inspect_module.Parameter.VAR_KEYWORD
             for parameter in signature.parameters.values()
         )
-    optional_kwargs = {
-        "use_cache": False,
-        "use_osm_water": _bool_env("NIMBUS_WATERMASK_USE_OSM_WATER", default=True),
-        "use_osm_building": _bool_env("NIMBUS_WATERMASK_USE_OSM_BUILDING", default=True),
-        "use_osm_roads": _bool_env("NIMBUS_WATERMASK_USE_OSM_ROADS", default=True),
-        "optimise_model": normalize_device_name(device) in {"cuda", "mps"},
-        "use_model": True,
-        "use_ndwi": True,
-    }
-    for key, value in optional_kwargs.items():
-        if accepts_var_kwargs or not accepted or key in accepted:
-            kwargs[key] = value
-    return make_water_mask(**kwargs)
+    normalized_device = normalize_device_name(device)
+    attempt_summaries: list[dict[str, Any]] = []
+    last_exc: Exception | None = None
+    for profile in _omniwater_model_profiles(device=device, tile_size=tile_size):
+        kwargs: dict[str, Any] = {
+            "scene_paths": scene_paths,
+            "band_order": [1, 2, 3, 4],
+            "output_dir": output_dir,
+            "overwrite": True,
+            "cache_dir": cache_dir,
+            "batch_size": int(profile.batch_size),
+            "mosaic_device": device,
+            "inference_device": device,
+            "inference_patch_size": int(profile.inference_patch_size),
+            "inference_overlap_size": int(profile.inference_overlap_size),
+            "destination_model_dir": _watermask_model_dir(scene_dir),
+            "model_download_source": "hugging_face",
+        }
+        optional_kwargs = {
+            "use_cache": False,
+            "use_osm_water": _bool_env("NIMBUS_WATERMASK_USE_OSM_WATER", default=True),
+            "use_osm_building": _bool_env("NIMBUS_WATERMASK_USE_OSM_BUILDING", default=True),
+            "use_osm_roads": _bool_env("NIMBUS_WATERMASK_USE_OSM_ROADS", default=True),
+            "optimise_model": bool(profile.optimise_model),
+            "use_model": True,
+            "use_ndwi": True,
+        }
+        for key, value in optional_kwargs.items():
+            if accepts_var_kwargs or not accepted or key in accepted:
+                kwargs[key] = value
+        attempt_summaries.append(
+            {
+                "profile": profile.name,
+                "device": normalized_device,
+                "batch_size": int(profile.batch_size),
+                "inference_patch_size": int(profile.inference_patch_size),
+                "inference_overlap_size": int(profile.inference_overlap_size),
+                "optimise_model": bool(profile.optimise_model),
+            }
+        )
+        try:
+            result = make_water_mask(**kwargs)
+            return result, {
+                "device": normalized_device,
+                "profile": profile.name,
+                "attempt_count": len(attempt_summaries),
+                "attempts": [dict(item) for item in attempt_summaries],
+            }
+        except Exception as exc:
+            last_exc = exc
+            setattr(last_exc, "nimbus_attempts", [dict(item) for item in attempt_summaries])
+            _LOGGER.warning(
+                "OmniWater model attempt '%s' failed on device '%s' for %d tile(s): %s",
+                profile.name,
+                normalized_device,
+                len(scene_paths),
+                exc,
+            )
+    if last_exc is None:
+        raise ConversionError("OmniWaterMask did not produce a model execution attempt.")
+    raise last_exc
 
 
 def _bool_env(name: str, *, default: bool) -> bool:
@@ -1323,6 +1395,38 @@ def _is_legacy_model_dependency_error(exc: Exception) -> bool:
     )
 
 
+def _should_fail_open_model_runtime(*, exc: Exception, device: str | None) -> bool:
+    if _is_legacy_model_dependency_error(exc):
+        return True
+    return normalize_device_name(device) == "mps" and _watermask_mps_fail_open()
+
+
+def _format_model_runtime_warning(*, exc: Exception, device: str | None) -> str:
+    normalized_device = normalize_device_name(device)
+    reason = str(exc).strip()
+    if normalized_device == "mps":
+        return (
+            "OmniWater model runtime failed on MPS; Nimbus switched this scene to the tiled "
+            f"heuristic fallback to keep the pipeline running ({reason})."
+        )
+    return (
+        "OmniWater model runtime fell back to the tiled heuristic water mask "
+        f"({reason})."
+    )
+
+
+def _model_attempt_summaries(exc: Exception) -> list[dict[str, Any]]:
+    raw = getattr(exc, "nimbus_attempts", None)
+    if not isinstance(raw, list):
+        return []
+    summaries: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        summaries.append(dict(item))
+    return summaries
+
+
 def _watermask_tile_size() -> int:
     raw = str(os.getenv("NIMBUS_WATERMASK_TILE_SIZE") or "").strip()
     try:
@@ -1339,6 +1443,58 @@ def _watermask_runtime_mode(explicit: str | None = None) -> str:
     if _omniwater_module_available():
         return "model"
     return "fallback"
+
+
+def _watermask_mps_safe_mode() -> bool:
+    return _bool_env("NIMBUS_WATERMASK_MPS_SAFE_MODE", default=True)
+
+
+def _watermask_mps_fail_open() -> bool:
+    return _bool_env("NIMBUS_WATERMASK_MPS_FAIL_OPEN", default=True)
+
+
+def _omniwater_model_profiles(*, device: str | None, tile_size: int) -> list[OmniWaterModelProfile]:
+    normalized_device = normalize_device_name(device)
+    requested_batch_size = batch_size_for_device(
+        device=device,
+        env_var="NIMBUS_WATERMASK_BATCH_SIZE",
+        cpu_default=1,
+        gpu_default=2,
+        hard_limit=8,
+    )
+    base_patch_size = min(_watermask_inference_patch_size(), tile_size)
+    base_overlap_size = min(_watermask_inference_overlap_size(), max(0, tile_size - 1))
+    if normalized_device == "mps":
+        safe_mode = _watermask_mps_safe_mode()
+        primary = OmniWaterModelProfile(
+            name="mps_safe",
+            batch_size=1 if safe_mode else requested_batch_size,
+            inference_patch_size=base_patch_size,
+            inference_overlap_size=base_overlap_size,
+            optimise_model=False if safe_mode else True,
+        )
+        profiles = [primary]
+        compact_patch_size = min(base_patch_size, 256)
+        compact_overlap_size = min(base_overlap_size, max(0, min(64, compact_patch_size // 4)))
+        compact = OmniWaterModelProfile(
+            name="mps_compact_retry",
+            batch_size=1,
+            inference_patch_size=compact_patch_size,
+            inference_overlap_size=compact_overlap_size,
+            optimise_model=False,
+        )
+        if compact != primary:
+            profiles.append(compact)
+        return profiles
+    return [
+        OmniWaterModelProfile(
+            name=f"{normalized_device or 'cpu'}_default",
+            batch_size=requested_batch_size,
+            inference_patch_size=base_patch_size,
+            inference_overlap_size=base_overlap_size,
+            optimise_model=normalized_device == "cuda",
+        )
+    ]
 
 
 def _omniwater_module_available() -> bool:

@@ -47,8 +47,9 @@ def test_parallel_worker_count_uses_gpu_safe_default(monkeypatch) -> None:
 
 def test_omnicloudmask_tile_size_defaults_are_stable(monkeypatch) -> None:
     monkeypatch.delenv("NIMBUS_CLOUDMASK_TILE_SIZE", raising=False)
-    assert _cloud_tile_size(backend_name="omnicloudmask") == 1024
-    assert _cloud_tile_size(backend_name="heuristic") == 1024
+    assert _cloud_tile_size(backend_name="omnicloudmask", device="cpu") == 512
+    assert _cloud_tile_size(backend_name="omnicloudmask", device="mps") == 1024
+    assert _cloud_tile_size(backend_name="heuristic", device="cpu") == 1024
 
 
 def test_auto_cloud_backend_always_uses_omnicloudmask(monkeypatch) -> None:
@@ -152,6 +153,7 @@ def test_omniwater_model_enables_osm_priors_by_default(monkeypatch) -> None:
     monkeypatch.delenv("NIMBUS_WATERMASK_USE_OSM_WATER", raising=False)
     monkeypatch.delenv("NIMBUS_WATERMASK_USE_OSM_BUILDING", raising=False)
     monkeypatch.delenv("NIMBUS_WATERMASK_USE_OSM_ROADS", raising=False)
+    monkeypatch.setenv("NIMBUS_WATERMASK_BATCH_SIZE", "2")
     monkeypatch.setattr(omniwater_module, "resolve_inference_device", lambda **kwargs: "mps")
 
     _run_omniwater_model(
@@ -167,4 +169,42 @@ def test_omniwater_model_enables_osm_priors_by_default(monkeypatch) -> None:
     assert captured["use_osm_water"] is True
     assert captured["use_osm_building"] is True
     assert captured["use_osm_roads"] is True
-    assert captured["optimise_model"] is True
+    assert captured["batch_size"] == 1
+    assert captured["optimise_model"] is False
+
+
+def test_omniwater_model_retries_with_compact_mps_profile(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def flaky_make_water_mask(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise RuntimeError(
+                "Sizes of tensors must match except in dimension 1. Expected size 2 but got size 1."
+            )
+        return {"status": "ok"}
+
+    monkeypatch.delenv("NIMBUS_WATERMASK_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("NIMBUS_WATERMASK_MPS_SAFE_MODE", raising=False)
+    monkeypatch.setenv("NIMBUS_WATERMASK_INFERENCE_PATCH_SIZE", "512")
+    monkeypatch.setenv("NIMBUS_WATERMASK_INFERENCE_OVERLAP_SIZE", "128")
+    monkeypatch.setattr(omniwater_module, "resolve_inference_device", lambda **kwargs: "mps")
+
+    result, runtime = _run_omniwater_model(
+        make_water_mask=flaky_make_water_mask,
+        scene_dir=Path("/tmp/scene"),
+        scene_paths=[Path("/tmp/scene/tile.tif")],
+        output_dir=Path("/tmp/out"),
+        cache_dir=Path("/tmp/cache"),
+        tile_size=1024,
+        inference_device=None,
+    )
+
+    assert result == {"status": "ok"}
+    assert runtime["attempt_count"] == 2
+    assert calls[0]["batch_size"] == 1
+    assert calls[0]["optimise_model"] is False
+    assert calls[1]["batch_size"] == 1
+    assert calls[1]["optimise_model"] is False
+    assert calls[1]["inference_patch_size"] == 256
+    assert calls[1]["inference_overlap_size"] == 64
