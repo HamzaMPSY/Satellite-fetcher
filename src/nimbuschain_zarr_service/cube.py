@@ -23,6 +23,14 @@ from nimbuschain_zarr_service.schema import ChunkShape, ZARR_FORMAT_VERSION
 
 
 @dataclass(frozen=True)
+class MaskLayer:
+    name: str
+    dtype: str
+    shape: tuple[int, int, int]
+    attrs: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class SourceScene:
     zarr_uri: str
     scene_id: str
@@ -46,6 +54,7 @@ class SourceScene:
     ancillary_shape: tuple[int, int, int, int] | None
     ancillary_layer_names: list[str]
     ancillary_attrs: dict[str, Any]
+    mask_layers: dict[str, MaskLayer]
 
 
 def build_time_cube(
@@ -53,6 +62,7 @@ def build_time_cube(
     output_uri: str,
     *,
     include_ancillary: bool = True,
+    include_masks: bool = False,
 ) -> dict[str, Any]:
     try:
         import zarr
@@ -68,7 +78,11 @@ def build_time_cube(
 
     scenes = [_load_source_scene(uri, include_ancillary=include_ancillary) for uri in source_zarr_uris]
     baseline = scenes[0]
-    ancillary_mode = _validate_scene_compatibility(scenes, include_ancillary=include_ancillary)
+    ancillary_mode, mask_layer_names = _validate_scene_compatibility(
+        scenes,
+        include_ancillary=include_ancillary,
+        include_masks=include_masks,
+    )
     ordered_scenes = sorted(scenes, key=lambda item: item.sort_key)
 
     source_count = len(ordered_scenes)
@@ -121,7 +135,6 @@ def build_time_cube(
     ancillary = None
     ancillary_layer_names: list[str] = []
     ancillary_dtype: np.dtype[Any] | None = None
-    ancillary_chunks: tuple[int, int, int, int] | None = None
     if ancillary_mode == "stack":
         ancillary_layer_names = list(baseline.ancillary_layer_names)
         ancillary_dtype = np.dtype(str(baseline.ancillary_dtype))
@@ -144,12 +157,43 @@ def build_time_cube(
             overwrite=True,
         )
 
+    masks_group = None
+    mask_arrays: dict[str, Any] = {}
+    if mask_layer_names:
+        masks_group = root.require_group("masks")
+        masks_group.attrs.update(
+            {
+                "dimensions": ["time", "y", "x"],
+                "mask_layer_names": list(mask_layer_names),
+            }
+        )
+        mask_chunks = (
+            min(chunk_spec.time, source_count),
+            min(chunk_spec.y, height),
+            min(chunk_spec.x, width),
+        )
+        for mask_name in mask_layer_names:
+            mask_spec = baseline.mask_layers[mask_name]
+            target = masks_group.create_array(
+                mask_name,
+                shape=(source_count, height, width),
+                chunks=mask_chunks,
+                dtype=np.dtype(mask_spec.dtype),
+                compressor=compressor,
+            )
+            target.attrs.update(_sanitize_mask_array_attrs(mask_spec.attrs))
+            mask_arrays[mask_name] = target
+
     for time_index, scene in enumerate(ordered_scenes):
         source_store = _open_existing_output_store(scene.zarr_uri)
         source_root = zarr.open_group(source_store, mode="r", zarr_format=2)
         imagery[time_index, :, :, :] = source_root["imagery"][0, :, :, :]
         if ancillary is not None:
             ancillary[time_index, :, :, :] = source_root["ancillary"][0, :, :, :]
+        if mask_arrays:
+            source_masks = source_root["masks"]
+            for mask_name, target in mask_arrays.items():
+                target[time_index, :, :] = source_masks[mask_name][0, :, :]
 
     imagery_metadata = _sanitize_layer_metadata(baseline.imagery_attrs)
     ancillary_metadata = _sanitize_layer_metadata(baseline.ancillary_attrs)
@@ -194,6 +238,19 @@ def build_time_cube(
             "the same ancillary schema."
         )
 
+    if mask_arrays:
+        root.attrs.update(
+            {
+                "mask_dimensions": ["time", "y", "x"],
+                "mask_layer_names": list(mask_layer_names),
+            }
+        )
+    elif include_masks:
+        root.attrs["masks_omitted_reason"] = (
+            "Mask layers were not written because the source stores do not all share "
+            "the same masks schema."
+        )
+
     quadkey_attrs = _build_quadkey_metadata(
         crs=baseline.crs,
         transform=baseline.transform,
@@ -230,6 +287,8 @@ def build_time_cube(
         "dimensions": ["time", "band", "y", "x"],
         "ancillary_written": ancillary is not None,
         "ancillary_layer_names": list(ancillary_layer_names),
+        "masks_written": bool(mask_arrays),
+        "mask_layer_names": list(mask_layer_names),
     }
     if quadkey_attrs:
         cube_summary.update(
@@ -248,6 +307,7 @@ def build_grouped_time_cubes(
     output_dir: str,
     *,
     include_ancillary: bool = True,
+    include_masks: bool | None = None,
     start_date: str | date | None = None,
     end_date: str | date | None = None,
     stage_label: str | None = None,
@@ -261,6 +321,8 @@ def build_grouped_time_cubes(
             "tiles_built": [],
             "tiles_skipped": [],
         }
+
+    resolved_include_masks = _include_masks_for_stage(stage_label) if include_masks is None else bool(include_masks)
 
     scenes = [_load_source_scene(uri, include_ancillary=include_ancillary) for uri in source_zarr_uris]
     start_bound = _coerce_date_only(start_date)
@@ -319,6 +381,7 @@ def build_grouped_time_cubes(
             [scene.zarr_uri for scene in unique_scenes],
             output_uri,
             include_ancillary=include_ancillary,
+            include_masks=resolved_include_masks,
         )
         cube_outputs.append(str(summary["zarr_uri"]))
         items.append(
@@ -391,6 +454,7 @@ def _load_source_scene(source_zarr_uri: str, *, include_ancillary: bool) -> Sour
     ancillary_shape: tuple[int, int, int, int] | None = None
     ancillary_layer_names: list[str] = []
     ancillary_attrs: dict[str, Any] = {}
+    mask_layers: dict[str, MaskLayer] = {}
     if include_ancillary and "ancillary" in group:
         ancillary = group["ancillary"]
         if len(ancillary.shape) != 4:
@@ -417,6 +481,32 @@ def _load_source_scene(source_zarr_uri: str, *, include_ancillary: bool) -> Sour
         ancillary_dtype = str(ancillary.dtype)
         ancillary_shape = tuple(int(value) for value in ancillary.shape)
         ancillary_attrs = dict(group.attrs.get("ancillary_metadata") or {})
+
+    if "masks" in group:
+        masks_group = group["masks"]
+        for mask_name in sorted(masks_group.array_keys()):
+            mask_array = masks_group[mask_name]
+            if len(mask_array.shape) != 3:
+                raise ConversionError(
+                    "Source mask arrays must use the (time, y, x) layout: "
+                    f"{source_zarr_uri}"
+                )
+            if int(mask_array.shape[0]) != 1:
+                raise ConversionError(
+                    "Cube v1 only supports source mask arrays with time=1: "
+                    f"{source_zarr_uri}"
+                )
+            if tuple(mask_array.shape[1:]) != tuple(imagery.shape[2:]):
+                raise ConversionError(
+                    "Source mask grid does not match source imagery grid: "
+                    f"{source_zarr_uri}"
+                )
+            mask_layers[mask_name] = MaskLayer(
+                name=mask_name,
+                dtype=str(mask_array.dtype),
+                shape=tuple(int(value) for value in mask_array.shape),
+                attrs=dict(mask_array.attrs),
+            )
 
     x_coords = np.asarray(group["x"][:]) if "x" in group else None
     y_coords = np.asarray(group["y"][:]) if "y" in group else None
@@ -445,6 +535,7 @@ def _load_source_scene(source_zarr_uri: str, *, include_ancillary: bool) -> Sour
         ancillary_shape=ancillary_shape,
         ancillary_layer_names=ancillary_layer_names,
         ancillary_attrs=ancillary_attrs,
+        mask_layers=mask_layers,
     )
 
 
@@ -452,9 +543,14 @@ def _validate_scene_compatibility(
     scenes: list[SourceScene],
     *,
     include_ancillary: bool,
-) -> str:
+    include_masks: bool,
+) -> tuple[str, list[str]]:
     baseline = scenes[0]
     ancillary_mode = "stack" if include_ancillary and baseline.ancillary_layer_names else "skip"
+    mask_layer_names = _validate_mask_compatibility(
+        scenes,
+        include_masks=include_masks,
+    )
 
     for scene in scenes[1:]:
         _ensure_same(scene.provider, baseline.provider, field_name="provider", scene=scene)
@@ -510,7 +606,47 @@ def _validate_scene_compatibility(
         elif include_ancillary and scene.ancillary_layer_names:
             ancillary_mode = "skip"
 
-    return ancillary_mode
+    return ancillary_mode, mask_layer_names
+
+
+def _validate_mask_compatibility(
+    scenes: list[SourceScene],
+    *,
+    include_masks: bool,
+) -> list[str]:
+    if not include_masks:
+        return []
+
+    baseline = scenes[0]
+    if not baseline.mask_layers:
+        raise ConversionError(
+            f"Cube requested masks, but source Zarr has no masks group: {baseline.zarr_uri}"
+        )
+
+    mask_layer_names = sorted(baseline.mask_layers)
+    for scene in scenes[1:]:
+        scene_mask_names = sorted(scene.mask_layers)
+        if scene_mask_names != mask_layer_names:
+            raise ConversionError(
+                "Source Zarr masks do not match the cube baseline: "
+                f"{scene.zarr_uri}"
+            )
+        for mask_name in mask_layer_names:
+            baseline_mask = baseline.mask_layers[mask_name]
+            scene_mask = scene.mask_layers[mask_name]
+            _ensure_same(
+                scene_mask.dtype,
+                baseline_mask.dtype,
+                field_name=f"masks/{mask_name}.dtype",
+                scene=scene,
+            )
+            _ensure_same(
+                scene_mask.shape[1:],
+                baseline_mask.shape[1:],
+                field_name=f"masks/{mask_name}.shape",
+                scene=scene,
+            )
+    return mask_layer_names
 
 
 def _ensure_same(expected: Any, actual: Any, *, field_name: str, scene: SourceScene) -> None:
@@ -589,6 +725,30 @@ def _sanitize_layer_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+def _sanitize_mask_array_attrs(attrs: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(attrs or {})
+    sanitized["dimensions"] = ["time", "y", "x"]
+    sanitized.pop("created_at", None)
+    sanitized.pop("written_at", None)
+    sanitized.pop("summary", None)
+
+    metadata = dict(sanitized.get("metadata") or {})
+    for key in [
+        "scene_id",
+        "input_zarr_uri",
+        "output_zarr_uri",
+        "artifact_uri",
+        "status_path",
+        "work_dir",
+    ]:
+        metadata.pop(key, None)
+    if metadata:
+        sanitized["metadata"] = metadata
+    else:
+        sanitized.pop("metadata", None)
+    return sanitized
+
+
 def _clean_optional_text(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
@@ -603,6 +763,10 @@ def _coerce_date_only(value: str | date | None) -> date | None:
     if not text:
         return None
     return _coerce_timestamp(text).date()
+
+
+def _include_masks_for_stage(stage_label: str | None) -> bool:
+    return str(stage_label or "").strip().lower() == "after_mask"
 
 
 def _scene_within_date_range(

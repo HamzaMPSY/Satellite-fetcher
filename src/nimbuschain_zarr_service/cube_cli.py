@@ -36,6 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write only imagery even if compatible ancillary layers exist.",
     )
     parser.add_argument(
+        "--include-masks",
+        action="store_true",
+        help="Also stack masks/* arrays when the source scene Zarrs contain a compatible masks schema.",
+    )
+    parser.add_argument(
         "--group-by-tile",
         action="store_true",
         help="Group source scene Zarrs by tile/path-row and build one cube per group.",
@@ -66,6 +71,7 @@ def run(args: argparse.Namespace) -> int:
             args.sources,
             args.output_dir,
             include_ancillary=not args.skip_ancillary,
+            include_masks=args.include_masks or str(args.stage_label or "").strip().lower() == "after_mask",
             start_date=args.start_date,
             end_date=args.end_date,
             stage_label=args.stage_label,
@@ -77,6 +83,7 @@ def run(args: argparse.Namespace) -> int:
             args.sources,
             args.output_uri,
             include_ancillary=not args.skip_ancillary,
+            include_masks=args.include_masks,
         )
     print(json.dumps(summary))
     return 0
