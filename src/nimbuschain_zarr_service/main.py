@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,8 @@ from nimbuschain_zarr_service.config_loader import (
     supported_collections,
     supported_product_types,
 )
+from nimbuschain_zarr_service.logging_config import configure_logging
+from nimbuschain_zarr_service.middleware import RequestTelemetryMiddleware
 from nimbuschain_zarr_service.oci_storage import oci_support_status
 from nimbuschain_zarr_service.sentinel1_raw import raw_support_status
 from nimbuschain_zarr_service.snap_runtime import snap_support_status
@@ -28,6 +31,12 @@ APP_VERSION = "0.1.0"
 DEFAULT_PORT = 8010
 _CONVERSION_SERVICE = ZarrConversionService()
 _REQUIRED_MODULES = ("numpy", "zarr", "xarray", "rasterio", "numcodecs")
+
+configure_logging(
+    level=str(os.getenv("NIMBUS_LOG_LEVEL") or "INFO"),
+    json_logs=str(os.getenv("NIMBUS_LOG_JSON") or "").strip().lower() in {"1", "true", "yes", "on"},
+)
+logger = logging.getLogger("nimbus.zarr")
 
 
 class ConvertRequest(BaseModel):
@@ -68,6 +77,7 @@ app = FastAPI(
         "into time/band/y/x datasets, and writes local Zarr stores."
     ),
 )
+app.add_middleware(RequestTelemetryMiddleware)
 
 
 @app.get("/")
@@ -157,7 +167,7 @@ def schema() -> dict[str, object]:
 
 
 @app.post("/convert", response_model=ConvertResponse)
-def convert(payload: ConvertRequest) -> ConvertResponse:
+def convert(payload: ConvertRequest, request: Request) -> ConvertResponse:
     from nimbuschain_zarr_service.core import (
         ConversionDependencyError,
         ConversionError,
@@ -166,6 +176,61 @@ def convert(payload: ConvertRequest) -> ConvertResponse:
         LandsatDependencyError,
         LandsatNormalizationError,
     )
+
+    request_id = getattr(request.state, "request_id", None)
+
+    logger.info(
+        "conversion_requested job_id=%s pipeline_id=%s provider=%s collection=%s scene_id=%s output_uri=%s",
+        payload.job_id,
+        payload.pipeline_id,
+        payload.provider,
+        payload.collection,
+        payload.scene_id,
+        payload.output_uri,
+        extra={"request_id": request_id},
+    )
+
+    progress_state = {
+        "fraction_bucket": -1,
+        "stage": "",
+        "array_name": "",
+        "band_name": "",
+    }
+
+    def _progress_logger(progress: dict[str, Any]) -> None:
+        stage = str(progress.get("stage") or "").strip() or "unknown"
+        array_name = str(progress.get("array_name") or "").strip()
+        band_name = str(progress.get("band_name") or "").strip()
+        fraction = float(progress.get("fraction") or 0.0)
+        bucket = int(min(100, max(0, fraction * 100)) // 5)
+
+        should_log = (
+            bucket > progress_state["fraction_bucket"]
+            or stage != progress_state["stage"]
+            or array_name != progress_state["array_name"]
+            or band_name != progress_state["band_name"]
+            or fraction >= 1.0
+        )
+        if not should_log:
+            return
+
+        progress_state["fraction_bucket"] = bucket
+        progress_state["stage"] = stage
+        progress_state["array_name"] = array_name
+        progress_state["band_name"] = band_name
+
+        logger.info(
+            "conversion_progress job_id=%s scene_id=%s stage=%s array_name=%s band_name=%s fraction=%.4f blocks_written=%s total_blocks=%s",
+            payload.job_id,
+            payload.scene_id,
+            stage,
+            array_name or "-",
+            band_name or "-",
+            fraction,
+            progress.get("blocks_written"),
+            progress.get("total_blocks"),
+            extra={"request_id": request_id},
+        )
 
     try:
         normalized_collection = payload.collection.strip().lower() if payload.provider == "usgs" else payload.collection.strip().upper()
@@ -177,11 +242,48 @@ def convert(payload: ConvertRequest) -> ConvertResponse:
             raw_uri=payload.raw_uri,
             output_uri=payload.output_uri,
             product_type=normalized_product_type,
+            progress_callback=_progress_logger,
         )
     except (LandsatNormalizationError, ConversionError) as exc:
+        logger.warning(
+            "conversion_failed job_id=%s scene_id=%s provider=%s reason=%s",
+            payload.job_id,
+            payload.scene_id,
+            payload.provider,
+            str(exc),
+            extra={"request_id": request_id},
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (LandsatDependencyError, ConversionDependencyError) as exc:
+        logger.exception(
+            "conversion_runtime_error job_id=%s scene_id=%s provider=%s",
+            payload.job_id,
+            payload.scene_id,
+            payload.provider,
+            extra={"request_id": request_id},
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception:
+        logger.exception(
+            "conversion_unhandled_error job_id=%s scene_id=%s provider=%s",
+            payload.job_id,
+            payload.scene_id,
+            payload.provider,
+            extra={"request_id": request_id},
+        )
+        raise
+
+    logger.info(
+        "conversion_completed job_id=%s scene_id=%s provider=%s data_family=%s zarr_uri=%s band_count=%s ancillary_count=%s",
+        payload.job_id,
+        payload.scene_id,
+        payload.provider,
+        data_family,
+        written_uri,
+        len(dataset_summary["band_names"]),
+        len(dataset_summary.get("ancillary_layer_names") or []),
+        extra={"request_id": request_id},
+    )
 
     return ConvertResponse(
         job_id=payload.job_id,
@@ -206,6 +308,13 @@ def convert(payload: ConvertRequest) -> ConvertResponse:
 def run() -> None:
     import uvicorn
 
+    logger.info(
+        "zarr_service_starting host=%s port=%s log_level=%s json_logs=%s",
+        "0.0.0.0",
+        DEFAULT_PORT,
+        str(os.getenv("NIMBUS_LOG_LEVEL") or "INFO"),
+        str(os.getenv("NIMBUS_LOG_JSON") or "").strip().lower() in {"1", "true", "yes", "on"},
+    )
     uvicorn.run(
         "nimbuschain_zarr_service.main:app",
         host="0.0.0.0",
