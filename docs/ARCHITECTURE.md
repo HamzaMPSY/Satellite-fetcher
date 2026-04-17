@@ -2,7 +2,7 @@
 
 ## 1. System overview
 
-NimbusChain Fetch is split into four runtime components with explicit boundaries, but the backend/orchestrator is the only public API surface.
+NimbusChain Fetch is split into five main runtime components with explicit boundaries, but the backend/orchestrator is the only public API surface.
 
 ```text
 Browser
@@ -11,9 +11,10 @@ Browser
             -> MongoDB or SQLite store
             -> nimbus-worker (download + Zarr execution)
             -> nimbus-zarr runtime/library (internal conversion code)
+            -> nimbus-mask-service (cloud/water masking runtime)
 ```
 
-The UI never executes downloads directly. It submits pipeline jobs to the API. The worker owns execution from search to download to Zarr. The Zarr package is reused as worker-internal conversion logic, while the backend exposes converter health/schema endpoints for the UI.
+The UI never executes downloads directly. It submits jobs to the API. The worker owns execution from search to download to Zarr conversion. The mask service owns cloud and water masking on existing Zarr outputs. The Zarr package is reused as worker-internal conversion logic, while the backend exposes converter and mask health/schema endpoints for the UI.
 
 ## 2. Runtime responsibilities
 
@@ -26,11 +27,11 @@ Main role:
 - manual Zarr conversion and artifact browsing
 
 Key folders:
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_ui/app.py`: Streamlit entrypoint
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_ui/component_leaflet.py`: map component bridge
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_ui/jobs_helpers.py`: API access and job filtering helpers
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_ui/zarr_utils.py`: Zarr discovery and registration helpers
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_ui/runtime_status.py`: UI runtime status collection and rendering
+- `src/nimbuschain_fetch_ui/app.py`: Streamlit entrypoint
+- `src/nimbuschain_fetch_ui/component_leaflet.py`: map component bridge
+- `src/nimbuschain_fetch_ui/jobs_helpers.py`: API access and job filtering helpers
+- `src/nimbuschain_fetch_ui/zarr_utils.py`: Zarr discovery and registration helpers
+- `src/nimbuschain_fetch_ui/runtime_status.py`: UI runtime status collection and rendering
 
 ### `nimbus-api`
 
@@ -41,12 +42,13 @@ Main role:
 - register artifacts and expose health/readiness status
 - expose worker capacity status
 - expose converter health/readiness/schema and manual conversion routes under `/v1`
+- expose mask health/schema and manual mask routes under `/v1`
 
 Key folders:
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_service/main.py`: FastAPI entrypoint
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_service/api/`: routers
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/engine/`: orchestration engine
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/jobs/`: job store implementations
+- `src/nimbuschain_fetch_service/main.py`: FastAPI entrypoint
+- `src/nimbuschain_fetch_service/api/`: routers
+- `src/nimbuschain_fetch/engine/`: orchestration engine
+- `src/nimbuschain_fetch/jobs/`: job store implementations
 
 ### `nimbus-worker`
 
@@ -59,8 +61,8 @@ Main role:
 - heartbeat execution capacity back to the store
 
 Key code:
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/worker.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/providers/`
+- `src/nimbuschain_fetch/worker.py`
+- `src/nimbuschain_fetch/providers/`
 
 ### `nimbus-zarr` runtime
 
@@ -72,11 +74,26 @@ Main role:
 - provide reusable conversion code used by the worker and by backend-owned manual conversion routes
 
 Key code:
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/main.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/service.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/copernicus.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/landsat.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/core.py`
+- `src/nimbuschain_zarr_service/main.py`
+- `src/nimbuschain_zarr_service/service.py`
+- `src/nimbuschain_zarr_service/copernicus.py`
+- `src/nimbuschain_zarr_service/landsat.py`
+- `src/nimbuschain_zarr_service/core.py`
+
+### `nimbus-mask-service`
+
+Main role:
+- apply cloud and water masks to an existing Zarr store
+- support in-place masking and derived masked-store outputs
+- expose a small internal FastAPI harness for health, schema, and remote apply calls
+- support device-aware inference selection across `cpu`, `cuda`, and `mps`
+
+Key code:
+- `src/nimbuschain_mask_service/main.py`
+- `src/nimbuschain_mask_service/service.py`
+- `src/nimbuschain_mask_service/inference.py`
+- `src/nimbuschain_mask_service/omniwater.py`
+- `src/nimbuschain_mask_service/io.py`
 
 ## 3. Data flow
 
@@ -91,6 +108,7 @@ UI form
   -> raw outputs persisted
   -> worker runs Zarr conversion in-process
   -> raw + zarr outputs persisted on the same job
+  -> optional mask job created for existing Zarr output
   -> events + pipeline status updates emitted
   -> UI reads jobs/events/results
 ```
@@ -107,34 +125,52 @@ raw scene folder/archive
   -> artifact registration through /v1/artifacts under the same job lineage
 ```
 
+### Mask flow
+
+```text
+existing Zarr output
+  -> POST /v1/jobs/{job_id}/mask on nimbus-api
+  -> API creates a separate mask job linked to source_job_id
+  -> worker resolves the selected source Zarr
+  -> mask service applies cloud and/or water inference
+  -> masked outputs and mask metadata written to Zarr
+  -> result, artifacts, and mask-quality metadata persisted
+```
+
 ## 4. Folder structure and intent
 
 ### Source code
 
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/`
+- `src/nimbuschain_fetch/`
   Core domain logic, providers, worker logic, storage contracts.
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_service/`
+- `src/nimbuschain_fetch_service/`
   Public API layer over the engine, stores, and converter-facing routes.
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_ui/`
+- `src/nimbuschain_fetch_ui/`
   Streamlit presentation layer and client-side orchestration.
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/`
+- `src/nimbuschain_zarr_service/`
   Conversion logic reused by the worker and converter routes.
+- `src/nimbuschain_mask_service/`
+  Internal masking runtime and remote/client adapter.
+- `src/nimbuschain_zarr_viewer/`
+  Browser and Napari launch helpers for local Zarr inspection.
 
 ### Infrastructure and operations
 
-- `/Users/mehdidinari/Desktop/backend nimbus/Containerfile`
+- `Containerfile`
   API and worker image.
-- `/Users/mehdidinari/Desktop/backend nimbus/ui/Containerfile`
+- `ui/Containerfile`
   UI image, including tracked tile files for standalone fallback.
-- `/Users/mehdidinari/Desktop/backend nimbus/zarr-service/Containerfile`
+- `zarr-service/Containerfile`
   Zarr service image.
-- `/Users/mehdidinari/Desktop/backend nimbus/podman-compose.yml`
+- `mask-service/Containerfile`
+  Mask service image.
+- `podman-compose.yml`
   Local Podman stack.
-- `/Users/mehdidinari/Desktop/backend nimbus/docker-compose.yml`
+- `docker-compose.yml`
   Docker-compatible compose stack.
-- `/Users/mehdidinari/Desktop/backend nimbus/k8s/`
+- `k8s/`
   Kubernetes manifests.
-- `/Users/mehdidinari/Desktop/backend nimbus/scripts/`
+- `scripts/`
   Operational entrypoints for local run and Minikube.
 
 ## 5. Architecture strengths

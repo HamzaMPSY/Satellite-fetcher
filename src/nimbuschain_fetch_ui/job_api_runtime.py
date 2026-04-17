@@ -71,6 +71,9 @@ def build_job_payload(
     output_dir: str | None = None,
     mask_types: list[str] | None = None,
     download_strategy: str | None = None,
+    cube_mode: str | None = None,
+    cube_start_date: dt.date | None = None,
+    cube_end_date: dt.date | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "job_type": "search_download",
@@ -95,6 +98,12 @@ def build_job_payload(
     normalized_strategy = str(download_strategy or "").strip().lower()
     if normalized_strategy in {"copernicus_account_pool"}:
         payload["download_strategy"] = normalized_strategy
+    normalized_cube_mode = str(cube_mode or "").strip().lower() or "none"
+    if normalized_cube_mode in {"none", "before_mask", "after_mask"}:
+        payload["cube_mode"] = normalized_cube_mode
+        if normalized_cube_mode != "none":
+            payload["cube_start_date"] = str(cube_start_date or start_date)
+            payload["cube_end_date"] = str(cube_end_date or end_date)
     return payload
 
 

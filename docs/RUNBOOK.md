@@ -13,7 +13,7 @@ Optional:
 ## 2. First local setup
 
 ```bash
-cd "/Users/mehdidinari/Desktop/backend nimbus"
+cd /path/to/Satellite-fetcher
 cp .env.example .env
 ```
 
@@ -56,7 +56,7 @@ Example file format:
 ```
 
 An example file is available at:
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/copernicus_account_pool.example.json`
+- `docs/copernicus_account_pool.example.json`
 
 In the UI, choose:
 - `Download execution -> Account pool test`
@@ -88,8 +88,8 @@ Use Docker Compose with the GPU override:
 ```
 
 This uses:
-- `/Users/mehdidinari/Desktop/backend nimbus/docker-compose.yml`
-- `/Users/mehdidinari/Desktop/backend nimbus/docker-compose.gpu.yml`
+- `docker-compose.yml`
+- `docker-compose.gpu.yml`
 
 Expected runtime:
 - `NIMBUS_CLOUDMASK_DEVICE=cuda`
@@ -131,6 +131,8 @@ Important:
 - Worker status: [http://127.0.0.1:8000/v1/worker/status](http://127.0.0.1:8000/v1/worker/status)
 - Zarr health: [http://127.0.0.1:8010/health](http://127.0.0.1:8010/health)
 - Zarr readiness: [http://127.0.0.1:8010/readiness](http://127.0.0.1:8010/readiness)
+- Backend mask health: [http://127.0.0.1:8000/v1/mask/health](http://127.0.0.1:8000/v1/mask/health)
+- Backend mask schema: [http://127.0.0.1:8000/v1/mask/schema](http://127.0.0.1:8000/v1/mask/schema)
 
 ## 5. Stop locally
 
@@ -145,6 +147,7 @@ podman logs -f backendnimbus_nimbus-api_1
 podman logs -f backendnimbus_nimbus-worker_1
 podman logs -f backendnimbus_nimbus-ui_1
 podman logs -f backendnimbus_nimbus-zarr_1
+podman logs -f backendnimbus_nimbus-mask_1
 ```
 
 ## 7. Smoke checks
@@ -163,6 +166,8 @@ curl -s http://127.0.0.1:8000/v1/worker/status | python3 -m json.tool
 curl -s http://127.0.0.1:8000/v1/converter/health | python3 -m json.tool
 curl -s http://127.0.0.1:8000/v1/converter/readiness | python3 -m json.tool
 curl -s http://127.0.0.1:8000/v1/converter/schema | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/mask/health | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/mask/schema | python3 -m json.tool
 ```
 
 ### UI
@@ -205,6 +210,14 @@ Check:
 - Zarr `/readiness` endpoint is `ready`
 - converter logs for missing bands or unsupported inputs
 
+### Native mask service does not start on macOS
+
+Check:
+- `.venv/bin/uvicorn` exists in the repo root
+- `.env` is present if you rely on it for credentials or overrides
+- port `8020` is free, or let `./scripts/12_up_mask_service_native.sh` remove the conflicting containerized mask service
+- `python -c "import torch; print(bool(getattr(getattr(torch,'backends',None),'mps',None) and torch.backends.mps.is_available()))"` reports `True` if you expect `mps`
+
 ### Cloud masking is still CPU-only
 
 Check the current mode first:
@@ -242,10 +255,10 @@ Stop local exposure:
 
 ## 10. Onboarding checklist for a new developer
 
-1. Read `/Users/mehdidinari/Desktop/backend nimbus/README.md`
-2. Read `/Users/mehdidinari/Desktop/backend nimbus/docs/ARCHITECTURE.md`
+1. Read `README.md`
+2. Read `docs/ARCHITECTURE.md`
 3. Launch the Podman stack
 4. Verify all health and readiness endpoints
 5. Open the UI and submit one small job
 6. Inspect one finished job through the API and UI
-7. Review `/Users/mehdidinari/Desktop/backend nimbus/docs/ZARR.md` before touching conversion logic
+7. Review `docs/ZARR.md` before touching conversion logic

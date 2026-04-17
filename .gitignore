@@ -26,3 +26,12 @@ data/*
 !data/Sentinel-2-tiles/
 !data/Sentinel-2-tiles/**
 cache/
+
+docs/copernicus_account_pool.json
+real_validation_outputs/
+scripts/*tmp.py
+scripts/calc_pipeline_times.py
+tmp/
+test.py
+
+docs/MASTER_DIAGRAM.md

@@ -25,6 +25,11 @@ def _load_aoi_payload(aoi_file: str) -> dict[str, Any]:
 
 
 def _build_request(args: argparse.Namespace) -> dict[str, Any]:
+    normalized_mask_types = [
+        item.strip().lower()
+        for item in str(args.mask_types or "").split(",")
+        if item.strip().lower() in {"water", "cloud"}
+    ]
     if args.product_ids:
         product_ids = [item.strip() for item in args.product_ids.split(",") if item.strip()]
         return {
@@ -52,6 +57,10 @@ def _build_request(args: argparse.Namespace) -> dict[str, Any]:
         "aoi": _load_aoi_payload(args.aoi_file),
         "tile_id": args.tile_id,
         "output_dir": args.output_dir,
+        "mask_types": normalized_mask_types,
+        "cube_mode": args.cube_mode,
+        "cube_start_date": args.cube_start_date or args.start_date,
+        "cube_end_date": args.cube_end_date or args.end_date,
     }
     return request
 
@@ -72,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aoi_file", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--product-ids", default=None)
+    parser.add_argument("--mask-types", default=None, help="Comma-separated: water,cloud")
+    parser.add_argument(
+        "--cube-mode",
+        choices=["none", "before_mask", "after_mask"],
+        default="none",
+    )
+    parser.add_argument("--cube-start-date", default=None)
+    parser.add_argument("--cube-end-date", default=None)
 
     # Legacy CLI compatibility flags (accepted but currently handled by engine defaults).
     parser.add_argument("--config", default=None)

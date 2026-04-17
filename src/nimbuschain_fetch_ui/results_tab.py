@@ -325,6 +325,7 @@ def _render_pipeline_result_section(
 
     raw_outputs = list(result_payload.get("raw_outputs") or selected_row.get("raw_outputs") or [])
     zarr_outputs = list(result_payload.get("zarr_outputs") or selected_row.get("zarr_outputs") or [])
+    cube_outputs = list(result_payload.get("cube_outputs") or selected_row.get("cube_outputs") or [])
     pipeline_metadata = dict(result_payload.get("pipeline_metadata") or selected_row.get("pipeline_metadata") or {})
     conversion_metadata = dict(result_payload.get("conversion_metadata") or selected_row.get("conversion_metadata") or {})
     result_metadata = dict(result_payload.get("metadata") or {})
@@ -343,9 +344,10 @@ def _render_pipeline_result_section(
 
     visible_raw_outputs = raw_outputs if output_type_filter in {None, "", "raw"} else []
     visible_zarr_outputs = zarr_outputs if output_type_filter in {None, "", "zarr"} else []
+    visible_cube_outputs = cube_outputs if output_type_filter in {None, "", "cube"} else []
     visible_mask_layer_outputs = mask_layer_outputs if output_type_filter in {None, "", "mask_layers"} else []
 
-    top1, top2, top3, top4, top5 = st.columns(5)
+    top1, top2, top3, top4, top5, top6 = st.columns(6)
     with top1:
         st.metric("State", str(selected_row.get("state") or "-"))
     with top2:
@@ -355,6 +357,8 @@ def _render_pipeline_result_section(
     with top4:
         st.metric("Zarr stores", len(zarr_outputs))
     with top5:
+        st.metric("Cube Zarrs", len(cube_outputs))
+    with top6:
         st.metric("Mask layers", len(mask_layer_outputs))
 
     meta1, meta2, meta3 = st.columns(3)
@@ -380,7 +384,7 @@ def _render_pipeline_result_section(
     if target_zarr_uri:
         st.caption(f"Target Zarr: `{target_zarr_uri}`")
 
-    out1, out2, out3 = st.columns(3)
+    out1, out2, out3, out4 = st.columns(4)
     with out1:
         _render_outputs_block(
             "Raw outputs",
@@ -394,6 +398,12 @@ def _render_pipeline_result_section(
             "No Zarr stores match the selected output filter for this pipeline run.",
         )
     with out3:
+        _render_outputs_block(
+            "Cube Zarrs",
+            visible_cube_outputs,
+            "No cube Zarrs match the selected output filter for this pipeline run.",
+        )
+    with out4:
         _render_outputs_block(
             "In-place mask layers",
             visible_mask_layer_outputs,
@@ -514,7 +524,7 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
         '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span>📂</span><span style="font-weight:600;font-size:.94rem;">Results</span></div>',
         unsafe_allow_html=True,
     )
-    st.caption("This view shows pipeline outputs only: raw downloads, Zarr stores, and in-place mask layers written by the same pipeline run.")
+    st.caption("This view shows pipeline outputs only: raw downloads, scene Zarr stores, grouped cube Zarrs, and in-place mask layers written by the same pipeline run.")
 
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1, 1, 1, 1.2])
     with filter_col1:
@@ -528,7 +538,7 @@ def render_results_tab(*, api_url: str, api_key: str) -> None:
     with filter_col3:
         output_type_filter = st.selectbox(
             "Output type",
-            ["", "raw", "zarr", "mask_layers"],
+            ["", "raw", "zarr", "cube", "mask_layers"],
             index=0,
         )
     with filter_col4:

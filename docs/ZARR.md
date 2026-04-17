@@ -14,6 +14,14 @@ The core output layout is:
 imagery(time, band, y, x)
 ```
 
+There is also a cube-building step for already-normalized scene stores:
+
+```text
+imagery(time, band, y, x)
+```
+
+In that cube, `time` grows across scenes instead of remaining `1`.
+
 Default output location:
 
 ```text
@@ -42,7 +50,7 @@ The converter uses the best target grid per sensor family, not a fake one-size-f
 
 ### Landsat 8/9
 - target grid: `10 m`
-- all native image bands are aligned to the `10 m` grid
+- all native image bands are aligned to the collection target grid configured by the converter
 - ancillary layers such as QA and angle rasters are stored separately when present
 
 ### Sentinel-1
@@ -54,7 +62,7 @@ The converter uses the best target grid per sensor family, not a fake one-size-f
 ## 4. Layer preservation policy
 
 Detailed product-by-product reference:
-- `/Users/mehdidinari/Desktop/backend nimbus/docs/PRODUCT_BANDS.md`
+- `docs/PRODUCT_BANDS.md`
 
 The converter no longer maps imagery to a reduced RGB/NIR/SWIR subset.
 
@@ -115,15 +123,15 @@ POST /v1/jobs
 ## 6. Implementation notes
 
 Important modules:
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/service.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/core.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/copernicus.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/readers/landsat.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/readers/sentinel.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/writers/zarr.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_zarr_service/config/config.yaml`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch/engine/nimbus_fetcher.py`
-- `/Users/mehdidinari/Desktop/backend nimbus/src/nimbuschain_fetch_service/api/converter.py`
+- `src/nimbuschain_zarr_service/service.py`
+- `src/nimbuschain_zarr_service/core.py`
+- `src/nimbuschain_zarr_service/copernicus.py`
+- `src/nimbuschain_zarr_service/readers/landsat.py`
+- `src/nimbuschain_zarr_service/readers/sentinel.py`
+- `src/nimbuschain_zarr_service/writers/zarr.py`
+- `src/nimbuschain_zarr_service/config/config.yaml`
+- `src/nimbuschain_fetch/engine/nimbus_fetcher.py`
+- `src/nimbuschain_fetch_service/api/converter.py`
 
 Design choice:
 - Landsat conversion uses a streaming write path to avoid building an oversized in-memory cube.
@@ -137,3 +145,49 @@ A Zarr store is considered current when:
 - it is either registered as an artifact or locally discovered and matches the current schema expectations
 
 Legacy local stores may still exist on disk. The UI hides them by default unless explicitly requested.
+
+## 8. Time-series cube builder
+
+The project also supports building a time-series cube from existing scene-level Zarr stores.
+
+CLI:
+
+```bash
+nimbuschain-zarr-cube /path/to/scene_1.zarr /path/to/scene_2.zarr \
+  --output-uri /path/to/cube.zarr
+```
+
+Grouped CLI:
+
+```bash
+nimbuschain-zarr-cube /data/downloads/zarr/*.zarr \
+  --group-by-tile \
+  --output-dir /data/downloads/zarr/cubes/manual \
+  --start-date 2026-04-10 \
+  --end-date 2026-04-13 \
+  --stage-label before_mask
+```
+
+Integrated fetch pipeline:
+
+```text
+search/download -> scene zarr conversion -> optional cube before masking -> optional in-place masking -> optional cube after masking
+```
+
+The fetch job request now accepts:
+- `cube_mode`: `none`, `before_mask`, or `after_mask`
+- `cube_start_date`
+- `cube_end_date`
+
+The Streamlit UI exposes the same choices and limits the selectable cube date range to dates that are actually present in the current preview results.
+
+V1 rules:
+- inputs must already share the same spatial grid and imagery schema
+- grouped mode builds one cube per Sentinel tile or Landsat path/row
+- `time` uses the real acquisition timestamps from the source scene Zarr metadata
+- the cube preserves `scene_id(time)` and `source_zarr_uri(time)` arrays for provenance
+- ancillary layers are stacked only when every source has the same ancillary layer names, shape, and dtype
+- quadkeys are written once at the cube root because the full cube shares one spatial footprint
+- cube outputs are registered as `zarr_cube` artifacts by the pipeline
+- `masks/...` arrays are not stacked into the cube yet; cube contents are currently imagery plus compatible ancillary layers
+- reprojection, mosaicking, and mixed-grid harmonization are out of scope for this first version

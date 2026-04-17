@@ -191,9 +191,9 @@ Expected imagery count:
 - `11`
 
 Resolution policy:
-- target grid: `30 m`
-- `B8` (`15 m`, panchromatic) is preserved
-- but the multispectral normalized grid remains `30 m`
+- target grid: `10 m`
+- native `15 m`, `30 m`, and thermal-resolution rasters are aligned to the configured collection target grid
+- native source pixel sizes are still preserved in metadata
 
 Band meaning:
 
@@ -228,7 +228,7 @@ Rule:
 
 ### 4.2 Landsat Collection 2 Level 2
 
-Expected imagery bands:
+Expected imagery bands for `L2SP`:
 
 - `SR_B1`
 - `SR_B2`
@@ -239,7 +239,7 @@ Expected imagery bands:
 - `SR_B7`
 - `ST_B10`
 
-Expected imagery count:
+Expected imagery count for `L2SP`:
 - `8`
 
 This matches:
@@ -247,7 +247,20 @@ This matches:
 - 1 surface temperature band (`ST_B10`)
 
 Resolution policy:
-- target grid: `30 m`
+- target grid: `10 m`
+
+Expected imagery bands for `L2SR`:
+
+- `SR_B1`
+- `SR_B2`
+- `SR_B3`
+- `SR_B4`
+- `SR_B5`
+- `SR_B6`
+- `SR_B7`
+
+Expected imagery count for `L2SR`:
+- `7`
 
 Typical ancillary layers if present:
 
@@ -345,12 +358,18 @@ The converter tests should validate exact imagery layer counts for the product f
   - `B1` through `B11`
 - ancillary count: dynamic, QA and angle layers if present
 
-### Landsat 8/9 L2
+### Landsat 8/9 L2SP
 - imagery count: `8`
 - expected imagery layers:
   - `SR_B1` through `SR_B7`
   - `ST_B10`
 - ancillary count: dynamic, QA/aerosol/temperature support/angle layers if present
+
+### Landsat 8/9 L2SR
+- imagery count: `7`
+- expected imagery layers:
+  - `SR_B1` through `SR_B7`
+- ancillary count: dynamic, QA/aerosol/angle layers if present
 
 ### Sentinel-1 GRD / SLC / IW_SLC__1S
 - imagery count: dynamic

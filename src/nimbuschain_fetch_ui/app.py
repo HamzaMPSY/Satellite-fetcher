@@ -306,6 +306,9 @@ def _build_job_payload(
     output_dir: str | None = None,
     mask_types: list[str] | None = None,
     download_strategy: str | None = None,
+    cube_mode: str | None = None,
+    cube_start_date: dt.date | None = None,
+    cube_end_date: dt.date | None = None,
 ) -> dict[str, Any]:
     provider_api = PROVIDER_CLI_MAP[provider_label]
     return build_job_payload_runtime(
@@ -319,7 +322,23 @@ def _build_job_payload(
         output_dir=output_dir,
         mask_types=mask_types,
         download_strategy=download_strategy,
+        cube_mode=cube_mode,
+        cube_start_date=cube_start_date,
+        cube_end_date=cube_end_date,
     )
+
+
+def _preview_available_dates(items: list[dict[str, Any]]) -> list[dt.date]:
+    available: set[dt.date] = set()
+    for item in list(items or []):
+        raw = str(item.get("sensing_time") or "").strip()
+        if not raw:
+            continue
+        try:
+            available.add(dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).date())
+        except Exception:
+            continue
+    return sorted(available)
 
 
 
@@ -1767,11 +1786,15 @@ def _job_pipeline_state(item: dict[str, Any]) -> str:
         return state or "queued"
     mask_types = _mask_types_from_payload(item)
     pipeline_meta = dict(item.get("pipeline_metadata") or {})
+    cube_outputs = list(item.get("cube_outputs") or pipeline_meta.get("cube_outputs") or [])
+    cube_status = str(pipeline_meta.get("cube_status") or "").strip().lower()
     if state == "succeeded" and (
         str(pipeline_meta.get("mask_status") or "").strip().lower() == "written"
         or (mask_types and str(pipeline_meta.get("mask_mode") or "").strip().lower() == "integrated")
     ):
         return "masked_zarr_written"
+    if state == "succeeded" and (cube_outputs or cube_status == "written"):
+        return "cube_written"
     if state == "succeeded" and list(item.get("zarr_outputs") or []):
         return "zarr_written"
     return state or "queued"
@@ -1813,12 +1836,20 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
         return ("zarr converting", "#38bdf8", "rgba(56,189,248,0.16)", "⚙")
     if pipeline_state == "zarr_written":
         return ("zarr ready", "#4ade80", "rgba(74,222,128,0.14)", "⬢")
+    if pipeline_state == "cube_queued":
+        return ("cube queued", "#fbbf24", "rgba(251,191,36,0.16)", "⏳")
+    if pipeline_state == "cube_building":
+        return ("cube building", "#14b8a6", "rgba(20,184,166,0.16)", "▣")
+    if pipeline_state == "cube_written":
+        return ("cube ready", "#4ade80", "rgba(74,222,128,0.14)", "▣")
     if pipeline_state == "running_cloud_inference":
         return ("cloud inference", "#38bdf8", "rgba(56,189,248,0.16)", "☁")
     if pipeline_state == "running_water_inference":
         return ("water inference", "#22d3ee", "rgba(34,211,238,0.16)", "≈")
     if pipeline_state == "masked_zarr_written":
         return ("pipeline ready", "#4ade80", "rgba(74,222,128,0.14)", "✓")
+    if pipeline_state == "cube_failed":
+        return ("cube failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
     if pipeline_state == "zarr_failed":
         return ("zarr failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
     if pipeline_state == "cancelled":
@@ -1830,13 +1861,13 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
 
 def _job_progress_visual_state(item: dict[str, Any]) -> str:
     pipeline_state = _job_pipeline_state(item)
-    if pipeline_state in {"failed", "zarr_failed"}:
+    if pipeline_state in {"failed", "zarr_failed", "cube_failed"}:
         return "failed"
     if pipeline_state == "cancelled":
         return "cancelled"
-    if pipeline_state in {"queued", "zarr_queued"}:
+    if pipeline_state in {"queued", "zarr_queued", "cube_queued"}:
         return "queued"
-    if pipeline_state in {"zarr_written", "masked_zarr_written"}:
+    if pipeline_state in {"zarr_written", "masked_zarr_written", "cube_written"}:
         return "succeeded"
     return "running"
 
@@ -1875,14 +1906,18 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
     bytes_downloaded = int(item.get("bytes_downloaded", 0) or 0)
     raw_count = len(item.get("raw_outputs") or []) or int(pipeline_meta.get("raw_output_count", 0) or 0)
     zarr_count = len(item.get("zarr_outputs") or []) or int(pipeline_meta.get("zarr_output_count", 0) or 0)
+    cube_count = len(item.get("cube_outputs") or []) or int(pipeline_meta.get("cube_output_count", 0) or 0)
     products_found = int(pipeline_meta.get("products_found", 0) or 0)
     mask_types = _mask_types_from_payload(item)
     integrated_mask = bool(mask_types) and str(pipeline_meta.get("mask_mode") or "").strip().lower() == "integrated"
+    cube_mode = str(pipeline_meta.get("cube_mode") or "none").strip().lower() or "none"
     suffix_parts: list[str] = []
     if raw_count:
         suffix_parts.append(f"raw outputs: {raw_count}")
     if zarr_count:
         suffix_parts.append(f"zarr outputs: {zarr_count}")
+    if cube_count:
+        suffix_parts.append(f"cubes: {cube_count}")
     suffix = f" ({' · '.join(suffix_parts)})" if suffix_parts else ""
     if pipeline_state == "searching":
         return "Searching the provider catalogue for matching products."
@@ -1902,12 +1937,22 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
         if integrated_mask:
             return f"Download complete. Zarr output is ready and the same job will continue with {' + '.join(mask_types)} masking{suffix}."
         return f"Download complete. Zarr output is ready{suffix}."
+    if pipeline_state == "cube_queued":
+        placement = "before masking" if cube_mode == "before_mask" else "after masking" if cube_mode == "after_mask" else "after conversion"
+        return f"Scene Zarr outputs are ready. Cube building is queued {placement}{suffix}."
+    if pipeline_state == "cube_building":
+        placement = "before masking" if cube_mode == "before_mask" else "after masking" if cube_mode == "after_mask" else "after conversion"
+        return f"Stacking scene Zarr outputs into grouped time cubes {placement}{suffix}."
     if pipeline_state == "running_cloud_inference":
         return f"Download and conversion completed. Running cloud masking in-place on the resulting Zarr{suffix}."
     if pipeline_state == "running_water_inference":
         return f"Download and conversion completed. Running water masking in-place on the resulting Zarr{suffix}."
     if pipeline_state == "masked_zarr_written":
         return f"Download complete. Zarr output and requested masks are ready{suffix}."
+    if pipeline_state == "cube_written":
+        return f"Download complete. Cube outputs are ready{suffix}."
+    if pipeline_state == "cube_failed":
+        return f"Download and conversion succeeded, but cube building failed{suffix}."
     if pipeline_state == "zarr_failed":
         return f"Download completed, but Zarr conversion failed{suffix}."
     if pipeline_state == "failed":
@@ -1967,6 +2012,7 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
         return None
     mask_types = _mask_types_from_payload(item)
     integrated_mask = bool(mask_types) and str(pipeline_meta.get("mask_mode") or "").strip().lower() == "integrated"
+    cube_mode = str(pipeline_meta.get("cube_mode") or "none").strip().lower() or "none"
     download_strategy = str(pipeline_meta.get("download_strategy") or "default").strip().lower()
     if download_strategy == "copernicus_account_pool" and pipeline_state in {
         "searching",
@@ -2006,6 +2052,19 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
         if pipeline_step == "registering_artifact":
             return f"Registering the Zarr artifact in the backend{item_suffix}{worker_suffix}."
         return f"Zarr conversion is active{item_suffix}{worker_suffix}."
+    if pipeline_state in {"cube_queued", "cube_building", "cube_written", "cube_failed"}:
+        tiles_built = int(len(pipeline_meta.get("cube_tiles_built") or []))
+        cube_count = int(pipeline_meta.get("cube_output_count", 0) or 0)
+        start_date = str(dict(pipeline_meta.get("cube_date_range") or {}).get("start_date") or "").strip()
+        end_date = str(dict(pipeline_meta.get("cube_date_range") or {}).get("end_date") or "").strip()
+        parts = [
+            f"Cube stage: {cube_mode or '-'}",
+            f"outputs: {cube_count}",
+            f"groups built: {tiles_built}",
+        ]
+        if start_date or end_date:
+            parts.append(f"date range: {start_date or '?'} -> {end_date or '?'}")
+        return " · ".join(parts) + "."
     if pipeline_state == "downloaded":
         return "Raw product is available locally. The backend is about to start the Zarr stage."
     if integrated_mask and pipeline_state == "zarr_written":
@@ -2044,6 +2103,7 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
 
 
 def _job_pipeline_paths(item: dict[str, Any]) -> tuple[str | None, str | None]:
+    pipeline_state = _job_pipeline_state(item)
     if _job_is_mask_job(item):
         pipeline_meta = dict(item.get("pipeline_metadata") or {})
         conversion_meta = dict(item.get("conversion_metadata") or {})
@@ -2073,6 +2133,10 @@ def _job_pipeline_paths(item: dict[str, Any]) -> tuple[str | None, str | None]:
         zarr_outputs = list(item.get("zarr_outputs") or [])
         if zarr_outputs:
             zarr_uri = str(zarr_outputs[-1]).strip()
+    if pipeline_state in {"cube_queued", "cube_building", "cube_written", "cube_failed"}:
+        cube_outputs = list(item.get("cube_outputs") or dict(item.get("pipeline_metadata") or {}).get("cube_outputs") or [])
+        if cube_outputs:
+            zarr_uri = str(cube_outputs[-1]).strip() or zarr_uri
     return (raw_uri or None, zarr_uri or None)
 
 
@@ -2093,7 +2157,8 @@ def _render_job_pipeline_paths(item: dict[str, Any]) -> None:
         if raw_uri:
             lines.append(f"Source raw: {Path(raw_uri).name}")
         if zarr_uri:
-            lines.append(f"Zarr target: {Path(zarr_uri).name}")
+            label = "Cube target" if _job_pipeline_state(item) in {"cube_queued", "cube_building", "cube_written", "cube_failed"} else "Zarr target"
+            lines.append(f"{label}: {Path(zarr_uri).name}")
     st.code("\n".join(lines), language="text")
 
 
@@ -2112,22 +2177,41 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         steps.append(("masked_zarr_written", "Ready"))
     else:
         mask_types = _normalize_mask_types(_mask_types_from_payload(item))
+        pipeline_meta = dict(item.get("pipeline_metadata") or {})
+        cube_mode = str(pipeline_meta.get("cube_mode") or "none").strip().lower() or "none"
         steps = [
             ("searching", "Search"),
             ("downloading", "Download"),
             ("zarr_converting", "Convert"),
         ]
+        if cube_mode == "before_mask":
+            steps.append(("cube_building", "Cube"))
         if "cloud" in mask_types:
             steps.append(("running_cloud_inference", "Cloud"))
         if "water" in mask_types:
             steps.append(("running_water_inference", "Water"))
-        steps.append(("masked_zarr_written" if mask_types else "zarr_written", "Ready"))
+        if cube_mode == "after_mask":
+            steps.append(("cube_building", "Cube"))
+            steps.append(("cube_written", "Ready"))
+        elif mask_types:
+            steps.append(("masked_zarr_written", "Ready"))
+        elif cube_mode == "before_mask":
+            steps.append(("cube_written", "Ready"))
+        else:
+            steps.append(("zarr_written", "Ready"))
     order = {key: idx for idx, (key, _label) in enumerate(steps)}
     anchor_state = pipeline_state
     if pipeline_state == "queued":
         anchor_state = steps[0][0]
-    elif not _job_is_mask_job(item) and pipeline_state in {"downloaded", "zarr_queued", "zarr_converting", "zarr_written"}:
+    elif not _job_is_mask_job(item) and pipeline_state in {"downloaded", "zarr_queued", "zarr_converting"}:
         anchor_state = "zarr_converting" if "zarr_converting" in order else anchor_state
+    elif not _job_is_mask_job(item) and pipeline_state == "zarr_written":
+        anchor_state = "zarr_written" if "zarr_written" in order else "zarr_converting"
+    elif not _job_is_mask_job(item) and pipeline_state in {"cube_queued", "cube_building", "cube_written", "cube_failed"}:
+        if pipeline_state == "cube_written" and "cube_written" in order:
+            anchor_state = "cube_written"
+        else:
+            anchor_state = "cube_building" if "cube_building" in order else "cube_written"
     elif not _job_is_mask_job(item) and pipeline_state in {"writing_mask_artifacts", "writing_masked_zarr", "registering_artifacts"}:
         anchor_state = "running_water_inference" if "running_water_inference" in order else "running_cloud_inference"
     elif _job_is_mask_job(item) and pipeline_state in {"writing_mask_artifacts", "writing_masked_zarr", "registering_artifacts"}:
@@ -2136,14 +2220,16 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         anchor_state = "running_water_inference" if _job_is_mask_job(item) and "running_water_inference" in order else steps[max(0, len(steps) - 2)][0]
     elif pipeline_state == "zarr_failed":
         anchor_state = "zarr_converting"
+    elif pipeline_state == "cube_failed":
+        anchor_state = "cube_building" if "cube_building" in order else anchor_state
     elif pipeline_state == "cancelled":
         anchor_state = steps[0][0] if _job_is_mask_job(item) else "downloading"
     anchor_index = order.get(anchor_state, 0)
     chips: list[str] = []
     for idx, (key, label) in enumerate(steps):
-        if state == "succeeded" and pipeline_state == "zarr_written":
+        if state == "succeeded" and pipeline_state in {"zarr_written", "cube_written"}:
             status_kind = "done" if idx <= anchor_index else "pending"
-        elif pipeline_state in {"failed", "zarr_failed"} and idx == anchor_index:
+        elif pipeline_state in {"failed", "zarr_failed", "cube_failed"} and idx == anchor_index:
             status_kind = "failed"
         elif idx < anchor_index:
             status_kind = "done"
@@ -3325,6 +3411,63 @@ def main():
         else:
             st.caption("This pipeline stops at the Zarr stage.")
 
+        preview_available_dates = _preview_available_dates(list(_ss("preview_items", []) or []))
+        cube_mode_options = ["none", "before_mask", "after_mask"]
+        cube_mode_help = "Cube building uses only dates that are actually available in the current preview results."
+        selected_cube_mode = st.radio(
+            "Cube building",
+            options=cube_mode_options,
+            horizontal=True,
+            key="download_cube_mode",
+            format_func=lambda value: {
+                "none": "No cube",
+                "before_mask": "Cube before masking",
+                "after_mask": "Cube after masking",
+            }[value],
+            help=cube_mode_help,
+        )
+        if selected_cube_mode == "after_mask" and not requested_download_mask_types:
+            st.caption("Cube after masking requires at least one mask type in the Zarr + mask mode above.")
+
+        cube_start_date = st.session_state["start_date"]
+        cube_end_date = st.session_state["end_date"]
+        cube_ready = len(preview_available_dates) >= 2
+        if selected_cube_mode != "none":
+            if cube_ready:
+                default_cube_start = min(
+                    max(st.session_state["start_date"], preview_available_dates[0]),
+                    preview_available_dates[-1],
+                )
+                default_cube_end = min(
+                    max(st.session_state["end_date"], default_cube_start),
+                    preview_available_dates[-1],
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    cube_start_date = st.date_input(
+                        "Cube start",
+                        value=default_cube_start,
+                        min_value=preview_available_dates[0],
+                        max_value=preview_available_dates[-1],
+                        key="cube_start_date",
+                    )
+                with c2:
+                    cube_end_date = st.date_input(
+                        "Cube end",
+                        value=max(default_cube_end, cube_start_date),
+                        min_value=cube_start_date,
+                        max_value=preview_available_dates[-1],
+                        key="cube_end_date",
+                    )
+                preview_date_text = ", ".join(day.isoformat() for day in preview_available_dates[:8])
+                if len(preview_available_dates) > 8:
+                    preview_date_text = f"{preview_date_text}, ..."
+                st.caption(f"Available dates from preview: {preview_date_text}")
+            else:
+                st.warning(
+                    "Cube building needs at least two available acquisition dates in the current preview. Refresh preview or widen the search dates first."
+                )
+
         d1, d2 = st.columns([2, 1])
         with d1:
             start_clicked = st.button(
@@ -3404,6 +3547,10 @@ def main():
         if start_clicked:
             if not aoi_text_for_download:
                 st.error("Define AOI or select tiles first.")
+            elif selected_cube_mode == "after_mask" and not requested_download_mask_types:
+                st.error("Cube after masking requires enabling cloud, water, or cloud + water masking.")
+            elif selected_cube_mode != "none" and not cube_ready:
+                st.error("Cube building needs at least two available acquisition dates in the current preview.")
             else:
                 try:
                     if provider == "Copernicus" and len(selected_tiles_for_cmd) > 1:
@@ -3418,6 +3565,9 @@ def main():
                                 tile_id=tile_id,
                                 mask_types=requested_download_mask_types,
                                 download_strategy=download_strategy,
+                                cube_mode=selected_cube_mode,
+                                cube_start_date=cube_start_date,
+                                cube_end_date=cube_end_date,
                             )
                             for tile_id in selected_tiles_for_cmd
                         ]
@@ -3446,6 +3596,9 @@ def main():
                             tile_id=tile_id,
                             mask_types=requested_download_mask_types,
                             download_strategy=download_strategy,
+                            cube_mode=selected_cube_mode,
+                            cube_start_date=cube_start_date,
+                            cube_end_date=cube_end_date,
                         )
                         response = _api_request(
                             "POST",

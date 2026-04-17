@@ -29,6 +29,12 @@ Typical response fields:
 - `running_jobs`
 - `can_accept_work`
 
+### `GET /v1/providers/status`
+Runtime provider configuration and authentication status for `copernicus` and `usgs`.
+
+### `POST /v1/preview`
+Preview matching scenes without creating a persisted job.
+
 ## 2. Jobs
 
 ### `POST /v1/jobs`
@@ -45,6 +51,18 @@ Request cancellation for one job.
 
 ### `GET /v1/jobs/{job_id}/result`
 Read the persisted result payload for a finished job.
+
+### `POST /v1/jobs/{job_id}/convert`
+Run manual conversion for raw outputs already attached to an existing job lineage.
+
+### `POST /v1/jobs/{job_id}/mask`
+Queue a separate mask job for an existing Zarr output attached to the source job.
+
+### `POST /v1/jobs/{job_id}/water-mask`
+Convenience route for water-only masking.
+
+### `POST /v1/jobs/{job_id}/mask-cloud`
+Convenience route for cloud-only masking.
 
 ### `GET /v1/jobs`
 List jobs with filters.
@@ -114,7 +132,24 @@ curl -s "http://127.0.0.1:8000/v1/artifacts?artifact_type=zarr&include_local=tru
 ### `GET /v1/metrics`
 Prometheus metrics endpoint.
 
-## 6. Operational notes
+## 6. Converter and mask status
+
+### `GET /v1/converter/health`
+Converter runtime health as exposed by the backend.
+
+### `GET /v1/converter/readiness`
+Converter readiness, including stricter dependency and write-path checks.
+
+### `GET /v1/converter/schema`
+Converter schema and loaded runtime configuration.
+
+### `GET /v1/mask/health`
+Mask-service health as exposed by the backend.
+
+### `GET /v1/mask/schema`
+Mask-service schema as exposed by the backend.
+
+## 7. Operational notes
 
 - The API is the source of truth for job status.
 - The UI should not infer job execution from local files only.

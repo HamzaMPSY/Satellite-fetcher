@@ -888,6 +888,8 @@ def resolve_output_path(output_uri: str) -> Path:
     if output_uri.startswith("file://"):
         parsed = urlparse(output_uri)
         candidate = Path(unquote(parsed.path)).expanduser().resolve()
+        if candidate.exists() or candidate.parent.exists():
+            return candidate
         mapped = _fallback_mounted_data_output(candidate)
         return mapped if mapped is not None else candidate
     parsed = urlparse(output_uri)
@@ -896,6 +898,8 @@ def resolve_output_path(output_uri: str) -> Path:
             "Only local file paths can be resolved with resolve_output_path()."
         )
     candidate = Path(output_uri).expanduser().resolve()
+    if candidate.exists() or candidate.parent.exists():
+        return candidate
     mapped = _fallback_mounted_data_output(candidate)
     return mapped if mapped is not None else candidate
 

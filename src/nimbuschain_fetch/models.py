@@ -46,6 +46,10 @@ class PipelineState(str, Enum):
     zarr_queued = "zarr_queued"
     zarr_converting = "zarr_converting"
     zarr_written = "zarr_written"
+    cube_queued = "cube_queued"
+    cube_building = "cube_building"
+    cube_written = "cube_written"
+    cube_failed = "cube_failed"
     resolving_source_zarr = "resolving_source_zarr"
     copying_source_zarr = "copying_source_zarr"
     running_water_inference = "running_water_inference"
@@ -85,6 +89,9 @@ class SearchDownloadRequest(BaseModel):
     output_dir: str | None = None
     mask_types: list[Literal["water", "cloud"]] = Field(default_factory=list)
     download_strategy: Literal["default", "copernicus_account_pool"] = "default"
+    cube_mode: Literal["none", "before_mask", "after_mask"] = "none"
+    cube_start_date: date | None = None
+    cube_end_date: date | None = None
 
     @field_validator("collection", "product_type")
     @classmethod
@@ -115,6 +122,14 @@ class SearchDownloadRequest(BaseModel):
             raise ValueError("end_date must be greater or equal to start_date.")
         if self.provider != ProviderName.copernicus and self.download_strategy != "default":
             raise ValueError("download_strategy is only supported for Copernicus jobs.")
+        if self.cube_mode == "after_mask" and not self.mask_types:
+            raise ValueError("cube_mode='after_mask' requires at least one mask_type.")
+        if self.cube_start_date is None:
+            self.cube_start_date = self.start_date
+        if self.cube_end_date is None:
+            self.cube_end_date = self.end_date
+        if self.cube_mode != "none" and self.cube_end_date < self.cube_start_date:
+            raise ValueError("cube_end_date must be greater or equal to cube_start_date.")
         return self
 
 
@@ -205,6 +220,7 @@ class JobStatusResponse(BaseModel):
     conversion_metadata: dict[str, Any] = Field(default_factory=dict)
     raw_outputs: list[str] = Field(default_factory=list)
     zarr_outputs: list[str] = Field(default_factory=list)
+    cube_outputs: list[str] = Field(default_factory=list)
     masked_zarr_outputs: list[str] = Field(default_factory=list)
     watermask_outputs: list[str] = Field(default_factory=list)
     cloudmask_outputs: list[str] = Field(default_factory=list)
@@ -234,6 +250,7 @@ class JobResultResponse(BaseModel):
     paths: list[str] = Field(default_factory=list)
     raw_outputs: list[str] = Field(default_factory=list)
     zarr_outputs: list[str] = Field(default_factory=list)
+    cube_outputs: list[str] = Field(default_factory=list)
     masked_zarr_outputs: list[str] = Field(default_factory=list)
     watermask_outputs: list[str] = Field(default_factory=list)
     cloudmask_outputs: list[str] = Field(default_factory=list)
@@ -328,6 +345,7 @@ class JobListResponse(BaseModel):
 
 class ArtifactType(str, Enum):
     zarr = "zarr"
+    zarr_cube = "zarr_cube"
     zarr_masked = "zarr_masked"
     watermask = "watermask"
     cloudmask = "cloudmask"

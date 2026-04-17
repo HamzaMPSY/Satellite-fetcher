@@ -56,6 +56,7 @@ from nimbuschain_fetch.settings import Settings, get_settings
 from nimbuschain_fetch.usgs_product_type import canonicalize_usgs_product_type
 from nimbuschain_mask_service.client import MaskServiceClient
 from nimbuschain_mask_service.runtime import normalize_device_name, resolve_inference_device
+from nimbuschain_zarr_service.cube import build_grouped_time_cubes
 from nimbuschain_zarr_service.service import ZarrConversionService
 
 
@@ -421,6 +422,7 @@ class NimbusFetcher:
                     "paths": [],
                     "raw_outputs": [],
                     "zarr_outputs": [],
+                    "cube_outputs": [],
                     "masked_zarr_outputs": [],
                     "watermask_outputs": [],
                     "cloudmask_outputs": [],
@@ -546,6 +548,7 @@ class NimbusFetcher:
 
         result = self._normalize_backend_paths_in_result_payload(result)
         zarr_outputs = list(result.get("zarr_outputs") or job_row.get("zarr_outputs") or [])
+        cube_outputs = self._cube_outputs_for_job(job_id=job_id, result=result, row=job_row)
         masked_zarr_outputs = self._masked_zarr_outputs_for_job(job_id=job_id, result=result, row=job_row)
         normalized_result = {
             "job_id": job_id,
@@ -556,6 +559,7 @@ class NimbusFetcher:
             "paths": list(result.get("paths") or []),
             "raw_outputs": list(result.get("raw_outputs") or job_row.get("raw_outputs") or []),
             "zarr_outputs": zarr_outputs,
+            "cube_outputs": cube_outputs,
             "masked_zarr_outputs": masked_zarr_outputs,
             "watermask_outputs": list(result.get("watermask_outputs") or job_row.get("watermask_outputs") or []),
             "cloudmask_outputs": list(result.get("cloudmask_outputs") or job_row.get("cloudmask_outputs") or []),
@@ -1144,6 +1148,7 @@ class NimbusFetcher:
             "paths": self._merge_paths(visible_masked_zarr_outputs, []),
             "raw_outputs": [],
             "zarr_outputs": visible_masked_zarr_outputs,
+            "cube_outputs": [],
             "masked_zarr_outputs": visible_masked_zarr_outputs,
             "watermask_outputs": visible_watermask_outputs,
             "cloudmask_outputs": visible_cloudmask_outputs,
@@ -1600,6 +1605,46 @@ class NimbusFetcher:
             safe_scene = "scene"
         return str(self.settings.nimbus_data_dir / "zarr" / f"{safe_scene}.zarr")
 
+    def _default_cube_output_dir(self, job_id: str) -> str:
+        safe_job_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (job_id or "job")).strip("._-")
+        if not safe_job_id:
+            safe_job_id = "job"
+        return str(self.settings.nimbus_data_dir / "zarr" / "cubes" / safe_job_id)
+
+    @staticmethod
+    def _path_size_bytes(target_path: str | Path | None) -> int | None:
+        if not target_path:
+            return None
+        try:
+            path = Path(target_path)
+        except TypeError:
+            return None
+        try:
+            if not path.exists():
+                return None
+            if path.is_file():
+                return int(path.stat().st_size)
+            total = 0
+            for child in path.rglob("*"):
+                if child.is_file():
+                    total += int(child.stat().st_size)
+            return total
+        except OSError:
+            return None
+
+    @staticmethod
+    def _cube_config_from_request(request: JobCreateRequest) -> dict[str, Any] | None:
+        if not isinstance(request, SearchDownloadRequest):
+            return None
+        cube_mode = str(getattr(request, "cube_mode", "none") or "none").strip().lower() or "none"
+        if cube_mode == "none":
+            return None
+        return {
+            "mode": cube_mode,
+            "start_date": getattr(request, "cube_start_date", None),
+            "end_date": getattr(request, "cube_end_date", None),
+        }
+
     @staticmethod
     def _merge_paths(existing: list[str], additions: list[str]) -> list[str]:
         merged: list[str] = []
@@ -1664,6 +1709,7 @@ class NimbusFetcher:
         normalized["paths"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("paths") or []))))
         normalized["raw_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("raw_outputs") or []))))
         normalized["zarr_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("zarr_outputs") or []))))
+        normalized["cube_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("cube_outputs") or []))))
         normalized["masked_zarr_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("masked_zarr_outputs") or []))))
         normalized["watermask_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("watermask_outputs") or []))))
         normalized["cloudmask_outputs"] = self._merge_paths([], list(self._normalize_backend_paths_payload(list(normalized.get("cloudmask_outputs") or []))))
@@ -1722,6 +1768,45 @@ class NimbusFetcher:
             metadata={
                 "normalization_summary": conversion_summary,
                 "zarr_summary": dataset_summary,
+                "registered_via": "pipeline_job",
+            },
+        )
+        self.upsert_artifact(artifact_request)
+
+    def _register_cube_artifact(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        collection: str,
+        cube_stage: str,
+        cube_summary: dict[str, Any],
+    ) -> None:
+        artifact_uri = str(cube_summary.get("zarr_uri") or "").strip()
+        if not artifact_uri:
+            return
+        scene_ids = [str(item) for item in list(cube_summary.get("scene_ids") or []) if str(item).strip()]
+        source_uris = [str(item) for item in list(cube_summary.get("source_zarr_uris") or []) if str(item).strip()]
+        artifact_request = ArtifactUpsertRequest(
+            artifact_type=ArtifactType.zarr_cube,
+            artifact_uri=artifact_uri,
+            provider=ProviderName(provider_name),
+            collection=collection,
+            scene_id=scene_ids[0] if len(scene_ids) == 1 else None,
+            source_uri=source_uris[0] if len(source_uris) == 1 else None,
+            created_by_job_id=job_id,
+            source_job_id=job_id,
+            data_family=str(cube_summary.get("data_family") or "").strip() or None,
+            band_names=[str(item) for item in list(cube_summary.get("band_names") or [])],
+            dimensions=[str(item) for item in list(cube_summary.get("dimensions") or [])],
+            shape=[int(item) for item in list(cube_summary.get("shape") or [])],
+            size_bytes=self._path_size_bytes(artifact_uri),
+            metadata={
+                "cube_summary": cube_summary,
+                "cube_stage": cube_stage,
+                "group_key": str(cube_summary.get("group_key") or "").strip() or None,
+                "source_scene_ids": scene_ids,
+                "source_zarr_uris": source_uris,
                 "registered_via": "pipeline_job",
             },
         )
@@ -1999,6 +2084,196 @@ class NimbusFetcher:
             page_size=500,
         )
         return [str(item.artifact_uri).strip() for item in artifacts.items if str(item.artifact_uri).strip()]
+
+    def _cube_outputs_for_job(
+        self,
+        *,
+        job_id: str,
+        result: dict[str, Any],
+        row: dict[str, Any],
+    ) -> list[str]:
+        outputs = self._merge_paths([], list(result.get("cube_outputs") or []))
+        if outputs:
+            return outputs
+        pipeline_metadata = dict(result.get("pipeline_metadata") or row.get("pipeline_metadata") or {})
+        outputs = self._merge_paths([], list(pipeline_metadata.get("cube_outputs") or []))
+        if outputs:
+            return outputs
+        artifacts = self.list_artifacts(
+            artifact_type=ArtifactType.zarr_cube.value,
+            provider=None,
+            collection=None,
+            scene_id=None,
+            job_id=job_id,
+            uri_query=None,
+            date_from=None,
+            date_to=None,
+            page=1,
+            page_size=500,
+        )
+        return [str(item.artifact_uri).strip() for item in artifacts.items if str(item.artifact_uri).strip()]
+
+    def _build_cube_outputs(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        collection: str,
+        source_zarr_outputs: list[str],
+        cube_mode: str,
+        cube_start_date: Any,
+        cube_end_date: Any,
+        pipeline_metadata: dict[str, Any],
+        stage_start_progress: float,
+        stage_end_progress: float,
+    ) -> dict[str, Any]:
+        if not source_zarr_outputs:
+            return {
+                "status": "skipped",
+                "reason": "no_source_zarrs",
+                "cube_outputs": [],
+                "items": [],
+                "pipeline_metadata": {
+                    **pipeline_metadata,
+                    "cube_mode": cube_mode,
+                    "cube_stage": cube_mode,
+                    "cube_status": "skipped",
+                    "cube_reason": "no_source_zarrs",
+                    "cube_output_count": 0,
+                    "cube_outputs": [],
+                },
+            }
+
+        output_dir = self._default_cube_output_dir(job_id)
+        requested_date_range = {
+            "start_date": cube_start_date.isoformat() if hasattr(cube_start_date, "isoformat") else cube_start_date,
+            "end_date": cube_end_date.isoformat() if hasattr(cube_end_date, "isoformat") else cube_end_date,
+        }
+        queued_metadata = {
+            **pipeline_metadata,
+            "cube_mode": cube_mode,
+            "cube_stage": cube_mode,
+            "cube_status": "queued",
+            "cube_output_dir": output_dir,
+            "cube_source_count": len(source_zarr_outputs),
+            "cube_date_range": requested_date_range,
+        }
+        self._update_pipeline(
+            job_id,
+            pipeline_state=PipelineState.cube_queued,
+            pipeline_step="cube_queued",
+            pipeline_progress=stage_start_progress,
+            pipeline_metadata=queued_metadata,
+            event_type="job.cube_queued",
+            event_payload={
+                "cube_mode": cube_mode,
+                "cube_source_count": len(source_zarr_outputs),
+                "cube_output_dir": output_dir,
+                "cube_date_range": requested_date_range,
+            },
+        )
+
+        self._update_pipeline(
+            job_id,
+            pipeline_state=PipelineState.cube_building,
+            pipeline_step="cube_building",
+            pipeline_progress=min(99.0, stage_start_progress + max(0.5, (stage_end_progress - stage_start_progress) * 0.5)),
+            pipeline_metadata={**queued_metadata, "cube_status": "running"},
+            event_type="job.cube_building",
+            event_payload={
+                "cube_mode": cube_mode,
+                "cube_source_count": len(source_zarr_outputs),
+            },
+        )
+
+        try:
+            cube_summary = build_grouped_time_cubes(
+                source_zarr_outputs,
+                output_dir,
+                start_date=cube_start_date,
+                end_date=cube_end_date,
+                stage_label=cube_mode,
+            )
+        except Exception as exc:
+            failed_metadata = {
+                **queued_metadata,
+                "cube_status": "failed",
+                "cube_reason": str(exc),
+                "cube_output_count": 0,
+                "cube_outputs": [],
+            }
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.cube_failed,
+                pipeline_step="cube_failed",
+                pipeline_progress=min(99.0, stage_end_progress),
+                pipeline_metadata=failed_metadata,
+                event_type="job.cube_failed",
+                event_payload={
+                    "cube_mode": cube_mode,
+                    "error": str(exc),
+                },
+            )
+            raise
+
+        cube_outputs = self._merge_paths([], list(cube_summary.get("cube_outputs") or []))
+        cube_items = [dict(item) for item in list(cube_summary.get("items") or [])]
+        for item in cube_items:
+            self._register_cube_artifact(
+                job_id=job_id,
+                provider_name=provider_name,
+                collection=collection,
+                cube_stage=cube_mode,
+                cube_summary=item,
+            )
+
+        final_metadata = {
+            **pipeline_metadata,
+            "cube_mode": cube_mode,
+            "cube_stage": cube_mode,
+            "cube_status": str(cube_summary.get("status") or "").strip() or "skipped",
+            "cube_reason": str(cube_summary.get("reason") or "").strip() or "",
+            "cube_output_dir": output_dir,
+            "cube_output_count": len(cube_outputs),
+            "cube_outputs": cube_outputs,
+            "cube_items": cube_items,
+            "cube_tiles_built": list(cube_summary.get("tiles_built") or []),
+            "cube_tiles_skipped": list(cube_summary.get("tiles_skipped") or []),
+            "cube_date_range": dict(cube_summary.get("date_range") or requested_date_range),
+        }
+        if cube_outputs:
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.cube_written,
+                pipeline_step="cube_written",
+                pipeline_progress=stage_end_progress,
+                pipeline_metadata=final_metadata,
+                event_type="job.cube_written",
+                event_payload={
+                    "cube_mode": cube_mode,
+                    "cube_outputs": cube_outputs,
+                    "cube_output_count": len(cube_outputs),
+                },
+            )
+        else:
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.cube_building,
+                pipeline_step="cube_skipped",
+                pipeline_progress=stage_end_progress,
+                pipeline_metadata=final_metadata,
+                event_type="job.cube_skipped",
+                event_payload={
+                    "cube_mode": cube_mode,
+                    "reason": str(cube_summary.get("reason") or "").strip() or "no_groups_with_multiple_times",
+                },
+            )
+        return {
+            **cube_summary,
+            "cube_outputs": cube_outputs,
+            "items": cube_items,
+            "pipeline_metadata": final_metadata,
+        }
 
     def _resolve_zarr_context(
         self,
@@ -2742,6 +3017,7 @@ class NimbusFetcher:
             "paths": list(result.get("paths") or []),
             "raw_outputs": raw_outputs,
             "zarr_outputs": zarr_outputs,
+            "cube_outputs": [],
             "checksums": dict(result.get("checksums") or {}),
             "metadata": dict(result.get("metadata") or {}),
             "manifest_entry": dict(result.get("manifest_entry") or {}),
@@ -3169,6 +3445,7 @@ class NimbusFetcher:
                 "paths": raw_result_paths,
                 "raw_outputs": raw_outputs,
                 "zarr_outputs": [],
+                "cube_outputs": [],
                 "checksums": checksums,
                 "metadata": metadata,
                 "manifest_entry": manifest_entry,
@@ -3197,6 +3474,8 @@ class NimbusFetcher:
                 "zarr_written" if final_pipeline_state == PipelineState.zarr_written else "downloaded"
             )
             requested_mask_types = self._normalized_mask_types(getattr(request, "mask_types", []))
+            cube_config = self._cube_config_from_request(request)
+            cube_outputs: list[str] = []
             final_pipeline_metadata = {
                 **pipeline_metadata,
                 "zarr_output_count": len(zarr_outputs),
@@ -3206,6 +3485,20 @@ class NimbusFetcher:
             if requested_mask_types:
                 final_pipeline_metadata["mask_types"] = requested_mask_types
                 final_pipeline_metadata["mask_mode"] = "integrated"
+            if cube_config is not None:
+                final_pipeline_metadata["cube_mode"] = cube_config["mode"]
+                final_pipeline_metadata["cube_date_range"] = {
+                    "start_date": (
+                        cube_config["start_date"].isoformat()
+                        if hasattr(cube_config["start_date"], "isoformat")
+                        else cube_config["start_date"]
+                    ),
+                    "end_date": (
+                        cube_config["end_date"].isoformat()
+                        if hasattr(cube_config["end_date"], "isoformat")
+                        else cube_config["end_date"]
+                    ),
+                }
 
             self.store.set_result(
                 job_id,
@@ -3214,6 +3507,7 @@ class NimbusFetcher:
                     "paths": final_paths,
                     "raw_outputs": raw_outputs,
                     "zarr_outputs": zarr_outputs,
+                    "cube_outputs": cube_outputs,
                     "checksums": checksums,
                     "metadata": metadata,
                     "manifest_entry": manifest_entry,
@@ -3222,6 +3516,41 @@ class NimbusFetcher:
                 },
             )
             if final_pipeline_state == PipelineState.zarr_written:
+                if cube_config is not None and cube_config["mode"] == "before_mask":
+                    cube_execution = self._build_cube_outputs(
+                        job_id=job_id,
+                        provider_name=provider_name,
+                        collection=request.collection,
+                        source_zarr_outputs=zarr_outputs,
+                        cube_mode=str(cube_config["mode"]),
+                        cube_start_date=cube_config["start_date"],
+                        cube_end_date=cube_config["end_date"],
+                        pipeline_metadata=final_pipeline_metadata,
+                        stage_start_progress=73.0,
+                        stage_end_progress=75.0 if requested_mask_types else 100.0,
+                    )
+                    cube_outputs = list(cube_execution.get("cube_outputs") or [])
+                    final_pipeline_metadata = dict(cube_execution.get("pipeline_metadata") or final_pipeline_metadata)
+                    final_paths = [*raw_result_paths, *zarr_outputs, *cube_outputs]
+                    self.store.set_result(
+                        job_id,
+                        {
+                            "job_id": job_id,
+                            "paths": final_paths,
+                            "raw_outputs": raw_outputs,
+                            "zarr_outputs": zarr_outputs,
+                            "cube_outputs": cube_outputs,
+                            "checksums": checksums,
+                            "metadata": metadata,
+                            "manifest_entry": manifest_entry,
+                            "pipeline_metadata": final_pipeline_metadata,
+                            "conversion_metadata": conversion_metadata,
+                        },
+                    )
+                    if cube_outputs:
+                        final_pipeline_state = PipelineState.cube_written if not requested_mask_types else final_pipeline_state
+                        final_pipeline_step = "cube_written" if not requested_mask_types else final_pipeline_step
+
                 self.store.update_job(
                     job_id,
                     state=JobState.running.value if requested_mask_types else JobState.succeeded.value,
@@ -3235,7 +3564,7 @@ class NimbusFetcher:
                     bytes_total=max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"])),
                     pipeline_state=final_pipeline_state.value,
                     pipeline_step=final_pipeline_step,
-                    pipeline_progress=72.0 if requested_mask_types else 100.0,
+                    pipeline_progress=76.0 if requested_mask_types else 100.0,
                     pipeline_metadata=final_pipeline_metadata,
                     conversion_metadata=conversion_metadata,
                     raw_outputs=raw_outputs,
@@ -3243,10 +3572,11 @@ class NimbusFetcher:
                 )
                 self.store.append_event(
                     job_id,
-                    "job.zarr_written",
+                    "job.cube_written" if final_pipeline_state == PipelineState.cube_written else "job.zarr_written",
                     {
                         "pipeline_state": final_pipeline_state.value,
                         "zarr_outputs": zarr_outputs,
+                        "cube_outputs": cube_outputs,
                     },
                 )
                 if requested_mask_types:
@@ -3543,6 +3873,23 @@ class NimbusFetcher:
                         **metadata,
                         "mask": mask_summary,
                     }
+                    combined_cube_outputs = list(cube_outputs)
+                    if cube_config is not None and cube_config["mode"] == "after_mask" and mask_succeeded:
+                        cube_execution = self._build_cube_outputs(
+                            job_id=job_id,
+                            provider_name=provider_name,
+                            collection=request.collection,
+                            source_zarr_outputs=zarr_outputs,
+                            cube_mode=str(cube_config["mode"]),
+                            cube_start_date=cube_config["start_date"],
+                            cube_end_date=cube_config["end_date"],
+                            pipeline_metadata=final_pipeline_metadata,
+                            stage_start_progress=98.0,
+                            stage_end_progress=100.0,
+                        )
+                        combined_cube_outputs = list(cube_execution.get("cube_outputs") or [])
+                        final_pipeline_metadata = dict(cube_execution.get("pipeline_metadata") or final_pipeline_metadata)
+                    final_paths = [*raw_result_paths, *zarr_outputs, *combined_cube_outputs]
                     self.store.set_result(
                         job_id,
                         {
@@ -3550,6 +3897,7 @@ class NimbusFetcher:
                             "paths": final_paths,
                             "raw_outputs": raw_outputs,
                             "zarr_outputs": zarr_outputs,
+                            "cube_outputs": combined_cube_outputs,
                             "checksums": checksums,
                             "metadata": combined_metadata,
                             "manifest_entry": manifest_entry,
@@ -3558,10 +3906,18 @@ class NimbusFetcher:
                         },
                     )
                     terminal_pipeline_state = (
-                        PipelineState.masked_zarr_written if mask_succeeded else PipelineState.failed
+                        (
+                            PipelineState.cube_written
+                            if mask_succeeded and cube_config is not None and cube_config["mode"] == "after_mask" and combined_cube_outputs
+                            else PipelineState.masked_zarr_written
+                        )
+                        if mask_succeeded
+                        else PipelineState.failed
                     )
                     terminal_state = (
-                        JobState.succeeded if terminal_pipeline_state == PipelineState.masked_zarr_written else JobState.failed
+                        JobState.succeeded
+                        if terminal_pipeline_state in {PipelineState.masked_zarr_written, PipelineState.cube_written}
+                        else JobState.failed
                     )
                     self.store.update_job(
                         job_id,
@@ -3587,6 +3943,7 @@ class NimbusFetcher:
                             "source_job_id": job_id,
                             "mask_types": requested_mask_types,
                             "zarr_outputs": zarr_outputs,
+                            "cube_outputs": combined_cube_outputs,
                             "pipeline_state": terminal_pipeline_state.value,
                             "errors": mask_errors,
                         },
@@ -3638,10 +3995,27 @@ class NimbusFetcher:
                 PipelineState.zarr_converting.value,
                 PipelineState.downloaded.value,
             }
-            pipeline_state = PipelineState.zarr_failed if is_zarr_failure and raw_outputs else PipelineState.failed
-            pipeline_step = "zarr_failed" if pipeline_state == PipelineState.zarr_failed else "failed"
+            is_cube_failure = current_pipeline_state in {
+                PipelineState.cube_queued.value,
+                PipelineState.cube_building.value,
+                PipelineState.cube_failed.value,
+            }
+            pipeline_state = (
+                PipelineState.zarr_failed
+                if is_zarr_failure and raw_outputs
+                else PipelineState.cube_failed
+                if is_cube_failure
+                else PipelineState.failed
+            )
+            pipeline_step = (
+                "zarr_failed"
+                if pipeline_state == PipelineState.zarr_failed
+                else "cube_failed"
+                if pipeline_state == PipelineState.cube_failed
+                else "failed"
+            )
             conversion_metadata = dict(existing_result.get("conversion_metadata") or {})
-            if pipeline_state == PipelineState.zarr_failed:
+            if pipeline_state in {PipelineState.zarr_failed, PipelineState.cube_failed}:
                 conversion_metadata = {
                     **conversion_metadata,
                     "status": "failed",
@@ -3655,6 +4029,7 @@ class NimbusFetcher:
                             "conversion_metadata": conversion_metadata,
                             "raw_outputs": raw_outputs,
                             "zarr_outputs": list(existing_result.get("zarr_outputs") or []),
+                            "cube_outputs": list(existing_result.get("cube_outputs") or []),
                         },
                     )
             self.store.update_job(
@@ -3966,6 +4341,7 @@ class NimbusFetcher:
         service_name = self._service_name_for_type(job_type)
         masked_zarr_outputs = self._masked_zarr_outputs_for_job(job_id=row["job_id"], result={}, row=row)
         pipeline_metadata = dict(row.get("pipeline_metadata") or {})
+        cube_outputs = self._cube_outputs_for_job(job_id=row["job_id"], result={}, row=row)
         source_job_id = str(
             pipeline_metadata.get("source_job_id")
             or (row.get("request") or {}).get("source_job_id")
@@ -3990,6 +4366,7 @@ class NimbusFetcher:
             conversion_metadata=dict(row.get("conversion_metadata") or {}),
             raw_outputs=list(row.get("raw_outputs") or []),
             zarr_outputs=list(row.get("zarr_outputs") or []),
+            cube_outputs=cube_outputs,
             masked_zarr_outputs=masked_zarr_outputs,
             watermask_outputs=list(row.get("watermask_outputs") or []),
             cloudmask_outputs=list(row.get("cloudmask_outputs") or []),

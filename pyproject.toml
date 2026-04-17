@@ -65,6 +65,7 @@ zarr-service = []
 nimbuschain-fetch = "nimbuschain_fetch.cli:main"
 nimbuschain-worker = "nimbuschain_fetch.worker:main"
 nimbuschain-zarr-service = "nimbuschain_zarr_service.main:run"
+nimbuschain-zarr-cube = "nimbuschain_zarr_service.cube_cli:main"
 nimbuschain-zarr-viewer = "nimbuschain_zarr_viewer.cli:main"
 nimbuschain-zarr-browser = "nimbuschain_zarr_viewer.launch:main"
 
