@@ -12,7 +12,7 @@ import socket
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -20,7 +20,11 @@ from typing import Any, cast
 import anyio
 from pydantic import TypeAdapter
 
-from nimbuschain_fetch.download.coordinator import DownloadBatchResult, DownloadCoordinator
+from nimbuschain_fetch.download.coordinator import (
+    DownloadBatchResult,
+    DownloadCoordinator,
+    DownloadCoordinatorStore,
+)
 from nimbuschain_fetch.download.download_manager import (
     CancelChecker,
     DownloadCancelled,
@@ -56,6 +60,7 @@ from nimbuschain_fetch.models import (
     ProviderName,
     SearchDownloadRequest,
 )
+from nimbuschain_fetch.pipeline_timeline import advance_pipeline_timeline
 from nimbuschain_fetch.providers import CopernicusProvider, UsgsProvider
 from nimbuschain_fetch.security.paths import sanitize_output_dir
 from nimbuschain_fetch.jobs.store_factory import create_job_store
@@ -119,6 +124,7 @@ class NimbusFetcher:
         self._worker_pid = os.getpid()
         self._worker_started_at = datetime.now(timezone.utc).isoformat()
         self._cancel_check_cache: dict[str, tuple[float, bool]] = {}
+        self._pipeline_update_lock = threading.RLock()
         self._zarr_converter: ZarrConversionService | None = None
         self._mask_service: Any | None = None
         self._download_coordinator: DownloadCoordinator | None = None
@@ -703,6 +709,78 @@ class NimbusFetcher:
         return normalized
 
     @staticmethod
+    def _normalize_mask_failure_step(value: Any) -> str | None:
+        candidate = str(value or "").strip().lower()
+        if candidate in {"failed", "cloud_failed", "water_failed"}:
+            return candidate
+        return None
+
+    @classmethod
+    def _preferred_mask_failure_step(
+        cls,
+        values: Iterable[Any],
+    ) -> str:
+        priority = {
+            "failed": 0,
+            "cloud_failed": 1,
+            "water_failed": 2,
+        }
+        selected = "failed"
+        selected_priority = -1
+        for raw_value in values:
+            candidate = cls._normalize_mask_failure_step(raw_value)
+            if candidate is None:
+                continue
+            candidate_priority = priority.get(candidate, -1)
+            if candidate_priority > selected_priority:
+                selected = candidate
+                selected_priority = candidate_priority
+        return selected
+
+    @classmethod
+    def _mask_failure_step_from_payloads(
+        cls,
+        *,
+        mask_types: list[str] | tuple[str, ...] | None,
+        water_mask: dict[str, Any] | None,
+        cloud_mask: dict[str, Any] | None,
+    ) -> str | None:
+        normalized_mask_types = cls._normalized_mask_types(list(mask_types or []))
+        failure_steps: list[str] = []
+        water_status = str((water_mask or {}).get("status") or "").strip().lower()
+        cloud_status = str((cloud_mask or {}).get("status") or "").strip().lower()
+        if "water" in normalized_mask_types and water_status == "failed":
+            failure_steps.append("water_failed")
+        if "cloud" in normalized_mask_types and cloud_status == "failed":
+            failure_steps.append("cloud_failed")
+        if not failure_steps:
+            return None
+        return cls._preferred_mask_failure_step(failure_steps)
+
+    @classmethod
+    def _mask_failure_step_from_items(
+        cls,
+        *,
+        mask_types: list[str] | tuple[str, ...] | None,
+        items: list[dict[str, Any]] | None,
+    ) -> str:
+        failure_steps: list[str] = []
+        for item in list(items or []):
+            direct_step = cls._normalize_mask_failure_step(item.get("failed_step"))
+            if direct_step is not None:
+                failure_steps.append(direct_step)
+                continue
+            conversion_metadata = dict(item.get("conversion_metadata") or {})
+            inferred_step = cls._mask_failure_step_from_payloads(
+                mask_types=mask_types,
+                water_mask=dict(conversion_metadata.get("water_mask") or {}),
+                cloud_mask=dict(conversion_metadata.get("cloud_mask") or {}),
+            )
+            if inferred_step is not None:
+                failure_steps.append(inferred_step)
+        return cls._preferred_mask_failure_step(failure_steps)
+
+    @staticmethod
     def _build_mask_progress_plan(
         *,
         mask_types: list[str],
@@ -864,7 +942,11 @@ class NimbusFetcher:
                     "running_water_inference",
                     progress_plan["water_end"],
                 ),
-                "water_masking_failed": (PipelineState.failed, "failed", min(99.0, progress_plan["water_end"])),
+                "water_masking_failed": (
+                    PipelineState.failed,
+                    "water_failed",
+                    min(99.0, progress_plan["water_end"]),
+                ),
                 "cloud_masking_started": (
                     PipelineState.running_cloud_inference,
                     "running_cloud_inference",
@@ -875,7 +957,11 @@ class NimbusFetcher:
                     "running_cloud_inference",
                     progress_plan["cloud_end"],
                 ),
-                "cloud_masking_failed": (PipelineState.failed, "failed", min(99.0, progress_plan["cloud_end"])),
+                "cloud_masking_failed": (
+                    PipelineState.failed,
+                    "cloud_failed",
+                    min(99.0, progress_plan["cloud_end"]),
+                ),
             }
             mapped = stage_map.get(stage_name)
             if not mapped:
@@ -1041,6 +1127,7 @@ class NimbusFetcher:
             )
 
         errors: list[str] = []
+        failed_step = None
         if not mask_job_succeeded:
             for payload in (water_mask, cloud_mask):
                 reason = str(payload.get("reason") or "").strip()
@@ -1048,6 +1135,13 @@ class NimbusFetcher:
                     errors.append(reason)
             if not errors:
                 errors.append(f"Mask execution failed with status '{final_status or 'unknown'}'.")
+            failed_step = self._mask_failure_step_from_payloads(
+                mask_types=mask_types,
+                water_mask=water_mask,
+                cloud_mask=cloud_mask,
+            ) or "failed"
+            pipeline_metadata["failed_step"] = failed_step
+            conversion_metadata["failed_step"] = failed_step
 
         return {
             "status": final_status,
@@ -1061,6 +1155,7 @@ class NimbusFetcher:
             "pipeline_metadata": pipeline_metadata,
             "conversion_metadata": conversion_metadata,
             "errors": errors,
+            "failed_step": failed_step,
         }
 
     def _execute_mask_existing_zarr_job(
@@ -1187,9 +1282,26 @@ class NimbusFetcher:
             "pipeline_metadata": pipeline_metadata,
             "conversion_metadata": conversion_metadata,
         }
-        self.store.set_result(job_id, result_payload)
         terminal_pipeline_state = PipelineState.masked_zarr_written if mask_job_succeeded else PipelineState.failed
+        terminal_pipeline_step = (
+            PipelineState.masked_zarr_written.value
+            if mask_job_succeeded
+            else self._preferred_mask_failure_step([mask_execution.get("failed_step")])
+        )
         terminal_state = JobState.succeeded if terminal_pipeline_state == PipelineState.masked_zarr_written else JobState.failed
+        pipeline_metadata = self._merged_pipeline_metadata(job_id, pipeline_metadata)
+        self._update_pipeline(
+            job_id,
+            pipeline_state=terminal_pipeline_state,
+            pipeline_step=terminal_pipeline_step,
+            pipeline_progress=100.0 if terminal_state == JobState.succeeded else 95.0,
+            pipeline_metadata=pipeline_metadata,
+            conversion_metadata=conversion_metadata,
+            zarr_outputs=visible_masked_zarr_outputs,
+        )
+        pipeline_metadata = self._merged_pipeline_metadata(job_id, pipeline_metadata)
+        result_payload["pipeline_metadata"] = pipeline_metadata
+        self.store.set_result(job_id, result_payload)
         errors = list(mask_execution.get("errors") or [])
         self.store.update_job(
             job_id,
@@ -1197,7 +1309,7 @@ class NimbusFetcher:
             finished_at=self._now_iso(),
             progress=100.0 if terminal_state == JobState.succeeded else 0.0,
             pipeline_state=terminal_pipeline_state.value,
-            pipeline_step=terminal_pipeline_state.value,
+            pipeline_step=terminal_pipeline_step,
             pipeline_progress=100.0 if terminal_state == JobState.succeeded else 95.0,
             pipeline_metadata=pipeline_metadata,
             conversion_metadata=conversion_metadata,
@@ -1252,6 +1364,79 @@ class NimbusFetcher:
         if self._execution_enabled and self._executor is not None:
             await self._executor.cancel(job_id)
         return True
+
+    def _list_jobs_by_states(self, states: tuple[str, ...]) -> list[dict[str, Any]]:
+        page = 1
+        rows: list[dict[str, Any]] = []
+        while True:
+            batch, total = self.store.list_jobs(
+                JobListFilters(
+                    states=states,
+                    sort_by="updated_at",
+                    sort_desc=True,
+                    page=page,
+                    page_size=200,
+                )
+            )
+            rows.extend(batch)
+            if len(rows) >= int(total) or not batch:
+                break
+            page += 1
+        return rows
+
+    async def reset_runtime_state(self) -> dict[str, Any]:
+        active_rows = self._list_jobs_by_states(
+            (
+                JobState.queued.value,
+                JobState.running.value,
+                JobState.cancel_requested.value,
+            )
+        )
+        active_job_ids = [
+            str(row.get("job_id") or "").strip()
+            for row in active_rows
+            if str(row.get("job_id") or "").strip()
+        ]
+
+        executor_cancelled = 0
+        if self._execution_enabled and self._executor is not None:
+            for job_id in active_job_ids:
+                try:
+                    await self._executor.cancel(job_id)
+                    executor_cancelled += 1
+                except Exception:
+                    continue
+
+        for job_id in active_job_ids:
+            self._mark_cancelled(job_id, "runtime_reset")
+            self._cancel_check_cache[job_id] = (time.monotonic() + 60.0, True)
+
+        coordinator_reason = "Download cancelled by runtime reset."
+        if self._download_coordinator is not None:
+            coordinator_reset = self._download_coordinator.reset_runtime_state(reason=coordinator_reason)
+        else:
+            coordinator_store = DownloadCoordinatorStore(self.settings.download_coordinator_db_path)
+            try:
+                task_ids = coordinator_store.cancel_all_non_terminal_tasks(reason=coordinator_reason)
+            finally:
+                coordinator_store.close()
+            coordinator_reset = {
+                "tasks_cancelled": len(task_ids),
+                "task_ids": task_ids,
+            }
+
+        workers_cleared = int(self.store.clear_workers())
+
+        return {
+            "status": "ok",
+            "history_preserved": True,
+            "jobs_cancelled": len(active_job_ids),
+            "job_ids": active_job_ids,
+            "executor_cancellations_requested": executor_cancelled,
+            "coordinator_tasks_cancelled": int(coordinator_reset.get("tasks_cancelled", 0) or 0),
+            "coordinator_task_ids": list(coordinator_reset.get("task_ids") or []),
+            "worker_heartbeats_cleared": workers_cleared,
+        }
 
     def list_jobs(
         self,
@@ -1758,31 +1943,69 @@ class NimbusFetcher:
         event_type: str | None = None,
         event_payload: dict[str, Any] | None = None,
     ) -> None:
-        fields: dict[str, Any] = {
-            "pipeline_state": pipeline_state.value,
-            "pipeline_step": pipeline_step,
-        }
-        if pipeline_progress is not None:
-            fields["pipeline_progress"] = max(0.0, min(100.0, float(pipeline_progress)))
-        if pipeline_metadata is not None:
-            fields["pipeline_metadata"] = pipeline_metadata
-        if conversion_metadata is not None:
-            fields["conversion_metadata"] = conversion_metadata
-        if raw_outputs is not None:
-            fields["raw_outputs"] = list(raw_outputs)
-        if zarr_outputs is not None:
-            fields["zarr_outputs"] = list(zarr_outputs)
-        self.store.update_job(job_id, **fields)
-        if event_type:
-            self.store.append_event(
-                job_id,
-                event_type,
-                {
-                    "pipeline_state": pipeline_state.value,
-                    "pipeline_step": pipeline_step,
-                    **(event_payload or {}),
-                },
+        with self._pipeline_update_lock:
+            row_now = self.store.get_job(job_id) or {}
+            existing_pipeline_metadata = dict(row_now.get("pipeline_metadata") or {})
+            merged_pipeline_metadata = dict(
+                pipeline_metadata if pipeline_metadata is not None else existing_pipeline_metadata
             )
+            existing_timeline = existing_pipeline_metadata.get("timeline")
+            merged_pipeline_metadata["timeline"] = advance_pipeline_timeline(
+                dict(existing_timeline) if isinstance(existing_timeline, dict) else {},
+                job_state=str(row_now.get("state") or ""),
+                pipeline_state=pipeline_state.value,
+                pipeline_step=pipeline_step,
+                pipeline_progress=pipeline_progress,
+                timestamp=self._now_iso(),
+                job_kind=self._job_kind_for_type(row_now.get("job_type")),
+                mask_types=self._normalized_mask_types(
+                    merged_pipeline_metadata.get("mask_types")
+                    or existing_pipeline_metadata.get("mask_types")
+                    or dict(row_now.get("request") or {}).get("mask_types")
+                    or []
+                ),
+            )
+            fields: dict[str, Any] = {
+                "pipeline_state": pipeline_state.value,
+                "pipeline_step": pipeline_step,
+                "pipeline_metadata": merged_pipeline_metadata,
+            }
+            if pipeline_progress is not None:
+                fields["pipeline_progress"] = max(0.0, min(100.0, float(pipeline_progress)))
+            if conversion_metadata is not None:
+                fields["conversion_metadata"] = conversion_metadata
+            if raw_outputs is not None:
+                fields["raw_outputs"] = list(raw_outputs)
+            if zarr_outputs is not None:
+                fields["zarr_outputs"] = list(zarr_outputs)
+            self.store.update_job(job_id, **fields)
+            if event_type:
+                self.store.append_event(
+                    job_id,
+                    event_type,
+                    {
+                        "pipeline_state": pipeline_state.value,
+                        "pipeline_step": pipeline_step,
+                        **(event_payload or {}),
+                    },
+                )
+
+    def _merged_pipeline_metadata(
+        self,
+        job_id: str,
+        pipeline_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row_now = self.store.get_job(job_id) or {}
+        existing_pipeline_metadata = dict(row_now.get("pipeline_metadata") or {})
+        merged = dict(existing_pipeline_metadata)
+        if pipeline_metadata is not None:
+            merged.update(pipeline_metadata)
+        timeline = merged.get("timeline")
+        if isinstance(timeline, dict):
+            merged["timeline"] = dict(timeline)
+        elif isinstance(existing_pipeline_metadata.get("timeline"), dict):
+            merged["timeline"] = dict(existing_pipeline_metadata["timeline"])
+        return merged
 
     @staticmethod
     def _filter_manifest_paths(paths: list[str]) -> list[str]:
@@ -3204,13 +3427,33 @@ class NimbusFetcher:
             pipeline_metadata=dict(row.get("pipeline_metadata") or {}),
         )
         pipeline_state = PipelineState.zarr_written
-        pipeline_metadata = {
-            **dict(row.get("pipeline_metadata") or {}),
-            "manual_conversion": True,
-            "raw_output_count": len(raw_outputs),
-            "zarr_output_count": len(zarr_outputs),
-            "zarr_parallel_workers": int(conversion_metadata.get("parallel_workers", 1) or 1),
-        }
+        pipeline_metadata = self._merged_pipeline_metadata(
+            job_id,
+            {
+                **dict(row.get("pipeline_metadata") or {}),
+                "manual_conversion": True,
+                "raw_output_count": len(raw_outputs),
+                "zarr_output_count": len(zarr_outputs),
+                "zarr_parallel_workers": int(conversion_metadata.get("parallel_workers", 1) or 1),
+            },
+        )
+        self._update_pipeline(
+            job_id,
+            pipeline_state=pipeline_state,
+            pipeline_step="zarr_written",
+            pipeline_progress=100.0,
+            pipeline_metadata=pipeline_metadata,
+            conversion_metadata=conversion_metadata,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+            event_type="job.zarr_written",
+            event_payload={
+                "manual_conversion": True,
+                "zarr_outputs": zarr_outputs,
+                "pipeline_progress": 100.0,
+            },
+        )
+        pipeline_metadata = self._merged_pipeline_metadata(job_id, pipeline_metadata)
         result_payload = {
             "job_id": job_id,
             "paths": list(result.get("paths") or []),
@@ -3235,15 +3478,6 @@ class NimbusFetcher:
             conversion_metadata=conversion_metadata,
             raw_outputs=raw_outputs,
             zarr_outputs=zarr_outputs,
-        )
-        self.store.append_event(
-            job_id,
-            "job.zarr_written",
-            {
-                "pipeline_state": pipeline_state.value,
-                "manual_conversion": True,
-                "zarr_outputs": zarr_outputs,
-            },
         )
         return self.get_job(job_id)
 
@@ -3648,7 +3882,7 @@ class NimbusFetcher:
                 "checksums": checksums,
                 "metadata": metadata,
                 "manifest_entry": manifest_entry,
-                "pipeline_metadata": pipeline_metadata,
+                "pipeline_metadata": self._merged_pipeline_metadata(job_id, pipeline_metadata),
                 "conversion_metadata": {},
             }
             self.store.set_result(job_id, base_result_payload)
@@ -3675,12 +3909,15 @@ class NimbusFetcher:
             requested_mask_types = self._normalized_mask_types(getattr(request, "mask_types", []))
             cube_config = self._cube_config_from_request(request)
             cube_outputs: list[str] = []
-            final_pipeline_metadata = {
-                **pipeline_metadata,
-                "zarr_output_count": len(zarr_outputs),
-                "manual_conversion": False,
-                "zarr_parallel_workers": int(conversion_metadata.get("parallel_workers", 1) or 1),
-            }
+            final_pipeline_metadata = self._merged_pipeline_metadata(
+                job_id,
+                {
+                    **pipeline_metadata,
+                    "zarr_output_count": len(zarr_outputs),
+                    "manual_conversion": False,
+                    "zarr_parallel_workers": int(conversion_metadata.get("parallel_workers", 1) or 1),
+                },
+            )
             if requested_mask_types:
                 final_pipeline_metadata["mask_types"] = requested_mask_types
                 final_pipeline_metadata["mask_mode"] = "integrated"
@@ -3699,6 +3936,23 @@ class NimbusFetcher:
                     ),
                 }
 
+            if final_pipeline_state == PipelineState.zarr_written:
+                self._update_pipeline(
+                    job_id,
+                    pipeline_state=final_pipeline_state,
+                    pipeline_step=final_pipeline_step,
+                    pipeline_progress=72.0 if requested_mask_types else 100.0,
+                    pipeline_metadata=final_pipeline_metadata,
+                    conversion_metadata=conversion_metadata,
+                    raw_outputs=raw_outputs,
+                    zarr_outputs=zarr_outputs,
+                    event_type="job.zarr_written",
+                    event_payload={
+                        "zarr_outputs": zarr_outputs,
+                        "pipeline_progress": 72.0 if requested_mask_types else 100.0,
+                    },
+                )
+            final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
             self.store.set_result(
                 job_id,
                 {
@@ -3805,6 +4059,7 @@ class NimbusFetcher:
                         item_index: 0.0 for item_index in range(len(zarr_outputs))
                     }
                     stage_by_index: dict[int, PipelineState] = {}
+                    step_by_index: dict[int, str] = {}
                     scene_count = max(1, len(zarr_outputs))
 
                     def _normalize_pipeline_state(value: Any) -> PipelineState:
@@ -3815,10 +4070,19 @@ class NimbusFetcher:
                         except Exception:
                             return PipelineState.running_cloud_inference
 
+                    def _normalize_pipeline_step(value: Any) -> str:
+                        candidate = str(value or "").strip().lower()
+                        if candidate:
+                            return candidate
+                        return "running_cloud_inference"
+
                     def _aggregate_pipeline_state() -> tuple[PipelineState, str]:
                         states = set(stage_by_index.values())
                         if PipelineState.failed in states:
-                            return PipelineState.failed, "failed"
+                            return (
+                                PipelineState.failed,
+                                self._preferred_mask_failure_step(step_by_index.values()),
+                            )
                         if PipelineState.running_water_inference in states:
                             return (
                                 PipelineState.running_water_inference,
@@ -3852,6 +4116,9 @@ class NimbusFetcher:
                                 )
                                 stage_by_index[item_index] = _normalize_pipeline_state(
                                     payload.get("pipeline_state")
+                                )
+                                step_by_index[item_index] = _normalize_pipeline_step(
+                                    payload.get("pipeline_step")
                                 )
                                 aggregate_fraction = sum(progress_by_index.values()) / scene_count
                                 aggregate_progress = 76.0 + (aggregate_fraction * 22.0)
@@ -3901,10 +4168,12 @@ class NimbusFetcher:
                             progress_by_index[item_index] = max(progress_by_index.get(item_index, 0.0), 1.0)
                             if not item_succeeded:
                                 stage_by_index[item_index] = PipelineState.failed
-                            elif "water" in requested_mask_types:
-                                stage_by_index[item_index] = PipelineState.running_water_inference
+                                step_by_index[item_index] = self._preferred_mask_failure_step(
+                                    [mask_execution.get("failed_step")]
+                                )
                             else:
-                                stage_by_index[item_index] = PipelineState.running_cloud_inference
+                                stage_by_index.pop(item_index, None)
+                                step_by_index.pop(item_index, None)
                             aggregate_fraction = sum(progress_by_index.values()) / scene_count
                             aggregate_progress = 76.0 + (aggregate_fraction * 22.0)
                             aggregate_state, aggregate_step = _aggregate_pipeline_state()
@@ -3982,6 +4251,7 @@ class NimbusFetcher:
                                 "pipeline_metadata": item_pipeline,
                                 "conversion_metadata": item_conversion,
                                 "errors": list(mask_execution.get("errors") or []),
+                                "failed_step": mask_execution.get("failed_step"),
                             }
                             _mark_item_completion(item_index, mask_execution=mask_execution)
                             last_mask_execution = mask_execution
@@ -4012,22 +4282,31 @@ class NimbusFetcher:
                                     "pipeline_metadata": item_pipeline,
                                     "conversion_metadata": item_conversion,
                                     "errors": list(mask_execution.get("errors") or []),
+                                    "failed_step": mask_execution.get("failed_step"),
                                 }
                                 _mark_item_completion(item_index, mask_execution=mask_execution)
+                                last_mask_execution = mask_execution
                                 mask_errors.extend(
                                     error
                                     for error in list(mask_execution.get("errors") or [])
                                     if error not in mask_errors
                                 )
-                                if item_index == len(zarr_outputs) - 1:
-                                    last_mask_execution = mask_execution
                     mask_items = [item for item in mask_items if item is not None]
                     final_pipeline_metadata["mask_parallel_workers"] = mask_workers
                     final_pipeline_metadata["mask_total_scenes"] = scene_count
                     final_pipeline_metadata["mask_completed_scenes"] = len(mask_items)
                     final_pipeline_metadata["mask_active_scenes"] = 0
 
-                    mask_succeeded = bool(last_mask_execution and last_mask_execution.get("succeeded")) and not mask_errors
+                    mask_item_statuses = [
+                        str((item or {}).get("status") or "").strip().lower()
+                        for item in mask_items
+                    ]
+                    mask_succeeded = (
+                        len(mask_items) == len(zarr_outputs)
+                        and bool(mask_items)
+                        and not mask_errors
+                        and all(status == "written" for status in mask_item_statuses)
+                    )
                     mask_summary = {
                         "status": "written" if mask_succeeded else "failed",
                         "mask_types": requested_mask_types,
@@ -4089,6 +4368,42 @@ class NimbusFetcher:
                         combined_cube_outputs = list(cube_execution.get("cube_outputs") or [])
                         final_pipeline_metadata = dict(cube_execution.get("pipeline_metadata") or final_pipeline_metadata)
                     final_paths = [*raw_result_paths, *zarr_outputs, *combined_cube_outputs]
+                    terminal_pipeline_step = (
+                        PipelineState.cube_written.value
+                        if mask_succeeded
+                        and cube_config is not None
+                        and cube_config["mode"] == "after_mask"
+                        and combined_cube_outputs
+                        else PipelineState.masked_zarr_written.value
+                    )
+                    if not mask_succeeded:
+                        terminal_pipeline_step = self._mask_failure_step_from_items(
+                            mask_types=requested_mask_types,
+                            items=cast(list[dict[str, Any]], mask_items),
+                        )
+                        mask_summary["failed_step"] = terminal_pipeline_step
+                        final_pipeline_metadata["failed_step"] = terminal_pipeline_step
+                        combined_conversion_metadata["failed_step"] = terminal_pipeline_step
+                    terminal_pipeline_state = (
+                        PipelineState.masked_zarr_written if mask_succeeded else PipelineState.failed
+                    )
+                    terminal_state = (
+                        JobState.succeeded
+                        if terminal_pipeline_state in {PipelineState.masked_zarr_written, PipelineState.cube_written}
+                        else JobState.failed
+                    )
+                    final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
+                    self._update_pipeline(
+                        job_id,
+                        pipeline_state=terminal_pipeline_state,
+                        pipeline_step=terminal_pipeline_step,
+                        pipeline_progress=100.0 if terminal_state == JobState.succeeded else 95.0,
+                        pipeline_metadata=final_pipeline_metadata,
+                        conversion_metadata=combined_conversion_metadata,
+                        raw_outputs=raw_outputs,
+                        zarr_outputs=zarr_outputs,
+                    )
+                    final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
                     self.store.set_result(
                         job_id,
                         {
@@ -4104,20 +4419,6 @@ class NimbusFetcher:
                             "conversion_metadata": combined_conversion_metadata,
                         },
                     )
-                    terminal_pipeline_state = (
-                        (
-                            PipelineState.cube_written
-                            if mask_succeeded and cube_config is not None and cube_config["mode"] == "after_mask" and combined_cube_outputs
-                            else PipelineState.masked_zarr_written
-                        )
-                        if mask_succeeded
-                        else PipelineState.failed
-                    )
-                    terminal_state = (
-                        JobState.succeeded
-                        if terminal_pipeline_state in {PipelineState.masked_zarr_written, PipelineState.cube_written}
-                        else JobState.failed
-                    )
                     self.store.update_job(
                         job_id,
                         state=terminal_state.value,
@@ -4126,7 +4427,7 @@ class NimbusFetcher:
                         bytes_downloaded=int(aggregate["bytes_downloaded"]),
                         bytes_total=max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"])),
                         pipeline_state=terminal_pipeline_state.value,
-                        pipeline_step=terminal_pipeline_state.value,
+                        pipeline_step=terminal_pipeline_step,
                         pipeline_progress=100.0 if terminal_state == JobState.succeeded else 95.0,
                         pipeline_metadata=final_pipeline_metadata,
                         conversion_metadata=combined_conversion_metadata,
@@ -4158,6 +4459,7 @@ class NimbusFetcher:
                         },
                     )
                     return
+            final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
             self.store.update_job(
                 job_id,
                 state=JobState.succeeded.value,
@@ -4619,6 +4921,55 @@ class NimbusFetcher:
         masked_zarr_outputs = self._masked_zarr_outputs_for_job(job_id=row["job_id"], result={}, row=row)
         pipeline_metadata = dict(row.get("pipeline_metadata") or {})
         cube_outputs = self._cube_outputs_for_job(job_id=row["job_id"], result={}, row=row)
+        pipeline_progress = (
+            float(row["pipeline_progress"])
+            if row.get("pipeline_progress") is not None
+            else None
+        )
+        timeline_timestamp: str | datetime
+        if str(row.get("state") or "").strip().lower() in {
+            JobState.running.value,
+            JobState.cancel_requested.value,
+        }:
+            timeline_timestamp = self._now_iso()
+        else:
+            timeline_timestamp = finished_at or updated_at or started_at or self._now_iso()
+        existing_timeline = pipeline_metadata.get("timeline")
+        pipeline_timeline = advance_pipeline_timeline(
+            dict(existing_timeline) if isinstance(existing_timeline, dict) else {},
+            job_state=str(row.get("state") or ""),
+            pipeline_state=str(row.get("pipeline_state") or PipelineState.queued.value),
+            pipeline_step=row.get("pipeline_step"),
+            pipeline_progress=pipeline_progress,
+            timestamp=timeline_timestamp,
+            job_kind=job_kind,
+            mask_types=self._normalized_mask_types(
+                (row.get("request") or {}).get("mask_types")
+                or pipeline_metadata.get("mask_types")
+                or dict(row.get("conversion_metadata") or {}).get("mask_types")
+                or []
+            ),
+        )
+        timeline_mask_types = self._normalized_mask_types(
+            (row.get("request") or {}).get("mask_types")
+            or pipeline_metadata.get("mask_types")
+            or dict(row.get("conversion_metadata") or {}).get("mask_types")
+            or []
+        )
+        if self._pipeline_timeline_needs_rebuild(
+            row=row,
+            pipeline_timeline=pipeline_timeline,
+            mask_types=timeline_mask_types,
+        ):
+            pipeline_timeline = self._rebuild_pipeline_timeline_from_events(
+                row=row,
+                job_kind=job_kind,
+                mask_types=timeline_mask_types,
+                pipeline_progress=pipeline_progress,
+                timeline_timestamp=timeline_timestamp,
+            )
+        if pipeline_timeline:
+            pipeline_metadata["timeline"] = pipeline_timeline
         source_job_id = str(
             pipeline_metadata.get("source_job_id")
             or (row.get("request") or {}).get("source_job_id")
@@ -4634,11 +4985,8 @@ class NimbusFetcher:
             state=JobState(row["state"]),
             pipeline_state=PipelineState(str(row.get("pipeline_state") or PipelineState.queued.value)),
             pipeline_step=row.get("pipeline_step"),
-            pipeline_progress=(
-                float(row["pipeline_progress"])
-                if row.get("pipeline_progress") is not None
-                else None
-            ),
+            pipeline_progress=pipeline_progress,
+            pipeline_timeline=pipeline_timeline,
             pipeline_metadata=pipeline_metadata,
             conversion_metadata=dict(row.get("conversion_metadata") or {}),
             raw_outputs=list(row.get("raw_outputs") or []),
@@ -4663,6 +5011,148 @@ class NimbusFetcher:
             provider=ProviderName(row["provider"]),
             collection=str(row["collection"]),
         )
+
+    def _rebuild_pipeline_timeline_from_events(
+        self,
+        *,
+        row: dict[str, Any],
+        job_kind: str | None,
+        mask_types: list[str],
+        pipeline_progress: float | None,
+        timeline_timestamp: str | datetime,
+    ) -> dict[str, Any]:
+        rebuilt: dict[str, Any] = {}
+        try:
+            events = self.store.list_events(str(row.get("job_id") or ""), None, 500)
+        except Exception:
+            events = []
+
+        for event in events:
+            payload = dict(event.get("payload") or {})
+            event_pipeline_state = str(payload.get("pipeline_state") or "").strip().lower()
+            event_pipeline_step = str(payload.get("pipeline_step") or event_pipeline_state).strip().lower()
+            if not event_pipeline_state and not event_pipeline_step:
+                continue
+            event_progress = payload.get("pipeline_progress")
+            rebuilt = advance_pipeline_timeline(
+                rebuilt,
+                job_state=str(row.get("state") or ""),
+                pipeline_state=event_pipeline_state or str(row.get("pipeline_state") or ""),
+                pipeline_step=event_pipeline_step or event_pipeline_state,
+                pipeline_progress=(
+                    float(event_progress)
+                    if event_progress is not None
+                    else None
+                ),
+                timestamp=event.get("timestamp") or timeline_timestamp,
+                job_kind=job_kind,
+                mask_types=mask_types,
+            )
+
+        return advance_pipeline_timeline(
+            rebuilt,
+            job_state=str(row.get("state") or ""),
+            pipeline_state=str(row.get("pipeline_state") or PipelineState.queued.value),
+            pipeline_step=row.get("pipeline_step"),
+            pipeline_progress=pipeline_progress,
+            timestamp=timeline_timestamp,
+            job_kind=job_kind,
+            mask_types=mask_types,
+        )
+
+    @staticmethod
+    def _pipeline_timeline_needs_rebuild(
+        *,
+        row: dict[str, Any],
+        pipeline_timeline: dict[str, Any],
+        mask_types: list[str],
+    ) -> bool:
+        steps = [
+            dict(step)
+            for step in list(pipeline_timeline.get("steps") or [])
+            if isinstance(step, dict)
+        ]
+        if not steps:
+            return True
+
+        active_steps = [
+            dict(step)
+            for step in steps
+            if str(step.get("status") or "").strip().lower() in {"running", "queued"}
+        ]
+        if len(active_steps) > 1:
+            return True
+
+        stage_statuses = {
+            str(stage.get("key") or "").strip().lower(): str(stage.get("status") or "").strip().lower()
+            for stage in list(pipeline_timeline.get("stages") or [])
+            if isinstance(stage, dict)
+        }
+        pipeline_state = str(row.get("pipeline_state") or "").strip().lower()
+        current_stage = str(pipeline_timeline.get("current_stage") or "").strip().lower()
+
+        if pipeline_state == PipelineState.searching.value and stage_statuses.get("search", "pending") == "pending":
+            return True
+        if pipeline_state in {PipelineState.downloading.value, PipelineState.downloaded.value} and stage_statuses.get("download", "pending") == "pending":
+            return True
+        if pipeline_state in {
+            PipelineState.zarr_queued.value,
+            PipelineState.zarr_converting.value,
+            PipelineState.zarr_written.value,
+            PipelineState.running_cloud_inference.value,
+            PipelineState.running_water_inference.value,
+            PipelineState.zarr_failed.value,
+            PipelineState.masked_zarr_written.value,
+        } and stage_statuses.get("convert", "pending") == "pending":
+            return True
+        if (
+            pipeline_state in {
+                PipelineState.running_cloud_inference.value,
+                PipelineState.running_water_inference.value,
+                PipelineState.masked_zarr_written.value,
+                PipelineState.failed.value,
+            }
+            and stage_statuses.get("convert") == "running"
+        ):
+            return True
+        if pipeline_state == PipelineState.resolving_source_zarr.value and stage_statuses.get("resolve", "pending") == "pending":
+            return True
+        if (
+            pipeline_state == PipelineState.running_cloud_inference.value
+            and current_stage not in {"cloud"}
+        ):
+            return True
+        if (
+            pipeline_state == PipelineState.running_water_inference.value
+            and current_stage not in {"water"}
+        ):
+            return True
+        if (
+            "cloud" in mask_types
+            and pipeline_state in {
+                PipelineState.running_cloud_inference.value,
+                PipelineState.running_water_inference.value,
+                PipelineState.masked_zarr_written.value,
+            }
+            and stage_statuses.get("cloud", "pending") == "pending"
+        ):
+            return True
+        if (
+            "water" in mask_types
+            and pipeline_state in {
+                PipelineState.running_water_inference.value,
+                PipelineState.masked_zarr_written.value,
+            }
+            and stage_statuses.get("water", "pending") == "pending"
+        ):
+            return True
+        if (
+            "cloud" in mask_types
+            and pipeline_state == PipelineState.masked_zarr_written.value
+            and stage_statuses.get("cloud", "pending") == "pending"
+        ):
+            return True
+        return False
 
     @staticmethod
     def _duration_seconds_for_row(

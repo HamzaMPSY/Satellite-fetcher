@@ -78,6 +78,13 @@ async def cancel_job(
     return {"job_id": job_id, "cancel_requested": cancel_requested}
 
 
+@router.post("/jobs/reset-active")
+async def reset_active_jobs(
+    fetcher: NimbusFetcher = Depends(get_fetcher),
+) -> dict[str, object]:
+    return await fetcher.reset_runtime_state()
+
+
 @router.get("/jobs/{job_id}/result", response_model=JobResultResponse)
 def get_job_result(
     job_id: str,

@@ -798,3 +798,9 @@ class SQLiteJobStore:
             )
             self._conn.commit()
         return int(cursor.rowcount or 0)
+
+    def clear_workers(self) -> int:
+        with self._lock:
+            cursor = self._conn.execute("DELETE FROM workers")
+            self._conn.commit()
+        return int(cursor.rowcount or 0)

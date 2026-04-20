@@ -29,6 +29,11 @@ from nimbuschain_mask_service.runtime import (
     runtime_device_status,
 )
 from nimbuschain_mask_service.sensor_mapping import resolve_sensor_mask_spec
+from nimbuschain_mask_service.tile_sizing import (
+    choose_mask_tile_sizing,
+    cloud_tile_sizing_policy_status,
+    water_tile_sizing_policy_status,
+)
 from nimbuschain_mask_service.writer import (
     finalize_cloud_outputs,
     prepare_cloud_output_arrays,
@@ -289,6 +294,10 @@ class MaskService:
                 metadata=metadata,
                 include_shadows=include_shadows,
                 inference_device=inference_device,
+                provider=provider,
+                collection=collection,
+                product_type=product_type,
+                dataset_summary=dataset_summary,
                 stage_callback=stage_callback,
                 source_zarr_uri=source_zarr_uri,
                 target_zarr_uri=target_zarr_uri,
@@ -316,6 +325,8 @@ class MaskService:
                 "input_bands": list(backend_descriptor.required_bands(sensor)),
                 "written_at": write_summary["written_at"],
                 "inference": inference_summary,
+                "tile_size": int(inference_summary.get("tile_size") or 0),
+                "tile_sizing": dict(inference_summary.get("tile_sizing") or {}),
                 "include_shadows": bool(include_shadows),
                 "cloud_fraction": float(inference_summary.get("cloud_fraction") or 0.0),
                 "cloud_only_fraction": float(inference_summary.get("cloud_only_fraction") or 0.0),
@@ -418,6 +429,10 @@ def support_status() -> dict[str, Any]:
         "runtime": {
             "cloud": runtime_device_status(explicit=None, env_var="NIMBUS_CLOUDMASK_DEVICE"),
             "water": runtime_device_status(explicit=None, env_var="NIMBUS_WATERMASK_DEVICE"),
+        },
+        "tile_sizing": {
+            "cloud": cloud_tile_sizing_policy_status(),
+            "water": water_tile_sizing_policy_status(),
         },
         "registry": registry,
     }
@@ -567,6 +582,10 @@ def _run_cloud_inference_tiled(
     metadata: dict[str, Any],
     include_shadows: bool,
     inference_device: str | None,
+    provider: str | None = None,
+    collection: str | None = None,
+    product_type: str | None = None,
+    dataset_summary: dict[str, Any] | None = None,
     stage_callback: Any = None,
     source_zarr_uri: str = "",
     target_zarr_uri: str = "",
@@ -575,6 +594,13 @@ def _run_cloud_inference_tiled(
     imagery = root["imagery"]
     height = int(imagery.shape[2])
     width = int(imagery.shape[3])
+    effective_dataset_summary = dict(dataset_summary or {})
+    if not effective_dataset_summary.get("shape"):
+        effective_dataset_summary["shape"] = [1, len(context.band_names), height, width]
+    if not effective_dataset_summary.get("pixel_size"):
+        pixel_size = root.attrs.get("reference_pixel_size") or root.attrs.get("pixel_size")
+        if pixel_size is not None:
+            effective_dataset_summary["pixel_size"] = list(pixel_size) if isinstance(pixel_size, (list, tuple)) else pixel_size
     cloud_arr, cloud_prob_arr = prepare_cloud_output_arrays(root, overwrite=True)
     total_pixels = max(1, height * width)
     valid_pixels_total = 0
@@ -593,12 +619,24 @@ def _run_cloud_inference_tiled(
         env_var="NIMBUS_CLOUDMASK_DEVICE",
     )
     try:
-        tile_size = _cloud_tile_size(
+        tile_sizing = _cloud_tile_sizing(
             backend_name=str(backend_descriptor.name),
             device=resolved_device,
+            provider=provider,
+            collection=collection,
+            product_type=product_type,
+            dataset_summary=effective_dataset_summary,
         )
+        tile_size = int(tile_sizing["tile_size"])
     except TypeError as exc:
-        if "backend_name" not in str(exc) and "device" not in str(exc):
+        if (
+            "backend_name" not in str(exc)
+            and "device" not in str(exc)
+            and "provider" not in str(exc)
+            and "collection" not in str(exc)
+            and "product_type" not in str(exc)
+            and "dataset_summary" not in str(exc)
+        ):
             raise
         try:
             tile_size = _cloud_tile_size(backend_name=str(backend_descriptor.name))
@@ -606,6 +644,34 @@ def _run_cloud_inference_tiled(
             if "backend_name" not in str(nested_exc):
                 raise
             tile_size = _cloud_tile_size()
+        tile_sizing = {
+            "source": "legacy_wrapper",
+            "tile_size": int(tile_size),
+            "mask_kind": "cloud",
+            "provider": str(provider or "").strip().lower(),
+            "collection": str(collection or "").strip(),
+            "collection_family": None,
+            "product_type": str(product_type or "").strip() or None,
+            "backend": str(backend_descriptor.name),
+            "device": normalize_device_name(resolved_device),
+            "scene_shape": list((effective_dataset_summary or {}).get("shape")[-2:] if (effective_dataset_summary or {}).get("shape") else []),
+            "scene_max_dimension": None,
+            "scene_area_pixels": None,
+            "target_pixel_size_meters": None,
+            "scene_ground_span_meters": None,
+            "tile_ground_span_meters": None,
+            "target_tiles_long_axis": None,
+            "target_tile_pixels": None,
+            "target_tile_ground_span_meters": None,
+            "estimated_tiles_long_axis": None,
+            "model_patch_size": 256,
+            "snap_multiple": 256,
+            "patch_multiple": None,
+            "min_patch_multiple": None,
+            "max_patch_multiple": None,
+            "requested_env_value": None,
+            "invalid_env_value": None,
+        }
     total_tiles = ((height + tile_size - 1) // tile_size) * ((width + tile_size - 1) // tile_size)
     tile_workers = parallel_worker_count(
         device=resolved_device,
@@ -773,6 +839,7 @@ def _run_cloud_inference_tiled(
             "probability_source": probability_source,
             "requested_threshold": float(threshold),
             "threshold_for_mask": None if backend_name == "omnicloudmask" else float(threshold),
+            "tile_sizing": dict(tile_sizing),
         },
     )
     return (
@@ -793,6 +860,7 @@ def _run_cloud_inference_tiled(
             "probability_source": probability_source,
             "requested_threshold": float(threshold),
             "threshold_for_mask": None if backend_name == "omnicloudmask" else float(threshold),
+            "tile_sizing": dict(tile_sizing),
         },
     )
 
@@ -899,19 +967,43 @@ def _effective_cloud_backend_request(*, backend: str | None, inference_device: s
 
 def _cloud_tile_size(*, backend_name: str | None = None, device: str | None = None) -> int:
     raw = str(os.getenv("NIMBUS_CLOUDMASK_TILE_SIZE") or "").strip()
-    try:
-        if raw:
-            value = int(raw)
-        else:
-            normalized_backend = str(backend_name or "").strip().lower()
-            normalized_device = normalize_device_name(device)
-            if normalized_backend == "omnicloudmask" and normalized_device not in {"cuda", "mps"}:
-                value = 512
-            else:
-                value = 1024
-    except ValueError:
-        value = 1024
-    return max(256, min(value, 2048))
+    if raw:
+        try:
+            return max(256, min(int(raw), 2048))
+        except ValueError:
+            pass
+    return int(
+        _cloud_tile_sizing(
+            backend_name=backend_name,
+            device=device,
+            provider=None,
+            collection=None,
+            product_type=None,
+            dataset_summary=None,
+        )["tile_size"]
+    )
+
+
+def _cloud_tile_sizing(
+    *,
+    backend_name: str | None = None,
+    device: str | None = None,
+    provider: str | None = None,
+    collection: str | None = None,
+    product_type: str | None = None,
+    dataset_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return choose_mask_tile_sizing(
+        mask_kind="cloud",
+        provider=provider,
+        collection=collection,
+        product_type=product_type,
+        dataset_summary=dataset_summary,
+        device=device,
+        backend_name=backend_name,
+        model_patch_size=256,
+        env_var="NIMBUS_CLOUDMASK_TILE_SIZE",
+    )
 
 
 def _iter_windows(*, height: int, width: int, tile_size: int):

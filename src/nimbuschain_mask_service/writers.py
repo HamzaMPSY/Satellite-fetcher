@@ -379,6 +379,8 @@ def finalize_water_outputs(
         "probability_path": WATER_PROBABILITY_PATH,
         "threshold_used": (float(threshold) if threshold is not None else None),
         "water_fraction": float(water_fraction),
+        "tile_size": (summary or {}).get("tile_size"),
+        "tile_sizing": dict((summary or {}).get("tile_sizing") or {}),
         "updated_at": common_attrs["created_at"],
         "probability_source": str((summary or {}).get("probability_source") or "water_score"),
     }
@@ -397,6 +399,8 @@ def finalize_water_outputs(
     root.attrs["water_mask_threshold_used"] = (float(threshold) if threshold is not None else None)
     root.attrs["water_mask_sensor_recipe"] = sensor_key
     root.attrs["water_mask_fraction"] = float(water_fraction)
+    root.attrs["water_mask_tile_size"] = (summary or {}).get("tile_size")
+    root.attrs["water_mask_tile_sizing"] = dict((summary or {}).get("tile_sizing") or {})
 
     try:
         zarr.consolidate_metadata(root.store)
@@ -505,6 +509,8 @@ def write_cloud_outputs(
         "shadow_fraction": float((summary or {}).get("shadow_fraction", 0.0)),
         "cloud_only_fraction": float((summary or {}).get("cloud_only_fraction", 0.0)),
         "class_histogram": dict((summary or {}).get("class_histogram") or {}),
+        "tile_size": (summary or {}).get("tile_size"),
+        "tile_sizing": dict((summary or {}).get("tile_sizing") or {}),
         "updated_at": common_attrs["created_at"],
     }
     root.attrs["cloud_mask_path"] = CLOUD_MASK_PATH
@@ -522,6 +528,8 @@ def write_cloud_outputs(
     root.attrs["cloud_mask_probability_source"] = str((summary or {}).get("probability_source") or "")
     root.attrs["cloud_mask_requested_threshold"] = (summary or {}).get("requested_threshold")
     root.attrs["cloud_mask_threshold_for_mask"] = (summary or {}).get("threshold_for_mask")
+    root.attrs["cloud_mask_tile_size"] = (summary or {}).get("tile_size")
+    root.attrs["cloud_mask_tile_sizing"] = dict((summary or {}).get("tile_sizing") or {})
 
     try:
         zarr.consolidate_metadata(root.store)
@@ -641,6 +649,8 @@ def finalize_cloud_outputs(
         "shadow_fraction": float((summary or {}).get("shadow_fraction", 0.0)),
         "cloud_only_fraction": float((summary or {}).get("cloud_only_fraction", 0.0)),
         "class_histogram": dict((summary or {}).get("class_histogram") or {}),
+        "tile_size": (summary or {}).get("tile_size"),
+        "tile_sizing": dict((summary or {}).get("tile_sizing") or {}),
         "updated_at": common_attrs["created_at"],
     }
     root.attrs["cloud_mask_path"] = CLOUD_MASK_PATH
@@ -658,6 +668,8 @@ def finalize_cloud_outputs(
     root.attrs["cloud_mask_probability_source"] = str((summary or {}).get("probability_source") or "")
     root.attrs["cloud_mask_requested_threshold"] = (summary or {}).get("requested_threshold")
     root.attrs["cloud_mask_threshold_for_mask"] = (summary or {}).get("threshold_for_mask")
+    root.attrs["cloud_mask_tile_size"] = (summary or {}).get("tile_size")
+    root.attrs["cloud_mask_tile_sizing"] = dict((summary or {}).get("tile_sizing") or {})
 
     try:
         zarr.consolidate_metadata(root.store)

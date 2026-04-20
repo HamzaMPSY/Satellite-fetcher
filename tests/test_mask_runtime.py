@@ -10,7 +10,12 @@ from nimbuschain_mask_service import runtime
 import nimbuschain_mask_service.service as mask_service_module
 import nimbuschain_mask_service.omniwater as omniwater_module
 from nimbuschain_mask_service.omniwater import _run_omniwater_model
-from nimbuschain_mask_service.service import _cloud_tile_size, _effective_cloud_backend_request
+from nimbuschain_mask_service.service import (
+    _cloud_tile_size,
+    _cloud_tile_sizing,
+    _effective_cloud_backend_request,
+    support_status,
+)
 
 
 def test_resolve_inference_device_prefers_explicit_value() -> None:
@@ -45,11 +50,150 @@ def test_parallel_worker_count_uses_gpu_safe_default(monkeypatch) -> None:
     ) == 3
 
 
-def test_omnicloudmask_tile_size_defaults_are_stable(monkeypatch) -> None:
+def test_mask_failure_step_prefers_stage_specific_water_failure() -> None:
+    assert NimbusFetcher._mask_failure_step_from_payloads(
+        mask_types=["cloud", "water"],
+        water_mask={"status": "failed", "reason": "disk full"},
+        cloud_mask={"status": "written"},
+    ) == "water_failed"
+
+
+def test_pipeline_timeline_rebuild_detects_corrupted_multiple_active_steps() -> None:
+    assert NimbusFetcher._pipeline_timeline_needs_rebuild(
+        row={"pipeline_state": "running_water_inference"},
+        pipeline_timeline={
+            "current_stage": "convert",
+            "steps": [
+                {"key": "writing_chunks", "status": "running"},
+                {"key": "running_water_inference", "status": "running"},
+            ],
+            "stages": [
+                {"key": "convert", "status": "running"},
+                {"key": "cloud", "status": "pending"},
+                {"key": "water", "status": "running"},
+            ],
+        },
+        mask_types=["cloud", "water"],
+    )
+    assert NimbusFetcher._mask_failure_step_from_items(
+        mask_types=["cloud", "water"],
+        items=[
+            {
+                "failed_step": "cloud_failed",
+                "conversion_metadata": {},
+            },
+            {
+                "conversion_metadata": {
+                    "water_mask": {"status": "failed"},
+                    "cloud_mask": {"status": "written"},
+                }
+            },
+        ],
+    ) == "water_failed"
+
+
+def test_omnicloudmask_tile_size_defaults_to_fixed_512(monkeypatch) -> None:
     monkeypatch.delenv("NIMBUS_CLOUDMASK_TILE_SIZE", raising=False)
+    s2_summary = {"shape": [1, 4, 10980, 10980], "pixel_size": [10.0, 10.0]}
+    landsat_summary = {"shape": [1, 7, 23040, 23040], "pixel_size": [10.0, 10.0]}
+
+    sentinel_cpu = _cloud_tile_sizing(
+        backend_name="omnicloudmask",
+        device="cpu",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        dataset_summary=s2_summary,
+    )
+    sentinel_mps = _cloud_tile_sizing(
+        backend_name="omnicloudmask",
+        device="mps",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        dataset_summary=s2_summary,
+    )
+    landsat_mps = _cloud_tile_sizing(
+        backend_name="omnicloudmask",
+        device="mps",
+        provider="usgs",
+        collection="LANDSAT_OT_C2_L2",
+        product_type="L2SR",
+        dataset_summary=landsat_summary,
+    )
+
+    assert sentinel_cpu["tile_size"] == 512
+    assert sentinel_cpu["target_tiles_long_axis"] == 22
+    assert sentinel_cpu["target_pixel_size_meters"] == 10.0
+    assert sentinel_cpu["source"] == "fixed_default"
+
+    assert sentinel_mps["tile_size"] == 512
+    assert sentinel_mps["target_tiles_long_axis"] == 22
+    assert sentinel_mps["estimated_tiles_long_axis"] == 22
+
+    assert landsat_mps["tile_size"] == 512
+    assert landsat_mps["collection_family"] == "landsat-8-9"
     assert _cloud_tile_size(backend_name="omnicloudmask", device="cpu") == 512
-    assert _cloud_tile_size(backend_name="omnicloudmask", device="mps") == 1024
-    assert _cloud_tile_size(backend_name="heuristic", device="cpu") == 1024
+
+
+def test_water_tile_size_defaults_to_fixed_512(monkeypatch) -> None:
+    monkeypatch.delenv("NIMBUS_WATERMASK_TILE_SIZE", raising=False)
+    summary = {"shape": [1, 6, 10980, 10980], "pixel_size": [10.0, 10.0]}
+
+    decision = omniwater_module._watermask_tile_sizing(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        dataset_summary=summary,
+        device="mps",
+        model_patch_size=512,
+    )
+
+    assert decision["tile_size"] == 512
+    assert decision["target_tiles_long_axis"] == 22
+    assert decision["snap_multiple"] == 512
+    assert decision["target_pixel_size_meters"] == 10.0
+    assert decision["source"] == "fixed_default"
+
+
+def test_explicit_tile_size_override_still_wins(monkeypatch) -> None:
+    monkeypatch.setenv("NIMBUS_CLOUDMASK_TILE_SIZE", "1400")
+    monkeypatch.setenv("NIMBUS_WATERMASK_TILE_SIZE", "3000")
+
+    cloud = _cloud_tile_sizing(
+        backend_name="omnicloudmask",
+        device="mps",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        dataset_summary={"shape": [1, 4, 10980, 10980], "pixel_size": [10.0, 10.0]},
+    )
+    water = omniwater_module._watermask_tile_sizing(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        dataset_summary={"shape": [1, 6, 10980, 10980], "pixel_size": [10.0, 10.0]},
+        device="mps",
+        model_patch_size=512,
+    )
+
+    assert cloud["source"] == "env_override"
+    assert cloud["tile_size"] == 1400
+    assert water["source"] == "env_override"
+    assert water["tile_size"] == 3000
+
+
+def test_support_status_exposes_tile_sizing_policy(monkeypatch) -> None:
+    monkeypatch.setenv("NIMBUS_CLOUDMASK_TILE_SIZE", "1536")
+    monkeypatch.delenv("NIMBUS_WATERMASK_TILE_SIZE", raising=False)
+
+    status = support_status()
+
+    assert status["tile_sizing"]["cloud"]["env_var"] == "NIMBUS_CLOUDMASK_TILE_SIZE"
+    assert status["tile_sizing"]["cloud"]["env_override"] == "1536"
+    assert status["tile_sizing"]["cloud"]["default_tile_size"] == 512
+    assert status["tile_sizing"]["cloud"]["mode"] == "fixed_default"
+    assert status["tile_sizing"]["water"]["patch_quantum"] == 512
 
 
 def test_auto_cloud_backend_always_uses_omnicloudmask(monkeypatch) -> None:

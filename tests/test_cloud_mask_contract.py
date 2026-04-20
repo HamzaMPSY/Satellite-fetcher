@@ -143,9 +143,14 @@ def test_omnicloudmask_branch_preserves_shadow_class_pixels(tmp_path: Path, monk
     assert np.all(cloud_mask[2:6, 2:6] == 1)
     assert np.all(cloud_mask[7:10, 7:10] == 1)
     assert float(cloud_prob[7:10, 7:10].mean()) > 0.0
+    assert result["tile_size"] == 512
+    assert result["tile_size"] == result["tile_sizing"]["tile_size"]
+    assert result["inference"]["tile_size"] == result["tile_size"]
     assert result["inference"]["includes_shadows"] is True
     assert result["inference"]["shadow_fraction"] > 0.0
     assert masked.attrs["cloud_mask_status"] == "written"
+    assert masked.attrs["cloud_mask_tile_size"] == result["tile_size"]
+    assert masked.attrs["cloud_mask"]["tile_size"] == result["tile_size"]
 
 
 def test_heuristic_cloud_mask_should_capture_shadow_pixels_adjacent_to_cloud(tmp_path: Path) -> None:

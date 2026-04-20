@@ -104,3 +104,6 @@ class JobStore(Protocol):
 
     def prune_stale_workers(self, stale_after_seconds: int) -> int:
         ...
+
+    def clear_workers(self) -> int:
+        ...

@@ -255,14 +255,49 @@ class MaskServiceClient:
             except (TypeError, ValueError):
                 sequence = 0
             status = str(progress.get("status") or "").strip().lower()
+            history: list[dict[str, Any]] = [
+                dict(item)
+                for item in list(progress.get("history") or [])
+                if isinstance(item, dict)
+            ]
+
+            emitted = False
+            if history and callable(stage_callback):
+                unseen_history: list[tuple[int, str, dict[str, Any]]] = []
+                for item in history:
+                    item_stage = str(item.get("stage_name") or "").strip()
+                    item_payload = dict(item.get("payload") or {})
+                    try:
+                        item_sequence = int(item.get("sequence") or 0)
+                    except (TypeError, ValueError):
+                        item_sequence = 0
+                    if not item_stage or item_sequence <= last_sequence:
+                        continue
+                    unseen_history.append((item_sequence, item_stage, item_payload))
+                unseen_history.sort(key=lambda item: item[0])
+                for item_sequence, item_stage, item_payload in unseen_history:
+                    stage_callback(item_stage, item_payload)
+                    last_sequence = item_sequence
+                    last_stage_name = item_stage
+                    last_payload = dict(item_payload)
+                    emitted = True
 
             if stage_name and callable(stage_callback):
-                if sequence > last_sequence or stage_name != last_stage_name or payload != last_payload:
+                if not history:
+                    if sequence > last_sequence or stage_name != last_stage_name or payload != last_payload:
+                        stage_callback(stage_name, payload)
+                        last_sequence = sequence
+                        last_stage_name = stage_name
+                        last_payload = dict(payload)
+                        emitted = True
+                elif sequence > last_sequence:
                     stage_callback(stage_name, payload)
                     last_sequence = sequence
                     last_stage_name = stage_name
                     last_payload = dict(payload)
-                elif last_stage_name:
+                    emitted = True
+
+                if not emitted and last_stage_name:
                     heartbeat_payload = dict(last_payload)
                     heartbeat_payload["heartbeat"] = True
                     stage_callback(last_stage_name, heartbeat_payload)

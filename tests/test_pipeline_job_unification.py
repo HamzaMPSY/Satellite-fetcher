@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -344,6 +345,93 @@ class RemoteLikeMaskService:
         }
 
 
+class ControlledMaskService:
+    def __init__(self, *, water_started: threading.Event, allow_water_finish: threading.Event):
+        self.water_started = water_started
+        self.allow_water_finish = allow_water_finish
+
+    def apply_masks_to_zarr(
+        self,
+        *,
+        job_id: str | None = None,
+        zarr_uri: str,
+        provider: str,
+        collection: str,
+        product_type: str | None,
+        scene_id: str,
+        acquisition_datetime: str | None,
+        dataset_summary: dict[str, object],
+        mask_types: list[str],
+        stage_callback=None,
+        **_kwargs,
+    ) -> dict[str, object]:
+        water_mask = {
+            "status": "written",
+            "input_zarr_uri": zarr_uri,
+            "output_zarr_uri": zarr_uri,
+            "storage_mode": "in_place_zarr_masking",
+            "mask_path": "masks/water",
+            "probability_path": "masks/water_probability",
+            "water_fraction": 0.2,
+        }
+        cloud_mask = {
+            "status": "written",
+            "input_zarr_uri": zarr_uri,
+            "output_zarr_uri": zarr_uri,
+            "storage_mode": "in_place_zarr_masking",
+            "mask_path": "masks/cloud",
+            "probability_path": "masks/cloud_probability",
+            "backend": "omnicloudmask",
+            "cloud_fraction": 0.3,
+            "cloud_only_fraction": 0.2,
+            "shadow_fraction": 0.1,
+        }
+
+        if stage_callback is not None and "cloud" in mask_types:
+            stage_callback(
+                "cloud_masking_started",
+                {"job_id": job_id, "zarr_uri": zarr_uri, "scene_id": scene_id},
+            )
+            stage_callback(
+                "cloud_masking_finished",
+                {
+                    "job_id": job_id,
+                    "zarr_uri": zarr_uri,
+                    "scene_id": scene_id,
+                    "cloud_mask": cloud_mask,
+                },
+            )
+        if stage_callback is not None and "water" in mask_types:
+            stage_callback(
+                "water_masking_started",
+                {"job_id": job_id, "zarr_uri": zarr_uri, "scene_id": scene_id},
+            )
+            self.water_started.set()
+            assert self.allow_water_finish.wait(30.0), "Timed out waiting to release water masking."
+            stage_callback(
+                "water_masking_finished",
+                {
+                    "job_id": job_id,
+                    "zarr_uri": zarr_uri,
+                    "scene_id": scene_id,
+                    "water_mask": water_mask,
+                },
+            )
+
+        return {
+            "status": "written",
+            "mask_types": list(mask_types),
+            "input_zarr_uri": zarr_uri,
+            "output_zarr_uri": zarr_uri,
+            "masked_zarr_uri": zarr_uri,
+            "masked_zarr_outputs": [zarr_uri],
+            "water_mask": water_mask if "water" in mask_types else {},
+            "cloud_mask": cloud_mask if "cloud" in mask_types else {},
+            "watermask_outputs": [],
+            "cloudmask_outputs": [],
+        }
+
+
 @pytest.fixture()
 def pipeline_runtime(tmp_path: Path):
     settings = get_settings().model_copy(
@@ -373,6 +461,32 @@ def _wait_for_completion(client: NimbusFetcherClient, job_id: str, timeout_secon
             return status
         time.sleep(0.1)
     pytest.fail(f"Job {job_id} did not finish in time. Last status: {last_status}")
+
+
+def _fetcher_job_status(fetcher: NimbusFetcher, job_id: str):
+    row = fetcher.store.get_job(job_id)
+    assert row is not None
+    normalized = fetcher._normalize_backend_paths_in_job_row(  # type: ignore[attr-defined]
+        fetcher._normalize_historical_job_row(row)  # type: ignore[attr-defined]
+    )
+    return fetcher._to_status_response(normalized)  # type: ignore[attr-defined]
+
+
+def _wait_for_fetcher_status(
+    fetcher: NimbusFetcher,
+    job_id: str,
+    predicate,
+    timeout_seconds: float = 10.0,
+):
+    deadline = time.monotonic() + timeout_seconds
+    last_status = None
+    while time.monotonic() < deadline:
+        status = _fetcher_job_status(fetcher, job_id)
+        last_status = status
+        if predicate(status):
+            return status
+        time.sleep(0.1)
+    pytest.fail(f"Job {job_id} did not reach the expected intermediate state. Last status: {last_status}")
 
 
 def _request_payload(mask_types: list[str] | None = None) -> SearchDownloadRequest:
@@ -445,6 +559,15 @@ def test_single_job_runs_download_and_zarr_in_one_pipeline(pipeline_runtime) -> 
     assert final_status.state == JobState.succeeded
     assert final_status.pipeline_state == PipelineState.zarr_written
     assert final_status.pipeline_step == "zarr_written"
+    assert final_status.pipeline_timeline["terminal"] is True
+    stage_statuses = {
+        str(stage["key"]): str(stage["status"])
+        for stage in final_status.pipeline_timeline["stages"]
+    }
+    assert stage_statuses["search"] == "done"
+    assert stage_statuses["download"] == "done"
+    assert stage_statuses["convert"] == "done"
+    assert stage_statuses["ready"] == "done"
     assert final_status.raw_outputs, "Expected raw outputs on the same pipeline job."
     assert final_status.zarr_outputs, "Expected Zarr outputs on the same pipeline job."
 
@@ -508,6 +631,44 @@ def test_single_job_can_continue_with_integrated_masking(pipeline_runtime) -> No
     assert "job.zarr_written" in event_types
     assert "job.mask_completed" in event_types
     assert "job.succeeded" in event_types
+
+
+def test_integrated_masking_keeps_convert_done_while_water_is_running(pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+
+    water_started = threading.Event()
+    allow_water_finish = threading.Event()
+    fetcher._mask_service = ControlledMaskService(
+        water_started=water_started,
+        allow_water_finish=allow_water_finish,
+    )
+
+    job_id = client.submit_job(_request_payload(mask_types=["water", "cloud"]))
+    assert water_started.wait(5.0), "Water masking never started in the controlled test."
+
+    running_status = _wait_for_fetcher_status(
+        fetcher,
+        job_id,
+        lambda status: status.pipeline_state == PipelineState.running_water_inference,
+    )
+    stage_statuses = {
+        str(stage["key"]): str(stage["status"])
+        for stage in running_status.pipeline_timeline["stages"]
+    }
+
+    assert running_status.state == JobState.running
+    assert stage_statuses["search"] == "done"
+    assert stage_statuses["download"] == "done"
+    assert stage_statuses["convert"] == "done"
+    assert stage_statuses["cloud"] == "done"
+    assert stage_statuses["water"] == "running"
+    assert stage_statuses["ready"] == "pending"
+
+    allow_water_finish.set()
+    final_status = _wait_for_completion(client, job_id)
+    assert final_status.state == JobState.succeeded
+    assert final_status.pipeline_state == PipelineState.masked_zarr_written
 
 
 def test_download_progress_updates_are_throttled_to_coarser_intervals() -> None:

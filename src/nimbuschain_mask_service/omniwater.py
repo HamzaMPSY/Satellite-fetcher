@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass
+import errno
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from nimbuschain_mask_service.io import (
     read_required_channels_window,
 )
 from nimbuschain_mask_service.sensor_mapping import SensorMaskSpec, resolve_sensor_mask_spec
+from nimbuschain_mask_service.tile_sizing import choose_mask_tile_sizing, water_tile_sizing_policy_status
 from nimbuschain_mask_service.runtime import (
     batch_size_for_device,
     normalize_device_name,
@@ -78,6 +80,9 @@ def omniwater_support_status() -> dict[str, Any]:
     return {
         "available": _omniwater_module_available(),
         "module": "omniwatermask",
+        "tile_sizing": water_tile_sizing_policy_status(
+            model_patch_size=_watermask_inference_patch_size(),
+        ),
     }
 
 
@@ -177,22 +182,30 @@ def apply_omniwatermask_to_zarr(
                 },
             )
         if preferred_runtime == "model" and make_water_mask is not None:
-            with tempfile.TemporaryDirectory(prefix=f"nimbus-water-{scene_id}-") as tmp_dir:
-                scene_dir = Path(tmp_dir)
-                tiles_dir = scene_dir / "tiles"
-                cache_dir = scene_dir / "cache"
-                output_dir = scene_dir / "outputs"
-                output_dir.mkdir(parents=True, exist_ok=True)
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                tile_manifest = _export_rgbnir_tiles(
-                    zarr_uri=prepared_output_zarr_uri,
-                    tiles_dir=tiles_dir,
-                    dataset_summary=dataset_summary,
-                    input_bands=plan.input_bands,
-                    sensor=plan.sensor,
-                )
-                tile_paths = [tile.path for tile in tile_manifest["tiles"]]
-                try:
+            scratch_root = _watermask_scratch_root(output_zarr_uri=prepared_output_zarr_uri)
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix=f"nimbus-water-{scene_id}-",
+                    dir=str(scratch_root),
+                ) as tmp_dir:
+                    scene_dir = Path(tmp_dir)
+                    tiles_dir = scene_dir / "tiles"
+                    cache_dir = scene_dir / "cache"
+                    output_dir = scene_dir / "outputs"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    tile_manifest = _export_rgbnir_tiles(
+                        zarr_uri=prepared_output_zarr_uri,
+                        tiles_dir=tiles_dir,
+                        dataset_summary=dataset_summary,
+                        input_bands=plan.input_bands,
+                        sensor=plan.sensor,
+                        provider=provider,
+                        collection=collection,
+                        product_type=product_type,
+                        inference_device=resolved_device,
+                    )
+                    tile_paths = [tile.path for tile in tile_manifest["tiles"]]
                     mask_output, model_runtime = _run_omniwater_model(
                         make_water_mask=make_water_mask,
                         scene_paths=tile_paths,
@@ -219,51 +232,64 @@ def apply_omniwatermask_to_zarr(
                     )
                     runtime_summary.update(
                         {
+                            "tile_size": int(tile_manifest["tile_size"]),
+                            "tile_sizing": dict(tile_manifest.get("tile_sizing") or {}),
                             "model_profile": str(model_runtime.get("profile") or ""),
                             "model_attempt_count": int(model_runtime.get("attempt_count") or 0),
                             "model_attempts": list(model_runtime.get("attempts") or []),
+                            "scratch_root": str(scratch_root),
                         }
                     )
                     runtime_mode = "model"
                     input_bands = list(plan.input_bands)
-                except Exception as exc:
-                    if not _should_fail_open_model_runtime(exc=exc, device=resolved_device):
-                        raise
-                    runtime_warning = _format_model_runtime_warning(exc=exc, device=resolved_device)
-                    water_arr, water_prob_arr = prepare_water_output_arrays(target_root, overwrite=True)
-                    runtime_summary = _run_water_fallback_tiled(
-                        zarr_uri=prepared_output_zarr_uri,
-                        sensor=plan.sensor,
-                        threshold=float(plan.threshold or 0.0),
-                        water_arr=water_arr,
-                        water_prob_arr=water_prob_arr,
-                        inference_device=resolved_device,
-                        stage_callback=stage_callback,
-                        source_zarr_uri=source_lineage_uri,
-                        target_zarr_uri=prepared_output_zarr_uri,
-                        scene_id=scene_id,
-                    )
-                    attempt_summaries = _model_attempt_summaries(exc)
-                    runtime_summary.update(
-                        {
-                            "model_profile": "",
-                            "model_attempt_count": len(attempt_summaries),
-                            "model_attempts": attempt_summaries,
-                            "runtime_warning": runtime_warning,
-                            "model_error": str(exc),
-                            "fallback_trigger": (
-                                "legacy_dependency"
-                                if _is_legacy_model_dependency_error(exc)
-                                else "mps_fail_open"
-                            ),
-                        }
-                    )
-                    runtime_mode = "heuristic_fallback"
-                    input_bands = list(plan.fallback_bands)
+            except Exception as exc:
+                if not _should_fail_open_model_runtime(exc=exc, device=resolved_device):
+                    raise
+                runtime_warning = _format_model_runtime_warning(exc=exc, device=resolved_device)
+                water_arr, water_prob_arr = prepare_water_output_arrays(target_root, overwrite=True)
+                runtime_summary = _run_water_fallback_tiled(
+                    zarr_uri=prepared_output_zarr_uri,
+                    provider=provider,
+                    collection=collection,
+                    product_type=product_type,
+                    dataset_summary=dataset_summary,
+                    sensor=plan.sensor,
+                    threshold=float(plan.threshold or 0.0),
+                    water_arr=water_arr,
+                    water_prob_arr=water_prob_arr,
+                    inference_device=resolved_device,
+                    stage_callback=stage_callback,
+                    source_zarr_uri=source_lineage_uri,
+                    target_zarr_uri=prepared_output_zarr_uri,
+                    scene_id=scene_id,
+                )
+                attempt_summaries = _model_attempt_summaries(exc)
+                fallback_trigger = "mps_fail_open"
+                if _is_legacy_model_dependency_error(exc):
+                    fallback_trigger = "legacy_dependency"
+                elif _is_watermask_scratch_capacity_error(exc):
+                    fallback_trigger = "scratch_capacity"
+                runtime_summary.update(
+                    {
+                        "model_profile": "",
+                        "model_attempt_count": len(attempt_summaries),
+                        "model_attempts": attempt_summaries,
+                        "runtime_warning": runtime_warning,
+                        "model_error": str(exc),
+                        "fallback_trigger": fallback_trigger,
+                        "scratch_root": str(scratch_root),
+                    }
+                )
+                runtime_mode = "heuristic_fallback"
+                input_bands = list(plan.fallback_bands)
         else:
             water_arr, water_prob_arr = prepare_water_output_arrays(target_root, overwrite=True)
             runtime_summary = _run_water_fallback_tiled(
                 zarr_uri=prepared_output_zarr_uri,
+                provider=provider,
+                collection=collection,
+                product_type=product_type,
+                dataset_summary=dataset_summary,
                 sensor=plan.sensor,
                 threshold=float(plan.threshold or 0.0),
                 water_arr=water_arr,
@@ -305,6 +331,9 @@ def apply_omniwatermask_to_zarr(
                 "model_attempts": list(runtime_summary.get("model_attempts") or []),
                 "runtime_warning": str(runtime_summary.get("runtime_warning") or runtime_warning),
                 "fallback_trigger": str(runtime_summary.get("fallback_trigger") or ""),
+                "tile_size": runtime_summary.get("tile_size"),
+                "tile_sizing": dict(runtime_summary.get("tile_sizing") or {}),
+                "scratch_root": str(runtime_summary.get("scratch_root") or ""),
             },
             water_fraction=float(runtime_summary.get("water_fraction") or 0.0),
             water_arr=water_arr,
@@ -348,8 +377,12 @@ def apply_omniwatermask_to_zarr(
             "probability_source": str(runtime_summary.get("probability_source") or "water_score"),
             "cloud_blocked_fraction": float(runtime_summary.get("cloud_blocked_fraction") or 0.0),
             "runtime_warning": str(runtime_summary.get("runtime_warning") or runtime_warning),
+            "fallback_trigger": str(runtime_summary.get("fallback_trigger") or ""),
             "model_profile": str(runtime_summary.get("model_profile") or ""),
             "model_attempt_count": int(runtime_summary.get("model_attempt_count") or 0),
+            "tile_size": int(runtime_summary.get("tile_size") or 0),
+            "tile_sizing": dict(runtime_summary.get("tile_sizing") or {}),
+            "scratch_root": str(runtime_summary.get("scratch_root") or ""),
         }
         _sync_zarr_mask_attrs(zarr_uri=prepared_output_zarr_uri, payload=payload)
         if stage_callback is not None:
@@ -510,6 +543,10 @@ def _export_rgbnir_tiles(
     dataset_summary: dict[str, Any],
     input_bands: list[str],
     sensor: SensorMaskSpec,
+    provider: str,
+    collection: str,
+    product_type: str | None,
+    inference_device: str | None,
 ) -> dict[str, Any]:
     try:
         import numpy as np
@@ -546,7 +583,15 @@ def _export_rgbnir_tiles(
     height = int(dataset_summary["shape"][2])
     width = int(dataset_summary["shape"][3])
     transform = Affine(*transform_values[:6])
-    tile_size = _watermask_tile_size()
+    tile_sizing = _watermask_tile_sizing(
+        provider=provider,
+        collection=collection,
+        product_type=product_type,
+        dataset_summary=dataset_summary,
+        device=inference_device,
+        model_patch_size=_watermask_inference_patch_size(),
+    )
+    tile_size = int(tile_sizing["tile_size"])
     tiles: list[OmniWaterTile] = []
     tiles_dir.mkdir(parents=True, exist_ok=True)
     tile_index = 0
@@ -627,6 +672,7 @@ def _export_rgbnir_tiles(
     return {
         "tiles": tiles,
         "tile_size": tile_size,
+        "tile_sizing": tile_sizing,
         "height": height,
         "width": width,
         "transform": transform,
@@ -781,6 +827,10 @@ def _run_internal_ndwi(*, scene_paths: list[Path], output_dir: Path) -> list[Pat
 def _run_water_fallback_tiled(
     *,
     zarr_uri: str,
+    provider: str,
+    collection: str,
+    product_type: str | None,
+    dataset_summary: dict[str, Any],
     sensor: SensorMaskSpec,
     threshold: float,
     water_arr: Any,
@@ -806,7 +856,15 @@ def _run_water_fallback_tiled(
     cloud_blocked_pixels = 0
     probability_sum = 0.0
     effective_threshold = float(threshold)
-    tile_size = _watermask_tile_size()
+    tile_sizing = _watermask_tile_sizing(
+        provider=provider,
+        collection=collection,
+        product_type=product_type,
+        dataset_summary=dataset_summary,
+        device=inference_device,
+        model_patch_size=_watermask_inference_patch_size(),
+    )
+    tile_size = int(tile_sizing["tile_size"])
     windows = [
         (
             row_start,
@@ -919,6 +977,8 @@ def _run_water_fallback_tiled(
         "probability_source": "water_score",
         "cloud_blocked_fraction": float(cloud_blocked_pixels / denominator),
         "valid_pixel_fraction": float(denominator / total_pixels),
+        "tile_size": tile_size,
+        "tile_sizing": tile_sizing,
         "tile_workers": tile_workers,
     }
 
@@ -1395,8 +1455,38 @@ def _is_legacy_model_dependency_error(exc: Exception) -> bool:
     )
 
 
+def _is_watermask_scratch_capacity_error(exc: Exception) -> bool:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        if getattr(current, "errno", None) == errno.ENOSPC:
+            return True
+        message = str(current).strip().lower()
+        if (
+            "no space left on device" in message
+            or "disk full" in message
+            or "not enough space" in message
+            or "filesystem full" in message
+        ):
+            return True
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        if cause is not None:
+            pending.append(cause)
+        if context is not None:
+            pending.append(context)
+    return False
+
+
 def _should_fail_open_model_runtime(*, exc: Exception, device: str | None) -> bool:
     if _is_legacy_model_dependency_error(exc):
+        return True
+    if _is_watermask_scratch_capacity_error(exc):
         return True
     return normalize_device_name(device) == "mps" and _watermask_mps_fail_open()
 
@@ -1404,6 +1494,11 @@ def _should_fail_open_model_runtime(*, exc: Exception, device: str | None) -> bo
 def _format_model_runtime_warning(*, exc: Exception, device: str | None) -> str:
     normalized_device = normalize_device_name(device)
     reason = str(exc).strip()
+    if _is_watermask_scratch_capacity_error(exc):
+        return (
+            "OmniWater scratch export ran out of local disk space; Nimbus switched this scene "
+            f"to the tiled heuristic fallback to keep the pipeline running ({reason})."
+        )
     if normalized_device == "mps":
         return (
             "OmniWater model runtime failed on MPS; Nimbus switched this scene to the tiled "
@@ -1429,11 +1524,33 @@ def _model_attempt_summaries(exc: Exception) -> list[dict[str, Any]]:
 
 def _watermask_tile_size() -> int:
     raw = str(os.getenv("NIMBUS_WATERMASK_TILE_SIZE") or "").strip()
-    try:
-        value = int(raw) if raw else 2048
-    except ValueError:
-        value = 2048
-    return max(256, value)
+    if raw:
+        try:
+            return max(256, int(raw))
+        except ValueError:
+            pass
+    return 512
+
+
+def _watermask_tile_sizing(
+    *,
+    provider: str | None,
+    collection: str | None,
+    product_type: str | None,
+    dataset_summary: dict[str, Any] | None,
+    device: str | None,
+    model_patch_size: int,
+) -> dict[str, Any]:
+    return choose_mask_tile_sizing(
+        mask_kind="water",
+        provider=provider,
+        collection=collection,
+        product_type=product_type,
+        dataset_summary=dataset_summary,
+        device=device,
+        model_patch_size=model_patch_size,
+        env_var="NIMBUS_WATERMASK_TILE_SIZE",
+    )
 
 
 def _watermask_runtime_mode(explicit: str | None = None) -> str:
@@ -1501,6 +1618,17 @@ def _omniwater_module_available() -> bool:
     if "omniwatermask" in sys.modules:
         return True
     return importlib.util.find_spec("omniwatermask") is not None
+
+
+def _watermask_scratch_root(*, output_zarr_uri: str) -> Path:
+    configured = str(os.getenv("NIMBUS_WATERMASK_TMP_DIR") or "").strip()
+    if configured:
+        target = Path(configured).expanduser()
+    else:
+        output_path = local_path_for_uri(output_zarr_uri)
+        target = output_path.parent / ".nimbus-mask-tmp" / "water"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def _watermask_model_dir(scene_dir: Path) -> Path:

@@ -1135,3 +1135,89 @@ def test_remote_mask_service_client_forwards_progress_callbacks_during_apply() -
     assert result["status"] == "written"
     assert any(stage_name == "cloud_masking_started" for stage_name, _ in progress_calls)
     assert any(stage_name == "cloud_masking_progress" for stage_name, _ in progress_calls)
+
+
+def test_remote_mask_service_client_replays_missed_progress_history_between_polls() -> None:
+    progress_calls: list[tuple[str, dict[str, object]]] = []
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object], *, status_code: int = 200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"status={self.status_code}")
+
+        def json(self) -> dict[str, object]:
+            return dict(self._payload)
+
+    class _FakeSession:
+        def post(self, url: str, *, json: dict[str, object], timeout, params=None):  # noqa: A002
+            assert url == "http://nimbus-mask:8020/apply"
+            assert params == {"job_id": "job-456"}
+            time.sleep(0.05)
+            return _FakeResponse({"status": "written"})
+
+        def get(self, url: str, *, timeout):
+            assert timeout == 10
+            assert url == "http://nimbus-mask:8020/progress/job-456"
+            return _FakeResponse(
+                {
+                    "job_id": "job-456",
+                    "stage_name": "water_masking_started",
+                    "payload": {"scene_id": "S2A_SCENE"},
+                    "status": "running",
+                    "sequence": 3,
+                    "history": [
+                        {
+                            "job_id": "job-456",
+                            "stage_name": "cloud_masking_started",
+                            "payload": {"scene_id": "S2A_SCENE"},
+                            "status": "running",
+                            "sequence": 1,
+                        },
+                        {
+                            "job_id": "job-456",
+                            "stage_name": "cloud_masking_finished",
+                            "payload": {"scene_id": "S2A_SCENE"},
+                            "status": "running",
+                            "sequence": 2,
+                        },
+                        {
+                            "job_id": "job-456",
+                            "stage_name": "water_masking_started",
+                            "payload": {"scene_id": "S2A_SCENE"},
+                            "status": "running",
+                            "sequence": 3,
+                        },
+                    ],
+                }
+            )
+
+        def close(self) -> None:
+            return None
+
+    client = MaskServiceClient(service_url="http://nimbus-mask:8020")
+    client.REMOTE_PROGRESS_POLL_SECONDS = 0.01
+    client._session = _FakeSession()
+
+    result = client.apply_masks_to_zarr(
+        job_id="job-456",
+        zarr_uri="/tmp/source.zarr",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        scene_id="S2A_SCENE",
+        acquisition_datetime="2026-04-01T10:00:00Z",
+        dataset_summary={"shape": [1, 12, 4, 4]},
+        mask_types=["cloud", "water"],
+        stage_callback=lambda stage_name, payload: progress_calls.append((stage_name, dict(payload))),
+    )
+
+    assert result["status"] == "written"
+    assert [stage_name for stage_name, _ in progress_calls[:3]] == [
+        "cloud_masking_started",
+        "cloud_masking_finished",
+        "water_masking_started",
+    ]

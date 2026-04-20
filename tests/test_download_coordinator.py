@@ -7,7 +7,9 @@ from pathlib import Path
 from nimbuschain_fetch.download.coordinator import (
     DownloadCoordinator,
     DownloadCoordinatorStore,
+    TASK_STATUS_CANCELLED,
     TASK_STATUS_DOWNLOADING,
+    TASK_STATUS_DONE,
     TASK_STATUS_QUEUED,
     TASK_STATUS_READY,
 )
@@ -80,6 +82,53 @@ def test_download_coordinator_store_requeues_prepared_usgs_downloads_as_ready(tm
     assert row["file_name"] == "scene-1.tar"
     assert row["account_label"] is None
     assert row["retry_after"] is None
+
+    store.close()
+
+
+def test_download_coordinator_store_cancel_all_non_terminal_tasks(tmp_path: Path) -> None:
+    store = DownloadCoordinatorStore(tmp_path / "download-coordinator.db")
+    queued = store.ensure_task(
+        task_id="task-queued",
+        provider="copernicus",
+        job_id="job-1",
+        collection="SENTINEL-2",
+        product_id="scene-queued",
+        output_dir=str(tmp_path / "downloads"),
+        metadata={},
+    )
+    downloading = store.ensure_task(
+        task_id="task-downloading",
+        provider="usgs",
+        job_id="job-2",
+        collection="landsat_ot_c2_l1",
+        product_id="scene-downloading",
+        output_dir=str(tmp_path / "downloads"),
+        metadata={},
+    )
+    completed = store.ensure_task(
+        task_id="task-done",
+        provider="copernicus",
+        job_id="job-3",
+        collection="SENTINEL-2",
+        product_id="scene-done",
+        output_dir=str(tmp_path / "downloads"),
+        metadata={},
+    )
+    store.update_task(str(downloading["task_id"]), status=TASK_STATUS_DOWNLOADING)
+    store.update_task(str(completed["task_id"]), status=TASK_STATUS_DONE, finished_at="2026-04-17T11:00:00+00:00")
+
+    cancelled_ids = store.cancel_all_non_terminal_tasks(reason="reset")
+
+    queued_row = store.get_task(str(queued["task_id"])) or {}
+    downloading_row = store.get_task(str(downloading["task_id"])) or {}
+    completed_row = store.get_task(str(completed["task_id"])) or {}
+
+    assert cancelled_ids == [str(queued["task_id"]), str(downloading["task_id"])]
+    assert queued_row["status"] == TASK_STATUS_CANCELLED
+    assert queued_row["error_text"] == "reset"
+    assert downloading_row["status"] == TASK_STATUS_CANCELLED
+    assert completed_row["status"] == TASK_STATUS_DONE
 
     store.close()
 

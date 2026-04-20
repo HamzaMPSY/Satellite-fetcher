@@ -42,6 +42,10 @@ try:
 except Exception:
     ConfigLoader = None
 
+from nimbuschain_fetch.pipeline_timeline import (
+    advance_pipeline_timeline,
+    refresh_pipeline_timeline,
+)
 from nimbuschain_fetch_ui.aoi_utils import parse_aoi_text
 from nimbuschain_fetch_ui.constants import (
     SRC_ROOT,
@@ -1895,6 +1899,9 @@ def _render_job_cards(
         pipeline_state = _job_pipeline_state(item)
         pipeline_progress = _job_pipeline_progress(item)
         duration = item.get("duration_seconds")
+        current_stage = _current_timeline_stage(item)
+        current_stage_label = str((current_stage or {}).get("label") or "-")
+        current_stage_duration = _format_runtime_duration((current_stage or {}).get("duration_seconds"))
         errors = item.get("errors", []) or []
         error_summary = None
         if errors:
@@ -1932,7 +1939,7 @@ def _render_job_cards(
                 + "</div>",
                 unsafe_allow_html=True,
             )
-            h1, h2, h3, h4 = st.columns([3, 1, 1, 1])
+            h1, h2, h3, h4, h5 = st.columns([3, 1, 1, 1, 1])
             with h1:
                 st.markdown(f"**{job_id}**")
                 st.caption(
@@ -1944,11 +1951,15 @@ def _render_job_cards(
             with h3:
                 st.metric("Pipeline", pipeline_label)
             with h4:
-                st.metric("Duration", f"{float(duration):.1f}s" if duration is not None else "-")
+                st.metric("Job elapsed", _format_runtime_duration(duration))
+            with h5:
+                st.metric("Stage elapsed", current_stage_duration)
             _render_pipeline_timeline(item)
             _render_job_progress_bar(pipeline_progress, _job_progress_visual_state(item))
             st.caption(
-                f"Pipeline progress: {pipeline_progress:.2f}%"
+                f"Current stage: {current_stage_label}"
+                f" · Pipeline state: {pipeline_state}"
+                f" · Pipeline progress: {pipeline_progress:.2f}%"
                 f" · Download progress: {download_progress:.2f}%"
                 f" · Updated: {item.get('updated_at', '-')}"
             )
@@ -2069,6 +2080,83 @@ def _job_pipeline_progress(item: dict[str, Any]) -> float:
     if item.get("pipeline_progress") is not None:
         return float(item.get("pipeline_progress", 0.0) or 0.0)
     return float(item.get("progress", 0.0) or 0.0)
+
+
+def _format_runtime_duration(value: Any) -> str:
+    try:
+        seconds = max(0.0, float(value or 0.0))
+    except Exception:
+        return "-"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minute = divmod(minutes, 60)
+    return f"{hours}h {minute:02d}m"
+
+
+def _pipeline_timeline_snapshot(item: dict[str, Any]) -> dict[str, Any]:
+    pipeline_metadata = dict(item.get("pipeline_metadata") or {})
+    existing_timeline = item.get("pipeline_timeline")
+    if not isinstance(existing_timeline, dict):
+        existing_timeline = pipeline_metadata.get("timeline")
+    if not isinstance(existing_timeline, dict):
+        existing_timeline = {}
+
+    state_value = str(item.get("state") or "").strip().lower()
+    if state_value in ACTIVE_JOB_STATES:
+        timeline_timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    else:
+        timeline_timestamp = (
+            item.get("finished_at")
+            or item.get("updated_at")
+            or item.get("started_at")
+            or dt.datetime.now(dt.timezone.utc).isoformat()
+        )
+
+    pipeline_state = str(item.get("pipeline_state") or _job_pipeline_state(item) or "").strip().lower()
+    pipeline_step = str(item.get("pipeline_step") or "").strip().lower() or None
+    job_kind = "mask" if _job_is_mask_job(item) else "fetch"
+    normalized_mask_types = list(_normalize_mask_types(_mask_types_from_payload(item)))
+
+    if existing_timeline:
+        return refresh_pipeline_timeline(
+            dict(existing_timeline),
+            timestamp=timeline_timestamp,
+            job_state=state_value,
+            pipeline_state=pipeline_state,
+            pipeline_step=pipeline_step,
+            job_kind=job_kind,
+            mask_types=normalized_mask_types,
+        )
+
+    return advance_pipeline_timeline(
+        dict(existing_timeline),
+        job_state=state_value,
+        pipeline_state=pipeline_state,
+        pipeline_step=pipeline_step,
+        pipeline_progress=_job_pipeline_progress(item),
+        timestamp=timeline_timestamp,
+        job_kind=job_kind,
+        mask_types=normalized_mask_types,
+    )
+
+
+def _current_timeline_stage(item: dict[str, Any]) -> dict[str, Any] | None:
+    timeline = _pipeline_timeline_snapshot(item)
+    current_stage_key = str(timeline.get("current_stage") or "").strip().lower()
+    stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    for stage in stages:
+        if str(stage.get("key") or "").strip().lower() == current_stage_key:
+            return stage
+    for stage in stages:
+        if str(stage.get("status") or "").strip().lower() in {"running", "queued"}:
+            return stage
+    for stage in reversed(stages):
+        if str(stage.get("status") or "").strip().lower() in {"done", "failed", "cancelled"}:
+            return stage
+    return None
 
 
 def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -2428,99 +2516,77 @@ def _render_job_pipeline_paths(item: dict[str, Any]) -> None:
 
 
 def _render_pipeline_timeline(item: dict[str, Any]) -> None:
-    pipeline_state = _job_pipeline_state(item)
-    state = str(item.get("state", "") or "").strip().lower()
-    if _job_is_mask_job(item):
-        mask_types = _normalize_mask_types(_mask_types_from_payload(item))
-        steps = [
-            ("resolving_source_zarr", "Resolve"),
-        ]
-        if "cloud" in mask_types:
-            steps.append(("running_cloud_inference", "Cloud"))
-        if "water" in mask_types:
-            steps.append(("running_water_inference", "Water"))
-        steps.append(("masked_zarr_written", "Ready"))
-    else:
-        mask_types = _normalize_mask_types(_mask_types_from_payload(item))
-        pipeline_meta = dict(item.get("pipeline_metadata") or {})
-        cube_mode = str(pipeline_meta.get("cube_mode") or "none").strip().lower() or "none"
-        steps = [
-            ("searching", "Search"),
-            ("downloading", "Download"),
-            ("zarr_converting", "Convert"),
-        ]
-        if cube_mode == "before_mask":
-            steps.append(("cube_building", "Cube"))
-        if "cloud" in mask_types:
-            steps.append(("running_cloud_inference", "Cloud"))
-        if "water" in mask_types:
-            steps.append(("running_water_inference", "Water"))
-        if cube_mode == "after_mask":
-            steps.append(("cube_building", "Cube"))
-            steps.append(("cube_written", "Ready"))
-        elif mask_types:
-            steps.append(("masked_zarr_written", "Ready"))
-        elif cube_mode == "before_mask":
-            steps.append(("cube_written", "Ready"))
-        else:
-            steps.append(("zarr_written", "Ready"))
-    order = {key: idx for idx, (key, _label) in enumerate(steps)}
-    anchor_state = pipeline_state
-    if pipeline_state == "queued":
-        anchor_state = steps[0][0]
-    elif not _job_is_mask_job(item) and pipeline_state in {"downloaded", "zarr_queued", "zarr_converting"}:
-        anchor_state = "zarr_converting" if "zarr_converting" in order else anchor_state
-    elif not _job_is_mask_job(item) and pipeline_state == "zarr_written":
-        anchor_state = "zarr_written" if "zarr_written" in order else "zarr_converting"
-    elif not _job_is_mask_job(item) and pipeline_state in {"cube_queued", "cube_building", "cube_written", "cube_failed"}:
-        if pipeline_state == "cube_written" and "cube_written" in order:
-            anchor_state = "cube_written"
-        else:
-            anchor_state = "cube_building" if "cube_building" in order else "cube_written"
-    elif not _job_is_mask_job(item) and pipeline_state in {"writing_mask_artifacts", "writing_masked_zarr", "registering_artifacts"}:
-        anchor_state = "running_water_inference" if "running_water_inference" in order else "running_cloud_inference"
-    elif _job_is_mask_job(item) and pipeline_state in {"writing_mask_artifacts", "writing_masked_zarr", "registering_artifacts"}:
-        anchor_state = "running_water_inference" if "running_water_inference" in order else "running_cloud_inference"
-    elif pipeline_state == "failed":
-        anchor_state = "running_water_inference" if _job_is_mask_job(item) and "running_water_inference" in order else steps[max(0, len(steps) - 2)][0]
-    elif pipeline_state == "zarr_failed":
-        anchor_state = "zarr_converting"
-    elif pipeline_state == "cube_failed":
-        anchor_state = "cube_building" if "cube_building" in order else anchor_state
-    elif pipeline_state == "cancelled":
-        anchor_state = steps[0][0] if _job_is_mask_job(item) else "downloading"
-    anchor_index = order.get(anchor_state, 0)
-    chips: list[str] = []
-    for idx, (key, label) in enumerate(steps):
-        if state == "succeeded" and pipeline_state in {"zarr_written", "cube_written"}:
-            status_kind = "done" if idx <= anchor_index else "pending"
-        elif pipeline_state in {"failed", "zarr_failed", "cube_failed"} and idx == anchor_index:
-            status_kind = "failed"
-        elif idx < anchor_index:
-            status_kind = "done"
-        elif idx == anchor_index:
-            status_kind = "current"
-        else:
-            status_kind = "pending"
-        if status_kind == "done":
-            fg, bg, border = "#4ade80", "rgba(74,222,128,0.12)", "rgba(74,222,128,0.28)"
-        elif status_kind == "current":
-            fg, bg, border = "#38bdf8", "rgba(56,189,248,0.12)", "rgba(56,189,248,0.32)"
-        elif status_kind == "failed":
-            fg, bg, border = "#f87171", "rgba(248,113,113,0.12)", "rgba(248,113,113,0.28)"
-        else:
-            fg, bg, border = "#94a3b8", "rgba(148,163,184,0.08)", "rgba(148,163,184,0.14)"
-        chips.append(
-            f"<span style='display:inline-flex;align-items:center;justify-content:center;"
-            f"padding:4px 10px;border-radius:999px;border:1px solid {border};"
-            f"background:{bg};color:{fg};font-size:.72rem;font-weight:600;'>{label}</span>"
+    timeline = _pipeline_timeline_snapshot(item)
+    stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    if not stages:
+        return
+
+    current_stage_key = str(timeline.get("current_stage") or "").strip().lower()
+    cards: list[str] = []
+    for stage in stages:
+        status_kind = str(stage.get("status") or "pending").strip().lower() or "pending"
+        stage_key = str(stage.get("key") or "").strip().lower()
+        label = html.escape(str(stage.get("label") or stage_key or "Stage"))
+        badge = html.escape(str(stage.get("badge") or "STEP"))
+        detail = html.escape(str(stage.get("detail_label") or label))
+        duration_label = _format_runtime_duration(stage.get("duration_seconds"))
+        started_label = _format_status_timestamp(stage.get("started_at"))
+        finished_label = _format_status_timestamp(stage.get("finished_at"))
+
+        meta_line = "Pending"
+        if status_kind == "queued":
+            meta_line = "Queued"
+        elif status_kind == "running":
+            meta_line = f"{detail} · {duration_label}"
+        elif status_kind in {"done", "failed", "cancelled"}:
+            when_label = finished_label if finished_label != "-" else started_label
+            meta_line = f"{duration_label} · {when_label}"
+
+        card_classes = ["nimbus-stage-card", f"nimbus-stage-{status_kind}"]
+        if stage_key == current_stage_key and status_kind in {"running", "queued"}:
+            card_classes.append("is-current")
+
+        cards.append(
+            "<div class='{classes}'>"
+            "<div class='nimbus-stage-head'>"
+            "<span class='nimbus-stage-badge'>{badge}</span>"
+            "<span class='nimbus-stage-status'>{status}</span>"
+            "</div>"
+            "<div class='nimbus-stage-title'>{label}</div>"
+            "<div class='nimbus-stage-meta'>{meta}</div>"
+            "</div>".format(
+                classes=" ".join(card_classes),
+                badge=badge,
+                status=html.escape(status_kind.replace("_", " ")),
+                label=label,
+                meta=html.escape(meta_line),
+            )
         )
+
     st.markdown(
-        "<div style='display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 8px 0;'>"
-        + "".join(chips)
-        + "</div>",
+        "<div class='nimbus-stage-grid'>" + "".join(cards) + "</div>",
         unsafe_allow_html=True,
     )
+
+    raw_steps = [dict(step) for step in list(timeline.get("steps") or []) if isinstance(step, dict)]
+    if not raw_steps:
+        return
+    with st.expander("Step breakdown", expanded=False):
+        st.dataframe(
+            [
+                {
+                    "step": str(step.get("label") or step.get("key") or "-"),
+                    "status": str(step.get("status") or "-"),
+                    "started": _format_status_timestamp(step.get("started_at")),
+                    "finished": _format_status_timestamp(step.get("finished_at")),
+                    "duration": _format_runtime_duration(step.get("duration_seconds")),
+                    "stage": str(step.get("group_label") or step.get("group") or "-"),
+                }
+                for step in raw_steps
+            ],
+            width="stretch",
+            hide_index=True,
+        )
 
 
 def _job_progress_color(state: str) -> str:
@@ -2769,14 +2835,31 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
         and str(item.get("job_id", "")).strip()
     ]
     cancel_clicked = False
+    reset_runtime_clicked = False
     if active_ids:
-        cancel_clicked = st.button(
-            f"⏹ Cancel active pipelines ({len(active_ids)})",
-            width="stretch",
-            key="jobs_cancel_active_btn",
-        )
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            cancel_clicked = st.button(
+                f"⏹ Cancel active pipelines ({len(active_ids)})",
+                width="stretch",
+                key="jobs_cancel_active_btn",
+            )
+        with action_col2:
+            reset_runtime_clicked = st.button(
+                "♻️ Force reset runtime",
+                width="stretch",
+                key="jobs_force_reset_runtime_btn",
+            )
     else:
         st.caption("No active pipeline is running in the current scope.")
+        reset_runtime_clicked = st.button(
+            "♻️ Force reset runtime",
+            width="stretch",
+            key="jobs_force_reset_runtime_btn_idle",
+        )
+    st.caption(
+        "Force reset preserves history and files, but immediately closes non-terminal jobs, cancels queued/download coordinator tasks, and clears worker heartbeats."
+    )
 
     filter_col1, filter_col2 = st.columns([2, 4])
     with filter_col1:
@@ -2886,6 +2969,35 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
             except Exception:
                 continue
         st.info(f"Cancel requested for {cancelled}/{len(active_ids)} active pipelines in the current scope.")
+
+    if reset_runtime_clicked:
+        try:
+            response = _api_request(
+                "POST",
+                _ss("api_url"),
+                "/v1/jobs/reset-active",
+                api_key=_ss("api_key"),
+                timeout=60,
+            )
+            if response.ok:
+                payload = dict(response.json() or {})
+                st.session_state["active_job_ids"] = []
+                st.session_state["job_status_cache"] = {}
+                st.session_state["job_result_cache"] = {}
+                st.session_state["job_event_log"] = []
+                st.session_state["dl_last_event_id"] = 0
+                st.session_state["dl_last_sse_ok"] = 0.0
+                st.session_state["dl_event_errors"] = 0
+                st.success(
+                    "Runtime reset applied: "
+                    f"{int(payload.get('jobs_cancelled', 0) or 0)} jobs cancelled, "
+                    f"{int(payload.get('coordinator_tasks_cancelled', 0) or 0)} coordinator tasks cancelled, "
+                    f"{int(payload.get('worker_heartbeats_cleared', 0) or 0)} worker heartbeats cleared."
+                )
+            else:
+                st.error(f"{response.status_code}: {response.text}")
+        except Exception as exc:
+            st.error(str(exc))
 
     result_cache = _ensure_job_results_loaded(visible_statuses)
     _render_job_cards(
@@ -3841,11 +3953,11 @@ def main():
         _render_downloads_overview(download_provider_api)
 
         dl_live_tab, dl_coord_tab, dl_runtime_tab = st.tabs(
-            ["📋 Live Pipelines", "🧠 Coordinator", "⚙️ Runtime"]
+            ["🧭 Pipeline Monitor", "📦 Download Coordinator", "⚙️ Runtime Health"]
         )
 
         with dl_live_tab:
-            st.caption("Unified pipeline runs: search, raw download, Zarr conversion, and optional in-place masking.")
+            st.caption("Unified pipeline monitor: each card now shows the real step timeline, elapsed time per stage, and the raw breakdown used by the backend.")
             if bool(_ss("dl_auto_refresh", True)):
                 _render_download_jobs_panel_live(download_provider_api)
             else:

@@ -216,6 +216,7 @@ class JobStatusResponse(BaseModel):
     pipeline_state: PipelineState = PipelineState.queued
     pipeline_step: str | None = None
     pipeline_progress: float | None = Field(default=None, ge=0, le=100)
+    pipeline_timeline: dict[str, Any] = Field(default_factory=dict)
     pipeline_metadata: dict[str, Any] = Field(default_factory=dict)
     conversion_metadata: dict[str, Any] = Field(default_factory=dict)
     raw_outputs: list[str] = Field(default_factory=list)

@@ -543,3 +543,7 @@ class MongoJobStore:
         ).isoformat()
         result = self._workers.delete_many({"last_seen_at": {"$lt": cutoff}})
         return int(result.deleted_count or 0)
+
+    def clear_workers(self) -> int:
+        result = self._workers.delete_many({})
+        return int(result.deleted_count or 0)

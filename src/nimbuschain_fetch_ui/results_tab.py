@@ -58,6 +58,44 @@ def _fmt_timestamp(value: Any) -> str:
         return str(value)
 
 
+def _fmt_duration(value: Any) -> str:
+    try:
+        seconds = max(0.0, float(value or 0.0))
+    except Exception:
+        return "-"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minute = divmod(minutes, 60)
+    return f"{hours}h {minute:02d}m"
+
+
+def _stage_snapshot(row: dict[str, Any]) -> tuple[str, str]:
+    timeline = row.get("pipeline_timeline")
+    if not isinstance(timeline, dict):
+        pipeline_metadata = dict(row.get("pipeline_metadata") or {})
+        timeline = pipeline_metadata.get("timeline")
+    if not isinstance(timeline, dict):
+        return ("-", "-")
+    stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    current_key = str(timeline.get("current_stage") or "").strip().lower()
+    for stage in stages:
+        if str(stage.get("key") or "").strip().lower() == current_key:
+            return (
+                str(stage.get("label") or "-"),
+                _fmt_duration(stage.get("duration_seconds")),
+            )
+    for stage in reversed(stages):
+        if str(stage.get("status") or "").strip().lower() in {"running", "queued", "done", "failed", "cancelled"}:
+            return (
+                str(stage.get("label") or "-"),
+                _fmt_duration(stage.get("duration_seconds")),
+            )
+    return ("-", "-")
+
+
 def _row_is_pipeline_run(row: dict[str, Any]) -> bool:
     return str(row.get("job_kind") or row.get("job_type") or "").strip().lower() not in {
         "mask",
@@ -82,6 +120,7 @@ def _render_pipeline_summary_cards(rows: list[dict[str, Any]]) -> None:
 def _render_pipeline_runs_table(rows: list[dict[str, Any]]) -> None:
     compact_rows = []
     for row in rows:
+        stage_label, stage_duration = _stage_snapshot(row)
         compact_rows.append(
             {
                 "job_id": str(row.get("job_id", ""))[:12],
@@ -90,6 +129,8 @@ def _render_pipeline_runs_table(rows: list[dict[str, Any]]) -> None:
                 "product": row.get("product_type", "-"),
                 "state": row.get("state", "-"),
                 "pipeline": row.get("pipeline_state", "-"),
+                "stage": stage_label,
+                "stage_elapsed": stage_duration,
                 "progress": _fmt_progress(row.get("progress")),
                 "downloaded_mb": _fmt_mb(row.get("bytes_downloaded")),
                 "total_mb": _fmt_mb(row.get("bytes_total")),
@@ -123,6 +164,7 @@ def _render_pipeline_run_details(rows: list[dict[str, Any]]) -> None:
                     "state": selected_job.get("state"),
                     "pipeline_state": selected_job.get("pipeline_state"),
                     "pipeline_step": selected_job.get("pipeline_step"),
+                    "pipeline_timeline": selected_job.get("pipeline_timeline"),
                     "progress": selected_job.get("progress"),
                     "bytes_downloaded": selected_job.get("bytes_downloaded"),
                     "bytes_total": selected_job.get("bytes_total"),

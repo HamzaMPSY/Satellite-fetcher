@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 import sys
 import types
@@ -191,9 +192,14 @@ def test_sentinel2_manual_watermask_creates_masked_copy_without_mutating_source(
     assert tuple(group["imagery"].shape) == tuple(dataset_summary["shape"])
     assert len(group["band"][:].tolist()) == len(dataset_summary["band_names"])
     assert result["status"] == "written"
+    assert result["tile_size"] == 512
+    assert result["tile_size"] == result["tile_sizing"]["tile_size"]
+    assert result["tile_sizing"]["source"] == "fixed_default"
     assert group.attrs["water_mask_written"] is True
     assert group.attrs["water_mask_path"] == "masks/water"
     assert group.attrs["water_mask_status"] == "written"
+    assert group.attrs["water_mask_tile_size"] == result["tile_size"]
+    assert group.attrs["water_mask"]["tile_size"] == result["tile_size"]
 
 
 def test_landsat_manual_watermask_creates_masked_copy_without_mutating_source(
@@ -580,6 +586,54 @@ def test_manual_omniwater_uses_heuristic_fail_open_when_mps_model_runtime_is_uns
     assert result["runtime_mode"] == "heuristic_fallback"
     assert "MPS" in str(result["runtime_warning"])
     assert result["model_attempt_count"] >= 1
+    masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
+    assert masked_group.attrs["water_mask_status"] == "written"
+    assert "water_probability" in masked_group["masks"]
+
+
+def test_manual_omniwater_falls_back_when_scratch_export_runs_out_of_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_omniwatermask(monkeypatch)
+    monkeypatch.setenv("NIMBUS_WATERMASK_TILE_SIZE", "3")
+    scratch_root = tmp_path / "scratch-root"
+    monkeypatch.setenv("NIMBUS_WATERMASK_TMP_DIR", str(scratch_root))
+
+    def fail_export(**_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("nimbuschain_mask_service.omniwater._export_rgbnir_tiles", fail_export)
+
+    scene_id = "S2A_MSIL1C_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
+    raw_root = _build_s2_bundle(tmp_path / "raw", scene_id=scene_id)
+    output_uri = str((tmp_path / "out" / "fallback_export_enospc.zarr").resolve())
+
+    written_uri, _family, _summary, dataset_summary = ZarrConversionService().convert(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        scene_id=scene_id,
+        raw_uri=str(raw_root),
+        output_uri=output_uri,
+        product_type="S2MSI1C",
+    )
+
+    result = MaskService().apply_omniwater_to_zarr(
+        zarr_uri=written_uri,
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI1C",
+        scene_id=scene_id,
+        acquisition_datetime=dataset_summary.get("acquisition_datetime"),
+        dataset_summary=dataset_summary,
+        inference_device="cpu",
+    )
+
+    assert result["status"] == "written"
+    assert result["runtime_mode"] == "heuristic_fallback"
+    assert result["fallback_trigger"] == "scratch_capacity"
+    assert "disk space" in str(result["runtime_warning"]).lower()
+    assert result["scratch_root"] == str(scratch_root)
     masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
     assert masked_group.attrs["water_mask_status"] == "written"
     assert "water_probability" in masked_group["masks"]

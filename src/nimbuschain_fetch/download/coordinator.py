@@ -485,7 +485,12 @@ class DownloadCoordinatorStore:
             ).fetchone()
         return self._row_to_task(row) or {}
 
-    def cancel_pending_tasks(self, task_ids: list[str]) -> None:
+    def cancel_pending_tasks(
+        self,
+        task_ids: list[str],
+        *,
+        reason: str = "Download cancelled by job cancellation.",
+    ) -> None:
         if not task_ids:
             return
         placeholders = ", ".join("?" for _ in task_ids)
@@ -503,7 +508,7 @@ class DownloadCoordinatorStore:
                 """,
                 [
                     TASK_STATUS_CANCELLED,
-                    "Download cancelled by job cancellation.",
+                    str(reason or "Download cancelled.").strip(),
                     now,
                     now,
                     *task_ids,
@@ -513,6 +518,30 @@ class DownloadCoordinatorStore:
                 ],
             )
             self._conn.commit()
+
+    def cancel_all_non_terminal_tasks(
+        self,
+        *,
+        reason: str = "Download cancelled by runtime reset.",
+    ) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT task_id
+                FROM download_tasks
+                WHERE status IN (?, ?, ?, ?)
+                ORDER BY created_at ASC
+                """,
+                (
+                    TASK_STATUS_QUEUED,
+                    TASK_STATUS_PREPARING,
+                    TASK_STATUS_READY,
+                    TASK_STATUS_DOWNLOADING,
+                ),
+            ).fetchall()
+        task_ids = [str(row["task_id"]) for row in rows if row and str(row["task_id"]).strip()]
+        self.cancel_pending_tasks(task_ids, reason=reason)
+        return task_ids
 
 
 class DownloadCoordinator:
@@ -819,6 +848,30 @@ class DownloadCoordinator:
             self._scheduler_thread = None
         self.store.close()
         self._started = False
+
+    def reset_runtime_state(
+        self,
+        *,
+        reason: str = "Download cancelled by runtime reset.",
+    ) -> dict[str, Any]:
+        task_ids = self.store.cancel_all_non_terminal_tasks(reason=reason)
+        with self._condition:
+            self._job_round_robin.clear()
+            self._copernicus_account_round_robin.clear()
+            self._active_downloads_global = 0
+            self._copernicus_active_total = 0
+            self._copernicus_active_by_account.clear()
+            self._copernicus_account_cooldown_until.clear()
+            self._usgs_active_prepares = 0
+            self._usgs_active_downloads = 0
+            self._usgs_cooldown_until = 0.0
+            self._usgs_success_streak = 0
+            self._usgs_window_current = min(max(1, self._usgs_window_max), 2)
+            self._condition.notify_all()
+        return {
+            "tasks_cancelled": len(task_ids),
+            "task_ids": task_ids,
+        }
 
     def download_products(
         self,
