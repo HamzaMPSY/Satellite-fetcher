@@ -169,3 +169,56 @@ In the UI, users can choose:
 - cube after masking
 
 When cube building is enabled in the UI, the date range is limited to the acquisition dates currently visible in the preview results.
+
+## VM shell workflow
+
+For VM performance testing, the repo now includes shell-first commands for each stage of the pipeline.
+
+Start the services directly on the VM:
+
+```bash
+nimbuschain-api-service
+nimbuschain-worker
+nimbuschain-zarr-service
+nimbuschain-mask-service
+```
+
+Inspect or download source data from OCI Object Storage:
+
+```bash
+nimbuschain-oci ls oci://my-bucket@my-namespace/raw/
+nimbuschain-oci cp oci://my-bucket@my-namespace/raw/S2A_MSIL2A_20260410T080021_N0512_R035_T37RDP_20260410T134820.SAFE.zip /data/downloads/raw
+```
+
+Run each stage manually from the VM shell:
+
+```bash
+nimbuschain-zarr-convert \
+  oci://my-bucket@my-namespace/raw/S2A_MSIL2A_20260410T080021_N0512_R035_T37RDP_20260410T134820.SAFE.zip \
+  --provider copernicus \
+  --collection SENTINEL-2 \
+  --product-type S2MSI2A \
+  --output-uri /data/downloads/zarr/S2A_MSIL2A_20260410T080021_N0512_R035_T37RDP_20260410T134820.zarr
+
+nimbuschain-mask-apply \
+  /data/downloads/zarr/S2A_MSIL2A_20260410T080021_N0512_R035_T37RDP_20260410T134820.zarr \
+  --mask-types water,cloud
+
+nimbuschain-zarr-cube /data/downloads/zarr/*.zarr \
+  --group-by-tile \
+  --output-dir /data/downloads/zarr/cubes/manual_vm
+```
+
+Run the whole VM-oriented flow in one command:
+
+```bash
+nimbuschain-vm-pipeline \
+  oci://my-bucket@my-namespace/raw/S2A_MSIL2A_20260410T080021_N0512_R035_T37RDP_20260410T134820.SAFE.zip \
+  oci://my-bucket@my-namespace/raw/S2B_MSIL2A_20260413T075609_N0512_R035_T37RDP_20260413T102805.SAFE.zip \
+  --provider copernicus \
+  --collection SENTINEL-2 \
+  --product-type S2MSI2A \
+  --mask-types water,cloud \
+  --cube-mode grouped \
+  --include-masks-in-cube
+```

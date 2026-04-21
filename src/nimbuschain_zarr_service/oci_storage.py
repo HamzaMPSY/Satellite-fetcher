@@ -192,6 +192,21 @@ class OCIStore:
             return []
         return [str(item) for item in items if not str(item).endswith("/")]
 
+    def listdir(self, path: str, *, detail: bool = False) -> list[Any]:
+        full_path = self._full_path(path)
+        try:
+            items = list(self.fs.ls(full_path, detail=detail))
+        except FileNotFoundError:
+            return []
+        if detail:
+            normalized: list[dict[str, Any]] = []
+            for item in items:
+                entry = dict(item)
+                entry["name"] = str(entry.get("name") or "")
+                normalized.append(entry)
+            return normalized
+        return [str(item) for item in items]
+
     def download_file(self, path: str, destination: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with self.open(path, "rb") as source, destination.open("wb") as target:

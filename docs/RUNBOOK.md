@@ -178,6 +178,62 @@ Open the UI and verify:
 - status blocks show API, readiness, worker and Zarr state
 - recent jobs panel renders without browser refresh loops
 
+## 7.1 VM shell commands
+
+For a VM deployment where raw inputs already live in OCI Object Storage, use the shell-first commands below.
+
+Start each service directly:
+
+```bash
+nimbuschain-api-service
+nimbuschain-worker
+nimbuschain-zarr-service
+nimbuschain-mask-service
+```
+
+Inspect or download OCI inputs:
+
+```bash
+nimbuschain-oci ls oci://<bucket>@<namespace>/raw/
+nimbuschain-oci stat oci://<bucket>@<namespace>/raw/<scene>.SAFE.zip
+nimbuschain-oci cp oci://<bucket>@<namespace>/raw/<scene>.SAFE.zip /data/downloads/raw
+nimbuschain-oci cp oci://<bucket>@<namespace>/raw/<scene>.SAFE /data/downloads/raw --recursive
+```
+
+Run the stages one by one:
+
+```bash
+nimbuschain-zarr-convert /data/downloads/raw/<scene>.SAFE.zip \
+  --provider copernicus \
+  --collection SENTINEL-2 \
+  --product-type S2MSI2A \
+  --output-uri /data/downloads/zarr/<scene>.zarr
+
+nimbuschain-mask-apply /data/downloads/zarr/<scene>.zarr --mask-types water,cloud
+
+nimbuschain-zarr-cube /data/downloads/zarr/*.zarr \
+  --group-by-tile \
+  --output-dir /data/downloads/zarr/cubes/manual_vm
+```
+
+Or run the end-to-end VM test path in one command:
+
+```bash
+nimbuschain-vm-pipeline \
+  oci://<bucket>@<namespace>/raw/<scene-a>.SAFE.zip \
+  oci://<bucket>@<namespace>/raw/<scene-b>.SAFE.zip \
+  --provider copernicus \
+  --collection SENTINEL-2 \
+  --product-type S2MSI2A \
+  --mask-types water,cloud \
+  --cube-mode grouped
+```
+
+Important:
+- `nimbuschain-mask-apply` currently expects a local Zarr path on the VM, so download or convert locally before masking.
+- `nimbuschain-zarr-convert` can read local paths and `oci://` raw URIs directly.
+- `nimbuschain-vm-pipeline` stages `oci://` raw inputs into the VM before conversion.
+
 ## 8. Troubleshooting
 
 ### Podman is not reachable on macOS

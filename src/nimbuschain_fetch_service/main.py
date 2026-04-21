@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+import uvicorn
 
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.settings import get_settings
@@ -101,3 +102,16 @@ def root_page() -> str:
   </body>
 </html>
 """ % settings.runtime_role
+
+
+def run() -> None:
+    uvicorn.run(
+        "nimbuschain_fetch_service.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+    )
+
+
+if __name__ == "__main__":
+    run()
