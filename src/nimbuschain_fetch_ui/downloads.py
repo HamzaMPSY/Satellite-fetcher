@@ -74,9 +74,18 @@ def count_downloaded_products(dl_dir: Optional[str] = None):
     dl_path = Path(dl_dir) if dl_dir else DOWNLOADS_DIR
     if not dl_path.exists():
         return 0, 0.0
-    real_files = [f for f in dl_path.rglob("*") if f.is_file()]
-    total_size = sum(f.stat().st_size for f in real_files) / (1024 * 1024)
-    return len(real_files), total_size
+    total_files = 0
+    total_size_bytes = 0
+    for file_path in dl_path.rglob("*"):
+        try:
+            if not file_path.is_file():
+                continue
+            stat = file_path.stat()
+        except OSError:
+            continue
+        total_files += 1
+        total_size_bytes += stat.st_size
+    return total_files, total_size_bytes / (1024 * 1024)
 
 
 def parse_download_logs(path: Optional[str] = None):

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.jobs.sqlite_store import SQLiteJobStore
 from nimbuschain_fetch.models import ArtifactType, ArtifactUpsertRequest, JobState, PipelineState, ProviderName
+from nimbuschain_fetch.pipeline_timeline import advance_pipeline_timeline
 from nimbuschain_fetch.settings import get_settings
 
 
@@ -324,6 +325,134 @@ def test_running_job_missing_started_at_uses_first_execution_event(tmp_path: Pat
 
     assert status.started_at == datetime(2026, 4, 10, 9, 0, 5, tzinfo=timezone.utc)
     assert status.duration_seconds is not None
+
+
+def test_get_job_rebuild_ignores_previous_attempt_cube_events_after_restart(tmp_path: Path) -> None:
+    fetcher, store = _build_fetcher(tmp_path)
+    job_id = "legacy-restarted-cube-timeline"
+    store.create_job(
+        job_id=job_id,
+        job_type="search_download",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        request_payload={
+            "job_type": "search_download",
+            "provider": "copernicus",
+            "collection": "SENTINEL-2",
+            "product_type": "S2MSI2A",
+            "cube_mode": "before_mask",
+        },
+    )
+
+    leaked_timeline: dict[str, object] = {}
+    leaked_timeline = advance_pipeline_timeline(
+        leaked_timeline,
+        job_state="running",
+        pipeline_state="searching",
+        pipeline_step="searching",
+        pipeline_progress=5.0,
+        timestamp="2026-04-20T11:00:00+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+    leaked_timeline = advance_pipeline_timeline(
+        leaked_timeline,
+        job_state="running",
+        pipeline_state="downloaded",
+        pipeline_step="downloaded",
+        pipeline_progress=70.0,
+        timestamp="2026-04-20T11:10:00+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+    leaked_timeline = advance_pipeline_timeline(
+        leaked_timeline,
+        job_state="running",
+        pipeline_state="zarr_written",
+        pipeline_step="zarr_written",
+        pipeline_progress=72.0,
+        timestamp="2026-04-20T11:20:00+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+    leaked_timeline = advance_pipeline_timeline(
+        leaked_timeline,
+        job_state="running",
+        pipeline_state="cube_written",
+        pipeline_step="cube_written",
+        pipeline_progress=100.0,
+        timestamp="2026-04-20T11:30:00+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+    leaked_timeline = advance_pipeline_timeline(
+        leaked_timeline,
+        job_state="running",
+        pipeline_state="zarr_converting",
+        pipeline_step="writing_chunks",
+        pipeline_progress=68.0,
+        timestamp="2026-04-20T13:32:35+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+
+    store.update_job(
+        job_id,
+        state=JobState.running.value,
+        started_at="2026-04-20T13:32:17+00:00",
+        pipeline_state=PipelineState.zarr_converting.value,
+        pipeline_step="writing_chunks",
+        pipeline_progress=68.0,
+        pipeline_metadata={
+            "cube_mode": "before_mask",
+            "timeline": leaked_timeline,
+        },
+        product_type="S2MSI2A",
+        progress=0.0,
+        bytes_downloaded=0,
+        bytes_total=0,
+    )
+
+    event_specs = [
+        ("job.started", {"state": JobState.running.value}, "2026-04-20T11:00:00+00:00"),
+        ("job.searching", {"pipeline_state": "searching", "pipeline_step": "searching"}, "2026-04-20T11:00:01+00:00"),
+        ("job.downloaded", {"pipeline_state": "downloaded", "pipeline_step": "downloaded"}, "2026-04-20T11:10:00+00:00"),
+        ("job.zarr_written", {"pipeline_state": "zarr_written", "pipeline_step": "zarr_written"}, "2026-04-20T11:20:00+00:00"),
+        ("job.cube_written", {"pipeline_state": "cube_written", "pipeline_step": "cube_written", "cube_mode": "before_mask"}, "2026-04-20T11:30:00+00:00"),
+        ("job.requeued_after_restart", {"reason": "service_restart"}, "2026-04-20T13:31:59+00:00"),
+        ("job.started", {"state": JobState.running.value}, "2026-04-20T13:32:00+00:00"),
+        ("job.searching", {"pipeline_state": "searching", "pipeline_step": "searching"}, "2026-04-20T13:32:01+00:00"),
+        ("job.downloaded", {"pipeline_state": "downloaded", "pipeline_step": "downloaded"}, "2026-04-20T13:32:19+00:00"),
+    ]
+    for event_type, payload, timestamp in event_specs:
+        store.append_event(
+            job_id,
+            event_type,
+            payload,
+            timestamp=datetime.fromisoformat(timestamp),
+        )
+
+    status = fetcher.get_job(job_id)
+    timeline = status.pipeline_timeline
+    cube_stage = next(
+        stage
+        for stage in timeline.get("stages", [])
+        if isinstance(stage, dict) and stage.get("key") == "cube"
+    )
+    convert_stage = next(
+        stage
+        for stage in timeline.get("stages", [])
+        if isinstance(stage, dict) and stage.get("key") == "convert"
+    )
+
+    assert convert_stage["status"] == "running"
+    assert cube_stage["status"] == "pending"
+    assert timeline["current_stage"] == "convert"
 
 
 def test_artifact_api_normalizes_data_downloads_paths(tmp_path: Path) -> None:

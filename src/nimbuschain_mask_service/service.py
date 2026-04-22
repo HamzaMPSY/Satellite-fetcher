@@ -132,6 +132,10 @@ class MaskService:
         water_inference_device: str | None = None,
     ) -> dict[str, Any]:
         normalized_mask_types = _normalize_mask_types(mask_types)
+        effective_water_backend = _effective_water_backend_request(
+            backend=backend,
+            water_backend=water_backend,
+        )
         masked_zarr_uri = str(zarr_uri).strip()
         storage_mode = _storage_mode_for_paths(
             source_zarr_uri=zarr_uri,
@@ -178,7 +182,7 @@ class MaskService:
                 acquisition_datetime=acquisition_datetime,
                 dataset_summary=dataset_summary,
                 output_zarr_uri=masked_zarr_uri,
-                backend=water_backend,
+                backend=effective_water_backend,
                 overwrite=water_overwrite,
                 inference_device=water_inference_device,
                 fail_on_error=fail_on_error,
@@ -963,6 +967,23 @@ def _effective_cloud_backend_request(*, backend: str | None, inference_device: s
     if requested in {"", "auto"}:
         return "omnicloudmask"
     return requested
+
+
+def _effective_water_backend_request(
+    *,
+    backend: str | None,
+    water_backend: str | None,
+) -> str | None:
+    explicit_water_backend = str(water_backend or "").strip().lower()
+    if explicit_water_backend:
+        return explicit_water_backend
+
+    legacy_backend = str(backend or "").strip().lower()
+    if legacy_backend in {"", "auto"}:
+        return "auto"
+    if legacy_backend in {"heuristic", "fallback", "ndwi", "omniwatermask"}:
+        return legacy_backend
+    return None
 
 
 def _cloud_tile_size(*, backend_name: str | None = None, device: str | None = None) -> int:

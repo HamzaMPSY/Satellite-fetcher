@@ -118,7 +118,8 @@ class NimbusFetcher:
             else None
         )
         self._poller_task: asyncio.Task[None] | None = None
-        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_stop_event = threading.Event()
         self._worker_id = uuid.uuid4().hex
         self._worker_hostname = socket.gethostname()
         self._worker_pid = os.getpid()
@@ -145,10 +146,7 @@ class NimbusFetcher:
             await self._executor.start()
             await self._enqueue_queued_jobs()
             self._publish_worker_heartbeat()
-            self._heartbeat_task = asyncio.create_task(
-                self._worker_heartbeat_loop(),
-                name="nimbus-worker-heartbeat",
-            )
+            self._start_worker_heartbeat_thread()
             self._poller_task = asyncio.create_task(
                 self._monitor_queued_jobs_loop(),
                 name="nimbus-queue-poller",
@@ -165,13 +163,7 @@ class NimbusFetcher:
             except asyncio.CancelledError:
                 pass
             self._poller_task = None
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
+        self._stop_worker_heartbeat_thread()
         if self._executor is not None:
             await self._executor.stop()
         if self._mask_service is not None and hasattr(self._mask_service, "close"):
@@ -707,6 +699,26 @@ class NimbusFetcher:
             if candidate not in normalized:
                 normalized.append(candidate)
         return normalized
+
+    @staticmethod
+    def _normalized_cube_mode(value: Any) -> str:
+        candidate = str(value or "").strip().lower()
+        if candidate in {"before_mask", "after_mask"}:
+            return candidate
+        return "none"
+
+    def _timeline_cube_mode_for_row(
+        self,
+        row: dict[str, Any],
+        pipeline_metadata: dict[str, Any] | None = None,
+    ) -> str:
+        metadata = dict(row.get("pipeline_metadata") or {})
+        if pipeline_metadata is not None:
+            metadata.update(dict(pipeline_metadata))
+        return self._normalized_cube_mode(
+            metadata.get("cube_mode")
+            or dict(row.get("request") or {}).get("cube_mode")
+        )
 
     @staticmethod
     def _normalize_mask_failure_step(value: Any) -> str | None:
@@ -1557,10 +1569,34 @@ class NimbusFetcher:
             await self._enqueue_queued_jobs()
             await anyio.sleep(float(self.settings.nimbus_queue_poll_seconds))
 
-    async def _worker_heartbeat_loop(self) -> None:
-        while True:
-            self._publish_worker_heartbeat()
-            await anyio.sleep(float(self.settings.nimbus_worker_heartbeat_seconds))
+    def _start_worker_heartbeat_thread(self) -> None:
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop_event.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._worker_heartbeat_loop,
+            name="nimbus-worker-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_worker_heartbeat_thread(self) -> None:
+        thread = self._heartbeat_thread
+        if thread is None:
+            return
+        self._heartbeat_stop_event.set()
+        thread.join(timeout=2.0)
+        self._heartbeat_thread = None
+
+    def _worker_heartbeat_loop(self) -> None:
+        interval_seconds = max(1.0, float(self.settings.nimbus_worker_heartbeat_seconds))
+        while not self._heartbeat_stop_event.wait(interval_seconds):
+            try:
+                self._publish_worker_heartbeat()
+            except Exception:
+                # Heartbeats should retry on the next interval even if a single
+                # storage update fails while the worker continues processing.
+                continue
 
     async def _enqueue_queued_jobs(self) -> None:
         if self._executor is None:
@@ -1964,6 +2000,10 @@ class NimbusFetcher:
                     or dict(row_now.get("request") or {}).get("mask_types")
                     or []
                 ),
+                cube_mode=self._timeline_cube_mode_for_row(
+                    row_now,
+                    merged_pipeline_metadata,
+                ),
             )
             fields: dict[str, Any] = {
                 "pipeline_state": pipeline_state.value,
@@ -2056,7 +2096,9 @@ class NimbusFetcher:
     def _cube_config_from_request(request: JobCreateRequest) -> dict[str, Any] | None:
         if not isinstance(request, SearchDownloadRequest):
             return None
-        cube_mode = str(getattr(request, "cube_mode", "none") or "none").strip().lower() or "none"
+        cube_mode = NimbusFetcher._normalized_cube_mode(
+            getattr(request, "cube_mode", "none")
+        )
         if cube_mode == "none":
             return None
         return {
@@ -2606,6 +2648,64 @@ class NimbusFetcher:
             },
         )
 
+        last_cube_emit = {"mono": 0.0, "progress": float(stage_start_progress)}
+
+        def _emit_cube_progress(payload: dict[str, Any]) -> None:
+            group_total = max(1, int(payload.get("group_total") or 1))
+            group_index = min(group_total, max(1, int(payload.get("group_index") or 1)))
+            cube_fraction = min(1.0, max(0.0, float(payload.get("fraction") or 0.0)))
+            aggregate_fraction = min(
+                1.0,
+                max(0.0, ((group_index - 1) + cube_fraction) / group_total),
+            )
+            stage_span = max(0.0, float(stage_end_progress) - float(stage_start_progress))
+            stage_cap = (
+                max(float(stage_start_progress), float(stage_end_progress) - 0.1)
+                if stage_span > 0.1
+                else float(stage_end_progress)
+            )
+            candidate_progress = (
+                float(stage_start_progress) + stage_span * aggregate_fraction
+                if stage_span > 0.0
+                else float(stage_end_progress)
+            )
+            pipeline_progress = max(
+                float(last_cube_emit["progress"]),
+                min(stage_cap, candidate_progress),
+            )
+            now_mono = time.monotonic()
+            if not self._should_emit_zarr_progress(
+                now_mono=now_mono,
+                last_emit=float(last_cube_emit["mono"]),
+                progress_pct=pipeline_progress,
+                last_progress=float(last_cube_emit["progress"]),
+            ):
+                return
+            last_cube_emit["mono"] = now_mono
+            last_cube_emit["progress"] = pipeline_progress
+            progress_metadata = {
+                **queued_metadata,
+                "cube_status": "running",
+                "cube_active_group": str(payload.get("group_key") or "").strip(),
+                "cube_group_index": group_index,
+                "cube_group_total": group_total,
+                "cube_current_scene_id": str(payload.get("scene_id") or "").strip(),
+                "cube_current_layer": str(payload.get("layer_name") or "").strip(),
+                "cube_current_band": str(payload.get("band_name") or "").strip(),
+                "cube_blocks_written": int(payload.get("blocks_written") or 0),
+                "cube_total_blocks": int(payload.get("total_blocks") or 0),
+                "cube_fraction": round(cube_fraction, 6),
+                "cube_aggregate_fraction": round(aggregate_fraction, 6),
+                "cube_output_uri": str(payload.get("group_output_uri") or "").strip(),
+            }
+            self._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.cube_building,
+                pipeline_step="cube_building",
+                pipeline_progress=pipeline_progress,
+                pipeline_metadata=progress_metadata,
+            )
+
         try:
             cube_summary = build_grouped_time_cubes(
                 source_zarr_outputs,
@@ -2613,6 +2713,7 @@ class NimbusFetcher:
                 start_date=cube_start_date,
                 end_date=cube_end_date,
                 stage_label=cube_mode,
+                progress_callback=_emit_cube_progress,
             )
         except Exception as exc:
             failed_metadata = {
@@ -4385,7 +4486,14 @@ class NimbusFetcher:
                         final_pipeline_metadata["failed_step"] = terminal_pipeline_step
                         combined_conversion_metadata["failed_step"] = terminal_pipeline_step
                     terminal_pipeline_state = (
-                        PipelineState.masked_zarr_written if mask_succeeded else PipelineState.failed
+                        PipelineState.cube_written
+                        if mask_succeeded
+                        and cube_config is not None
+                        and cube_config["mode"] == "after_mask"
+                        and combined_cube_outputs
+                        else PipelineState.masked_zarr_written
+                        if mask_succeeded
+                        else PipelineState.failed
                     )
                     terminal_state = (
                         JobState.succeeded
@@ -4926,6 +5034,7 @@ class NimbusFetcher:
             if row.get("pipeline_progress") is not None
             else None
         )
+        timeline_cube_mode = self._timeline_cube_mode_for_row(row, pipeline_metadata)
         timeline_timestamp: str | datetime
         if str(row.get("state") or "").strip().lower() in {
             JobState.running.value,
@@ -4949,6 +5058,7 @@ class NimbusFetcher:
                 or dict(row.get("conversion_metadata") or {}).get("mask_types")
                 or []
             ),
+            cube_mode=timeline_cube_mode,
         )
         timeline_mask_types = self._normalized_mask_types(
             (row.get("request") or {}).get("mask_types")
@@ -4960,11 +5070,13 @@ class NimbusFetcher:
             row=row,
             pipeline_timeline=pipeline_timeline,
             mask_types=timeline_mask_types,
+            cube_mode=timeline_cube_mode,
         ):
             pipeline_timeline = self._rebuild_pipeline_timeline_from_events(
                 row=row,
                 job_kind=job_kind,
                 mask_types=timeline_mask_types,
+                cube_mode=timeline_cube_mode,
                 pipeline_progress=pipeline_progress,
                 timeline_timestamp=timeline_timestamp,
             )
@@ -5018,6 +5130,7 @@ class NimbusFetcher:
         row: dict[str, Any],
         job_kind: str | None,
         mask_types: list[str],
+        cube_mode: str,
         pipeline_progress: float | None,
         timeline_timestamp: str | datetime,
     ) -> dict[str, Any]:
@@ -5026,6 +5139,7 @@ class NimbusFetcher:
             events = self.store.list_events(str(row.get("job_id") or ""), None, 500)
         except Exception:
             events = []
+        events = self._events_for_current_timeline_attempt(events)
 
         for event in events:
             payload = dict(event.get("payload") or {})
@@ -5034,6 +5148,7 @@ class NimbusFetcher:
             if not event_pipeline_state and not event_pipeline_step:
                 continue
             event_progress = payload.get("pipeline_progress")
+            event_cube_mode = self._normalized_cube_mode(payload.get("cube_mode") or cube_mode)
             rebuilt = advance_pipeline_timeline(
                 rebuilt,
                 job_state=str(row.get("state") or ""),
@@ -5047,6 +5162,7 @@ class NimbusFetcher:
                 timestamp=event.get("timestamp") or timeline_timestamp,
                 job_kind=job_kind,
                 mask_types=mask_types,
+                cube_mode=event_cube_mode,
             )
 
         return advance_pipeline_timeline(
@@ -5058,7 +5174,35 @@ class NimbusFetcher:
             timestamp=timeline_timestamp,
             job_kind=job_kind,
             mask_types=mask_types,
+            cube_mode=cube_mode,
         )
+
+    @staticmethod
+    def _events_for_current_timeline_attempt(
+        events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        last_requeue_index: int | None = None
+        last_started_index: int | None = None
+
+        for index, event in enumerate(events):
+            event_type = str(event.get("type") or "").strip().lower()
+            if event_type in {"job.requeued_after_restart", "job.requeued_stale"}:
+                last_requeue_index = index
+            if event_type == "job.started":
+                last_started_index = index
+
+        boundary_index = 0
+        if last_requeue_index is not None:
+            boundary_index = last_requeue_index
+        if (
+            last_started_index is not None
+            and (
+                last_requeue_index is None
+                or last_started_index > last_requeue_index
+            )
+        ):
+            boundary_index = last_started_index
+        return list(events[boundary_index:])
 
     @staticmethod
     def _pipeline_timeline_needs_rebuild(
@@ -5066,6 +5210,7 @@ class NimbusFetcher:
         row: dict[str, Any],
         pipeline_timeline: dict[str, Any],
         mask_types: list[str],
+        cube_mode: str,
     ) -> bool:
         steps = [
             dict(step)
@@ -5090,6 +5235,59 @@ class NimbusFetcher:
         }
         pipeline_state = str(row.get("pipeline_state") or "").strip().lower()
         current_stage = str(pipeline_timeline.get("current_stage") or "").strip().lower()
+        normalized_cube_mode = NimbusFetcher._normalized_cube_mode(
+            cube_mode or pipeline_timeline.get("cube_mode")
+        )
+        cube_related_states = {
+            PipelineState.cube_queued.value,
+            PipelineState.cube_building.value,
+            PipelineState.cube_written.value,
+            PipelineState.cube_failed.value,
+        }
+
+        if normalized_cube_mode != "none" and "cube" not in stage_statuses:
+            return True
+        if (
+            pipeline_state in cube_related_states
+            and stage_statuses.get("cube", "pending") == "pending"
+        ):
+            return True
+        cube_stage_status = stage_statuses.get("cube", "pending")
+        if (
+            normalized_cube_mode == "before_mask"
+            and pipeline_state in {
+                PipelineState.queued.value,
+                PipelineState.searching.value,
+                PipelineState.downloading.value,
+                PipelineState.downloaded.value,
+                PipelineState.zarr_queued.value,
+                PipelineState.zarr_converting.value,
+                PipelineState.zarr_written.value,
+                PipelineState.zarr_failed.value,
+            }
+            and cube_stage_status not in {"pending"}
+        ):
+            return True
+        if (
+            normalized_cube_mode == "after_mask"
+            and pipeline_state in {
+                PipelineState.queued.value,
+                PipelineState.searching.value,
+                PipelineState.downloading.value,
+                PipelineState.downloaded.value,
+                PipelineState.zarr_queued.value,
+                PipelineState.zarr_converting.value,
+                PipelineState.zarr_written.value,
+                PipelineState.running_cloud_inference.value,
+                PipelineState.running_water_inference.value,
+                PipelineState.writing_mask_artifacts.value,
+                PipelineState.writing_masked_zarr.value,
+                PipelineState.registering_artifacts.value,
+                PipelineState.zarr_failed.value,
+            }
+            and cube_stage_status not in {"pending"}
+        ):
+            return True
 
         if pipeline_state == PipelineState.searching.value and stage_statuses.get("search", "pending") == "pending":
             return True
@@ -5103,6 +5301,10 @@ class NimbusFetcher:
             PipelineState.running_water_inference.value,
             PipelineState.zarr_failed.value,
             PipelineState.masked_zarr_written.value,
+            PipelineState.cube_queued.value,
+            PipelineState.cube_building.value,
+            PipelineState.cube_written.value,
+            PipelineState.cube_failed.value,
         } and stage_statuses.get("convert", "pending") == "pending":
             return True
         if (
@@ -5110,6 +5312,10 @@ class NimbusFetcher:
                 PipelineState.running_cloud_inference.value,
                 PipelineState.running_water_inference.value,
                 PipelineState.masked_zarr_written.value,
+                PipelineState.cube_queued.value,
+                PipelineState.cube_building.value,
+                PipelineState.cube_written.value,
+                PipelineState.cube_failed.value,
                 PipelineState.failed.value,
             }
             and stage_statuses.get("convert") == "running"
@@ -5128,11 +5334,20 @@ class NimbusFetcher:
         ):
             return True
         if (
+            pipeline_state == PipelineState.cube_building.value
+            and current_stage not in {"cube"}
+        ):
+            return True
+        if (
             "cloud" in mask_types
             and pipeline_state in {
                 PipelineState.running_cloud_inference.value,
                 PipelineState.running_water_inference.value,
                 PipelineState.masked_zarr_written.value,
+                PipelineState.cube_queued.value,
+                PipelineState.cube_building.value,
+                PipelineState.cube_written.value,
+                PipelineState.cube_failed.value,
             }
             and stage_statuses.get("cloud", "pending") == "pending"
         ):
@@ -5142,6 +5357,10 @@ class NimbusFetcher:
             and pipeline_state in {
                 PipelineState.running_water_inference.value,
                 PipelineState.masked_zarr_written.value,
+                PipelineState.cube_queued.value,
+                PipelineState.cube_building.value,
+                PipelineState.cube_written.value,
+                PipelineState.cube_failed.value,
             }
             and stage_statuses.get("water", "pending") == "pending"
         ):
@@ -5150,6 +5369,17 @@ class NimbusFetcher:
             "cloud" in mask_types
             and pipeline_state == PipelineState.masked_zarr_written.value
             and stage_statuses.get("cloud", "pending") == "pending"
+        ):
+            return True
+        if (
+            normalized_cube_mode == "before_mask"
+            and pipeline_state in {
+                PipelineState.running_cloud_inference.value,
+                PipelineState.running_water_inference.value,
+                PipelineState.masked_zarr_written.value,
+                PipelineState.failed.value,
+            }
+            and stage_statuses.get("cube", "pending") in {"pending", "queued", "running"}
         ):
             return True
         return False
@@ -5215,6 +5445,7 @@ class NimbusFetcher:
             events = self.store.list_events(str(row.get("job_id") or ""), None, 200)
         except Exception:
             events = []
+        events = self._events_for_current_timeline_attempt(events)
         for event in events:
             event_type = str(event.get("type") or "").strip()
             event_ts = self._parse_iso(event.get("timestamp"))

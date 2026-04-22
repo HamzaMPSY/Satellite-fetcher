@@ -65,6 +65,12 @@ class MaskApplyRequest(BaseModel):
         normalized.pop("zarr_uri", None)
 
         water = dict(normalized.get("water") or {})
+        legacy_backend = str(normalized.get("backend") or "").strip().lower()
+        if (
+            not water.get("backend")
+            and legacy_backend in {"auto", "heuristic", "fallback", "ndwi", "omniwatermask"}
+        ):
+            water.setdefault("backend", legacy_backend)
         if normalized.get("water_backend") is not None:
             water.setdefault("backend", normalized.pop("water_backend"))
         if normalized.get("water_overwrite") is not None:

@@ -85,6 +85,12 @@ class MongoJobStore:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
+    def _timeline_reset_pipeline_metadata(payload: Any) -> dict[str, Any]:
+        normalized = dict(payload or {})
+        normalized.pop("timeline", None)
+        return normalized
+
+    @staticmethod
     def _normalize_job(doc: dict[str, Any] | None) -> dict[str, Any] | None:
         if not doc:
             return None
@@ -417,7 +423,7 @@ class MongoJobStore:
         rows = list(
             self._jobs.find(
                 {"state": {"$in": ["running", "cancel_requested"]}},
-                {"job_id": 1},
+                {"job_id": 1, "pipeline_metadata": 1},
             )
         )
         job_ids = [str(row["job_id"]) for row in rows]
@@ -425,20 +431,24 @@ class MongoJobStore:
             return []
 
         now = self._utc_now()
-        self._jobs.update_many(
-            {"job_id": {"$in": job_ids}},
-            {
-                "$set": {
-                    "state": "queued",
-                    "pipeline_state": "queued",
-                    "pipeline_step": "queued",
-                    "pipeline_progress": 0.0,
-                    "started_at": None,
-                    "finished_at": None,
-                    "updated_at": now,
-                }
-            },
-        )
+        for row in rows:
+            self._jobs.update_one(
+                {"job_id": str(row["job_id"])},
+                {
+                    "$set": {
+                        "state": "queued",
+                        "pipeline_state": "queued",
+                        "pipeline_step": "queued",
+                        "pipeline_progress": 0.0,
+                        "pipeline_metadata": self._timeline_reset_pipeline_metadata(
+                            row.get("pipeline_metadata")
+                        ),
+                        "started_at": None,
+                        "finished_at": None,
+                        "updated_at": now,
+                    }
+                },
+            )
         for jid in job_ids:
             self.append_event(
                 jid,
@@ -473,7 +483,7 @@ class MongoJobStore:
                     "state": {"$in": ["running", "cancel_requested"]},
                     "updated_at": {"$lt": stale_before},
                 },
-                {"job_id": 1},
+                {"job_id": 1, "pipeline_metadata": 1},
             )
         )
         job_ids = [str(row["job_id"]) for row in rows]
@@ -481,20 +491,24 @@ class MongoJobStore:
             return []
 
         now = self._utc_now()
-        self._jobs.update_many(
-            {"job_id": {"$in": job_ids}},
-            {
-                "$set": {
-                    "state": "queued",
-                    "pipeline_state": "queued",
-                    "pipeline_step": "queued",
-                    "pipeline_progress": 0.0,
-                    "started_at": None,
-                    "finished_at": None,
-                    "updated_at": now,
-                }
-            },
-        )
+        for row in rows:
+            self._jobs.update_one(
+                {"job_id": str(row["job_id"])},
+                {
+                    "$set": {
+                        "state": "queued",
+                        "pipeline_state": "queued",
+                        "pipeline_step": "queued",
+                        "pipeline_progress": 0.0,
+                        "pipeline_metadata": self._timeline_reset_pipeline_metadata(
+                            row.get("pipeline_metadata")
+                        ),
+                        "started_at": None,
+                        "finished_at": None,
+                        "updated_at": now,
+                    }
+                },
+            )
         for jid in job_ids:
             self.append_event(
                 jid,

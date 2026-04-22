@@ -7,6 +7,8 @@ from typing import Any
 import requests
 from shapely.geometry import mapping
 
+from nimbuschain_fetch.copernicus_query import build_copernicus_filter as _shared_build_copernicus_filter
+
 try:
     from nimbuschain_fetch.usgs_product_type import usgs_product_type_matches
 except ModuleNotFoundError:
@@ -74,30 +76,28 @@ def build_copernicus_filter(
     aoi_wkt: str,
     tile_id: str | None = None,
 ) -> str:
-    query = (
-        f"Collection/Name eq '{collection}' "
-        f"and ContentDate/Start gt '{start_date}T00:00:00Z' "
-        f"and ContentDate/Start lt '{end_date}T23:59:59Z'"
+    geom = parse_aoi_text(aoi_wkt)
+    if geom is None or getattr(geom, "is_empty", True):
+        raise ValueError("Copernicus preview requires a valid AOI polygon.")
+    return _shared_build_copernicus_filter(
+        collection=collection,
+        product_type=product_type,
+        start_date=start_date,
+        end_date=end_date,
+        aoi=geom,
+        tile_id=tile_id,
     )
 
-    if product_type:
-        query += (
-            " and Attributes/OData.CSC.StringAttribute/any("
-            "att:att/Name eq 'productType' and "
-            f"att/OData.CSC.StringAttribute/Value eq '{product_type}')"
-        )
 
-    if tile_id:
-        query += (
-            " and Attributes/OData.CSC.StringAttribute/any("
-            "att:att/Name eq 'tileId' and "
-            f"att/OData.CSC.StringAttribute/Value eq '{tile_id}')"
-        )
-
-    if aoi_wkt:
-        query += f" and OData.CSC.Intersects(area=geography'SRID=4326;{aoi_wkt}')"
-
-    return query
+def _copernicus_error_message(status_code: int, detail: str) -> str:
+    text = str(detail or "").strip().lower()
+    if "invalidparameter" in text or "inappropriate content detected" in text or int(status_code) == 400:
+        return "Copernicus rejected the search query."
+    if int(status_code) in {401, 403}:
+        return "Copernicus credentials are invalid or rejected."
+    if int(status_code) in {429, 500, 502, 503, 504}:
+        return "Copernicus is temporarily unavailable."
+    return "Copernicus preview failed because of a technical error."
 
 
 def parse_copernicus_products(payload: dict[str, Any], *, max_items: int) -> dict[str, Any]:
@@ -178,14 +178,21 @@ def _copernicus_preview(
             "error": "Copernicus preview authentication failed: access_token missing in token response.",
         }
 
-    query = build_copernicus_filter(
-        collection=collection,
-        product_type=product_type,
-        start_date=start_date,
-        end_date=end_date,
-        aoi_wkt=aoi_wkt,
-        tile_id=tile_id,
-    )
+    try:
+        query = build_copernicus_filter(
+            collection=collection,
+            product_type=product_type,
+            start_date=start_date,
+            end_date=end_date,
+            aoi_wkt=aoi_wkt,
+            tile_id=tile_id,
+        )
+    except ValueError:
+        return {
+            "items": [],
+            "total": 0,
+            "error": "A valid AOI polygon is required for the Copernicus preview.",
+        }
     params = {
         "$filter": query,
         "$orderby": "ContentDate/Start desc",
@@ -211,13 +218,14 @@ def _copernicus_preview(
             time.sleep(delay)
     assert products_response is not None
     if not products_response.ok:
+        detail = f"Copernicus preview search failed (HTTP {products_response.status_code})."
+        body = " ".join(str(products_response.text or "").strip().split())
+        if body:
+            detail += f" Response: {body[:500]}{'...' if len(body) > 500 else ''}"
         return {
             "items": [],
             "total": 0,
-            "error": (
-                "Copernicus preview search is temporarily unavailable "
-                f"(HTTP {products_response.status_code}). Retry in a few seconds."
-            ),
+            "error": _copernicus_error_message(products_response.status_code, detail),
         }
 
     payload = products_response.json()

@@ -9,6 +9,7 @@ import requests
 from requests import RequestException
 from shapely.geometry.base import BaseGeometry
 
+from nimbuschain_fetch.copernicus_query import build_copernicus_filter
 from nimbuschain_fetch.download.download_manager import DownloadManager
 from nimbuschain_fetch.providers.base import ProviderBase
 from nimbuschain_fetch.settings import Settings
@@ -191,30 +192,57 @@ class CopernicusProvider(ProviderBase):
         aoi: BaseGeometry | None,
         tile_id: str | None,
     ) -> str:
-        query = (
-            f"Collection/Name eq '{collection}' "
-            f"and ContentDate/Start gt '{start_date}T00:00:00Z' "
-            f"and ContentDate/Start lt '{end_date}T23:59:59Z'"
+        return build_copernicus_filter(
+            collection=collection,
+            product_type=product_type,
+            start_date=start_date,
+            end_date=end_date,
+            aoi=aoi,
+            tile_id=tile_id,
         )
 
-        if product_type:
-            query += (
-                " and Attributes/OData.CSC.StringAttribute/any("
-                "att:att/Name eq 'productType' and "
-                f"att/OData.CSC.StringAttribute/Value eq '{product_type}')"
+    @staticmethod
+    def _response_body_snippet(response: requests.Response | None, *, limit: int = 500) -> str:
+        if response is None:
+            return ""
+        try:
+            body = str(response.text or "").strip()
+        except Exception:
+            body = ""
+        if not body:
+            try:
+                body = str(response.json())
+            except Exception:
+                body = ""
+        body = " ".join(body.split())
+        if len(body) > limit:
+            return body[:limit] + "..."
+        return body
+
+    @classmethod
+    def _catalogue_search_error(cls, exc: RequestException) -> RuntimeError:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        detail = cls._response_body_snippet(response)
+        if status_code in {503, 504}:
+            message = (
+                f"Copernicus catalogue search is temporarily unavailable (HTTP {status_code}). "
+                "Retry in a few seconds."
             )
-
-        if tile_id:
-            query += (
-                " and Attributes/OData.CSC.StringAttribute/any("
-                "att:att/Name eq 'tileId' and "
-                f"att/OData.CSC.StringAttribute/Value eq '{tile_id}')"
-            )
-
-        if aoi is not None:
-            query += f" and OData.CSC.Intersects(area=geography'SRID=4326;{aoi.wkt}')"
-
-        return query
+            if detail:
+                message += f" Response: {detail}"
+            return RuntimeError(message)
+        if status_code == 400:
+            message = "Copernicus rejected the catalogue search query (HTTP 400)."
+            if detail:
+                message += f" Response: {detail}"
+            return RuntimeError(message)
+        if status_code is not None:
+            message = f"Copernicus catalogue search failed (HTTP {status_code})."
+            if detail:
+                message += f" Response: {detail}"
+            return RuntimeError(message)
+        return RuntimeError(f"Copernicus catalogue search failed. Cause: {exc}")
 
     def search_products(
         self,
@@ -253,13 +281,7 @@ class CopernicusProvider(ProviderBase):
                 timeout=60,
             )
         except RequestException as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code in {503, 504}:
-                raise RuntimeError(
-                    f"Copernicus catalogue search is temporarily unavailable (HTTP {status_code}). "
-                    "Retry in a few seconds."
-                ) from exc
-            raise RuntimeError("Copernicus catalogue search failed.") from exc
+            raise self._catalogue_search_error(exc) from exc
         payload = response.json()
         values: list[dict[str, Any]] = payload.get("value", [])
         return [str(item.get("Id")) for item in values if item.get("Id")]

@@ -518,26 +518,18 @@ def _render_files_section(downloads_dir: Path) -> None:
     if use_comp and st_file_browser is not None:
         return
 
-    files = [entry for entry in downloads_dir.rglob("*") if entry.is_file()]
-    if not files:
+    rows = _download_file_rows(downloads_dir)
+    if not rows:
         st.info("No files yet.")
         return
-
-    rows = []
-    for file_path in sorted(files, key=lambda item: item.stat().st_mtime, reverse=True):
-        stat = file_path.stat()
-        rows.append(
-            {
-                "path": str(file_path.relative_to(downloads_dir)),
-                "size_MB": round(stat.st_size / (1024 * 1024), 3),
-                "modified": dt.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
 
     file_query = st.text_input("File search", value="", placeholder="path fragment")
     if file_query.strip():
         needle = file_query.strip().lower()
         rows = [row for row in rows if needle in row["path"].lower()]
+        if not rows:
+            st.info("No files match the current filter.")
+            return
 
     st.dataframe(rows[:100], width="stretch", hide_index=True)
     selected_path = st.selectbox("Select a file", options=[row["path"] for row in rows], index=0)
@@ -559,6 +551,28 @@ def _render_files_section(downloads_dir: Path) -> None:
                 f"Browser download is disabled for large files ({file_size_mb:.1f} MB) to keep Streamlit responsive. "
                 "Use the local path above."
             )
+
+
+def _download_file_rows(downloads_dir: Path) -> list[dict[str, Any]]:
+    indexed_files: list[tuple[Path, Any]] = []
+    for entry in downloads_dir.rglob("*"):
+        try:
+            if not entry.is_file():
+                continue
+            stat = entry.stat()
+        except OSError:
+            continue
+        indexed_files.append((entry, stat))
+
+    indexed_files.sort(key=lambda item: item[1].st_mtime, reverse=True)
+    return [
+        {
+            "path": str(file_path.relative_to(downloads_dir)),
+            "size_MB": round(file_stat.st_size / (1024 * 1024), 3),
+            "modified": dt.datetime.fromtimestamp(file_stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for file_path, file_stat in indexed_files
+    ]
 
 
 def render_results_tab(*, api_url: str, api_key: str) -> None:

@@ -9,6 +9,13 @@ __pycache__
 .pytest_cache
 .ruff_cache
 .mypy_cache
+.pytest_runtime
+
+cache
+download
+output
+zarr
+zarr_watermask
 
 .DS_Store
 app_debug.log

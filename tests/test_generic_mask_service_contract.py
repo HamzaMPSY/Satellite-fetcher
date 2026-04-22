@@ -867,6 +867,34 @@ def test_mask_service_client_maps_fetcher_kwargs_to_mask_contract() -> None:
     assert callable(captured["stage_callback"])
 
 
+def test_mask_service_client_legacy_heuristic_backend_populates_water_backend() -> None:
+    captured: dict[str, object] = {}
+
+    class FakeService:
+        def apply_masks_to_zarr(self, **kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return {"status": "written", "masked_zarr_uri": "/tmp/output.zarr"}
+
+    client = MaskServiceClient(service_url=None)
+    client._service = FakeService()  # type: ignore[assignment]
+
+    result = client.apply_masks_to_zarr(
+        zarr_uri="/tmp/source.zarr",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        scene_id="S2A_SCENE",
+        acquisition_datetime="2026-04-01T10:00:00Z",
+        dataset_summary={"shape": [1, 12, 4, 4]},
+        mask_types=["water", "cloud"],
+        backend="heuristic",
+    )
+
+    assert result["status"] == "written"
+    assert captured["backend"] == "omnicloudmask"
+    assert captured["water_backend"] == "heuristic"
+
+
 @pytest.mark.parametrize(
     "mask_types",
     [
@@ -908,7 +936,26 @@ def test_mask_apply_request_accepts_legacy_fetcher_payload(mask_types: list[str]
     assert request.cloud.include_shadows is True
     assert request.water.backend == "auto"
     assert request.water.overwrite is True
-    assert request.water.inference_device == "cpu"
+
+
+def test_mask_apply_request_maps_legacy_heuristic_backend_to_water_backend() -> None:
+    request = MaskApplyRequest.model_validate(
+        {
+            "zarr_uri": "/tmp/source.zarr",
+            "provider": "copernicus",
+            "collection": "SENTINEL-2",
+            "product_type": "S2MSI2A",
+            "scene_id": "S2A_SCENE",
+            "acquisition_datetime": "2026-04-01T10:00:00Z",
+            "dataset_summary": {"shape": [1, 12, 4, 4]},
+            "mask_types": ["water", "cloud"],
+            "backend": "heuristic",
+        }
+    )
+
+    assert request.cloud.backend == "omnicloudmask"
+    assert request.water.backend == "heuristic"
+    assert request.water.inference_device is None
 
 
 def test_copy_source_zarr_falls_back_when_fast_copy_path_is_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

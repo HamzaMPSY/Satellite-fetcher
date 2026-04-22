@@ -1253,6 +1253,26 @@ def _mask_types_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
     return _normalize_mask_types(list(inferred))
 
 
+def _cube_mode_from_payload(payload: dict[str, Any]) -> str:
+    pipeline_metadata = dict(payload.get("pipeline_metadata") or {})
+    request_payload = dict(payload.get("request") or {})
+    timeline_payload = payload.get("pipeline_timeline")
+    if not isinstance(timeline_payload, dict):
+        timeline_payload = pipeline_metadata.get("timeline")
+    if not isinstance(timeline_payload, dict):
+        timeline_payload = {}
+    candidate = str(
+        payload.get("cube_mode")
+        or request_payload.get("cube_mode")
+        or pipeline_metadata.get("cube_mode")
+        or timeline_payload.get("cube_mode")
+        or "none"
+    ).strip().lower() or "none"
+    if candidate in {"before_mask", "after_mask"}:
+        return candidate
+    return "none"
+
+
 def _mask_payload_matches_requested(payload: dict[str, Any], requested_mask_types: list[str]) -> bool:
     requested = _normalize_mask_types(requested_mask_types)
     if not requested:
@@ -1626,6 +1646,16 @@ def _format_eta_compact(value: Any) -> str:
     if minutes > 0:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def _format_eta(value: Any) -> str:
+    try:
+        seconds = int(float(value))
+    except Exception:
+        return "-"
+    if seconds <= 0:
+        return "done"
+    return _format_eta_compact(seconds)
 
 
 def _format_duration_compact(value: Any) -> str:
@@ -2096,6 +2126,140 @@ def _format_runtime_duration(value: Any) -> str:
     return f"{hours}h {minute:02d}m"
 
 
+def _promote_timeline_stage_for_display(
+    stage: dict[str, Any],
+    *,
+    reference_time: str | None,
+) -> bool:
+    current_status = str(stage.get("status") or "pending").strip().lower() or "pending"
+    if current_status in {"failed", "cancelled"}:
+        return False
+
+    changed = current_status != "done"
+    stage["status"] = "done"
+    if not stage.get("detail_label") or current_status in {"pending", "queued", "running"}:
+        stage["detail_label"] = str(stage.get("label") or stage.get("key") or "Stage")
+
+    if reference_time is None:
+        if stage.get("duration_seconds") is None:
+            stage["duration_seconds"] = 0.0
+            changed = True
+        return changed
+
+    if stage.get("started_at") is None:
+        stage["started_at"] = reference_time
+        changed = True
+    if current_status in {"pending", "queued", "running"} or stage.get("finished_at") is None:
+        stage["finished_at"] = reference_time
+        changed = True
+    if current_status in {"pending", "queued", "running"} or stage.get("duration_seconds") is None:
+        stage["duration_seconds"] = 0.0
+        changed = True
+    return changed
+
+
+def _timeline_display_completion_anchor(
+    timeline: dict[str, Any],
+    *,
+    job_state: str,
+    pipeline_state: str,
+) -> str | None:
+    stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    if not stages:
+        return None
+
+    stage_keys = [str(stage.get("key") or "").strip().lower() for stage in stages]
+    ready_stage = next(
+        (
+            stage
+            for stage in stages
+            if str(stage.get("key") or "").strip().lower() == "ready"
+        ),
+        None,
+    )
+    ready_status = str((ready_stage or {}).get("status") or "").strip().lower()
+    if ready_status in {"done", "failed", "cancelled"}:
+        return "ready"
+
+    normalized_job_state = str(job_state or "").strip().lower()
+    normalized_pipeline_state = str(pipeline_state or "").strip().lower()
+    current_stage = str(timeline.get("current_stage") or "").strip().lower()
+
+    if normalized_job_state != "succeeded":
+        if current_stage == "ready" and "ready" in stage_keys:
+            return "ready"
+        return None
+
+    if normalized_pipeline_state == "masked_zarr_written" and "ready" in stage_keys:
+        return "ready"
+    if normalized_pipeline_state == "cube_written" and "cube" in stage_keys:
+        cube_index = stage_keys.index("cube")
+        trailing = [key for key in stage_keys[cube_index + 1:] if key != "ready"]
+        return "ready" if not trailing and "ready" in stage_keys else "cube"
+    if normalized_pipeline_state == "zarr_written" and "convert" in stage_keys:
+        trailing = [key for key in stage_keys[stage_keys.index("convert") + 1:] if key != "ready"]
+        return "ready" if not trailing and "ready" in stage_keys else "convert"
+    if current_stage == "ready" and "ready" in stage_keys:
+        return "ready"
+    return None
+
+
+def _normalize_timeline_for_display(
+    timeline: dict[str, Any],
+    *,
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    if not stages:
+        return timeline
+
+    snapshot = dict(timeline)
+    snapshot["stages"] = stages
+    job_state = str(snapshot.get("job_state") or item.get("state") or "").strip().lower()
+    pipeline_state = str(snapshot.get("pipeline_state") or _job_pipeline_state(item) or "").strip().lower()
+    anchor_key = _timeline_display_completion_anchor(
+        snapshot,
+        job_state=job_state,
+        pipeline_state=pipeline_state,
+    )
+    if anchor_key is None:
+        return snapshot
+
+    stage_keys = [str(stage.get("key") or "").strip().lower() for stage in stages]
+    if anchor_key not in stage_keys:
+        return snapshot
+
+    anchor_stage = stages[stage_keys.index(anchor_key)]
+    reference_time = str(
+        anchor_stage.get("finished_at")
+        or anchor_stage.get("started_at")
+        or snapshot.get("updated_at")
+        or item.get("finished_at")
+        or item.get("updated_at")
+        or dt.datetime.now(dt.timezone.utc).isoformat()
+    ).strip() or None
+
+    changed = False
+    for stage in stages[: stage_keys.index(anchor_key) + 1]:
+        changed = _promote_timeline_stage_for_display(
+            stage,
+            reference_time=reference_time,
+        ) or changed
+
+    if not changed:
+        return snapshot
+
+    snapshot["visual_normalized"] = True
+    if anchor_key == "ready":
+        snapshot["current_stage"] = "ready"
+        snapshot["current_stage_label"] = str(anchor_stage.get("label") or "Ready")
+        snapshot["terminal"] = True
+    elif not snapshot.get("current_stage"):
+        snapshot["current_stage"] = anchor_key
+        snapshot["current_stage_label"] = str(anchor_stage.get("label") or anchor_key.title())
+    return snapshot
+
+
 def _pipeline_timeline_snapshot(item: dict[str, Any]) -> dict[str, Any]:
     pipeline_metadata = dict(item.get("pipeline_metadata") or {})
     existing_timeline = item.get("pipeline_timeline")
@@ -2119,9 +2283,10 @@ def _pipeline_timeline_snapshot(item: dict[str, Any]) -> dict[str, Any]:
     pipeline_step = str(item.get("pipeline_step") or "").strip().lower() or None
     job_kind = "mask" if _job_is_mask_job(item) else "fetch"
     normalized_mask_types = list(_normalize_mask_types(_mask_types_from_payload(item)))
+    cube_mode = _cube_mode_from_payload(item)
 
     if existing_timeline:
-        return refresh_pipeline_timeline(
+        snapshot = refresh_pipeline_timeline(
             dict(existing_timeline),
             timestamp=timeline_timestamp,
             job_state=state_value,
@@ -2129,17 +2294,24 @@ def _pipeline_timeline_snapshot(item: dict[str, Any]) -> dict[str, Any]:
             pipeline_step=pipeline_step,
             job_kind=job_kind,
             mask_types=normalized_mask_types,
+            cube_mode=cube_mode,
+        )
+    else:
+        snapshot = advance_pipeline_timeline(
+            dict(existing_timeline),
+            job_state=state_value,
+            pipeline_state=pipeline_state,
+            pipeline_step=pipeline_step,
+            pipeline_progress=_job_pipeline_progress(item),
+            timestamp=timeline_timestamp,
+            job_kind=job_kind,
+            mask_types=normalized_mask_types,
+            cube_mode=cube_mode,
         )
 
-    return advance_pipeline_timeline(
-        dict(existing_timeline),
-        job_state=state_value,
-        pipeline_state=pipeline_state,
-        pipeline_step=pipeline_step,
-        pipeline_progress=_job_pipeline_progress(item),
-        timestamp=timeline_timestamp,
-        job_kind=job_kind,
-        mask_types=normalized_mask_types,
+    return _normalize_timeline_for_display(
+        snapshot,
+        item=item,
     )
 
 
@@ -2515,6 +2687,158 @@ def _render_job_pipeline_paths(item: dict[str, Any]) -> None:
     st.code("\n".join(lines), language="text")
 
 
+_CONVERT_TIMELINE_STEP_KEYS = {"writing_chunks", "registering_artifact"}
+
+
+def _conversion_progress_snapshot(item: dict[str, Any]) -> dict[str, int]:
+    conversion_meta = dict(item.get("conversion_metadata") or {})
+    pipeline_meta = dict(item.get("pipeline_metadata") or {})
+    raw_outputs = list(item.get("raw_outputs") or [])
+    zarr_outputs = list(item.get("zarr_outputs") or [])
+
+    total = max(
+        int(conversion_meta.get("items_total", 0) or 0),
+        int(conversion_meta.get("total", 0) or 0),
+        int(pipeline_meta.get("raw_output_count", 0) or 0),
+        len(raw_outputs),
+    )
+    completed = max(
+        int(conversion_meta.get("items_completed", 0) or 0),
+        int(pipeline_meta.get("zarr_output_count", 0) or 0),
+        len(zarr_outputs),
+    )
+    active = max(int(conversion_meta.get("items_active", 0) or 0), 0)
+    workers = max(
+        int(conversion_meta.get("parallel_workers", 0) or 0),
+        int(pipeline_meta.get("zarr_parallel_workers", 0) or 0),
+    )
+    current_index = max(int(conversion_meta.get("current_index", 0) or 0), 0)
+
+    if total > 0:
+        completed = min(completed, total)
+        active = min(active, max(total - completed, 0))
+        current_index = min(
+            max(current_index, completed + (1 if active > 0 else 0)),
+            total,
+        )
+
+    return {
+        "total": total,
+        "completed": completed,
+        "active": active,
+        "workers": workers,
+        "current_index": current_index,
+    }
+
+
+def _conversion_progress_parts(item: dict[str, Any]) -> list[str]:
+    snapshot = _conversion_progress_snapshot(item)
+    total = snapshot["total"]
+    completed = snapshot["completed"]
+    active = snapshot["active"]
+    workers = snapshot["workers"]
+    current_index = snapshot["current_index"]
+
+    parts: list[str] = []
+    if total > 0:
+        if completed > 0 or active > 0:
+            parts.append(f"{completed}/{total} completed")
+        elif current_index > 0:
+            parts.append(f"scene {current_index}/{total}")
+    if active > 0:
+        parts.append(f"{active} active")
+    if workers > 1:
+        parts.append(f"{workers} workers")
+    return parts
+
+
+def _timeline_duration_seconds(
+    started_at: Any,
+    finished_at: Any,
+) -> float | None:
+    started = _parse_iso_datetime(started_at)
+    finished = _parse_iso_datetime(finished_at)
+    if started is None or finished is None:
+        return None
+    return max(0.0, (finished - started).total_seconds())
+
+
+def _timeline_breakdown_rows(
+    item: dict[str, Any],
+    timeline: dict[str, Any],
+) -> tuple[list[dict[str, str]], bool]:
+    raw_steps = [dict(step) for step in list(timeline.get("steps") or []) if isinstance(step, dict)]
+    if not raw_steps:
+        return ([], False)
+
+    rows: list[dict[str, str]] = []
+    collapsed_convert_rows = False
+    now_iso = timeline.get("updated_at")
+
+    index = 0
+    while index < len(raw_steps):
+        step = raw_steps[index]
+        step_key = str(step.get("key") or "").strip().lower()
+        if step_key not in _CONVERT_TIMELINE_STEP_KEYS:
+            rows.append(
+                {
+                    "step": str(step.get("label") or step.get("key") or "-"),
+                    "detail": "-",
+                    "status": str(step.get("status") or "-"),
+                    "started": _format_status_timestamp(step.get("started_at")),
+                    "finished": _format_status_timestamp(step.get("finished_at")),
+                    "duration": _format_runtime_duration(step.get("duration_seconds")),
+                    "stage": str(step.get("group_label") or step.get("group") or "-"),
+                }
+            )
+            index += 1
+            continue
+
+        grouped_steps: list[dict[str, Any]] = []
+        while index < len(raw_steps):
+            candidate = dict(raw_steps[index])
+            candidate_key = str(candidate.get("key") or "").strip().lower()
+            if candidate_key not in _CONVERT_TIMELINE_STEP_KEYS:
+                break
+            grouped_steps.append(candidate)
+            index += 1
+
+        if not grouped_steps:
+            continue
+
+        collapsed_convert_rows = collapsed_convert_rows or len(grouped_steps) > 1
+        first_step = grouped_steps[0]
+        last_step = grouped_steps[-1]
+        status = str(last_step.get("status") or "-").strip().lower() or "-"
+        finished_at = last_step.get("finished_at")
+        if status in {"running", "queued"}:
+            finished_at = None
+        duration_seconds = _timeline_duration_seconds(
+            first_step.get("started_at"),
+            finished_at or now_iso,
+        )
+        progress_parts = _conversion_progress_parts(item)
+        action_label = str(last_step.get("label") or last_step.get("key") or "").strip()
+        detail_parts: list[str] = []
+        if action_label:
+            action_prefix = "Current action" if status in {"running", "queued"} else "Last action"
+            detail_parts.append(f"{action_prefix}: {action_label}")
+        detail_parts.extend(progress_parts)
+        rows.append(
+            {
+                "step": "Convert Raw Scenes",
+                "detail": " · ".join(detail_parts) if detail_parts else "-",
+                "status": str(last_step.get("status") or "-"),
+                "started": _format_status_timestamp(first_step.get("started_at")),
+                "finished": _format_status_timestamp(finished_at),
+                "duration": _format_runtime_duration(duration_seconds),
+                "stage": str(last_step.get("group_label") or last_step.get("group") or "Convert"),
+            }
+        )
+
+    return (rows, collapsed_convert_rows)
+
+
 def _render_pipeline_timeline(item: dict[str, Any]) -> None:
     timeline = _pipeline_timeline_snapshot(item)
     stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
@@ -2522,68 +2846,166 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         return
 
     current_stage_key = str(timeline.get("current_stage") or "").strip().lower()
+    done_count = sum(
+        1
+        for stage in stages
+        if str(stage.get("status") or "").strip().lower() == "done"
+    )
+    active_count = sum(
+        1
+        for stage in stages
+        if str(stage.get("status") or "").strip().lower() in {"running", "queued"}
+    )
+    waiting_count = sum(
+        1
+        for stage in stages
+        if str(stage.get("status") or "").strip().lower() == "pending"
+    )
+    stage_progress = (100.0 * done_count / len(stages)) if stages else 0.0
+    current_stage_label = str(timeline.get("current_stage_label") or "").strip() or "Waiting"
+    mask_types = _normalize_mask_types(_mask_types_from_payload(item))
+    cube_mode = str(timeline.get("cube_mode") or _cube_mode_from_payload(item) or "none").strip().lower()
+    flow_bits: list[str] = []
+    if cube_mode == "before_mask":
+        flow_bits.append("Cube before masks")
+    elif cube_mode == "after_mask":
+        flow_bits.append("Cube after masks")
+    else:
+        flow_bits.append("Direct Zarr pipeline")
+    if mask_types:
+        flow_bits.append("Masks: " + " + ".join(mask.title() for mask in mask_types))
+    else:
+        flow_bits.append("No integrated masks")
+
+    overview_cards = [
+        ("Complete", f"{done_count}/{len(stages)}"),
+        ("Current", current_stage_label),
+        ("Waiting", str(waiting_count)),
+    ]
+    if active_count > 0:
+        overview_cards.append(("Live", str(active_count)))
+
     cards: list[str] = []
-    for stage in stages:
+    for index, stage in enumerate(stages, start=1):
         status_kind = str(stage.get("status") or "pending").strip().lower() or "pending"
         stage_key = str(stage.get("key") or "").strip().lower()
+        status_label = {
+            "pending": "waiting",
+            "queued": "queued",
+            "running": "live",
+            "done": "done",
+            "failed": "failed",
+            "cancelled": "stopped",
+        }.get(status_kind, status_kind.replace("_", " "))
         label = html.escape(str(stage.get("label") or stage_key or "Stage"))
         badge = html.escape(str(stage.get("badge") or "STEP"))
         detail = html.escape(str(stage.get("detail_label") or label))
         duration_label = _format_runtime_duration(stage.get("duration_seconds"))
         started_label = _format_status_timestamp(stage.get("started_at"))
         finished_label = _format_status_timestamp(stage.get("finished_at"))
+        progress_bits: list[str] = []
+        if stage_key == "convert":
+            progress_bits = _conversion_progress_parts(item)
 
-        meta_line = "Pending"
+        detail_line = detail
+        meta_pills: list[str] = []
         if status_kind == "queued":
-            meta_line = "Queued"
+            detail_line = "Queued to start"
         elif status_kind == "running":
-            meta_line = f"{detail} · {duration_label}"
+            if duration_label != "-":
+                meta_pills.append(duration_label)
+            meta_pills.extend(progress_bits)
+        elif status_kind == "pending":
+            detail_line = "Waiting for previous stage"
         elif status_kind in {"done", "failed", "cancelled"}:
             when_label = finished_label if finished_label != "-" else started_label
-            meta_line = f"{duration_label} · {when_label}"
+            if duration_label != "-":
+                meta_pills.append(duration_label)
+            if when_label != "-":
+                meta_pills.append(when_label)
+
+        if not meta_pills and status_kind == "pending":
+            meta_pills.append("blocked")
+        elif not meta_pills and status_kind == "queued":
+            meta_pills.append("scheduled")
 
         card_classes = ["nimbus-stage-card", f"nimbus-stage-{status_kind}"]
         if stage_key == current_stage_key and status_kind in {"running", "queued"}:
             card_classes.append("is-current")
+        if stage_key == current_stage_key and status_kind == "done":
+            card_classes.append("is-current")
+
+        pill_markup = "".join(
+            "<span class='nimbus-stage-pill'>{text}</span>".format(text=html.escape(str(text)))
+            for text in meta_pills
+        )
 
         cards.append(
             "<div class='{classes}'>"
             "<div class='nimbus-stage-head'>"
+            "<div class='nimbus-stage-chip-row'>"
+            "<span class='nimbus-stage-index'>{index:02d}</span>"
             "<span class='nimbus-stage-badge'>{badge}</span>"
+            "</div>"
             "<span class='nimbus-stage-status'>{status}</span>"
             "</div>"
             "<div class='nimbus-stage-title'>{label}</div>"
-            "<div class='nimbus-stage-meta'>{meta}</div>"
+            "<div class='nimbus-stage-detail'>{detail}</div>"
+            "<div class='nimbus-stage-pills'>{pills}</div>"
             "</div>".format(
                 classes=" ".join(card_classes),
+                index=index,
                 badge=badge,
-                status=html.escape(status_kind.replace("_", " ")),
+                status=html.escape(status_label),
                 label=label,
-                meta=html.escape(meta_line),
+                detail=html.escape(detail_line),
+                pills=pill_markup,
             )
         )
 
     st.markdown(
-        "<div class='nimbus-stage-grid'>" + "".join(cards) + "</div>",
+        "<div class='nimbus-pipeline-shell'>"
+        "<div class='nimbus-pipeline-overview'>"
+        "<div class='nimbus-pipeline-title-block'>"
+        "<div class='nimbus-pipeline-eyebrow'>Pipeline map</div>"
+        "<div class='nimbus-pipeline-headline'>{headline}</div>"
+        "<div class='nimbus-pipeline-subtitle'>{subtitle}</div>"
+        "</div>"
+        "<div class='nimbus-pipeline-metrics'>{metrics}</div>"
+        "</div>"
+        "<div class='nimbus-pipeline-progress'><span style='width:{progress:.2f}%'></span></div>"
+        "<div class='nimbus-stage-grid'>{cards}</div>"
+        "</div>".format(
+            headline=html.escape(" · ".join(flow_bits)),
+            subtitle=html.escape(
+                f"{done_count} complete · {active_count} live · {waiting_count} waiting"
+            ),
+            metrics="".join(
+                (
+                    "<div class='nimbus-pipeline-metric'>"
+                    f"<span>{html.escape(label_text)}</span>"
+                    f"<strong>{html.escape(value_text)}</strong>"
+                    "</div>"
+                )
+                for label_text, value_text in overview_cards
+            ),
+            progress=stage_progress,
+            cards="".join(cards),
+        ),
         unsafe_allow_html=True,
     )
 
-    raw_steps = [dict(step) for step in list(timeline.get("steps") or []) if isinstance(step, dict)]
-    if not raw_steps:
+    display_rows, convert_rows_grouped = _timeline_breakdown_rows(item, timeline)
+    if not display_rows:
         return
     with st.expander("Step breakdown", expanded=False):
+        if convert_rows_grouped:
+            st.caption(
+                "Convert rows are grouped here. Repeated write/register events usually mean "
+                "different scenes are finishing, not a backend loop."
+            )
         st.dataframe(
-            [
-                {
-                    "step": str(step.get("label") or step.get("key") or "-"),
-                    "status": str(step.get("status") or "-"),
-                    "started": _format_status_timestamp(step.get("started_at")),
-                    "finished": _format_status_timestamp(step.get("finished_at")),
-                    "duration": _format_runtime_duration(step.get("duration_seconds")),
-                    "stage": str(step.get("group_label") or step.get("group") or "-"),
-                }
-                for step in raw_steps
-            ],
+            display_rows,
             width="stretch",
             hide_index=True,
         )

@@ -7,7 +7,45 @@ import pytest
 import zarr
 
 from nimbuschain_zarr_service.core import ConversionError
-from nimbuschain_zarr_service.cube import build_grouped_time_cubes, build_time_cube
+from nimbuschain_zarr_service.cube import (
+    _copy_time_slice_in_chunks,
+    build_grouped_time_cubes,
+    build_time_cube,
+)
+
+
+class _ChunkGuardArray:
+    def __init__(self, data: np.ndarray, *, chunks: tuple[int, ...]) -> None:
+        self.data = np.asarray(data)
+        self.shape = self.data.shape
+        self.dtype = self.data.dtype
+        self.chunks = chunks
+        self.max_read_spans = [0 for _ in range(self.data.ndim)]
+
+    def __getitem__(self, key):
+        normalized = self._normalize_key(key)
+        for axis, item in enumerate(normalized):
+            span = 1
+            if isinstance(item, slice):
+                span = max(0, int(item.stop or 0) - int(item.start or 0))
+            self.max_read_spans[axis] = max(self.max_read_spans[axis], span)
+        return self.data[normalized]
+
+    def __setitem__(self, key, value) -> None:
+        self.data[key] = value
+
+    def _normalize_key(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        normalized = []
+        for axis, item in enumerate(key):
+            if isinstance(item, slice):
+                start = 0 if item.start is None else int(item.start)
+                stop = int(self.shape[axis]) if item.stop is None else int(item.stop)
+                normalized.append(slice(start, stop, item.step))
+            else:
+                normalized.append(int(item))
+        return tuple(normalized)
 
 
 def _write_scene_store(
@@ -281,3 +319,43 @@ def test_build_grouped_time_cubes_filters_dates_and_deduplicates_same_timestamp(
     assert summary["items"][0]["skipped_duplicate_scene_ids"] == [
         "S2B_MSIL2A_20260103T100000_N0512_R035_T37RDP_20260103T120500"
     ]
+
+
+def test_copy_time_slice_in_chunks_reads_imagery_by_chunk() -> None:
+    source_data = np.arange(1 * 3 * 4 * 5, dtype=np.uint16).reshape(1, 3, 4, 5)
+    source = _ChunkGuardArray(source_data, chunks=(1, 1, 2, 2))
+    target = _ChunkGuardArray(np.zeros((2, 3, 4, 5), dtype=np.uint16), chunks=(1, 1, 2, 2))
+
+    blocks_written = _copy_time_slice_in_chunks(
+        source,
+        target,
+        source_time_index=0,
+        target_time_index=1,
+        layer_name="imagery",
+        label_names=["B01", "B02", "B03"],
+    )
+
+    np.testing.assert_array_equal(target.data[1], source_data[0])
+    assert blocks_written == 18
+    assert source.max_read_spans[1] <= 1
+    assert source.max_read_spans[2] <= 2
+    assert source.max_read_spans[3] <= 2
+
+
+def test_copy_time_slice_in_chunks_reads_masks_by_chunk() -> None:
+    source_data = np.arange(1 * 4 * 5, dtype=np.uint8).reshape(1, 4, 5)
+    source = _ChunkGuardArray(source_data, chunks=(1, 2, 2))
+    target = _ChunkGuardArray(np.zeros((2, 4, 5), dtype=np.uint8), chunks=(1, 2, 2))
+
+    blocks_written = _copy_time_slice_in_chunks(
+        source,
+        target,
+        source_time_index=0,
+        target_time_index=1,
+        layer_name="masks/cloud",
+    )
+
+    np.testing.assert_array_equal(target.data[1], source_data[0])
+    assert blocks_written == 6
+    assert source.max_read_spans[1] <= 2
+    assert source.max_read_spans[2] <= 2

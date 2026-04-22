@@ -13,6 +13,14 @@ def _stage_by_key(timeline: dict[str, object], key: str) -> dict[str, object]:
     raise AssertionError(f"Stage '{key}' not found in timeline: {timeline}")
 
 
+def _stage_keys(timeline: dict[str, object]) -> list[str]:
+    return [
+        str(stage.get("key") or "")
+        for stage in timeline.get("stages", [])  # type: ignore[union-attr]
+        if isinstance(stage, dict)
+    ]
+
+
 def test_pipeline_timeline_tracks_stage_durations_for_fetch_pipeline() -> None:
     timeline: dict[str, object] = {}
 
@@ -462,3 +470,291 @@ def test_refresh_pipeline_timeline_preserves_backend_structure_despite_stale_row
     assert refreshed["current_step"] == "running_water_inference"
     assert refreshed["pipeline_step"] == "running_water_inference"
     assert len(refreshed.get("steps", [])) == len(timeline.get("steps", []))
+
+
+def test_pipeline_timeline_inserts_cube_before_masks_and_waits_for_next_stage() -> None:
+    mask_types = ["cloud", "water"]
+    timeline: dict[str, object] = {}
+
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="zarr_written",
+        pipeline_step="zarr_written",
+        pipeline_progress=72.0,
+        timestamp="2026-01-01T00:00:00+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="before_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="cube_building",
+        pipeline_step="cube_building",
+        pipeline_progress=74.0,
+        timestamp="2026-01-01T00:00:05+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="before_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="cube_written",
+        pipeline_step="cube_written",
+        pipeline_progress=76.0,
+        timestamp="2026-01-01T00:00:09+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="before_mask",
+    )
+
+    cube_stage = _stage_by_key(timeline, "cube")
+    ready_stage = _stage_by_key(timeline, "ready")
+
+    assert _stage_keys(timeline) == ["search", "download", "convert", "cube", "cloud", "water", "ready"]
+    assert cube_stage["status"] == "done"
+    assert ready_stage["status"] == "pending"
+    assert timeline["current_stage"] == "cube"
+
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="running_cloud_inference",
+        pipeline_step="running_cloud_inference",
+        pipeline_progress=82.0,
+        timestamp="2026-01-01T00:00:15+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="before_mask",
+    )
+
+    assert _stage_by_key(timeline, "cube")["status"] == "done"
+    assert _stage_by_key(timeline, "cloud")["status"] == "running"
+    assert timeline["current_stage"] == "cloud"
+
+
+def test_pipeline_timeline_inserts_cube_after_masks_and_finishes_on_ready() -> None:
+    mask_types = ["cloud", "water"]
+    timeline: dict[str, object] = {}
+
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="zarr_written",
+        pipeline_step="zarr_written",
+        pipeline_progress=72.0,
+        timestamp="2026-01-01T00:00:00+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="after_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="running_cloud_inference",
+        pipeline_step="running_cloud_inference",
+        pipeline_progress=82.0,
+        timestamp="2026-01-01T00:00:05+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="after_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="running_water_inference",
+        pipeline_step="running_water_inference",
+        pipeline_progress=91.0,
+        timestamp="2026-01-01T00:00:15+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="after_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="cube_building",
+        pipeline_step="cube_building",
+        pipeline_progress=98.0,
+        timestamp="2026-01-01T00:00:25+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="after_mask",
+    )
+
+    assert _stage_keys(timeline) == ["search", "download", "convert", "cloud", "water", "cube", "ready"]
+    assert _stage_by_key(timeline, "cube")["status"] == "running"
+    assert timeline["current_stage"] == "cube"
+
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="succeeded",
+        pipeline_state="cube_written",
+        pipeline_step="cube_written",
+        pipeline_progress=100.0,
+        timestamp="2026-01-01T00:00:33+00:00",
+        job_kind="fetch",
+        mask_types=mask_types,
+        cube_mode="after_mask",
+    )
+
+    assert _stage_by_key(timeline, "cube")["status"] == "done"
+    assert _stage_by_key(timeline, "ready")["status"] == "done"
+    assert timeline["current_stage"] == "ready"
+    assert timeline["terminal"] is True
+
+
+def test_pipeline_timeline_routes_cube_completion_to_ready_when_no_masks_are_requested() -> None:
+    timeline: dict[str, object] = {}
+
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="zarr_written",
+        pipeline_step="zarr_written",
+        pipeline_progress=72.0,
+        timestamp="2026-01-01T00:00:00+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="cube_building",
+        pipeline_step="cube_building",
+        pipeline_progress=90.0,
+        timestamp="2026-01-01T00:00:05+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="succeeded",
+        pipeline_state="cube_written",
+        pipeline_step="cube_written",
+        pipeline_progress=100.0,
+        timestamp="2026-01-01T00:00:10+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+
+    assert _stage_keys(timeline) == ["search", "download", "convert", "cube", "ready"]
+    assert _stage_by_key(timeline, "cube")["status"] == "done"
+    assert _stage_by_key(timeline, "ready")["status"] == "done"
+    assert timeline["current_stage"] == "ready"
+    assert timeline["terminal"] is True
+
+
+def test_refresh_pipeline_timeline_keeps_cube_done_when_rebuild_only_retains_cube_written() -> None:
+    timeline: dict[str, object] = {}
+
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="zarr_written",
+        pipeline_step="zarr_written",
+        pipeline_progress=72.0,
+        timestamp="2026-01-01T00:00:00+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="running",
+        pipeline_state="cube_building",
+        pipeline_step="cube_building",
+        pipeline_progress=90.0,
+        timestamp="2026-01-01T00:00:05+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+    timeline = advance_pipeline_timeline(
+        timeline,
+        job_state="succeeded",
+        pipeline_state="cube_written",
+        pipeline_step="cube_written",
+        pipeline_progress=100.0,
+        timestamp="2026-01-01T00:00:10+00:00",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+
+    rebuilt = dict(timeline)
+    rebuilt["steps"] = [
+        dict(step)
+        for step in list(timeline.get("steps") or [])
+        if isinstance(step, dict) and str(step.get("key") or "") in {"zarr_written", "cube_written"}
+    ]
+
+    refreshed = refresh_pipeline_timeline(
+        rebuilt,
+        timestamp="2026-01-01T00:00:10+00:00",
+        job_state="succeeded",
+        pipeline_state="cube_written",
+        pipeline_step="cube_written",
+        job_kind="fetch",
+        mask_types=[],
+        cube_mode="before_mask",
+    )
+
+    assert _stage_keys(refreshed) == ["search", "download", "convert", "cube", "ready"]
+    assert _stage_by_key(refreshed, "convert")["status"] == "done"
+    assert _stage_by_key(refreshed, "cube")["status"] == "done"
+    assert _stage_by_key(refreshed, "ready")["status"] == "done"
+    assert refreshed["current_stage"] == "ready"
+
+
+def test_pipeline_timeline_backfills_completed_stages_from_terminal_masked_state() -> None:
+    timeline = advance_pipeline_timeline(
+        {},
+        job_state="succeeded",
+        pipeline_state="masked_zarr_written",
+        pipeline_step="masked_zarr_written",
+        pipeline_progress=100.0,
+        timestamp="2026-01-01T00:00:10+00:00",
+        job_kind="fetch",
+        mask_types=["cloud", "water"],
+        cube_mode="before_mask",
+    )
+
+    assert _stage_keys(timeline) == ["search", "download", "convert", "cube", "cloud", "water", "ready"]
+    assert _stage_by_key(timeline, "search")["status"] == "done"
+    assert _stage_by_key(timeline, "download")["status"] == "done"
+    assert _stage_by_key(timeline, "convert")["status"] == "done"
+    assert _stage_by_key(timeline, "cube")["status"] == "done"
+    assert _stage_by_key(timeline, "cloud")["status"] == "done"
+    assert _stage_by_key(timeline, "water")["status"] == "done"
+    assert _stage_by_key(timeline, "ready")["status"] == "done"
+    assert timeline["current_stage"] == "ready"
+
+
+def test_pipeline_timeline_backfills_previous_stages_when_only_current_mask_stage_is_known() -> None:
+    timeline = advance_pipeline_timeline(
+        {},
+        job_state="running",
+        pipeline_state="running_water_inference",
+        pipeline_step="running_water_inference",
+        pipeline_progress=91.0,
+        timestamp="2026-01-01T00:00:10+00:00",
+        job_kind="fetch",
+        mask_types=["cloud", "water"],
+        cube_mode="before_mask",
+    )
+
+    assert _stage_keys(timeline) == ["search", "download", "convert", "cube", "cloud", "water", "ready"]
+    assert _stage_by_key(timeline, "search")["status"] == "done"
+    assert _stage_by_key(timeline, "download")["status"] == "done"
+    assert _stage_by_key(timeline, "convert")["status"] == "done"
+    assert _stage_by_key(timeline, "cube")["status"] == "done"
+    assert _stage_by_key(timeline, "cloud")["status"] == "done"
+    assert _stage_by_key(timeline, "water")["status"] == "running"
+    assert _stage_by_key(timeline, "ready")["status"] == "pending"
+    assert timeline["current_stage"] == "water"

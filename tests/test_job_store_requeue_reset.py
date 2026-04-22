@@ -33,7 +33,12 @@ def test_requeue_incomplete_jobs_preserves_completed_download_outputs(tmp_path: 
         pipeline_state="zarr_converting",
         pipeline_step="water_masking",
         pipeline_progress=88.0,
-        pipeline_metadata={"products_found": 2, "products_downloaded": 2},
+        pipeline_metadata={
+            "products_found": 2,
+            "products_downloaded": 2,
+            "cube_mode": "before_mask",
+            "timeline": {"steps": [{"key": "cube_written"}]},
+        },
         conversion_metadata={"stage": "water_masking", "current_output_uri": "/download/zarr/test.zarr"},
         raw_outputs=["/download/raw/a.SAFE.zip", "/download/raw/b.SAFE.zip"],
         zarr_outputs=["/download/zarr/test.zarr"],
@@ -55,7 +60,11 @@ def test_requeue_incomplete_jobs_preserves_completed_download_outputs(tmp_path: 
     assert row["pipeline_state"] == "zarr_converting"
     assert row["pipeline_step"] == "resume_after_restart"
     assert row["pipeline_progress"] == 88.0
-    assert row["pipeline_metadata"] == {"products_found": 2, "products_downloaded": 2}
+    assert row["pipeline_metadata"] == {
+        "products_found": 2,
+        "products_downloaded": 2,
+        "cube_mode": "before_mask",
+    }
     assert row["conversion_metadata"] == {"stage": "water_masking", "current_output_uri": "/download/zarr/test.zarr"}
     assert row["raw_outputs"] == ["/download/raw/a.SAFE.zip", "/download/raw/b.SAFE.zip"]
     assert row["zarr_outputs"] == ["/download/zarr/test.zarr"]
@@ -271,7 +280,11 @@ def test_requeue_stale_running_jobs_preserves_conversion_outputs(tmp_path: Path)
         pipeline_state="zarr_converting",
         pipeline_step="water_masking",
         pipeline_progress=88.0,
-        pipeline_metadata={"products_found": 1, "products_downloaded": 1},
+        pipeline_metadata={
+            "products_found": 1,
+            "products_downloaded": 1,
+            "timeline": {"steps": [{"key": "cube_building"}]},
+        },
         conversion_metadata={
             "stage": "water_masking",
             "current_output_uri": "/download/zarr/test.zarr",
@@ -310,6 +323,7 @@ def test_requeue_stale_running_jobs_preserves_conversion_outputs(tmp_path: Path)
     assert row["pipeline_state"] == "zarr_converting"
     assert row["pipeline_step"] == "resume_after_restart"
     assert row["pipeline_progress"] == 88.0
+    assert row["pipeline_metadata"] == {"products_found": 1, "products_downloaded": 1}
     assert row["raw_outputs"] == ["/download/raw/a.SAFE.zip"]
     assert row["zarr_outputs"] == ["/download/zarr/test.zarr"]
     assert row["watermask_outputs"] == ["/download/watermask/test/water_mask_status.json"]

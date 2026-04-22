@@ -44,9 +44,15 @@ class MaskServiceClient:
         source_zarr_uri = payload.pop("source_zarr_uri", None) or payload.pop("zarr_uri", None)
         cloud_payload = dict(payload.pop("cloud", {}) or {})
         water_payload = dict(payload.pop("water", {}) or {})
+        legacy_backend = str(payload.get("backend") or "").strip().lower()
 
         if payload.get("backend") is not None:
             cloud_payload.setdefault("backend", payload.pop("backend"))
+            if (
+                not water_payload.get("backend")
+                and legacy_backend in {"auto", "heuristic", "fallback", "ndwi", "omniwatermask"}
+            ):
+                water_payload.setdefault("backend", legacy_backend)
         if payload.get("threshold") is not None:
             cloud_payload.setdefault("threshold", payload.pop("threshold"))
         if payload.get("overwrite") is not None:

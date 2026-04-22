@@ -74,6 +74,7 @@ def test_pipeline_timeline_rebuild_detects_corrupted_multiple_active_steps() -> 
             ],
         },
         mask_types=["cloud", "water"],
+        cube_mode="none",
     )
     assert NimbusFetcher._mask_failure_step_from_items(
         mask_types=["cloud", "water"],
@@ -90,6 +91,51 @@ def test_pipeline_timeline_rebuild_detects_corrupted_multiple_active_steps() -> 
             },
         ],
     ) == "water_failed"
+
+
+def test_pipeline_timeline_rebuild_detects_missing_cube_stage_for_cube_building() -> None:
+    assert NimbusFetcher._pipeline_timeline_needs_rebuild(
+        row={"pipeline_state": "cube_building"},
+        pipeline_timeline={
+            "current_stage": "convert",
+            "cube_mode": "after_mask",
+            "steps": [
+                {"key": "zarr_written", "status": "done"},
+                {"key": "running_cloud_inference", "status": "done"},
+                {"key": "running_water_inference", "status": "done"},
+                {"key": "cube_building", "status": "running"},
+            ],
+            "stages": [
+                {"key": "convert", "status": "running"},
+                {"key": "cloud", "status": "done"},
+                {"key": "water", "status": "done"},
+                {"key": "ready", "status": "pending"},
+            ],
+        },
+        mask_types=["cloud", "water"],
+        cube_mode="after_mask",
+    )
+
+
+def test_pipeline_timeline_rebuild_detects_leaked_cube_stage_before_cube_starts() -> None:
+    assert NimbusFetcher._pipeline_timeline_needs_rebuild(
+        row={"pipeline_state": "zarr_converting"},
+        pipeline_timeline={
+            "current_stage": "convert",
+            "cube_mode": "before_mask",
+            "steps": [
+                {"key": "writing_chunks", "status": "running"},
+                {"key": "cube_written", "status": "done"},
+            ],
+            "stages": [
+                {"key": "convert", "status": "running"},
+                {"key": "cube", "status": "done"},
+                {"key": "ready", "status": "pending"},
+            ],
+        },
+        mask_types=[],
+        cube_mode="before_mask",
+    )
 
 
 def test_omnicloudmask_tile_size_defaults_to_fixed_512(monkeypatch) -> None:

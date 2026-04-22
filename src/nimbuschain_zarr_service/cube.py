@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+import math
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -57,12 +59,16 @@ class SourceScene:
     mask_layers: dict[str, MaskLayer]
 
 
+CubeProgressCallback = Callable[[dict[str, Any]], None]
+
+
 def build_time_cube(
     source_zarr_uris: list[str],
     output_uri: str,
     *,
     include_ancillary: bool = True,
     include_masks: bool = False,
+    progress_callback: CubeProgressCallback | None = None,
 ) -> dict[str, Any]:
     try:
         import zarr
@@ -184,16 +190,68 @@ def build_time_cube(
             target.attrs.update(_sanitize_mask_array_attrs(mask_spec.attrs))
             mask_arrays[mask_name] = target
 
+    total_blocks = source_count * _time_slice_block_count(imagery)
+    if ancillary is not None:
+        total_blocks += source_count * _time_slice_block_count(ancillary)
+    if mask_arrays:
+        total_blocks += source_count * sum(
+            _time_slice_block_count(target) for target in mask_arrays.values()
+        )
+    blocks_written = 0
+
     for time_index, scene in enumerate(ordered_scenes):
         source_store = _open_existing_output_store(scene.zarr_uri)
         source_root = zarr.open_group(source_store, mode="r", zarr_format=2)
-        imagery[time_index, :, :, :] = source_root["imagery"][0, :, :, :]
+
+        def _scene_progress(payload: dict[str, Any]) -> None:
+            if progress_callback is None:
+                return
+            progress_callback(
+                {
+                    **payload,
+                    "scene_id": scene.scene_id,
+                    "scene_index": time_index + 1,
+                    "scene_total": source_count,
+                    "cube_output_uri": public_uri,
+                }
+            )
+
+        blocks_written = _copy_time_slice_in_chunks(
+            source_root["imagery"],
+            imagery,
+            source_time_index=0,
+            target_time_index=time_index,
+            layer_name="imagery",
+            label_names=baseline.band_names,
+            blocks_written=blocks_written,
+            total_blocks=total_blocks,
+            progress_callback=_scene_progress,
+        )
         if ancillary is not None:
-            ancillary[time_index, :, :, :] = source_root["ancillary"][0, :, :, :]
+            blocks_written = _copy_time_slice_in_chunks(
+                source_root["ancillary"],
+                ancillary,
+                source_time_index=0,
+                target_time_index=time_index,
+                layer_name="ancillary",
+                label_names=ancillary_layer_names,
+                blocks_written=blocks_written,
+                total_blocks=total_blocks,
+                progress_callback=_scene_progress,
+            )
         if mask_arrays:
             source_masks = source_root["masks"]
             for mask_name, target in mask_arrays.items():
-                target[time_index, :, :] = source_masks[mask_name][0, :, :]
+                blocks_written = _copy_time_slice_in_chunks(
+                    source_masks[mask_name],
+                    target,
+                    source_time_index=0,
+                    target_time_index=time_index,
+                    layer_name=f"masks/{mask_name}",
+                    blocks_written=blocks_written,
+                    total_blocks=total_blocks,
+                    progress_callback=_scene_progress,
+                )
 
     imagery_metadata = _sanitize_layer_metadata(baseline.imagery_attrs)
     ancillary_metadata = _sanitize_layer_metadata(baseline.ancillary_attrs)
@@ -311,6 +369,7 @@ def build_grouped_time_cubes(
     start_date: str | date | None = None,
     end_date: str | date | None = None,
     stage_label: str | None = None,
+    progress_callback: CubeProgressCallback | None = None,
 ) -> dict[str, Any]:
     if not source_zarr_uris:
         return {
@@ -356,6 +415,7 @@ def build_grouped_time_cubes(
     items: list[dict[str, Any]] = []
     tiles_built: list[str] = []
     tiles_skipped: list[dict[str, Any]] = []
+    buildable_groups: list[tuple[str, list[SourceScene], list[str]]] = []
 
     for group_key in sorted(grouped):
         ordered = sorted(grouped[group_key], key=lambda item: item.sort_key)
@@ -369,7 +429,13 @@ def build_grouped_time_cubes(
                 }
             )
             continue
+        buildable_groups.append((group_key, unique_scenes, skipped_duplicates))
 
+    group_total = len(buildable_groups)
+    for group_index, (group_key, unique_scenes, skipped_duplicates) in enumerate(
+        buildable_groups,
+        start=1,
+    ):
         output_uri = str(
             output_root / _cube_output_name(
                 group_key=group_key,
@@ -377,11 +443,26 @@ def build_grouped_time_cubes(
                 stage_label=stage_label,
             )
         )
+
+        def _group_progress(payload: dict[str, Any]) -> None:
+            if progress_callback is None:
+                return
+            progress_callback(
+                {
+                    **payload,
+                    "group_key": group_key,
+                    "group_index": group_index,
+                    "group_total": group_total,
+                    "group_output_uri": output_uri,
+                }
+            )
+
         summary = build_time_cube(
             [scene.zarr_uri for scene in unique_scenes],
             output_uri,
             include_ancillary=include_ancillary,
             include_masks=resolved_include_masks,
+            progress_callback=_group_progress,
         )
         cube_outputs.append(str(summary["zarr_uri"]))
         items.append(
@@ -662,6 +743,137 @@ def _coords_equal(left: np.ndarray | None, right: np.ndarray | None) -> bool:
     if left is None or right is None:
         return False
     return bool(np.array_equal(left, right))
+
+
+def _copy_time_slice_in_chunks(
+    source_array: Any,
+    target_array: Any,
+    *,
+    source_time_index: int,
+    target_time_index: int,
+    layer_name: str,
+    label_names: list[str] | None = None,
+    blocks_written: int = 0,
+    total_blocks: int | None = None,
+    progress_callback: CubeProgressCallback | None = None,
+) -> int:
+    shape = tuple(int(value) for value in target_array.shape)
+    chunk_shape = _normalized_chunk_shape(target_array)
+
+    if len(shape) == 4:
+        band_count = int(shape[1])
+        height = int(shape[2])
+        width = int(shape[3])
+        band_chunk = max(1, int(chunk_shape[1]))
+        y_chunk = max(1, int(chunk_shape[2]))
+        x_chunk = max(1, int(chunk_shape[3]))
+        for band_start in range(0, band_count, band_chunk):
+            band_stop = min(band_count, band_start + band_chunk)
+            band_name = None
+            if label_names and band_stop - band_start == 1 and band_start < len(label_names):
+                band_name = str(label_names[band_start])
+            for y0 in range(0, height, y_chunk):
+                y1 = min(height, y0 + y_chunk)
+                for x0 in range(0, width, x_chunk):
+                    x1 = min(width, x0 + x_chunk)
+                    target_array[
+                        target_time_index,
+                        band_start:band_stop,
+                        y0:y1,
+                        x0:x1,
+                    ] = source_array[
+                        source_time_index,
+                        band_start:band_stop,
+                        y0:y1,
+                        x0:x1,
+                    ]
+                    blocks_written += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "layer_name": layer_name,
+                                "band_name": band_name,
+                                "blocks_written": blocks_written,
+                                "total_blocks": int(total_blocks or 0),
+                                "fraction": (
+                                    min(1.0, max(0.0, blocks_written / total_blocks))
+                                    if total_blocks
+                                    else 1.0
+                                ),
+                            }
+                        )
+        return blocks_written
+
+    if len(shape) == 3:
+        height = int(shape[1])
+        width = int(shape[2])
+        y_chunk = max(1, int(chunk_shape[1]))
+        x_chunk = max(1, int(chunk_shape[2]))
+        for y0 in range(0, height, y_chunk):
+            y1 = min(height, y0 + y_chunk)
+            for x0 in range(0, width, x_chunk):
+                x1 = min(width, x0 + x_chunk)
+                target_array[
+                    target_time_index,
+                    y0:y1,
+                    x0:x1,
+                ] = source_array[
+                    source_time_index,
+                    y0:y1,
+                    x0:x1,
+                ]
+                blocks_written += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "layer_name": layer_name,
+                            "blocks_written": blocks_written,
+                            "total_blocks": int(total_blocks or 0),
+                            "fraction": (
+                                min(1.0, max(0.0, blocks_written / total_blocks))
+                                if total_blocks
+                                else 1.0
+                            ),
+                        }
+                    )
+        return blocks_written
+
+    raise ConversionError(
+        "Cube arrays must use either the (time, band, y, x) or (time, y, x) layout."
+    )
+
+
+def _time_slice_block_count(array: Any) -> int:
+    shape = tuple(int(value) for value in array.shape)
+    chunk_shape = _normalized_chunk_shape(array)
+
+    if len(shape) == 4:
+        return (
+            math.ceil(shape[1] / max(1, int(chunk_shape[1])))
+            * math.ceil(shape[2] / max(1, int(chunk_shape[2])))
+            * math.ceil(shape[3] / max(1, int(chunk_shape[3])))
+        )
+    if len(shape) == 3:
+        return (
+            math.ceil(shape[1] / max(1, int(chunk_shape[1])))
+            * math.ceil(shape[2] / max(1, int(chunk_shape[2])))
+        )
+    raise ConversionError(
+        "Cube arrays must use either the (time, band, y, x) or (time, y, x) layout."
+    )
+
+
+def _normalized_chunk_shape(array: Any) -> tuple[int, ...]:
+    shape = tuple(int(value) for value in array.shape)
+    raw_chunks = getattr(array, "chunks", None)
+    if not isinstance(raw_chunks, (list, tuple)) or len(raw_chunks) != len(shape):
+        return shape
+
+    normalized: list[int] = []
+    for size, chunk in zip(shape, raw_chunks):
+        chunk_size = int(chunk or size)
+        normalized.append(min(int(size), max(1, chunk_size)))
+    return tuple(normalized)
 
 
 def _read_label_array(group: Any, key: str) -> list[str]:

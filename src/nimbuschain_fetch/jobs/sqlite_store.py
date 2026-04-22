@@ -172,6 +172,20 @@ class SQLiteJobStore:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
+    def _timeline_reset_pipeline_metadata(raw_value: str | None) -> str:
+        if not raw_value:
+            return "{}"
+        try:
+            payload = json.loads(raw_value)
+        except Exception:
+            return "{}"
+        if not isinstance(payload, dict):
+            return "{}"
+        normalized = dict(payload)
+        normalized.pop("timeline", None)
+        return json.dumps(normalized)
+
+    @staticmethod
     def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
         request = json.loads(row["request_json"])
         return {
@@ -594,14 +608,14 @@ class SQLiteJobStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT job_id FROM jobs
+                SELECT job_id, pipeline_metadata_json FROM jobs
                 WHERE state IN ('running', 'cancel_requested')
                 """
             ).fetchall()
             job_ids = [str(row["job_id"]) for row in rows]
 
             if job_ids:
-                self._conn.execute(
+                self._conn.executemany(
                     """
                     UPDATE jobs
                     SET state = 'queued',
@@ -610,10 +624,22 @@ class SQLiteJobStore:
                         finished_at = NULL,
                         worker_id = NULL,
                         errors_json = '[]',
+                        pipeline_metadata_json = ?,
                         updated_at = ?
-                    WHERE state IN ('running', 'cancel_requested')
+                    WHERE job_id = ?
                     """,
-                    (now,),
+                    [
+                        (
+                            self._timeline_reset_pipeline_metadata(
+                                row["pipeline_metadata_json"]
+                                if "pipeline_metadata_json" in row.keys()
+                                else None
+                            ),
+                            now,
+                            str(row["job_id"]),
+                        )
+                        for row in rows
+                    ],
                 )
 
                 for jid in job_ids:
@@ -659,7 +685,7 @@ class SQLiteJobStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT job_id FROM jobs
+                SELECT job_id, pipeline_metadata_json FROM jobs
                 WHERE state IN ('running', 'cancel_requested')
                   AND updated_at < ?
                 """,
@@ -669,7 +695,7 @@ class SQLiteJobStore:
             if not job_ids:
                 return []
 
-            self._conn.execute(
+            self._conn.executemany(
                 """
                 UPDATE jobs
                 SET state = 'queued',
@@ -678,11 +704,22 @@ class SQLiteJobStore:
                     finished_at = NULL,
                     worker_id = NULL,
                     errors_json = '[]',
+                    pipeline_metadata_json = ?,
                     updated_at = ?
-                WHERE state IN ('running', 'cancel_requested')
-                  AND updated_at < ?
+                WHERE job_id = ?
                 """,
-                (now_iso, stale_before),
+                [
+                    (
+                        self._timeline_reset_pipeline_metadata(
+                            row["pipeline_metadata_json"]
+                            if "pipeline_metadata_json" in row.keys()
+                            else None
+                        ),
+                        now_iso,
+                        str(row["job_id"]),
+                    )
+                    for row in rows
+                ],
             )
             for jid in job_ids:
                 self._conn.execute(

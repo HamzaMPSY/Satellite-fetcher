@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import time
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -125,3 +128,28 @@ def test_worker_heartbeat_persists_download_coordinator_metadata(tmp_path) -> No
     coordinator = dict(metadata.get("download_coordinator") or {})
     assert coordinator["status"] == "not_initialized"
     assert coordinator["machine"]["active_download_limit"] == 8
+
+
+def test_worker_heartbeat_thread_keeps_worker_alive_during_event_loop_block(monkeypatch, tmp_path) -> None:
+    settings = _sqlite_settings(tmp_path, runtime_role="worker").model_copy(
+        update={"nimbus_worker_heartbeat_seconds": 1.0}
+    )
+    fetcher = NimbusFetcher(settings=settings)
+    heartbeat_calls: list[float] = []
+    original_publish = fetcher._publish_worker_heartbeat
+
+    def _wrapped_publish() -> dict | None:
+        heartbeat_calls.append(time.monotonic())
+        return original_publish()
+
+    monkeypatch.setattr(fetcher, "_publish_worker_heartbeat", _wrapped_publish)
+
+    async def _scenario() -> None:
+        await fetcher.start()
+        # Simulate a long synchronous conversion step that blocks the event loop.
+        time.sleep(2.2)
+        await fetcher.stop()
+
+    asyncio.run(_scenario())
+
+    assert len(heartbeat_calls) >= 2
