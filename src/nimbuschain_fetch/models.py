@@ -87,6 +87,7 @@ class SearchDownloadRequest(BaseModel):
     aoi: AOIInput
     tile_id: str | None = None
     output_dir: str | None = None
+    download_only: bool = False
     mask_types: list[Literal["water", "cloud"]] = Field(default_factory=list)
     download_strategy: Literal["default", "copernicus_account_pool"] = "default"
     cube_mode: Literal["none", "before_mask", "after_mask"] = "none"
@@ -122,6 +123,10 @@ class SearchDownloadRequest(BaseModel):
             raise ValueError("end_date must be greater or equal to start_date.")
         if self.provider != ProviderName.copernicus and self.download_strategy != "default":
             raise ValueError("download_strategy is only supported for Copernicus jobs.")
+        if self.download_only and self.mask_types:
+            raise ValueError("download_only cannot be combined with mask_types.")
+        if self.download_only and self.cube_mode != "none":
+            raise ValueError("download_only requires cube_mode='none'.")
         if self.cube_mode == "after_mask" and not self.mask_types:
             raise ValueError("cube_mode='after_mask' requires at least one mask_type.")
         if self.cube_start_date is None:
@@ -141,6 +146,7 @@ class DownloadProductsRequest(BaseModel):
     collection: str
     product_ids: list[str] = Field(min_length=1)
     output_dir: str | None = None
+    download_only: bool = False
     download_strategy: Literal["default", "copernicus_account_pool"] = "default"
 
     @field_validator("collection")

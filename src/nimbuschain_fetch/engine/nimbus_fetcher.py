@@ -3672,6 +3672,7 @@ class NimbusFetcher:
             "output_dir": str(output_dir),
             "job_type": request.job_type,
             "download_strategy": str(getattr(request, "download_strategy", "default") or "default"),
+            "download_only": bool(getattr(request, "download_only", False)),
         }
         if isinstance(request, SearchDownloadRequest):
             base_pipeline_metadata["tile_id"] = request.tile_id
@@ -3987,6 +3988,46 @@ class NimbusFetcher:
                 "conversion_metadata": {},
             }
             self.store.set_result(job_id, base_result_payload)
+
+            if bool(getattr(request, "download_only", False)):
+                final_pipeline_metadata = {
+                    **pipeline_metadata,
+                    "download_only": True,
+                    "zarr_output_count": 0,
+                    "manual_conversion": False,
+                }
+                self.store.set_result(
+                    job_id,
+                    {
+                        **base_result_payload,
+                        "pipeline_metadata": final_pipeline_metadata,
+                    },
+                )
+                self.store.update_job(
+                    job_id,
+                    state=JobState.succeeded.value,
+                    progress=100.0,
+                    finished_at=self._now_iso(),
+                    bytes_downloaded=int(aggregate["bytes_downloaded"]),
+                    bytes_total=max(int(aggregate["bytes_total"]), int(aggregate["bytes_downloaded"])),
+                    pipeline_state=PipelineState.downloaded.value,
+                    pipeline_step="downloaded",
+                    pipeline_progress=100.0,
+                    pipeline_metadata=final_pipeline_metadata,
+                    conversion_metadata={},
+                    raw_outputs=raw_outputs,
+                    zarr_outputs=[],
+                )
+                self.store.append_event(
+                    job_id,
+                    "job.succeeded",
+                    {
+                        "status": JobState.succeeded.value,
+                        "paths": raw_result_paths,
+                        "pipeline_state": PipelineState.downloaded.value,
+                    },
+                )
+                return
 
             zarr_outputs, conversion_metadata = self._convert_raw_outputs(
                 job_id=job_id,

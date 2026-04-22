@@ -28,6 +28,7 @@ Optional:
   --cube-end-date DATE       Optional cube end date
   --mode MODE                direct or service, default: direct
   --service-url URL          default: http://127.0.0.1:8000
+  --download-only            Stop after raw download (no Zarr, masks, or cubes)
   --no-wait                  Return immediately after job submission
   -h, --help                 Show this help
 
@@ -54,6 +55,7 @@ CUBE_END_DATE=""
 MODE="direct"
 SERVICE_URL="http://127.0.0.1:8000"
 NO_WAIT=0
+DOWNLOAD_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -113,6 +115,10 @@ while [[ $# -gt 0 ]]; do
       NO_WAIT=1
       shift
       ;;
+    --download-only)
+      DOWNLOAD_ONLY=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -144,27 +150,36 @@ CMD=(
   --start-date "${START_DATE}"
   --end-date "${END_DATE}"
   --aoi_file "${AOI_FILE}"
-  --cube-mode "${CUBE_MODE}"
 )
+
+if [[ "${DOWNLOAD_ONLY}" -eq 1 ]]; then
+  CMD+=(--cube-mode "none")
+else
+  CMD+=(--cube-mode "${CUBE_MODE}")
+fi
 
 if [[ -n "${TILE_ID}" ]]; then
   CMD+=(--tile-id "${TILE_ID}")
 fi
 
-if [[ -n "${MASK_TYPES}" ]]; then
+if [[ "${DOWNLOAD_ONLY}" -ne 1 && -n "${MASK_TYPES}" ]]; then
   CMD+=(--mask-types "${MASK_TYPES}")
 fi
 
-if [[ -n "${CUBE_START_DATE}" ]]; then
+if [[ "${DOWNLOAD_ONLY}" -ne 1 && -n "${CUBE_START_DATE}" ]]; then
   CMD+=(--cube-start-date "${CUBE_START_DATE}")
 fi
 
-if [[ -n "${CUBE_END_DATE}" ]]; then
+if [[ "${DOWNLOAD_ONLY}" -ne 1 && -n "${CUBE_END_DATE}" ]]; then
   CMD+=(--cube-end-date "${CUBE_END_DATE}")
 fi
 
 if [[ "${NO_WAIT}" -eq 1 ]]; then
   CMD+=(--no-wait)
+fi
+
+if [[ "${DOWNLOAD_ONLY}" -eq 1 ]]; then
+  CMD+=(--download-only)
 fi
 
 echo "Running pipeline command:"

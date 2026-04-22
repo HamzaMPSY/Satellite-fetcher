@@ -38,6 +38,7 @@ def _build_request(args: argparse.Namespace) -> dict[str, Any]:
             "collection": args.collection,
             "product_ids": product_ids,
             "output_dir": args.output_dir,
+            "download_only": bool(args.download_only),
         }
 
     if not args.start_date or not args.end_date:
@@ -57,6 +58,7 @@ def _build_request(args: argparse.Namespace) -> dict[str, Any]:
         "aoi": _load_aoi_payload(args.aoi_file),
         "tile_id": args.tile_id,
         "output_dir": args.output_dir,
+        "download_only": bool(args.download_only),
         "mask_types": normalized_mask_types,
         "cube_mode": args.cube_mode,
         "cube_start_date": args.cube_start_date or args.start_date,
@@ -81,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aoi_file", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--product-ids", default=None)
+    parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--mask-types", default=None, help="Comma-separated: water,cloud")
     parser.add_argument(
         "--cube-mode",
