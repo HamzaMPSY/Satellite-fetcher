@@ -66,7 +66,26 @@ The backend will then:
 - estimate how many accounts are needed from the number of products found
 - distribute downloads across the available accounts
 
-## 3. Start locally with Podman
+## 3. Start stack with the launcher
+
+The new wrapper keeps the old startup paths intact and lets you choose the launch mode explicitly:
+
+```bash
+./scripts/up_stack.sh --mode local
+```
+
+Available modes:
+- `local`: standard local compose stack
+- `external-mask`: local compose stack plus host-native mask service for macOS/MPS
+- `gpu-container`: Linux/NVIDIA GPU container mode
+- `oci-full`: remote OCI GPU runtime + local SSH tunnels + local host UI
+
+The legacy scripts are still available and unchanged:
+- `./scripts/10_up_stack.sh`
+- `./scripts/10_up_stack_external_mask.sh`
+- `./scripts/10_up_stack_gpu.sh`
+
+## 3.1 Start locally with Podman
 
 ```bash
 ./scripts/10_up_stack.sh
@@ -77,7 +96,7 @@ The script:
 - launches the compose stack
 - waits briefly for API, UI and Zarr health endpoints
 
-## 3.1 GPU modes
+## 3.2 GPU modes
 
 ### Linux + NVIDIA GPU in the `nimbus-mask` container
 
@@ -121,6 +140,85 @@ In that mode:
 Important:
 - a Linux container on macOS cannot see Metal/MPS directly
 - if you keep `nimbus-mask` inside the container on macOS, it will run on CPU
+
+## 3.3 OCI full mode
+
+Use this mode when the heavy runtime must execute on an OCI GPU VM while the Streamlit UI stays on your laptop.
+
+Architecture:
+- remote VM: `api` + `worker` + `zarr` + `mask`
+- local machine: SSH tunnels + Streamlit UI
+- authentication in the VM: OCI instance principal
+
+### Remote VM setup
+
+On the OCI GPU VM:
+
+```bash
+cp .env.oci.remote.example .env.oci.remote
+```
+
+Fill at least:
+- `NIMBUS_OCI_NAMESPACE`
+- `NIMBUS_OCI_COMPARTMENT_ID`
+- `NIMBUS_OCI_REGION`
+
+Also add the provider credentials that the remote API must use for preview and job submission:
+- `NIMBUS_COPERNICUS_USERNAME`
+- `NIMBUS_COPERNICUS_PASSWORD`
+- `NIMBUS_USGS_USERNAME`
+- `NIMBUS_USGS_TOKEN`
+
+If you want OCI throughput similar to the local stack for Copernicus, also enable the account pool:
+- `NIMBUS_COPERNICUS_ACCOUNT_POOL_FILE=./docs/copernicus_account_pool.example.json`
+- `NIMBUS_COPERNICUS_ACCOUNT_POOL_CONCURRENCY=4`
+
+Then start the remote runtime:
+
+```bash
+./scripts/13_up_stack_oci_remote.sh
+```
+
+Notes:
+- this script expects the repo and `.venv` to already exist on the VM
+- services run host-native and write logs to `.runtime/oci-remote/`
+- `NIMBUS_OCI_AUTH=instance_principal` is the default in this mode
+- if a shared `.env` exists on the VM, `13_up_stack_oci_remote.sh` loads it first and lets `.env.oci.remote` override OCI-specific values
+
+### Local laptop setup
+
+On your laptop:
+
+```bash
+cp .env.oci.local-ui.example .env.oci.local-ui
+```
+
+Fill at least:
+- `NIMBUS_OCI_REMOTE_HOST`
+- `NIMBUS_OCI_REMOTE_USER`
+- `NIMBUS_OCI_SSH_KEY_FILE`
+
+Optional Bastion settings:
+- `NIMBUS_OCI_SSH_PROXY_JUMP`
+- `NIMBUS_OCI_SSH_PROXY_COMMAND`
+
+Then launch the local side:
+
+```bash
+./scripts/up_stack.sh --mode oci-full
+```
+
+This starts:
+- `./scripts/14_open_oci_tunnels.sh`
+- `./scripts/15_up_ui_host.sh`
+
+Useful options:
+
+```bash
+./scripts/up_stack.sh --mode oci-full --no-ui
+./scripts/up_stack.sh --mode oci-full --no-tunnels
+./scripts/up_stack.sh --mode oci-full --env-file /path/to/custom.env
+```
 
 ## 4. Local URLs
 

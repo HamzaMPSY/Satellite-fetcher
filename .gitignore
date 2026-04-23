@@ -34,6 +34,8 @@ scripts/*tmp.py
 scripts/calc_pipeline_times.py
 tmp/
 test.py
+ssh-key-*.key
+ssh-key-*.key.pub
 
 docs/MASTER_DIAGRAM.md
 docs/aoi_morocco_landsat.wkt

@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from nimbuschain_fetch.oci_auth import (
+    default_oci_config_path,
+    default_oci_profile,
+    default_oci_region,
+    resolve_oci_auth_mode,
+)
+
 
 class OCIStorageError(RuntimeError):
     """Raised when OCI-backed storage cannot be used."""
@@ -74,6 +81,7 @@ class OCIStore:
         compartment_id: str | None = None,
         config_path: str | None = None,
         profile: str | None = None,
+        auth_mode: str | None = None,
     ) -> None:
         if not OCI_SUPPORT_AVAILABLE:
             raise OCIStorageError(
@@ -83,13 +91,10 @@ class OCIStore:
         self.bucket = bucket
         self._namespace = namespace
         self.compartment_id = compartment_id or os.getenv("NIMBUS_OCI_COMPARTMENT_ID")
-        self.config_path = os.path.expanduser(
-            config_path
-            or os.getenv("NIMBUS_OCI_CONFIG_FILE")
-            or os.getenv("OCI_CONFIG_FILE")
-            or "~/.oci/config"
-        )
-        self.profile = profile or os.getenv("NIMBUS_OCI_PROFILE") or os.getenv("OCI_PROFILE") or "DEFAULT"
+        self.auth_mode = resolve_oci_auth_mode(auth_mode)
+        self.config_path = default_oci_config_path(config_path)
+        self.profile = default_oci_profile(profile)
+        self.region = default_oci_region()
         self._fs = None
         self._signer = None
         self._oci_config = None
@@ -102,13 +107,22 @@ class OCIStore:
 
     def _get_auth(self) -> tuple[dict[str, Any], Any]:
         if self._oci_config is None:
-            self._oci_config = oci.config.from_file(self.config_path, self.profile)
-            token_file = self._oci_config.get("security_token_file")
-            if token_file:
-                with open(token_file, "r", encoding="utf-8") as handle:
-                    token = handle.read()
-                private_key = oci.signer.load_private_key_from_file(self._oci_config["key_file"])
-                self._signer = oci.auth.signers.SecurityTokenSigner(token, private_key)
+            if self.auth_mode == "instance_principal":
+                self._signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+                effective_region = str(
+                    self.region
+                    or getattr(self._signer, "region", "")
+                    or ""
+                ).strip()
+                self._oci_config = {"region": effective_region} if effective_region else {}
+            else:
+                self._oci_config = oci.config.from_file(self.config_path, self.profile)
+                token_file = self._oci_config.get("security_token_file")
+                if token_file:
+                    with open(token_file, "r", encoding="utf-8") as handle:
+                        token = handle.read()
+                    private_key = oci.signer.load_private_key_from_file(self._oci_config["key_file"])
+                    self._signer = oci.auth.signers.SecurityTokenSigner(token, private_key)
         return self._oci_config, self._signer
 
     @property
@@ -232,11 +246,9 @@ class OCIStore:
 def oci_support_status() -> dict[str, Any]:
     return {
         "available": OCI_SUPPORT_AVAILABLE,
-        "config_path": os.path.expanduser(
-            os.getenv("NIMBUS_OCI_CONFIG_FILE")
-            or os.getenv("OCI_CONFIG_FILE")
-            or "~/.oci/config"
-        ),
-        "profile": os.getenv("NIMBUS_OCI_PROFILE") or os.getenv("OCI_PROFILE") or "DEFAULT",
+        "auth_mode": resolve_oci_auth_mode(),
+        "config_path": default_oci_config_path(),
+        "profile": default_oci_profile(),
+        "region": default_oci_region(),
         "namespace": os.getenv("NIMBUS_OCI_NAMESPACE"),
     }

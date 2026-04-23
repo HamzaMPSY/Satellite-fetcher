@@ -13,7 +13,27 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 # Streamlit can be launched from any working directory (VSCode, terminal, etc.).
 # Resolve everything against the project root (folder containing the repo).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DOWNLOADS_DIR = Path(os.getenv("NIMBUS_UI_DATA_DIR", "/data/downloads"))
+
+
+def _resolve_ui_downloads_dir() -> Path:
+    raw_value = str(os.getenv("NIMBUS_UI_DATA_DIR", "") or "").strip()
+    if raw_value:
+        candidate = Path(raw_value).expanduser()
+        if not candidate.is_absolute():
+            candidate = PROJECT_ROOT / candidate
+        return candidate
+
+    container_root = Path("/data")
+    container_downloads = container_root / "downloads"
+    if container_downloads.exists() and os.access(container_downloads, os.W_OK):
+        return container_downloads
+    if container_root.exists() and os.access(container_root, os.W_OK):
+        return container_downloads
+
+    return PROJECT_ROOT / "data" / "downloads"
+
+
+DOWNLOADS_DIR = _resolve_ui_downloads_dir()
 ZARR_STORES_DIR = DOWNLOADS_DIR / "zarr"
 NOHUP_PATH = PROJECT_ROOT / "nohup.out"
 PID_PATH = PROJECT_ROOT / "job_pid"

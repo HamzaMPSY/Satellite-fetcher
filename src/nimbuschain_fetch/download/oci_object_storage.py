@@ -4,40 +4,63 @@ import mimetypes
 import os
 from pathlib import Path
 
+from nimbuschain_fetch.oci_auth import (
+    default_oci_config_path,
+    default_oci_profile,
+    default_oci_region,
+    resolve_oci_auth_mode,
+)
+
 
 class OCIObjectStorageUploader:
-    """Upload local files to OCI Object Storage using a standard OCI CLI profile."""
+    """Upload local files to OCI Object Storage using config/profile or instance principal auth."""
 
     def __init__(
         self,
         *,
         bucket: str,
-        config_path: str,
-        profile: str,
+        config_path: str | None = None,
+        profile: str | None = None,
         namespace: str | None = None,
         verify_bucket_access: bool = True,
+        auth_mode: str | None = None,
     ) -> None:
         if not bucket.strip():
             raise ValueError("OCI bucket is required.")
 
         self.bucket = bucket.strip()
-        self.config_path = os.path.expanduser(config_path.strip() or "~/.oci/config")
-        self.profile = profile.strip() or "DEFAULT"
+        self.auth_mode = resolve_oci_auth_mode(auth_mode)
+        self.config_path = default_oci_config_path(config_path)
+        self.profile = default_oci_profile(profile)
 
         oci = self._load_oci_module()
-        config = oci.config.from_file(
-            file_location=self.config_path,
-            profile_name=self.profile,
-        )
         self._oci = oci
-        self._config = config
-        self._signer = self._build_signer(oci, config)
-        if self._signer is None:
-            self._client = oci.object_storage.ObjectStorageClient(config=config)
+        if self.auth_mode == "instance_principal":
+            self._config = {}
+            self._signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+            region = str(
+                default_oci_region()
+                or getattr(self._signer, "region", "")
+                or ""
+            ).strip()
+            if region:
+                self._config["region"] = region
         else:
-            self._client = oci.object_storage.ObjectStorageClient(config=config, signer=self._signer)
+            config = oci.config.from_file(
+                file_location=self.config_path,
+                profile_name=self.profile,
+            )
+            self._config = config
+            self._signer = self._build_signer(oci, config)
+        if self._signer is None:
+            self._client = oci.object_storage.ObjectStorageClient(config=self._config)
+        else:
+            self._client = oci.object_storage.ObjectStorageClient(
+                config=self._config,
+                signer=self._signer,
+            )
 
-        configured_namespace = str(config.get("namespace", "") or "").strip()
+        configured_namespace = str(self._config.get("namespace", "") or "").strip()
         self.namespace = (namespace or configured_namespace or self._resolve_namespace()).strip()
         if verify_bucket_access:
             self._client.get_bucket(
