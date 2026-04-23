@@ -151,9 +151,6 @@ existing Zarr output
   Conversion logic reused by the worker and converter routes.
 - `src/nimbuschain_mask_service/`
   Internal masking runtime and remote/client adapter.
-- `src/nimbuschain_zarr_viewer/`
-  Browser and Napari launch helpers for local Zarr inspection.
-
 ### Infrastructure and operations
 
 - `Containerfile`

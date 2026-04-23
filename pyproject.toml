@@ -54,11 +54,6 @@ ui = [
   "geopandas>=1.0.1",
   "pyproj>=3.7.0"
 ]
-viewer = [
-  "streamlit>=1.38.0",
-  "napari>=0.5.0",
-  "dask[array]>=2024.10.0"
-]
 zarr-service = []
 
 [project.scripts]
@@ -72,11 +67,9 @@ nimbuschain-zarr-cube = "nimbuschain_zarr_service.cube_cli:main"
 nimbuschain-oci = "nimbuschain_zarr_service.oci_cli:main"
 nimbuschain-mask-service = "nimbuschain_mask_service.main:run"
 nimbuschain-mask-apply = "nimbuschain_mask_service.cli:main"
-nimbuschain-zarr-viewer = "nimbuschain_zarr_viewer.cli:main"
-nimbuschain-zarr-browser = "nimbuschain_zarr_viewer.launch:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service", "src/nimbuschain_mask_service", "src/nimbuschain_zarr_viewer"]
+packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service", "src/nimbuschain_mask_service"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

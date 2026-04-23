@@ -46,7 +46,7 @@ def _build_request(args: argparse.Namespace) -> dict[str, Any]:
     if not args.product_type:
         raise ValueError("product-type is required for search_download mode.")
     if not args.aoi_file:
-        raise ValueError("aoi_file is required for search_download mode.")
+        raise ValueError("aoi-file is required for search_download mode.")
 
     request = {
         "job_type": "search_download",
@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tile-id", default=None)
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
-    parser.add_argument("--aoi_file", default=None)
+    parser.add_argument("--aoi-file", "--aoi_file", dest="aoi_file", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--product-ids", default=None)
     parser.add_argument("--download-only", action="store_true")

@@ -29,7 +29,6 @@ src/nimbuschain_fetch_service/    FastAPI API layer and public converter endpoin
 src/nimbuschain_fetch_ui/         Streamlit frontend
 src/nimbuschain_zarr_service/     Internal Zarr conversion runtime/library
 src/nimbuschain_mask_service/     Cloud and water masking runtime/service
-src/nimbuschain_zarr_viewer/      Local Zarr viewing/browser helpers
 
 Containerfile                     API/worker image
 ui/Containerfile                  UI image
@@ -38,7 +37,6 @@ mask-service/Containerfile        Mask service image
 podman-compose.yml                Local Podman stack
 docker-compose.yml                Local Docker-compatible stack
 k8s/                              Kubernetes base + overlay
-scripts/                          Operational scripts
 
 data/Landsat-tiles/               Tracked Landsat tile index
 data/Sentinel-2-tiles/            Tracked Sentinel-2 tile index
@@ -50,21 +48,9 @@ data/downloads/                   Local runtime data, ignored from git
 ```bash
 cd /path/to/Satellite-fetcher
 cp .env.example .env
-./scripts/10_up_stack.sh
 ```
 
-Then open:
-
-- UI: [http://127.0.0.1:8501](http://127.0.0.1:8501)
-- API docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-- Converter schema: [http://127.0.0.1:8000/v1/converter/schema](http://127.0.0.1:8000/v1/converter/schema)
-- Mask schema: [http://127.0.0.1:8000/v1/mask/schema](http://127.0.0.1:8000/v1/mask/schema)
-
-Stop the stack:
-
-```bash
-./scripts/11_down_stack.sh
-```
+Then start the API/worker/UI/runtime services with the container or host-process commands appropriate for your environment.
 
 ## Health endpoints
 
@@ -129,7 +115,7 @@ nimbuschain-fetch \
   --product-type S2MSI2A \
   --start-date 2026-04-10 \
   --end-date 2026-04-13 \
-  --aoi_file /path/to/aoi.geojson \
+  --aoi-file /path/to/aoi.geojson \
   --tile-id 37RDP \
   --mask-types water,cloud \
   --cube-mode before_mask \
@@ -146,7 +132,7 @@ nimbuschain-fetch \
   --product-type S2MSI2A \
   --start-date 2026-04-10 \
   --end-date 2026-04-13 \
-  --aoi_file /path/to/aoi.geojson \
+  --aoi-file /path/to/aoi.geojson \
   --tile-id 37RDP \
   --mask-types water,cloud \
   --cube-mode after_mask \
@@ -219,6 +205,7 @@ nimbuschain-vm-pipeline \
   --collection SENTINEL-2 \
   --product-type S2MSI2A \
   --mask-types water,cloud \
-  --cube-mode grouped \
+  --cube-mode after_mask \
+  --group-by-tile \
   --include-masks-in-cube
 ```

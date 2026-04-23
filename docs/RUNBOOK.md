@@ -66,61 +66,14 @@ The backend will then:
 - estimate how many accounts are needed from the number of products found
 - distribute downloads across the available accounts
 
-## 3. Start locally with Podman
+## 3. Start locally
 
 ```bash
-./scripts/10_up_stack.sh
+cd /path/to/Satellite-fetcher
+cp .env.example .env
 ```
 
-The script:
-- starts the Podman machine on macOS when available
-- launches the compose stack
-- waits briefly for API, UI and Zarr health endpoints
-
-## 3.1 GPU modes
-
-### Linux + NVIDIA GPU in the `nimbus-mask` container
-
-Use Docker Compose with the GPU override:
-
-```bash
-./scripts/10_up_stack_gpu.sh
-```
-
-This uses:
-- `docker-compose.yml`
-- `docker-compose.gpu.yml`
-
-Expected runtime:
-- `NIMBUS_CLOUDMASK_DEVICE=cuda`
-- `NIMBUS_WATERMASK_DEVICE=cuda`
-
-### macOS + Apple Silicon / Metal (`mps`)
-
-`mps` is not available inside the Linux container runtime, so `nimbus-mask` must run on the host.
-
-Start the stack in external-mask mode:
-
-```bash
-./scripts/10_up_stack_external_mask.sh
-```
-
-Then start the host-native mask service:
-
-```bash
-./scripts/12_up_mask_service_native.sh
-```
-
-In that mode:
-- the containers use `NIMBUS_MASK_SERVICE_URL=http://host.containers.internal:8020`
-- `nimbus-mask` does not run as a container
-- the host service defaults to:
-  - `NIMBUS_CLOUDMASK_DEVICE=mps`
-  - `NIMBUS_WATERMASK_DEVICE=mps`
-
-Important:
-- a Linux container on macOS cannot see Metal/MPS directly
-- if you keep `nimbus-mask` inside the container on macOS, it will run on CPU
+After that, start the API/worker/UI/runtime services with the container or host-process commands appropriate for your environment. The old helper startup scripts have been removed and will be replaced later.
 
 ## 4. Local URLs
 
@@ -136,19 +89,11 @@ Important:
 
 ## 5. Stop locally
 
-```bash
-./scripts/11_down_stack.sh
-```
+Stop the services using the same container or host-process commands you used to start them.
 
 ## 6. Inspect logs
 
-```bash
-podman logs -f backendnimbus_nimbus-api_1
-podman logs -f backendnimbus_nimbus-worker_1
-podman logs -f backendnimbus_nimbus-ui_1
-podman logs -f backendnimbus_nimbus-zarr_1
-podman logs -f backendnimbus_nimbus-mask_1
-```
+Inspect logs using the runtime you started the services with. For containers, discover the actual container names and follow the relevant service logs. For host-native services, check the terminal session or process manager that launched them.
 
 ## 7. Smoke checks
 
@@ -226,7 +171,8 @@ nimbuschain-vm-pipeline \
   --collection SENTINEL-2 \
   --product-type S2MSI2A \
   --mask-types water,cloud \
-  --cube-mode grouped
+  --cube-mode after_mask \
+  --group-by-tile
 ```
 
 Important:
@@ -271,7 +217,7 @@ Check:
 Check:
 - `.venv/bin/uvicorn` exists in the repo root
 - `.env` is present if you rely on it for credentials or overrides
-- port `8020` is free, or let `./scripts/12_up_mask_service_native.sh` remove the conflicting containerized mask service
+- port `8020` is free
 - `python -c "import torch; print(bool(getattr(getattr(torch,'backends',None),'mps',None) and torch.backends.mps.is_available()))"` reports `True` if you expect `mps`
 
 ### Cloud masking is still CPU-only
@@ -279,13 +225,19 @@ Check:
 Check the current mode first:
 
 ```bash
-podman exec backendnimbus_nimbus-mask_1 python -c "import torch; print(torch.cuda.is_available()); print(bool(getattr(getattr(torch,'backends',None),'mps',None) and torch.backends.mps.is_available()))"
+podman exec backendnimbus-nimbus-mask-1 python -c "import torch; print(torch.cuda.is_available()); print(bool(getattr(getattr(torch,'backends',None),'mps',None) and torch.backends.mps.is_available()))"
 ```
 
 Interpretation:
 - `False / False` in the container means no accelerator is exposed to `nimbus-mask`
-- on macOS, switch to the external host-native mask service if you want `mps`
-- on Linux/NVIDIA, use `./scripts/10_up_stack_gpu.sh`
+- on macOS, use a host-native mask service if you want `mps`
+- on Linux/NVIDIA, ensure your chosen container runtime exposes the GPU correctly
+
+In external-mask mode on macOS, do not use `podman exec` for `nimbus-mask` because that service is not running in a container. Check the host Python environment directly instead:
+
+```bash
+.venv/bin/python -c "import torch; print(torch.cuda.is_available()); print(bool(getattr(getattr(torch,'backends',None),'mps',None) and torch.backends.mps.is_available()))"
+```
 
 ### Port conflict
 
@@ -297,17 +249,7 @@ lsof -nP -iTCP:8010 -sTCP:LISTEN
 
 ## 9. Kubernetes / Minikube
 
-```bash
-./scripts/32_k8s_bootstrap_minikube.sh
-./scripts/33_k8s_apply_minikube.sh
-./scripts/35_k8s_expose_local.sh
-```
-
-Stop local exposure:
-
-```bash
-./scripts/36_k8s_unexpose_local.sh
-```
+Bootstrap, apply, and expose your Minikube deployment with the `minikube` / `kubectl` commands appropriate for your environment. The old helper shell scripts have been removed and will be replaced later.
 
 ## 10. Onboarding checklist for a new developer
 

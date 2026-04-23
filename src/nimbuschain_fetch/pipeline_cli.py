@@ -58,6 +58,20 @@ def _mask_types(raw_value: str | None) -> list[str]:
     ]
 
 
+def _normalize_cube_mode(raw_value: str | None) -> tuple[str, bool]:
+    normalized = str(raw_value or "none").strip().lower() or "none"
+    if normalized in {"none", "before_mask", "after_mask"}:
+        return normalized, False
+    if normalized == "single":
+        return "after_mask", False
+    if normalized == "grouped":
+        return "after_mask", True
+    raise ValueError(
+        "--cube-mode must be one of: none, before_mask, after_mask. "
+        "Legacy aliases single/grouped are still accepted."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -73,10 +87,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--zarr-dir", default="./data/downloads/zarr")
     parser.add_argument("--mask-types", default=None, help="Comma-separated: water,cloud")
     parser.add_argument("--mask-service-url", default=None)
-    parser.add_argument("--cube-mode", choices=["none", "single", "grouped"], default="none")
+    parser.add_argument(
+        "--cube-mode",
+        default="none",
+        help="When to build cubes: none, before_mask, after_mask.",
+    )
     parser.add_argument("--cube-output-uri", default=None)
     parser.add_argument("--cube-output-dir", default="./data/downloads/zarr/cubes/manual")
-    parser.add_argument("--group-by-tile", action="store_true")
+    parser.add_argument(
+        "--group-by-tile",
+        action="store_true",
+        help="Build one cube per tile/path-row instead of a single explicit cube.",
+    )
     parser.add_argument("--include-masks-in-cube", action="store_true")
     parser.add_argument("--skip-ancillary", action="store_true")
     return parser
@@ -86,6 +108,8 @@ def run(args: argparse.Namespace) -> int:
     stage_dir = _resolve_output_root(args.stage_dir, "./data/downloads/staged")
     zarr_dir = _resolve_output_root(args.zarr_dir, "./data/downloads/zarr")
     zarr_dir.mkdir(parents=True, exist_ok=True)
+    cube_mode, legacy_grouped_mode = _normalize_cube_mode(args.cube_mode)
+    grouped_cube_build = bool(args.group_by_tile or legacy_grouped_mode)
 
     converter = ZarrConversionService()
     mask_client: MaskServiceClient | None = None
@@ -95,6 +119,7 @@ def run(args: argparse.Namespace) -> int:
 
     raw_items: list[dict[str, Any]] = []
     converted_items: list[dict[str, Any]] = []
+    converted_scene_uris: list[str] = []
     final_scene_uris: list[str] = []
 
     try:
@@ -126,6 +151,7 @@ def run(args: argparse.Namespace) -> int:
                 "summary": summary,
                 "dataset_summary": dataset_summary,
             }
+            converted_scene_uris.append(written_uri)
             final_scene_uri = written_uri
             if requested_mask_types and mask_client is not None:
                 mask_result = mask_client.apply_masks_to_zarr(
@@ -145,21 +171,25 @@ def run(args: argparse.Namespace) -> int:
             final_scene_uris.append(final_scene_uri)
 
         cube_result: dict[str, Any] | None = None
-        if args.cube_mode == "single":
+        cube_source_uris = converted_scene_uris if cube_mode == "before_mask" else final_scene_uris
+        if cube_mode != "none" and not grouped_cube_build:
             if not args.cube_output_uri:
-                raise ValueError("--cube-output-uri is required when --cube-mode=single.")
+                raise ValueError(
+                    "--cube-output-uri is required when building a single explicit cube."
+                )
             cube_result = build_time_cube(
-                final_scene_uris,
+                cube_source_uris,
                 str(args.cube_output_uri).strip(),
                 include_ancillary=not bool(args.skip_ancillary),
                 include_masks=bool(args.include_masks_in_cube),
             )
-        elif args.cube_mode == "grouped" or args.group_by_tile:
+        elif cube_mode != "none" and grouped_cube_build:
             cube_result = build_grouped_time_cubes(
-                final_scene_uris,
+                cube_source_uris,
                 str(args.cube_output_dir).strip(),
                 include_ancillary=not bool(args.skip_ancillary),
                 include_masks=bool(args.include_masks_in_cube),
+                stage_label=cube_mode,
             )
 
         print(
@@ -171,6 +201,7 @@ def run(args: argparse.Namespace) -> int:
                     "product_type": args.product_type,
                     "raw_items": raw_items,
                     "converted_items": converted_items,
+                    "cube_mode": cube_mode,
                     "final_scene_uris": final_scene_uris,
                     "cube_result": cube_result,
                 },

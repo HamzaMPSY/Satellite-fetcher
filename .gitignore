@@ -32,7 +32,6 @@ cache/
 docs/copernicus_account_pool.json
 real_validation_outputs/
 scripts/*tmp.py
-scripts/calc_pipeline_times.py
 tmp/
 *.zarr/
 tmp_zarr_preview.png

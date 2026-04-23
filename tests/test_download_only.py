@@ -25,7 +25,7 @@ def test_fetch_cli_builds_download_only_search_request(tmp_path: Path) -> None:
             "2026-04-14",
             "--end-date",
             "2026-04-21",
-            "--aoi_file",
+            "--aoi-file",
             str(aoi_file),
             "--download-only",
         ]

@@ -454,7 +454,7 @@ def _build_download_command(
             str(start_date),
             "--end-date",
             str(end_date),
-            "--aoi_file",
+            "--aoi-file",
             str(aoi_path),
             "--log-type",
             "all",
