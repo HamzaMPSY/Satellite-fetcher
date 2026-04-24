@@ -100,8 +100,8 @@ class ZarrServiceClient:
                 "output_dir": output_dir,
                 "include_ancillary": bool(include_ancillary),
                 "include_masks": include_masks,
-                "start_date": start_date,
-                "end_date": end_date,
+                "start_date": self._json_value(start_date),
+                "end_date": self._json_value(end_date),
                 "stage_label": stage_label,
             },
             timeout=(30, None),
@@ -176,6 +176,15 @@ class ZarrServiceClient:
         if not isinstance(payload, Mapping):
             raise RuntimeError(f"Zarr service returned a non-object payload for {path}.")
         return int(response.status_code), dict(payload)
+
+    @staticmethod
+    def _json_value(value: Any) -> Any:
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except TypeError:
+                return value
+        return value
 
     @staticmethod
     def _response_payload(response: requests.Response) -> dict[str, Any]:

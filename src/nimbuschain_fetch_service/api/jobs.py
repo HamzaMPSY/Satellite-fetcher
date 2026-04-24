@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from nimbuschain_fetch.engine.nimbus_fetcher import JobNotFoundError, NimbusFetcher
@@ -13,6 +14,7 @@ from nimbuschain_fetch.models import (
     JobCreateRequest,
     JobCreatedResponse,
     JobListResponse,
+    JobResumeResponse,
     JobResultResponse,
     JobStatusResponse,
 )
@@ -76,6 +78,19 @@ async def cancel_job(
     if cancel_requested:
         record_job_cancellation(status.provider.value)
     return {"job_id": job_id, "cancel_requested": cancel_requested}
+
+
+@router.post("/jobs/{job_id}/resume", response_model=JobResumeResponse)
+async def resume_job(
+    job_id: str,
+    fetcher: NimbusFetcher = Depends(get_fetcher),
+) -> JobResumeResponse:
+    try:
+        return await anyio.to_thread.run_sync(fetcher.resume_job, job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post("/jobs/reset-active")

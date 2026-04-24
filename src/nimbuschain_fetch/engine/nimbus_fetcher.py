@@ -52,6 +52,7 @@ from nimbuschain_fetch.models import (
     JobMaskRequest,
     JobMaskResponse,
     JobResultResponse,
+    JobResumeResponse,
     JobState,
     JobStatusResponse,
     JobWaterMaskRequest,
@@ -539,6 +540,274 @@ class NimbusFetcher:
         row = self._normalize_historical_job_row(row)
         row = self._normalize_backend_paths_in_job_row(row)
         return self._to_status_response(row)
+
+    @classmethod
+    def _resume_metadata_for_row(cls, row: dict[str, Any]) -> dict[str, Any]:
+        state = str(row.get("state") or "").strip().lower()
+        pipeline_state = str(row.get("pipeline_state") or "").strip().lower()
+        pipeline_step = str(row.get("pipeline_step") or "").strip().lower()
+        raw_outputs = [str(item).strip() for item in list(row.get("raw_outputs") or []) if str(item).strip()]
+        zarr_outputs = [str(item).strip() for item in list(row.get("zarr_outputs") or []) if str(item).strip()]
+        request_payload = dict(row.get("request") or {})
+        pipeline_metadata = dict(row.get("pipeline_metadata") or {})
+        conversion_metadata = dict(row.get("conversion_metadata") or {})
+        requested_mask_types = cls._normalized_mask_types(
+            request_payload.get("mask_types") or pipeline_metadata.get("mask_types") or []
+        )
+        cube_mode = cls._normalized_cube_mode(
+            request_payload.get("cube_mode") or pipeline_metadata.get("cube_mode")
+        )
+        mask_status = str(
+            pipeline_metadata.get("mask_status")
+            or dict(conversion_metadata.get("mask") or {}).get("status")
+            or ""
+        ).strip().lower()
+
+        if state != JobState.failed.value:
+            return {
+                "can_resume": False,
+                "resume_action": None,
+                "resume_label": None,
+                "resume_reason": None,
+            }
+
+        zarr_resume_states = {
+            PipelineState.downloaded.value,
+            PipelineState.zarr_queued.value,
+            PipelineState.zarr_converting.value,
+            PipelineState.zarr_failed.value,
+        }
+        cube_resume_states = {
+            PipelineState.cube_queued.value,
+            PipelineState.cube_building.value,
+            PipelineState.cube_failed.value,
+        }
+        mask_resume_states = {
+            PipelineState.resolving_source_zarr.value,
+            PipelineState.copying_source_zarr.value,
+            PipelineState.running_cloud_inference.value,
+            PipelineState.running_water_inference.value,
+            PipelineState.writing_mask_artifacts.value,
+            PipelineState.writing_masked_zarr.value,
+            PipelineState.registering_artifacts.value,
+            PipelineState.failed.value,
+        }
+
+        if pipeline_state in zarr_resume_states and raw_outputs:
+            return {
+                "can_resume": True,
+                "resume_action": "resume_pipeline_from_zarr",
+                "resume_label": "Resume Pipeline",
+                "resume_reason": (
+                    "Downloaded raw outputs are already available, so conversion can continue "
+                    "from the interrupted Zarr step and continue the remaining pipeline stages."
+                ),
+            }
+
+        if pipeline_state in zarr_resume_states:
+            return {
+                "can_resume": False,
+                "resume_action": None,
+                "resume_label": "Can't Resume",
+                "resume_reason": (
+                    "This job does not have reusable raw outputs, so the interrupted Zarr step cannot be resumed yet."
+                ),
+            }
+
+        if pipeline_state in cube_resume_states and zarr_outputs and cube_mode != "none":
+            return {
+                "can_resume": True,
+                "resume_action": "resume_pipeline_from_cube",
+                "resume_label": "Resume Pipeline",
+                "resume_reason": "Zarr outputs are already available, so the pipeline can continue from the interrupted cube step.",
+            }
+
+        if pipeline_state in cube_resume_states:
+            return {
+                "can_resume": False,
+                "resume_action": None,
+                "resume_label": "Can't Resume",
+                "resume_reason": "This cube step cannot be resumed because the required Zarr outputs are not available.",
+            }
+
+        if (
+            mask_status == "failed"
+            or pipeline_step in {"cloud_failed", "water_failed"}
+            or pipeline_state in mask_resume_states
+        ) and requested_mask_types and zarr_outputs:
+            return {
+                "can_resume": True,
+                "resume_action": "resume_pipeline_from_mask",
+                "resume_label": "Resume Pipeline",
+                "resume_reason": "Zarr outputs are already available, so the pipeline can continue from the interrupted mask step.",
+            }
+
+        if mask_status == "failed" or pipeline_step in {"cloud_failed", "water_failed"} or pipeline_state in mask_resume_states:
+            return {
+                "can_resume": False,
+                "resume_action": None,
+                "resume_label": "Can't Resume",
+                "resume_reason": "This mask step cannot be resumed because the required Zarr outputs are not available.",
+            }
+
+        return {
+            "can_resume": False,
+            "resume_action": None,
+            "resume_label": "Can't Resume",
+            "resume_reason": "Resume is not implemented for this failure type yet.",
+        }
+
+    def _resume_pipeline_from_mask_failure(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+    ) -> JobStatusResponse:
+        result = self.store.get_result(job_id) or {}
+        raw_outputs = self._merge_paths(
+            list(row.get("raw_outputs") or []),
+            list(result.get("raw_outputs") or []),
+        )
+        zarr_outputs = self._merge_paths(
+            list(row.get("zarr_outputs") or []),
+            list(result.get("zarr_outputs") or []),
+        )
+        if not zarr_outputs:
+            raise ValueError("This job cannot be resumed because the required Zarr outputs are not available.")
+        existing_cube_outputs = self._merge_paths(
+            list(row.get("cube_outputs") or []),
+            list(result.get("cube_outputs") or []),
+        )
+        initial_state = PipelineState.cube_written if existing_cube_outputs else PipelineState.zarr_written
+        initial_step = "cube_written" if existing_cube_outputs else "zarr_written"
+        return self._continue_remaining_pipeline_after_zarr(
+            job_id=job_id,
+            row=row,
+            result=result,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+            conversion_metadata=dict(result.get("conversion_metadata") or row.get("conversion_metadata") or {}),
+            rerun_before_mask_cube=False,
+            rerun_masks=True,
+            rerun_after_mask_cube=True,
+            existing_cube_outputs=existing_cube_outputs,
+            initial_pipeline_state=initial_state,
+            initial_pipeline_step=initial_step,
+            initial_pipeline_progress=76.0,
+        )
+
+    def _resume_pipeline_from_cube_failure(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+    ) -> JobStatusResponse:
+        result = self.store.get_result(job_id) or {}
+        raw_outputs = self._merge_paths(
+            list(row.get("raw_outputs") or []),
+            list(result.get("raw_outputs") or []),
+        )
+        zarr_outputs = self._merge_paths(
+            list(row.get("zarr_outputs") or []),
+            list(result.get("zarr_outputs") or []),
+        )
+        if not zarr_outputs:
+            raise ValueError("This job cannot be resumed because the required Zarr outputs are not available.")
+        cube_config = self._cube_config_from_request_payload(dict(row.get("request") or {}))
+        if cube_config is None:
+            raise ValueError("This job cannot be resumed because its cube configuration is missing.")
+        if str(cube_config.get("mode") or "") == "after_mask":
+            return self._continue_remaining_pipeline_after_zarr(
+                job_id=job_id,
+                row=row,
+                result=result,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+                conversion_metadata=dict(result.get("conversion_metadata") or row.get("conversion_metadata") or {}),
+                rerun_before_mask_cube=False,
+                rerun_masks=False,
+                rerun_after_mask_cube=True,
+                existing_cube_outputs=[],
+                initial_pipeline_state=PipelineState.masked_zarr_written,
+                initial_pipeline_step="masked_zarr_written",
+                initial_pipeline_progress=98.0,
+            )
+        return self._continue_remaining_pipeline_after_zarr(
+            job_id=job_id,
+            row=row,
+            result=result,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+            conversion_metadata=dict(result.get("conversion_metadata") or row.get("conversion_metadata") or {}),
+            rerun_before_mask_cube=True,
+            rerun_masks=bool(self._normalized_mask_types(dict(row.get("request") or {}).get("mask_types") or [])),
+            rerun_after_mask_cube=False,
+            existing_cube_outputs=[],
+            initial_pipeline_state=PipelineState.zarr_written,
+            initial_pipeline_step="zarr_written",
+            initial_pipeline_progress=72.0,
+        )
+
+    def resume_job(self, job_id: str) -> JobResumeResponse:
+        row = self.store.get_job(job_id)
+        if not row:
+            raise JobNotFoundError(job_id)
+        normalized_row = self._normalize_backend_paths_in_job_row(self._normalize_historical_job_row(row))
+        resume_metadata = self._resume_metadata_for_row(normalized_row)
+        if not bool(resume_metadata.get("can_resume")):
+            raise ValueError("This job cannot be resumed from its current pipeline state.")
+
+        resume_action = str(resume_metadata.get("resume_action") or "").strip()
+        resume_label = str(resume_metadata.get("resume_label") or "Resume").strip()
+        self.store.append_event(
+            job_id,
+            "job.resume_requested",
+            {
+                "resume_action": resume_action,
+                "resume_label": resume_label,
+                "pipeline_state": str(normalized_row.get("pipeline_state") or ""),
+                "pipeline_step": str(normalized_row.get("pipeline_step") or ""),
+            },
+        )
+
+        if resume_action == "resume_pipeline_from_zarr":
+            resumed_job = self.convert_existing_job(
+                job_id,
+                JobConvertRequest(),
+                continue_pipeline=True,
+            )
+        elif resume_action == "resume_pipeline_from_mask":
+            resumed_job = self._resume_pipeline_from_mask_failure(
+                job_id=job_id,
+                row=normalized_row,
+            )
+        elif resume_action == "resume_pipeline_from_cube":
+            resumed_job = self._resume_pipeline_from_cube_failure(
+                job_id=job_id,
+                row=normalized_row,
+            )
+        else:
+            raise ValueError(f"Unsupported resume action '{resume_action}'.")
+
+        self.store.append_event(
+            job_id,
+            "job.resumed",
+            {
+                "resume_action": resume_action,
+                "resume_label": resume_label,
+                "resumed_job_id": job_id,
+                "spawned_new_job": False,
+            },
+        )
+        return JobResumeResponse(
+            source_job_id=job_id,
+            resumed_job_id=job_id,
+            resume_action=resume_action,
+            resume_label=resume_label,
+            spawned_new_job=False,
+            message="Resumed the existing job and continued the remaining pipeline stages.",
+            job=resumed_job,
+        )
 
     def get_result(self, job_id: str) -> JobResultResponse:
         job_row = self.store.get_job(job_id)
@@ -2805,6 +3074,737 @@ class NimbusFetcher:
             "pipeline_metadata": final_metadata,
         }
 
+    @classmethod
+    def _cube_config_from_request_payload(cls, request_payload: dict[str, Any]) -> dict[str, Any] | None:
+        cube_mode = cls._normalized_cube_mode(request_payload.get("cube_mode"))
+        if cube_mode == "none":
+            return None
+        return {
+            "mode": cube_mode,
+            "start_date": request_payload.get("cube_start_date") or request_payload.get("start_date"),
+            "end_date": request_payload.get("cube_end_date") or request_payload.get("end_date"),
+        }
+
+    def _resume_base_result_paths(
+        self,
+        *,
+        result: dict[str, Any],
+        raw_outputs: list[str],
+    ) -> list[str]:
+        existing_paths = self._merge_paths([], list(result.get("paths") or []))
+        obsolete_paths = set(
+            self._merge_paths(
+                list(result.get("zarr_outputs") or []),
+                list(result.get("cube_outputs") or []),
+            )
+        )
+        preserved = [path for path in existing_paths if path not in obsolete_paths]
+        return self._merge_paths(preserved, raw_outputs)
+
+    def _continue_remaining_pipeline_after_zarr(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+        result: dict[str, Any],
+        raw_outputs: list[str],
+        zarr_outputs: list[str],
+        conversion_metadata: dict[str, Any],
+        rerun_before_mask_cube: bool = True,
+        rerun_masks: bool = True,
+        rerun_after_mask_cube: bool = True,
+        existing_cube_outputs: list[str] | None = None,
+        initial_pipeline_state: PipelineState = PipelineState.zarr_written,
+        initial_pipeline_step: str = "zarr_written",
+        initial_pipeline_progress: float | None = None,
+    ) -> JobStatusResponse:
+        request_payload = dict(row.get("request") or {})
+        provider_name = self._provider_name(row.get("provider"))
+        collection = str(row.get("collection") or "")
+        product_type = str(request_payload.get("product_type") or row.get("product_type") or "").strip() or None
+        requested_mask_types = self._normalized_mask_types(request_payload.get("mask_types") or [])
+        cube_config = self._cube_config_from_request_payload(request_payload)
+
+        checksums = dict(result.get("checksums") or {})
+        metadata = dict(result.get("metadata") or {})
+        manifest_entry = dict(result.get("manifest_entry") or {})
+        base_paths = self._resume_base_result_paths(result=result, raw_outputs=raw_outputs)
+        bytes_downloaded = int(row.get("bytes_downloaded") or 0)
+        bytes_total = max(int(row.get("bytes_total") or 0), bytes_downloaded)
+
+        final_pipeline_metadata = self._merged_pipeline_metadata(
+            job_id,
+            {
+                **dict(result.get("pipeline_metadata") or row.get("pipeline_metadata") or {}),
+                "zarr_output_count": len(zarr_outputs),
+                "manual_conversion": True,
+                "zarr_parallel_workers": int(conversion_metadata.get("parallel_workers", 1) or 1),
+            },
+        )
+        if requested_mask_types:
+            final_pipeline_metadata["mask_types"] = requested_mask_types
+            final_pipeline_metadata["mask_mode"] = "integrated"
+        if cube_config is not None:
+            final_pipeline_metadata["cube_mode"] = cube_config["mode"]
+            final_pipeline_metadata["cube_date_range"] = {
+                "start_date": (
+                    cube_config["start_date"].isoformat()
+                    if hasattr(cube_config["start_date"], "isoformat")
+                    else cube_config["start_date"]
+                ),
+                "end_date": (
+                    cube_config["end_date"].isoformat()
+                    if hasattr(cube_config["end_date"], "isoformat")
+                    else cube_config["end_date"]
+                ),
+            }
+
+        if initial_pipeline_progress is None:
+            if rerun_masks:
+                initial_pipeline_progress = 72.0 if rerun_before_mask_cube else 76.0
+            elif rerun_after_mask_cube:
+                initial_pipeline_progress = 98.0
+            else:
+                initial_pipeline_progress = 100.0
+
+        has_downstream_stages = any(
+            (
+                rerun_before_mask_cube and cube_config is not None and cube_config["mode"] == "before_mask",
+                rerun_masks and bool(requested_mask_types),
+                rerun_after_mask_cube and cube_config is not None and cube_config["mode"] == "after_mask",
+            )
+        )
+        self._update_pipeline(
+            job_id,
+            pipeline_state=initial_pipeline_state,
+            pipeline_step=initial_pipeline_step,
+            pipeline_progress=initial_pipeline_progress if has_downstream_stages else 100.0,
+            pipeline_metadata=final_pipeline_metadata,
+            conversion_metadata=conversion_metadata,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+            event_type=None,
+            event_payload={
+                "zarr_outputs": zarr_outputs,
+                "pipeline_progress": initial_pipeline_progress if has_downstream_stages else 100.0,
+                "resumed_pipeline": True,
+            },
+        )
+        final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
+        cube_outputs: list[str] = self._merge_paths([], list(existing_cube_outputs or []))
+        final_paths = [*base_paths, *zarr_outputs]
+        if cube_outputs:
+            final_paths.extend(cube_outputs)
+        self.store.set_result(
+            job_id,
+            {
+                "job_id": job_id,
+                "paths": final_paths,
+                "raw_outputs": raw_outputs,
+                "zarr_outputs": zarr_outputs,
+                "cube_outputs": cube_outputs,
+                "checksums": checksums,
+                "metadata": metadata,
+                "manifest_entry": manifest_entry,
+                "pipeline_metadata": final_pipeline_metadata,
+                "conversion_metadata": conversion_metadata,
+            },
+        )
+
+        final_pipeline_state = initial_pipeline_state
+        final_pipeline_step = initial_pipeline_step
+
+        if rerun_before_mask_cube and cube_config is not None and cube_config["mode"] == "before_mask":
+            cube_execution = self._build_cube_outputs(
+                job_id=job_id,
+                provider_name=provider_name,
+                collection=collection,
+                source_zarr_outputs=zarr_outputs,
+                cube_mode=str(cube_config["mode"]),
+                cube_start_date=cube_config["start_date"],
+                cube_end_date=cube_config["end_date"],
+                pipeline_metadata=final_pipeline_metadata,
+                stage_start_progress=73.0,
+                stage_end_progress=75.0 if requested_mask_types else 100.0,
+            )
+            cube_outputs = list(cube_execution.get("cube_outputs") or [])
+            final_pipeline_metadata = dict(cube_execution.get("pipeline_metadata") or final_pipeline_metadata)
+            final_paths = [*base_paths, *zarr_outputs, *cube_outputs]
+            self.store.set_result(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "paths": final_paths,
+                    "raw_outputs": raw_outputs,
+                    "zarr_outputs": zarr_outputs,
+                    "cube_outputs": cube_outputs,
+                    "checksums": checksums,
+                    "metadata": metadata,
+                    "manifest_entry": manifest_entry,
+                    "pipeline_metadata": final_pipeline_metadata,
+                    "conversion_metadata": conversion_metadata,
+                },
+            )
+            if cube_outputs and not requested_mask_types:
+                final_pipeline_state = PipelineState.cube_written
+                final_pipeline_step = "cube_written"
+
+        if not rerun_masks:
+            combined_cube_outputs = list(cube_outputs)
+            terminal_pipeline_state = final_pipeline_state
+            terminal_pipeline_step = final_pipeline_step
+            if rerun_after_mask_cube and cube_config is not None and cube_config["mode"] == "after_mask":
+                cube_execution = self._build_cube_outputs(
+                    job_id=job_id,
+                    provider_name=provider_name,
+                    collection=collection,
+                    source_zarr_outputs=zarr_outputs,
+                    cube_mode=str(cube_config["mode"]),
+                    cube_start_date=cube_config["start_date"],
+                    cube_end_date=cube_config["end_date"],
+                    pipeline_metadata=final_pipeline_metadata,
+                    stage_start_progress=98.0,
+                    stage_end_progress=100.0,
+                )
+                combined_cube_outputs = list(cube_execution.get("cube_outputs") or [])
+                final_pipeline_metadata = dict(cube_execution.get("pipeline_metadata") or final_pipeline_metadata)
+                if combined_cube_outputs:
+                    terminal_pipeline_state = PipelineState.cube_written
+                    terminal_pipeline_step = "cube_written"
+            final_paths = [*base_paths, *zarr_outputs, *combined_cube_outputs]
+            final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
+            self.store.set_result(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "paths": final_paths,
+                    "raw_outputs": raw_outputs,
+                    "zarr_outputs": zarr_outputs,
+                    "cube_outputs": combined_cube_outputs,
+                    "checksums": checksums,
+                    "metadata": metadata,
+                    "manifest_entry": manifest_entry,
+                    "pipeline_metadata": final_pipeline_metadata,
+                    "conversion_metadata": conversion_metadata,
+                },
+            )
+            self.store.update_job(
+                job_id,
+                state=JobState.succeeded.value,
+                progress=100.0,
+                finished_at=self._now_iso(),
+                bytes_downloaded=bytes_downloaded,
+                bytes_total=bytes_total,
+                pipeline_state=terminal_pipeline_state.value,
+                pipeline_step=terminal_pipeline_step,
+                pipeline_progress=100.0,
+                pipeline_metadata=final_pipeline_metadata,
+                conversion_metadata=conversion_metadata,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+                errors=[],
+            )
+            self.store.append_event(
+                job_id,
+                "job.succeeded",
+                {
+                    "status": JobState.succeeded.value,
+                    "paths": final_paths,
+                    "pipeline_state": terminal_pipeline_state.value,
+                },
+            )
+            return self.get_job(job_id)
+
+        if not requested_mask_types:
+            final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
+            self.store.update_job(
+                job_id,
+                state=JobState.succeeded.value,
+                progress=100.0,
+                finished_at=self._now_iso(),
+                bytes_downloaded=bytes_downloaded,
+                bytes_total=bytes_total,
+                pipeline_state=final_pipeline_state.value,
+                pipeline_step=final_pipeline_step,
+                pipeline_progress=100.0,
+                pipeline_metadata=final_pipeline_metadata,
+                conversion_metadata=conversion_metadata,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+            )
+            self.store.append_event(
+                job_id,
+                "job.succeeded",
+                {
+                    "status": JobState.succeeded.value,
+                    "paths": final_paths,
+                    "pipeline_state": final_pipeline_state.value,
+                },
+            )
+            return self.get_job(job_id)
+
+        self.store.update_job(
+            job_id,
+            state=JobState.running.value,
+            started_at=str((self.store.get_job(job_id) or {}).get("started_at") or "").strip() or self._now_iso(),
+            progress=100.0,
+            finished_at=None,
+            bytes_downloaded=bytes_downloaded,
+            bytes_total=bytes_total,
+            pipeline_state=final_pipeline_state.value,
+            pipeline_step=final_pipeline_step,
+            pipeline_progress=76.0,
+            pipeline_metadata=final_pipeline_metadata,
+            conversion_metadata=conversion_metadata,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+            errors=[],
+        )
+        self.store.append_event(
+            job_id,
+            "job.cube_written" if final_pipeline_state == PipelineState.cube_written else "job.zarr_written",
+            {
+                "pipeline_state": final_pipeline_state.value,
+                "zarr_outputs": zarr_outputs,
+                "cube_outputs": cube_outputs,
+                "resumed_pipeline": True,
+            },
+        )
+
+        total_mask_outputs = max(1, len(zarr_outputs))
+        mask_inference_device = str(request_payload.get("inference_device") or "").strip() or None
+        water_inference_device = str(request_payload.get("water_inference_device") or "").strip() or None
+        remote_mask_runtime = self._remote_mask_runtime()
+        mask_workers = self._integrated_mask_max_workers(
+            total=len(zarr_outputs),
+            inference_device=mask_inference_device,
+            water_inference_device=water_inference_device,
+            remote_runtime=remote_mask_runtime,
+            preferred_parallelism=self._scene_parallelism_target_from_download(
+                pipeline_metadata=final_pipeline_metadata,
+                total=len(zarr_outputs),
+            ),
+            max_limit=min(4, max(1, int(self.settings.nimbus_max_jobs or 1))),
+        )
+        mask_items: list[dict[str, Any] | None] = [None] * len(zarr_outputs)
+        mask_errors: list[str] = []
+        last_mask_execution: dict[str, Any] | None = None
+
+        progress_lock = threading.Lock()
+        progress_by_index: dict[int, float] = {
+            item_index: 0.0 for item_index in range(len(zarr_outputs))
+        }
+        stage_by_index: dict[int, PipelineState] = {}
+        step_by_index: dict[int, str] = {}
+        scene_count = max(1, len(zarr_outputs))
+
+        def _normalize_pipeline_state(value: Any) -> PipelineState:
+            if isinstance(value, PipelineState):
+                return value
+            try:
+                return PipelineState(str(value or "").strip())
+            except Exception:
+                return PipelineState.running_cloud_inference
+
+        def _normalize_pipeline_step(value: Any) -> str:
+            candidate = str(value or "").strip().lower()
+            if candidate:
+                return candidate
+            return "running_cloud_inference"
+
+        def _aggregate_pipeline_state() -> tuple[PipelineState, str]:
+            states = set(stage_by_index.values())
+            if PipelineState.failed in states:
+                return (
+                    PipelineState.failed,
+                    self._preferred_mask_failure_step(step_by_index.values()),
+                )
+            if PipelineState.running_water_inference in states:
+                return (
+                    PipelineState.running_water_inference,
+                    "running_water_inference",
+                )
+            if PipelineState.running_cloud_inference in states:
+                return (
+                    PipelineState.running_cloud_inference,
+                    "running_cloud_inference",
+                )
+            if "water" in requested_mask_types:
+                return (
+                    PipelineState.running_water_inference,
+                    "running_water_inference",
+                )
+            return (
+                PipelineState.running_cloud_inference,
+                "running_cloud_inference",
+            )
+
+        def _make_item_progress_callback(item_index: int) -> Callable[[dict[str, Any]], None]:
+            def _callback(payload: dict[str, Any]) -> None:
+                item_fraction = min(
+                    1.0,
+                    max(0.0, float(payload.get("item_fraction") or 0.0)),
+                )
+                with progress_lock:
+                    progress_by_index[item_index] = max(
+                        progress_by_index.get(item_index, 0.0),
+                        item_fraction,
+                    )
+                    stage_by_index[item_index] = _normalize_pipeline_state(
+                        payload.get("pipeline_state")
+                    )
+                    step_by_index[item_index] = _normalize_pipeline_step(
+                        payload.get("pipeline_step")
+                    )
+                    aggregate_fraction = sum(progress_by_index.values()) / scene_count
+                    aggregate_progress = 76.0 + (aggregate_fraction * 22.0)
+                    aggregate_state, aggregate_step = _aggregate_pipeline_state()
+                    aggregate_metadata = {
+                        **final_pipeline_metadata,
+                        **dict(payload.get("pipeline_metadata") or {}),
+                        "mask_parallel_workers": mask_workers,
+                        "mask_total_scenes": scene_count,
+                        "mask_completed_scenes": sum(
+                            1
+                            for current_fraction in progress_by_index.values()
+                            if current_fraction >= 1.0
+                        ),
+                        "mask_active_scenes": sum(
+                            1
+                            for current_fraction in progress_by_index.values()
+                            if 0.0 < current_fraction < 1.0
+                        ),
+                    }
+                    aggregate_event_payload = {
+                        **dict(payload.get("event_payload") or {}),
+                        "scene_index": item_index + 1,
+                        "scene_total": scene_count,
+                        "item_fraction": item_fraction,
+                        "aggregate_fraction": aggregate_fraction,
+                    }
+                    self._update_pipeline(
+                        job_id,
+                        pipeline_state=aggregate_state,
+                        pipeline_step=aggregate_step,
+                        pipeline_progress=aggregate_progress,
+                        pipeline_metadata=aggregate_metadata,
+                        event_type=str(payload.get("event_type") or "").strip() or None,
+                        event_payload=aggregate_event_payload,
+                    )
+
+            return _callback
+
+        def _mark_item_completion(
+            item_index: int,
+            *,
+            mask_execution: dict[str, Any],
+        ) -> None:
+            item_succeeded = bool(mask_execution.get("succeeded"))
+            with progress_lock:
+                progress_by_index[item_index] = max(progress_by_index.get(item_index, 0.0), 1.0)
+                if not item_succeeded:
+                    stage_by_index[item_index] = PipelineState.failed
+                    step_by_index[item_index] = self._preferred_mask_failure_step(
+                        [mask_execution.get("failed_step")]
+                    )
+                else:
+                    stage_by_index.pop(item_index, None)
+                    step_by_index.pop(item_index, None)
+                aggregate_fraction = sum(progress_by_index.values()) / scene_count
+                aggregate_progress = 76.0 + (aggregate_fraction * 22.0)
+                aggregate_state, aggregate_step = _aggregate_pipeline_state()
+                self._update_pipeline(
+                    job_id,
+                    pipeline_state=aggregate_state,
+                    pipeline_step=aggregate_step,
+                    pipeline_progress=aggregate_progress,
+                    pipeline_metadata={
+                        **final_pipeline_metadata,
+                        "mask_parallel_workers": mask_workers,
+                        "mask_total_scenes": scene_count,
+                        "mask_completed_scenes": sum(
+                            1
+                            for current_fraction in progress_by_index.values()
+                            if current_fraction >= 1.0
+                        ),
+                        "mask_active_scenes": sum(
+                            1
+                            for current_fraction in progress_by_index.values()
+                            if 0.0 < current_fraction < 1.0
+                        ),
+                    },
+                )
+
+        def _run_mask_item(item_index: int, zarr_uri: str) -> tuple[int, str, dict[str, Any]]:
+            if self._is_job_cancel_requested(job_id):
+                raise JobCancelledError(
+                    "Job cancellation requested during integrated masking."
+                )
+            zarr_context = self._resolve_zarr_context(
+                job_id=job_id,
+                row=row,
+                result={"conversion_metadata": conversion_metadata},
+                zarr_uri=zarr_uri,
+                scene_id_override=None,
+                product_type_override=product_type,
+            )
+            item_start = 76.0 + (item_index * (22.0 / total_mask_outputs))
+            item_end = 76.0 + ((item_index + 1) * (22.0 / total_mask_outputs))
+            mask_execution = self._run_in_place_mask_pipeline(
+                job_id=job_id,
+                source_job_id=job_id,
+                selected_zarr_uri=zarr_uri,
+                zarr_context=zarr_context,
+                mask_types=requested_mask_types,
+                backend_name="auto",
+                threshold=0.62,
+                inference_device=mask_inference_device,
+                include_shadows=True,
+                overwrite=True,
+                water_backend_name="auto",
+                water_overwrite=True,
+                water_inference_device=water_inference_device,
+                fail_on_error=False,
+                mask_mode="integrated",
+                include_resolve_stage=False,
+                resolve_progress=None,
+                stage_start_progress=item_start,
+                stage_end_progress=item_end,
+                expose_masked_outputs=False,
+                register_masked_artifact=False,
+                pipeline_progress_callback=_make_item_progress_callback(item_index),
+            )
+            return item_index, zarr_uri, mask_execution
+
+        if mask_workers <= 1 or len(zarr_outputs) <= 1:
+            for item_index, zarr_uri in enumerate(zarr_outputs):
+                item_index, zarr_uri, mask_execution = _run_mask_item(item_index, zarr_uri)
+                item_pipeline = dict(mask_execution.get("pipeline_metadata") or {})
+                item_conversion = dict(mask_execution.get("conversion_metadata") or {})
+                mask_items[item_index] = {
+                    "zarr_uri": zarr_uri,
+                    "status": str(mask_execution.get("status") or ""),
+                    "pipeline_metadata": item_pipeline,
+                    "conversion_metadata": item_conversion,
+                    "errors": list(mask_execution.get("errors") or []),
+                    "failed_step": mask_execution.get("failed_step"),
+                }
+                _mark_item_completion(item_index, mask_execution=mask_execution)
+                last_mask_execution = mask_execution
+                mask_errors.extend(
+                    error
+                    for error in list(mask_execution.get("errors") or [])
+                    if error not in mask_errors
+                )
+                if not bool(mask_execution.get("succeeded")):
+                    break
+        else:
+            with ThreadPoolExecutor(
+                max_workers=mask_workers,
+                thread_name_prefix="mask-scene",
+            ) as executor:
+                future_map = {
+                    executor.submit(_run_mask_item, item_index, zarr_uri): (item_index, zarr_uri)
+                    for item_index, zarr_uri in enumerate(zarr_outputs)
+                }
+                for future in as_completed(future_map):
+                    item_index, zarr_uri = future_map[future]
+                    item_index, zarr_uri, mask_execution = future.result()
+                    item_pipeline = dict(mask_execution.get("pipeline_metadata") or {})
+                    item_conversion = dict(mask_execution.get("conversion_metadata") or {})
+                    mask_items[item_index] = {
+                        "zarr_uri": zarr_uri,
+                        "status": str(mask_execution.get("status") or ""),
+                        "pipeline_metadata": item_pipeline,
+                        "conversion_metadata": item_conversion,
+                        "errors": list(mask_execution.get("errors") or []),
+                        "failed_step": mask_execution.get("failed_step"),
+                    }
+                    _mark_item_completion(item_index, mask_execution=mask_execution)
+                    last_mask_execution = mask_execution
+                    mask_errors.extend(
+                        error
+                        for error in list(mask_execution.get("errors") or [])
+                        if error not in mask_errors
+                    )
+
+        mask_items = [item for item in mask_items if item is not None]
+        final_pipeline_metadata["mask_parallel_workers"] = mask_workers
+        final_pipeline_metadata["mask_total_scenes"] = scene_count
+        final_pipeline_metadata["mask_completed_scenes"] = len(mask_items)
+        final_pipeline_metadata["mask_active_scenes"] = 0
+
+        mask_item_statuses = [
+            str((item or {}).get("status") or "").strip().lower()
+            for item in mask_items
+        ]
+        mask_succeeded = (
+            len(mask_items) == len(zarr_outputs)
+            and bool(mask_items)
+            and not mask_errors
+            and all(status == "written" for status in mask_item_statuses)
+        )
+        mask_summary = {
+            "status": "written" if mask_succeeded else "failed",
+            "mask_types": requested_mask_types,
+            "mask_mode": "integrated",
+            "items": mask_items,
+        }
+        if last_mask_execution is not None:
+            item_pipeline = dict(last_mask_execution.get("pipeline_metadata") or {})
+            item_conversion = dict(last_mask_execution.get("conversion_metadata") or {})
+            if len(mask_items) == 1:
+                mask_summary.update(
+                    {
+                        "masked_zarr_uri": item_pipeline.get("masked_zarr_uri") or zarr_outputs[0],
+                        "water_mask": item_conversion.get("water_mask") or {},
+                        "cloud_mask": item_conversion.get("cloud_mask") or {},
+                        "mask_quality": item_conversion.get("mask_quality") or {},
+                    }
+                )
+        final_pipeline_metadata = {
+            **final_pipeline_metadata,
+            "mask_status": mask_summary["status"],
+            "mask_items": mask_items,
+            "mask_types": requested_mask_types,
+            "mask_mode": "integrated",
+        }
+        if len(mask_items) == 1 and last_mask_execution is not None:
+            item_pipeline = dict(last_mask_execution.get("pipeline_metadata") or {})
+            item_conversion = dict(last_mask_execution.get("conversion_metadata") or {})
+            final_pipeline_metadata.update(
+                {
+                    "masked_zarr_uri": item_pipeline.get("masked_zarr_uri") or zarr_outputs[0],
+                    "water_mask": item_conversion.get("water_mask") or {},
+                    "cloud_mask": item_conversion.get("cloud_mask") or {},
+                    "mask_quality": item_conversion.get("mask_quality") or {},
+                }
+            )
+        combined_conversion_metadata = {
+            **conversion_metadata,
+            "mask": mask_summary,
+        }
+        combined_metadata = {
+            **metadata,
+            "mask": mask_summary,
+        }
+        combined_cube_outputs = list(cube_outputs)
+        if rerun_after_mask_cube and cube_config is not None and cube_config["mode"] == "after_mask" and mask_succeeded:
+            cube_execution = self._build_cube_outputs(
+                job_id=job_id,
+                provider_name=provider_name,
+                collection=collection,
+                source_zarr_outputs=zarr_outputs,
+                cube_mode=str(cube_config["mode"]),
+                cube_start_date=cube_config["start_date"],
+                cube_end_date=cube_config["end_date"],
+                pipeline_metadata=final_pipeline_metadata,
+                stage_start_progress=98.0,
+                stage_end_progress=100.0,
+            )
+            combined_cube_outputs = list(cube_execution.get("cube_outputs") or [])
+            final_pipeline_metadata = dict(cube_execution.get("pipeline_metadata") or final_pipeline_metadata)
+        final_paths = [*base_paths, *zarr_outputs, *combined_cube_outputs]
+        terminal_pipeline_step = (
+            PipelineState.cube_written.value
+            if mask_succeeded
+            and cube_config is not None
+            and cube_config["mode"] == "after_mask"
+            and combined_cube_outputs
+            else PipelineState.masked_zarr_written.value
+        )
+        if not mask_succeeded:
+            terminal_pipeline_step = self._mask_failure_step_from_items(
+                mask_types=requested_mask_types,
+                items=cast(list[dict[str, Any]], mask_items),
+            )
+            mask_summary["failed_step"] = terminal_pipeline_step
+            final_pipeline_metadata["failed_step"] = terminal_pipeline_step
+            combined_conversion_metadata["failed_step"] = terminal_pipeline_step
+        terminal_pipeline_state = (
+            PipelineState.cube_written
+            if mask_succeeded
+            and cube_config is not None
+            and cube_config["mode"] == "after_mask"
+            and combined_cube_outputs
+            else PipelineState.masked_zarr_written
+            if mask_succeeded
+            else PipelineState.failed
+        )
+        terminal_state = (
+            JobState.succeeded
+            if terminal_pipeline_state in {PipelineState.masked_zarr_written, PipelineState.cube_written}
+            else JobState.failed
+        )
+        final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
+        self._update_pipeline(
+            job_id,
+            pipeline_state=terminal_pipeline_state,
+            pipeline_step=terminal_pipeline_step,
+            pipeline_progress=100.0 if terminal_state == JobState.succeeded else 95.0,
+            pipeline_metadata=final_pipeline_metadata,
+            conversion_metadata=combined_conversion_metadata,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+        )
+        final_pipeline_metadata = self._merged_pipeline_metadata(job_id, final_pipeline_metadata)
+        self.store.set_result(
+            job_id,
+            {
+                "job_id": job_id,
+                "paths": final_paths,
+                "raw_outputs": raw_outputs,
+                "zarr_outputs": zarr_outputs,
+                "cube_outputs": combined_cube_outputs,
+                "checksums": checksums,
+                "metadata": combined_metadata,
+                "manifest_entry": manifest_entry,
+                "pipeline_metadata": final_pipeline_metadata,
+                "conversion_metadata": combined_conversion_metadata,
+            },
+        )
+        self.store.update_job(
+            job_id,
+            state=terminal_state.value,
+            progress=100.0 if terminal_state == JobState.succeeded else 0.0,
+            finished_at=self._now_iso(),
+            bytes_downloaded=bytes_downloaded,
+            bytes_total=bytes_total,
+            pipeline_state=terminal_pipeline_state.value,
+            pipeline_step=terminal_pipeline_step,
+            pipeline_progress=100.0 if terminal_state == JobState.succeeded else 95.0,
+            pipeline_metadata=final_pipeline_metadata,
+            conversion_metadata=combined_conversion_metadata,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+            errors=mask_errors,
+        )
+        self.store.append_event(
+            job_id,
+            "job.mask_completed" if terminal_state == JobState.succeeded else "job.mask_failed",
+            {
+                "status": terminal_state.value,
+                "source_job_id": job_id,
+                "mask_types": requested_mask_types,
+                "zarr_outputs": zarr_outputs,
+                "cube_outputs": combined_cube_outputs,
+                "pipeline_state": terminal_pipeline_state.value,
+                "errors": mask_errors,
+                "resumed_pipeline": True,
+            },
+        )
+        self.store.append_event(
+            job_id,
+            "job.succeeded" if terminal_state == JobState.succeeded else "job.failed",
+            {
+                "status": terminal_state.value,
+                "paths": final_paths,
+                "pipeline_state": terminal_pipeline_state.value,
+                "error": mask_errors[0] if mask_errors else "",
+            },
+        )
+        return self.get_job(job_id)
+
     def _resolve_zarr_context(
         self,
         *,
@@ -3469,7 +4469,13 @@ class NimbusFetcher:
             "parallel_workers": max_workers,
         }
 
-    def convert_existing_job(self, job_id: str, request: JobConvertRequest) -> JobStatusResponse:
+    def convert_existing_job(
+        self,
+        job_id: str,
+        request: JobConvertRequest,
+        *,
+        continue_pipeline: bool = False,
+    ) -> JobStatusResponse:
         row = self.store.get_job(job_id)
         if not row:
             raise JobNotFoundError(job_id)
@@ -3506,6 +4512,15 @@ class NimbusFetcher:
             output_uri_override=output_uri,
             pipeline_metadata=dict(row.get("pipeline_metadata") or {}),
         )
+        if continue_pipeline:
+            return self._continue_remaining_pipeline_after_zarr(
+                job_id=job_id,
+                row=row,
+                result=result,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+                conversion_metadata=conversion_metadata,
+            )
         pipeline_state = PipelineState.zarr_written
         pipeline_metadata = self._merged_pipeline_metadata(
             job_id,
@@ -5107,6 +6122,7 @@ class NimbusFetcher:
             or (row.get("request") or {}).get("source_job_id")
             or ""
         ).strip() or None
+        resume_metadata = self._resume_metadata_for_row(row)
 
         return JobStatusResponse(
             job_id=row["job_id"],
@@ -5140,6 +6156,10 @@ class NimbusFetcher:
             finished_at=finished_at,
             duration_seconds=duration_seconds,
             errors=list(row.get("errors", [])),
+            can_resume=bool(resume_metadata.get("can_resume")),
+            resume_action=cast(Any, resume_metadata.get("resume_action")),
+            resume_label=cast(Any, resume_metadata.get("resume_label")),
+            resume_reason=cast(Any, resume_metadata.get("resume_reason")),
             provider=ProviderName(row["provider"]),
             collection=str(row["collection"]),
         )

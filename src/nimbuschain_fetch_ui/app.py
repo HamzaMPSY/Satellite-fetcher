@@ -1948,6 +1948,7 @@ def _render_job_cards(
             else:
                 error_summary = first_error
         with st.container(border=True):
+            action_feedback = dict(st.session_state.get("job_action_feedback", {})).get(job_id)
             state_label, state_fg, state_bg, state_icon = _job_state_style(state)
             pipeline_label, pipeline_fg, pipeline_bg, pipeline_icon = _job_pipeline_style(item)
             provider_issue = _job_provider_issue_badge(item)
@@ -2024,6 +2025,71 @@ def _render_job_cards(
                 with st.expander("Error details", expanded=False):
                     for err in errors[:5]:
                         st.code(str(err), language="text")
+            if isinstance(action_feedback, dict):
+                feedback_kind = str(action_feedback.get("kind") or "").strip().lower()
+                feedback_message = str(action_feedback.get("message") or "").strip()
+                if feedback_message:
+                    if feedback_kind == "error":
+                        st.error(feedback_message)
+                    else:
+                        st.success(feedback_message)
+            show_resume_action = str(state).strip().lower() == "failed"
+            if show_resume_action:
+                can_resume = bool(item.get("can_resume"))
+                resume_label = str(
+                    item.get("resume_label")
+                    or ("Resume Pipeline" if can_resume else "Can't Resume")
+                ).strip() or ("Resume Pipeline" if can_resume else "Can't Resume")
+                resume_reason = str(item.get("resume_reason") or "").strip()
+                if resume_reason:
+                    prefix = "Resume available:" if can_resume else "Resume unavailable:"
+                    st.caption(f"{prefix} {resume_reason}")
+                if st.button(
+                    resume_label,
+                    key=f"resume_job_button_{job_id}",
+                    width="stretch",
+                    disabled=not can_resume,
+                ):
+                    try:
+                        response = _api_request(
+                            "POST",
+                            _ss("api_url"),
+                            f"/v1/jobs/{job_id}/resume",
+                            api_key=_ss("api_key"),
+                            timeout=60,
+                        )
+                        if response.ok:
+                            payload = dict(response.json() or {})
+                            resumed_job = dict(payload.get("job") or {})
+                            resumed_job_id = str(
+                                payload.get("resumed_job_id")
+                                or resumed_job.get("job_id")
+                                or job_id
+                            ).strip() or job_id
+                            feedback_message = str(payload.get("message") or f"{resume_label} requested.").strip()
+                            status_cache = dict(st.session_state.get("job_status_cache", {}))
+                            if resumed_job:
+                                status_cache[resumed_job_id] = resumed_job
+                            st.session_state["job_status_cache"] = status_cache
+                            action_messages = dict(st.session_state.get("job_action_feedback", {}))
+                            action_messages[job_id] = {"kind": "success", "message": feedback_message}
+                            st.session_state["job_action_feedback"] = action_messages
+                            active_job_ids = list(st.session_state.get("active_job_ids", []))
+                            if resumed_job_id and resumed_job_id not in active_job_ids:
+                                active_job_ids.append(resumed_job_id)
+                            st.session_state["active_job_ids"] = active_job_ids
+                        else:
+                            action_messages = dict(st.session_state.get("job_action_feedback", {}))
+                            action_messages[job_id] = {
+                                "kind": "error",
+                                "message": f"{response.status_code}: {_response_error_message(response)}",
+                            }
+                            st.session_state["job_action_feedback"] = action_messages
+                    except Exception as exc:
+                        action_messages = dict(st.session_state.get("job_action_feedback", {}))
+                        action_messages[job_id] = {"kind": "error", "message": str(exc)}
+                        st.session_state["job_action_feedback"] = action_messages
+                    st.rerun()
             if state == "succeeded":
                 result = result_cache.get(job_id, {})
                 paths = list(result.get("paths", [])) if isinstance(result, dict) else []

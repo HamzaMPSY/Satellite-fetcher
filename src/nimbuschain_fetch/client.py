@@ -25,6 +25,7 @@ from nimbuschain_fetch.models import (
     JobListResponse,
     JobMaskRequest,
     JobMaskResponse,
+    JobResumeResponse,
     JobResultResponse,
     JobStatusResponse,
     JobWaterMaskRequest,
@@ -151,6 +152,16 @@ class NimbusFetcherClient(AbstractContextManager["NimbusFetcherClient"]):
         response = self._session.get(f"{self.service_url}/v1/jobs/{job_id}/result", timeout=30)
         response.raise_for_status()
         return JobResultResponse.model_validate(response.json())
+
+    def resume_job(self, job_id: str) -> JobResumeResponse:
+        if self.mode == "direct":
+            assert self._portal and self._fetcher
+            return self._portal.call(self._fetcher.resume_job, job_id)
+
+        assert self._session is not None
+        response = self._session.post(f"{self.service_url}/v1/jobs/{job_id}/resume", timeout=60)
+        response.raise_for_status()
+        return JobResumeResponse.model_validate(response.json())
 
     def convert_job_output(self, job_id: str, request: JobConvertRequest | dict[str, Any]) -> JobStatusResponse:
         payload = JobConvertRequest.model_validate(request)

@@ -244,6 +244,10 @@ class JobStatusResponse(BaseModel):
     finished_at: datetime | None = None
     duration_seconds: float | None = None
     errors: list[str] = Field(default_factory=list)
+    can_resume: bool = False
+    resume_action: str | None = None
+    resume_label: str | None = None
+    resume_reason: str | None = None
     provider: ProviderName
     collection: str
 
@@ -341,6 +345,16 @@ class JobWaterMaskResponse(JobMaskResponse):
 
 class JobCloudMaskResponse(JobMaskResponse):
     pass
+
+
+class JobResumeResponse(BaseModel):
+    source_job_id: str
+    resumed_job_id: str
+    resume_action: str
+    resume_label: str
+    spawned_new_job: bool = False
+    message: str
+    job: JobStatusResponse
 
 
 class JobListResponse(BaseModel):
