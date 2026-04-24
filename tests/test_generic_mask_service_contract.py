@@ -821,13 +821,26 @@ def test_omnicloudmask_backend_treats_shadow_class_as_masked_obstruction(
 def test_mask_service_client_maps_fetcher_kwargs_to_mask_contract() -> None:
     captured: dict[str, object] = {}
 
-    class FakeService:
-        def apply_masks_to_zarr(self, **kwargs: object) -> dict[str, object]:
-            captured.update(kwargs)
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
             return {"status": "written", "masked_zarr_uri": "/tmp/output.zarr"}
 
-    client = MaskServiceClient(service_url=None)
-    client._service = FakeService()  # type: ignore[assignment]
+    class _FakeSession:
+        def post(self, url: str, *, json: dict[str, object], timeout, params=None):  # noqa: A002
+            captured["url"] = url
+            captured["payload"] = dict(json)
+            captured["timeout"] = timeout
+            captured["params"] = params
+            return _FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    client = MaskServiceClient(service_url="http://nimbus-mask:8020")
+    client._session = _FakeSession()
 
     def _stage_callback(_stage: str, _payload: dict[str, object]) -> None:
         return None
@@ -854,29 +867,42 @@ def test_mask_service_client_maps_fetcher_kwargs_to_mask_contract() -> None:
     )
 
     assert result["status"] == "written"
-    assert captured["job_id"] == "job-mask-client"
-    assert captured["zarr_uri"] == "/tmp/source.zarr"
-    assert captured["provider"] == "copernicus"
-    assert captured["collection"] == "SENTINEL-2"
-    assert captured["scene_id"] == "S2A_SCENE"
-    assert captured["mask_types"] == ["water", "cloud"]
-    assert captured["backend"] == "auto"
-    assert captured["threshold"] == 0.62
-    assert captured["include_shadows"] is True
-    assert captured["water_backend"] == "auto"
-    assert callable(captured["stage_callback"])
+    assert captured["url"] == "http://nimbus-mask:8020/apply"
+    assert captured["params"] == {"job_id": "job-mask-client"}
+    assert captured["timeout"] == (30, None)
+    payload = dict(captured["payload"])
+    assert payload["source_zarr_uri"] == "/tmp/source.zarr"
+    assert payload["provider"] == "copernicus"
+    assert payload["collection"] == "SENTINEL-2"
+    assert payload["scene_id"] == "S2A_SCENE"
+    assert payload["mask_types"] == ["water", "cloud"]
+    assert dict(payload["cloud"])["backend"] == "auto"
+    assert dict(payload["cloud"])["threshold"] == 0.62
+    assert dict(payload["cloud"])["include_shadows"] is True
+    assert dict(payload["water"])["backend"] == "auto"
 
 
 def test_mask_service_client_legacy_heuristic_backend_populates_water_backend() -> None:
     captured: dict[str, object] = {}
 
-    class FakeService:
-        def apply_masks_to_zarr(self, **kwargs: object) -> dict[str, object]:
-            captured.update(kwargs)
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
             return {"status": "written", "masked_zarr_uri": "/tmp/output.zarr"}
 
-    client = MaskServiceClient(service_url=None)
-    client._service = FakeService()  # type: ignore[assignment]
+    class _FakeSession:
+        def post(self, url: str, *, json: dict[str, object], timeout, params=None):  # noqa: A002
+            captured["url"] = url
+            captured["payload"] = dict(json)
+            return _FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    client = MaskServiceClient(service_url="http://nimbus-mask:8020")
+    client._session = _FakeSession()
 
     result = client.apply_masks_to_zarr(
         zarr_uri="/tmp/source.zarr",
@@ -891,8 +917,9 @@ def test_mask_service_client_legacy_heuristic_backend_populates_water_backend() 
     )
 
     assert result["status"] == "written"
-    assert captured["backend"] == "omnicloudmask"
-    assert captured["water_backend"] == "heuristic"
+    payload = dict(captured["payload"])
+    assert dict(payload["cloud"])["backend"] == "omnicloudmask"
+    assert dict(payload["water"])["backend"] == "heuristic"
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ import os
 from typing import Any
 
 from nimbuschain_mask_service.runtime import normalize_device_name
-from nimbuschain_zarr_service.config_loader import target_pixel_size_for
+from nimbuschain_shared.resolution import target_pixel_size_for
 
 _CLOUD_PATCH_QUANTUM = 256
 _DEFAULT_WATER_PATCH_SIZE = 512

@@ -5,9 +5,9 @@ import json
 import sys
 from typing import Any
 
-from nimbuschain_mask_service.client import MaskServiceClient
+from nimbuschain_shared.clients.mask import MaskServiceClient
 from nimbuschain_mask_service.io import open_zarr_group, read_context
-from nimbuschain_zarr_service.core import ConversionError
+from nimbuschain_shared.zarr import ConversionError
 
 
 def _json_default(value: Any) -> Any:
@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collection", default=None)
     parser.add_argument("--product-type", default=None)
     parser.add_argument("--scene-id", default=None)
-    parser.add_argument("--service-url", default=None, help="Optional remote mask service base URL.")
+    parser.add_argument("--service-url", required=True, help="Remote mask service base URL.")
     parser.add_argument("--cloud-backend", default="auto", choices=["auto", "omnicloudmask"])
     parser.add_argument("--cloud-threshold", type=float, default=0.45)
     parser.add_argument("--cloud-overwrite", action=argparse.BooleanOptionalAction, default=True)
@@ -78,7 +78,7 @@ def run(args: argparse.Namespace) -> int:
             "Either pass them explicitly or ensure the source Zarr attrs include them."
         )
 
-    client = MaskServiceClient(service_url=str(args.service_url or "").strip() or None)
+    client = MaskServiceClient(service_url=str(args.service_url or "").strip())
     try:
         result = client.apply_masks_to_zarr(
             zarr_uri=str(args.source_zarr_uri).strip(),

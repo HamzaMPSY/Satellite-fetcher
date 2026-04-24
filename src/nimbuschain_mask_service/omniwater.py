@@ -37,7 +37,7 @@ from nimbuschain_mask_service.writers import (
     prepare_water_output_arrays,
     write_water_mask_to_zarr,
 )
-from nimbuschain_zarr_service.core import ConversionDependencyError, ConversionError
+from nimbuschain_shared.zarr import ConversionDependencyError, ConversionError
 
 
 _S2_INPUT_BANDS = ["B04", "B03", "B02", "B08"]

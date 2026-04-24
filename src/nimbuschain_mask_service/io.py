@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlparse
 
 import numpy as np
 
-from nimbuschain_zarr_service.core import ConversionError
+from nimbuschain_shared.zarr import ConversionError
 
 
 @dataclass(frozen=True)

@@ -16,7 +16,12 @@ from nimbuschain_mask_service.schema import (
     WATER_MASK_PATH,
     WATER_PROBABILITY_PATH,
 )
-from nimbuschain_zarr_service.core import ChunkShape, ConversionDependencyError, ConversionError, _coerce_timestamp
+from nimbuschain_shared.zarr import (
+    ChunkShape,
+    ConversionDependencyError,
+    ConversionError,
+    _coerce_timestamp,
+)
 
 
 def _storage_mode_from_metadata(*, metadata: dict[str, Any] | None, output_uri: str) -> str:

@@ -66,10 +66,9 @@ from nimbuschain_fetch.security.paths import sanitize_output_dir
 from nimbuschain_fetch.jobs.store_factory import create_job_store
 from nimbuschain_fetch.settings import Settings, get_settings
 from nimbuschain_fetch.usgs_product_type import canonicalize_usgs_product_type
-from nimbuschain_mask_service.client import MaskServiceClient
-from nimbuschain_mask_service.runtime import normalize_device_name, resolve_inference_device
-from nimbuschain_zarr_service.cube import build_grouped_time_cubes
-from nimbuschain_zarr_service.service import ZarrConversionService
+from nimbuschain_shared.clients.mask import MaskServiceClient
+from nimbuschain_shared.clients.zarr import ZarrServiceClient
+from nimbuschain_shared.runtime import normalize_device_name, resolve_inference_device
 
 
 class JobNotFoundError(KeyError):
@@ -126,7 +125,7 @@ class NimbusFetcher:
         self._worker_started_at = datetime.now(timezone.utc).isoformat()
         self._cancel_check_cache: dict[str, tuple[float, bool]] = {}
         self._pipeline_update_lock = threading.RLock()
-        self._zarr_converter: ZarrConversionService | None = None
+        self._zarr_converter: Any | None = None
         self._mask_service: Any | None = None
         self._download_coordinator: DownloadCoordinator | None = None
         self._started = False
@@ -166,6 +165,9 @@ class NimbusFetcher:
         self._stop_worker_heartbeat_thread()
         if self._executor is not None:
             await self._executor.stop()
+        if self._zarr_converter is not None and hasattr(self._zarr_converter, "close"):
+            self._zarr_converter.close()
+            self._zarr_converter = None
         if self._mask_service is not None and hasattr(self._mask_service, "close"):
             self._mask_service.close()
             self._mask_service = None
@@ -1960,9 +1962,12 @@ class NimbusFetcher:
         self._cancel_check_cache[job_id] = (now + 0.5, is_cancelled)
         return is_cancelled
 
-    def _converter(self) -> ZarrConversionService:
+    def _converter(self) -> Any:
         if self._zarr_converter is None:
-            self._zarr_converter = ZarrConversionService()
+            service_url = str(self.settings.nimbus_zarr_service_url or "").strip()
+            if not service_url:
+                raise RuntimeError("Zarr service URL is not configured.")
+            self._zarr_converter = ZarrServiceClient(service_url=service_url)
         return self._zarr_converter
 
     def _update_pipeline(
@@ -2459,9 +2464,10 @@ class NimbusFetcher:
 
     def _masker(self) -> Any:
         if self._mask_service is None:
-            self._mask_service = MaskServiceClient(
-                service_url=self.settings.nimbus_mask_service_url,
-            )
+            service_url = str(self.settings.nimbus_mask_service_url or "").strip()
+            if not service_url:
+                raise RuntimeError("Mask service URL is not configured.")
+            self._mask_service = MaskServiceClient(service_url=service_url)
         return self._mask_service
 
     def _remote_mask_runtime(self) -> dict[str, Any]:
@@ -2707,9 +2713,12 @@ class NimbusFetcher:
             )
 
         try:
-            cube_summary = build_grouped_time_cubes(
-                source_zarr_outputs,
-                output_dir,
+            cube_summary = self._converter().build_grouped_cubes(
+                job_id=job_id,
+                pipeline_id=job_id,
+                trace_id=uuid.uuid4().hex,
+                source_zarr_uris=source_zarr_outputs,
+                output_dir=output_dir,
                 start_date=cube_start_date,
                 end_date=cube_end_date,
                 stage_label=cube_mode,
@@ -2869,53 +2878,7 @@ class NimbusFetcher:
         }
 
     def _inspect_zarr_dataset(self, zarr_uri: str) -> dict[str, Any]:
-        try:
-            import zarr
-        except Exception as exc:
-            raise ValueError(f"Unable to inspect existing Zarr output because zarr is unavailable ({exc}).") from exc
-
-        from nimbuschain_zarr_service.core import _open_existing_output_store
-
-        root = zarr.open_group(_open_existing_output_store(zarr_uri), mode="r")
-        imagery = root.get("imagery")
-        if imagery is None:
-            raise ValueError("The selected Zarr output does not contain an imagery array.")
-        band_names = list(root.attrs.get("band_names") or [])
-        if not band_names and "band" in root:
-            band_names = [str(item) for item in root["band"][:].tolist()]
-        acquisition_datetime = None
-        if "time" in root and len(root["time"]) > 0:
-            raw_time = root["time"][0]
-            acquisition_datetime = str(raw_time.item() if hasattr(raw_time, "item") else raw_time)
-        attrs = dict(root.attrs)
-        transform = list(attrs.get("transform") or [])
-        if len(transform) < 6 and "x" in root and "y" in root:
-            derived_transform = self._derive_transform_from_xy(
-                x_values=root["x"][:].tolist(),
-                y_values=root["y"][:].tolist(),
-            )
-            if derived_transform:
-                transform = derived_transform
-        crs = attrs.get("crs")
-        if not crs:
-            crs = self._infer_crs_from_scene_metadata(
-                scene_id=str(attrs.get("scene_id") or ""),
-                source_uri=str(attrs.get("source_uri") or zarr_uri),
-            )
-        return {
-            "dimensions": ["time", "band", "y", "x"],
-            "shape": list(imagery.shape),
-            "band_names": [str(item) for item in band_names],
-            "ancillary_layer_names": list(root.attrs.get("ancillary_layer_names") or []),
-            "acquisition_datetime": acquisition_datetime,
-            "crs": crs,
-            "transform": transform,
-            "dtype": str(attrs.get("dtype") or imagery.dtype),
-            "pixel_size": list(attrs.get("reference_pixel_size") or []),
-            "reference_pixel_size": list(attrs.get("reference_pixel_size") or []),
-            "band_metadata": dict(attrs.get("band_metadata") or {}),
-            "ancillary_metadata": dict(attrs.get("ancillary_metadata") or {}),
-        }
+        return self._converter().inspect_dataset(zarr_uri=zarr_uri)
 
     @staticmethod
     def _derive_transform_from_xy(*, x_values: list[Any], y_values: list[Any]) -> list[float]:
@@ -3077,6 +3040,7 @@ class NimbusFetcher:
     def _convert_single_raw_output(
         self,
         *,
+        job_id: str,
         provider_name: str,
         collection: str,
         product_type: str | None,
@@ -3087,6 +3051,9 @@ class NimbusFetcher:
     ) -> dict[str, Any]:
         converter = self._converter()
         convert_kwargs: dict[str, Any] = {
+            "job_id": job_id,
+            "pipeline_id": job_id,
+            "trace_id": uuid.uuid4().hex,
             "provider": provider_name,
             "collection": self._normalize_collection_for_zarr(provider_name, collection),
             "scene_id": scene_id,
@@ -3101,6 +3068,16 @@ class NimbusFetcher:
                 signature = None
             if signature is not None and "progress_callback" in signature.parameters:
                 convert_kwargs["progress_callback"] = progress_callback
+        try:
+            signature = inspect.signature(converter.convert)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None and not any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+        ):
+            convert_kwargs = {
+                key: value for key, value in convert_kwargs.items() if key in signature.parameters
+            }
         written_uri, data_family, conversion_summary, dataset_summary = converter.convert(**convert_kwargs)
         return {
             "raw_uri": raw_uri,
@@ -3225,6 +3202,7 @@ class NimbusFetcher:
                     parallel_workers=max_workers,
                 )
                 converted = self._convert_single_raw_output(
+                    job_id=job_id,
                     provider_name=provider_name,
                     collection=collection,
                     product_type=product_type,
@@ -3406,6 +3384,7 @@ class NimbusFetcher:
             future_to_item = {
                 executor.submit(
                     self._convert_single_raw_output,
+                    job_id=job_id,
                     provider_name=provider_name,
                     collection=collection,
                     product_type=product_type,

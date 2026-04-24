@@ -6,12 +6,21 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
+from nimbuschain_shared.contracts.zarr import (
+    BuildCubeRequest,
+    BuildCubeResponse,
+    BuildGroupedCubesRequest,
+    BuildGroupedCubesResponse,
+    ConvertRequest,
+    ConvertResponse,
+    InspectDatasetRequest,
+    InspectDatasetResponse,
+)
 from nimbuschain_zarr_service.config_loader import (
     _config_candidates,
     load_converter_config,
@@ -23,6 +32,7 @@ from nimbuschain_zarr_service.middleware import RequestTelemetryMiddleware
 from nimbuschain_zarr_service.oci_storage import oci_support_status
 from nimbuschain_zarr_service.sentinel1_raw import raw_support_status
 from nimbuschain_zarr_service.snap_runtime import snap_support_status
+from nimbuschain_zarr_service.cube import build_grouped_time_cubes, build_time_cube
 from nimbuschain_zarr_service.schema import default_zarr_model
 from nimbuschain_zarr_service.service import ZarrConversionService
 
@@ -37,37 +47,6 @@ configure_logging(
     json_logs=str(os.getenv("NIMBUS_LOG_JSON") or "").strip().lower() in {"1", "true", "yes", "on"},
 )
 logger = logging.getLogger("nimbus.zarr")
-
-
-class ConvertRequest(BaseModel):
-    job_id: str = Field(..., min_length=1)
-    pipeline_id: str = Field(..., min_length=1)
-    trace_id: str = Field(..., min_length=1)
-    provider: Literal["copernicus", "usgs"]
-    collection: str = Field(..., min_length=1)
-    product_type: str | None = None
-    scene_id: str = Field(..., min_length=1)
-    raw_uri: str = Field(..., min_length=1)
-    raw_format: str = Field(..., min_length=1)
-    output_uri: str = Field(..., min_length=1)
-
-
-class ConvertResponse(BaseModel):
-    job_id: str
-    pipeline_id: str
-    status: Literal["accepted", "normalized", "written"]
-    stage: Literal["zarr_converting"]
-    service: Literal["zarr-converter-service"]
-    message: str
-    accepted_at: str
-    zarr_uri: str | None = None
-    data_family: str | None = None
-    band_names: list[str] | None = None
-    dimensions: list[str] | None = None
-    ancillary_layer_names: list[str] | None = None
-    ancillary_dimensions: list[str] | None = None
-    normalization_summary: dict[str, object] | None = None
-
 
 app = FastAPI(
     title="Nimbus Zarr Converter Service",
@@ -305,6 +284,174 @@ def convert(payload: ConvertRequest, request: Request) -> ConvertResponse:
     )
 
 
+@app.post("/cubes/grouped/build", response_model=BuildGroupedCubesResponse)
+def build_grouped_cubes(payload: BuildGroupedCubesRequest, request: Request) -> BuildGroupedCubesResponse:
+    from nimbuschain_zarr_service.core import (
+        ConversionDependencyError,
+        ConversionError,
+    )
+
+    request_id = getattr(request.state, "request_id", None)
+    logger.info(
+        "grouped_cube_build_requested job_id=%s pipeline_id=%s source_count=%s output_dir=%s stage_label=%s",
+        payload.job_id,
+        payload.pipeline_id,
+        len(payload.source_zarr_uris),
+        payload.output_dir,
+        payload.stage_label,
+        extra={"request_id": request_id},
+    )
+    try:
+        cube_summary = build_grouped_time_cubes(
+            list(payload.source_zarr_uris),
+            payload.output_dir,
+            include_ancillary=bool(payload.include_ancillary),
+            include_masks=payload.include_masks,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            stage_label=payload.stage_label,
+        )
+    except ConversionError as exc:
+        logger.warning(
+            "grouped_cube_build_rejected job_id=%s pipeline_id=%s reason=%s",
+            payload.job_id,
+            payload.pipeline_id,
+            str(exc),
+            extra={"request_id": request_id},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ConversionDependencyError as exc:
+        logger.exception(
+            "grouped_cube_build_runtime_error job_id=%s pipeline_id=%s",
+            payload.job_id,
+            payload.pipeline_id,
+            extra={"request_id": request_id},
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception:
+        logger.exception(
+            "grouped_cube_build_unhandled_error job_id=%s pipeline_id=%s",
+            payload.job_id,
+            payload.pipeline_id,
+            extra={"request_id": request_id},
+        )
+        raise
+
+    logger.info(
+        "grouped_cube_build_completed job_id=%s pipeline_id=%s status=%s outputs=%s",
+        payload.job_id,
+        payload.pipeline_id,
+        cube_summary.get("status"),
+        len(list(cube_summary.get("cube_outputs") or [])),
+        extra={"request_id": request_id},
+    )
+    return BuildGroupedCubesResponse(
+        job_id=payload.job_id,
+        pipeline_id=payload.pipeline_id,
+        status=str(cube_summary.get("status") or "skipped"),
+        service="zarr-converter-service",
+        cube_summary=cube_summary,
+    )
+
+
+@app.post("/cubes/build", response_model=BuildCubeResponse)
+def build_cube(payload: BuildCubeRequest, request: Request) -> BuildCubeResponse:
+    from nimbuschain_zarr_service.core import (
+        ConversionDependencyError,
+        ConversionError,
+    )
+
+    request_id = getattr(request.state, "request_id", None)
+    logger.info(
+        "cube_build_requested job_id=%s pipeline_id=%s source_count=%s output_uri=%s",
+        payload.job_id,
+        payload.pipeline_id,
+        len(payload.source_zarr_uris),
+        payload.output_uri,
+        extra={"request_id": request_id},
+    )
+    try:
+        cube_summary = build_time_cube(
+            list(payload.source_zarr_uris),
+            payload.output_uri,
+            include_ancillary=bool(payload.include_ancillary),
+            include_masks=bool(payload.include_masks),
+        )
+    except ConversionError as exc:
+        logger.warning(
+            "cube_build_rejected job_id=%s pipeline_id=%s reason=%s",
+            payload.job_id,
+            payload.pipeline_id,
+            str(exc),
+            extra={"request_id": request_id},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ConversionDependencyError as exc:
+        logger.exception(
+            "cube_build_runtime_error job_id=%s pipeline_id=%s",
+            payload.job_id,
+            payload.pipeline_id,
+            extra={"request_id": request_id},
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception:
+        logger.exception(
+            "cube_build_unhandled_error job_id=%s pipeline_id=%s",
+            payload.job_id,
+            payload.pipeline_id,
+            extra={"request_id": request_id},
+        )
+        raise
+
+    logger.info(
+        "cube_build_completed job_id=%s pipeline_id=%s zarr_uri=%s",
+        payload.job_id,
+        payload.pipeline_id,
+        cube_summary.get("zarr_uri"),
+        extra={"request_id": request_id},
+    )
+    return BuildCubeResponse(
+        job_id=payload.job_id,
+        pipeline_id=payload.pipeline_id,
+        status="written",
+        service="zarr-converter-service",
+        cube_summary=cube_summary,
+    )
+
+
+@app.post("/inspect-dataset", response_model=InspectDatasetResponse)
+def inspect_dataset(payload: InspectDatasetRequest, request: Request) -> InspectDatasetResponse:
+    request_id = getattr(request.state, "request_id", None)
+    logger.info(
+        "dataset_inspection_requested zarr_uri=%s",
+        payload.zarr_uri,
+        extra={"request_id": request_id},
+    )
+    try:
+        dataset_summary = _inspect_dataset_summary(payload.zarr_uri)
+    except ValueError as exc:
+        logger.warning(
+            "dataset_inspection_rejected zarr_uri=%s reason=%s",
+            payload.zarr_uri,
+            str(exc),
+            extra={"request_id": request_id},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        logger.exception(
+            "dataset_inspection_unhandled_error zarr_uri=%s",
+            payload.zarr_uri,
+            extra={"request_id": request_id},
+        )
+        raise
+
+    return InspectDatasetResponse(
+        service="zarr-converter-service",
+        zarr_uri=payload.zarr_uri,
+        dataset_summary=dataset_summary,
+    )
+
+
 def run() -> None:
     import uvicorn
 
@@ -459,3 +606,64 @@ def _check_smoke_zarr_write() -> dict[str, object]:
                 shutil.rmtree(probe_dir)
             except Exception:
                 pass
+
+
+def _inspect_dataset_summary(zarr_uri: str) -> dict[str, Any]:
+    try:
+        import zarr
+    except Exception as exc:
+        raise ValueError(f"Unable to inspect existing Zarr output because zarr is unavailable ({exc}).") from exc
+
+    from nimbuschain_zarr_service.core import _open_existing_output_store
+
+    root = zarr.open_group(_open_existing_output_store(zarr_uri), mode="r")
+    imagery = root.get("imagery")
+    if imagery is None:
+        raise ValueError("The selected Zarr output does not contain an imagery array.")
+    band_names = list(root.attrs.get("band_names") or [])
+    if not band_names and "band" in root:
+        band_names = [str(item) for item in root["band"][:].tolist()]
+    acquisition_datetime = None
+    if "time" in root and len(root["time"]) > 0:
+        raw_time = root["time"][0]
+        acquisition_datetime = str(raw_time.item() if hasattr(raw_time, "item") else raw_time)
+    attrs = dict(root.attrs)
+    transform = list(attrs.get("transform") or [])
+    if len(transform) < 6 and "x" in root and "y" in root:
+        derived_transform = _derive_transform_from_xy(
+            x_values=root["x"][:].tolist(),
+            y_values=root["y"][:].tolist(),
+        )
+        if derived_transform:
+            transform = derived_transform
+    return {
+        "dimensions": ["time", "band", "y", "x"],
+        "shape": list(imagery.shape),
+        "band_names": [str(item) for item in band_names],
+        "ancillary_layer_names": list(root.attrs.get("ancillary_layer_names") or []),
+        "acquisition_datetime": acquisition_datetime,
+        "crs": attrs.get("crs"),
+        "transform": transform,
+        "dtype": str(attrs.get("dtype") or imagery.dtype),
+        "pixel_size": list(attrs.get("reference_pixel_size") or []),
+        "reference_pixel_size": list(attrs.get("reference_pixel_size") or []),
+        "band_metadata": dict(attrs.get("band_metadata") or {}),
+        "ancillary_metadata": dict(attrs.get("ancillary_metadata") or {}),
+    }
+
+
+def _derive_transform_from_xy(*, x_values: list[Any], y_values: list[Any]) -> list[float]:
+    if len(x_values) < 2 or len(y_values) < 2:
+        return []
+    try:
+        x0 = float(x_values[0])
+        x1 = float(x_values[1])
+        y0 = float(y_values[0])
+        y1 = float(y_values[1])
+    except (TypeError, ValueError):
+        return []
+    x_res = x1 - x0
+    y_res = y1 - y0
+    if x_res == 0.0 or y_res == 0.0:
+        return []
+    return [x_res, 0.0, x0 - (x_res / 2.0), 0.0, y_res, y0 - (y_res / 2.0)]

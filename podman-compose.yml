@@ -6,7 +6,8 @@ x-runtime-env: &runtime-env
   NIMBUS_MONGODB_DB: ${NIMBUS_MONGODB_DB:-nimbuschain_fetch}
   NIMBUS_DATA_DIR: /data/downloads
   NIMBUS_ZARRMASK_DIR: /data/downloads/zarrmask
-  NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-http://nimbus-mask:8020}
+  NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-}
+  NIMBUS_ZARR_SERVICE_URL: ${NIMBUS_ZARR_SERVICE_URL:-}
   NIMBUS_MAX_JOBS: ${NIMBUS_MAX_JOBS:-4}
   NIMBUS_LOG_LEVEL: ${NIMBUS_LOG_LEVEL:-INFO}
   NIMBUS_LOG_JSON: ${NIMBUS_LOG_JSON:-false}
@@ -25,7 +26,6 @@ x-runtime-env: &runtime-env
 x-runtime-volumes: &runtime-volumes
   - ./data:/data
   - ./docs:/app/docs:ro
-  - ./src:/app/src
 
 services:
   mongodb:
@@ -74,7 +74,7 @@ services:
     depends_on:
       - mongodb
       - nimbus-mask
-    command: ["nimbuschain-worker"]
+    command: ["python", "-m", "nimbuschain_fetch.worker"]
     restart: unless-stopped
     environment:
       <<: *runtime-env
@@ -106,7 +106,6 @@ services:
       NIMBUS_USGS_USERNAME: ${NIMBUS_USGS_USERNAME:-}
       NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
     volumes:
-      - ./src:/app/src
       - ./data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501')"]
@@ -128,7 +127,6 @@ services:
       NIMBUS_DATA_DIR: /data/downloads
       PYTHONPATH: /app/src
     volumes:
-      - ./src:/app/src
       - ./data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8010/readiness'))"]

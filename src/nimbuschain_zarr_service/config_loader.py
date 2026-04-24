@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from nimbuschain_shared.resolution import target_pixel_size_for as shared_target_pixel_size_for
 
 
 def _config_candidates() -> list[Path]:
@@ -40,11 +41,7 @@ def collection_resolution_policy(provider: str, collection: str) -> dict[str, An
 
 
 def target_pixel_size_for(provider: str, collection: str) -> float | None:
-    entry = collection_resolution_policy(provider, collection)
-    value = entry.get("target_pixel_size_meters")
-    if value in (None, "", "native", "auto"):
-        return None
-    return float(value)
+    return shared_target_pixel_size_for(provider, collection)
 
 
 def supported_collections() -> dict[str, list[str]]:

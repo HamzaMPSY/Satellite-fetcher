@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Query
 import uvicorn
 
-from nimbuschain_mask_service.contracts import MaskApplyRequest
+from nimbuschain_shared.contracts.mask import MaskApplyRequest
 from nimbuschain_mask_service.progress import get_progress, update_progress
 from nimbuschain_mask_service.schema import default_mask_model
 from nimbuschain_mask_service.service import MaskService, support_status

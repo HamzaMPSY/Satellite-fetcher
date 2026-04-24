@@ -3,6 +3,7 @@ from __future__ import annotations
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
+import requests
 
 from nimbuschain_fetch.engine.nimbus_fetcher import JobNotFoundError, NimbusFetcher
 from nimbuschain_fetch.models import (
@@ -15,36 +16,82 @@ from nimbuschain_fetch.models import (
     JobWaterMaskRequest,
     JobWaterMaskResponse,
 )
-from nimbuschain_fetch.settings import get_settings
-from nimbuschain_mask_service.client import MaskServiceClient
-from nimbuschain_fetch_service.dependencies import get_fetcher
-from nimbuschain_zarr_service.main import (
-    health as converter_health,
-    readiness as converter_readiness,
-    schema as converter_schema,
-)
+from nimbuschain_fetch.settings import Settings
+from nimbuschain_shared.clients.mask import MaskServiceClient
+from nimbuschain_shared.clients.zarr import ZarrServiceClient
+from nimbuschain_fetch_service.dependencies import get_fetcher, get_runtime_settings
 
 router = APIRouter(prefix="/v1", tags=["converter"])
 
 
+def _require_mask_service_url(settings: Settings) -> str:
+    service_url = str(settings.nimbus_mask_service_url or "").strip()
+    if not service_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Mask service URL is not configured.",
+        )
+    return service_url
+
+
+def _require_zarr_service_url(settings: Settings) -> str:
+    service_url = str(settings.nimbus_zarr_service_url or "").strip()
+    if not service_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Zarr service URL is not configured.",
+        )
+    return service_url
+
+
 @router.get("/converter/health")
-def get_converter_health() -> JSONResponse:
-    return converter_health()
+def get_converter_health(settings: Settings = Depends(get_runtime_settings)) -> JSONResponse:
+    client = ZarrServiceClient(service_url=_require_zarr_service_url(settings))
+    try:
+        status_code, payload = client.health()
+        return JSONResponse(status_code=status_code, content=payload)
+    except (requests.RequestException, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Zarr service health request failed: {exc}",
+        ) from exc
+    finally:
+        client.close()
 
 
 @router.get("/converter/readiness")
-def get_converter_readiness() -> JSONResponse:
-    return converter_readiness()
+def get_converter_readiness(settings: Settings = Depends(get_runtime_settings)) -> JSONResponse:
+    client = ZarrServiceClient(service_url=_require_zarr_service_url(settings))
+    try:
+        status_code, payload = client.readiness()
+        return JSONResponse(status_code=status_code, content=payload)
+    except (requests.RequestException, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Zarr service readiness request failed: {exc}",
+        ) from exc
+    finally:
+        client.close()
 
 
 @router.get("/converter/schema")
-def get_converter_schema() -> dict[str, object]:
-    return converter_schema()
+def get_converter_schema(settings: Settings = Depends(get_runtime_settings)) -> JSONResponse:
+    client = ZarrServiceClient(service_url=_require_zarr_service_url(settings))
+    try:
+        status_code, payload = client.schema()
+        return JSONResponse(status_code=status_code, content=payload)
+    except (requests.RequestException, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Zarr service schema request failed: {exc}",
+        ) from exc
+    finally:
+        client.close()
 
 
 @router.get("/mask/health")
-def get_mask_health() -> dict[str, object]:
-    client = MaskServiceClient(service_url=get_settings().nimbus_mask_service_url)
+def get_mask_health(settings: Settings = Depends(get_runtime_settings)) -> dict[str, object]:
+    client = MaskServiceClient(service_url=_require_mask_service_url(settings))
     try:
         return client.health()
     finally:
@@ -52,8 +99,8 @@ def get_mask_health() -> dict[str, object]:
 
 
 @router.get("/mask/schema")
-def get_mask_schema() -> dict[str, object]:
-    client = MaskServiceClient(service_url=get_settings().nimbus_mask_service_url)
+def get_mask_schema(settings: Settings = Depends(get_runtime_settings)) -> dict[str, object]:
+    client = MaskServiceClient(service_url=_require_mask_service_url(settings))
     try:
         return client.schema()
     finally:

@@ -34,13 +34,13 @@ from nimbuschain_mask_service.tile_sizing import (
     cloud_tile_sizing_policy_status,
     water_tile_sizing_policy_status,
 )
+from nimbuschain_shared.zarr import ConversionError
 from nimbuschain_mask_service.writer import (
     finalize_cloud_outputs,
     prepare_cloud_output_arrays,
     write_cloud_outputs,
     write_water_mask_to_zarr,
 )
-from nimbuschain_zarr_service.core import ConversionError
 
 
 class MaskService:

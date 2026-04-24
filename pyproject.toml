@@ -69,7 +69,7 @@ nimbuschain-mask-service = "nimbuschain_mask_service.main:run"
 nimbuschain-mask-apply = "nimbuschain_mask_service.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service", "src/nimbuschain_mask_service"]
+packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service", "src/nimbuschain_mask_service", "src/nimbuschain_shared"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

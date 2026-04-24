@@ -33,6 +33,7 @@ class Settings(BaseSettings):
 
     nimbus_data_dir: Path = Field(default=Path("./data/downloads"), alias="NIMBUS_DATA_DIR")
     nimbus_mask_service_url: str | None = Field(default=None, alias="NIMBUS_MASK_SERVICE_URL")
+    nimbus_zarr_service_url: str | None = Field(default=None, alias="NIMBUS_ZARR_SERVICE_URL")
     nimbus_runtime_role: str = Field(default="all", alias="NIMBUS_RUNTIME_ROLE")
     nimbus_max_jobs: int = Field(default=4, alias="NIMBUS_MAX_JOBS", ge=1, le=128)
     nimbus_queue_poll_seconds: float = Field(
@@ -158,6 +159,7 @@ class Settings(BaseSettings):
         "nimbus_copernicus_download_url",
         "nimbus_usgs_service_url",
         "nimbus_mask_service_url",
+        "nimbus_zarr_service_url",
         mode="before",
     )
     @classmethod

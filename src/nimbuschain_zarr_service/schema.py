@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from nimbuschain_shared.zarr import ChunkShape, ZARR_FORMAT_VERSION
 
-ZARR_FORMAT_VERSION = 1
 DIMENSIONS = ("time", "band", "y", "x")
 ANCILLARY_DIMENSIONS = ("time", "ancillary_layer", "y", "x")
 REQUIRED_METADATA_FIELDS = (
@@ -17,15 +17,6 @@ REQUIRED_METADATA_FIELDS = (
     "band_names",
     "zarr_format_version",
 )
-
-
-@dataclass(frozen=True)
-class ChunkShape:
-    time: int = 1
-    band: int = 1
-    y: int = 1024
-    x: int = 1024
-
 
 @dataclass(frozen=True)
 class CompressionSpec:

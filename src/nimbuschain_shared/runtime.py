@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import importlib
 import os
 from typing import Any
 
-from nimbuschain_shared import runtime as _shared_runtime
-
-importlib = _shared_runtime.importlib
-
 
 def normalize_device_name(value: str | None) -> str:
-    return _shared_runtime.normalize_device_name(value)
+    normalized = str(value or "").strip().lower()
+    if normalized in {"", "auto"}:
+        return "auto"
+    if normalized in {"cuda", "gpu", "nvidia"}:
+        return "cuda"
+    if normalized in {"mps", "metal"}:
+        return "mps"
+    if normalized in {"cpu"}:
+        return "cpu"
+    return normalized
 
 
 def resolve_inference_device(*, explicit: str | None, env_var: str) -> str:
@@ -46,13 +52,14 @@ def parallel_worker_count(
     gpu_default: int = 1,
     hard_limit: int = 8,
 ) -> int:
-    return _shared_runtime.parallel_worker_count(
-        device=device,
-        env_var=env_var,
-        cpu_default=cpu_default,
-        gpu_default=gpu_default,
-        hard_limit=hard_limit,
-    )
+    raw = str(os.getenv(env_var) or "").strip()
+    try:
+        configured = int(raw) if raw else None
+    except ValueError:
+        configured = None
+    default_value = gpu_default if normalize_device_name(device) in {"cuda", "mps"} else cpu_default
+    value = configured if configured is not None else default_value
+    return max(1, min(int(value), hard_limit))
 
 
 def batch_size_for_device(
@@ -63,13 +70,14 @@ def batch_size_for_device(
     gpu_default: int = 2,
     hard_limit: int = 16,
 ) -> int:
-    return _shared_runtime.batch_size_for_device(
-        device=device,
-        env_var=env_var,
-        cpu_default=cpu_default,
-        gpu_default=gpu_default,
-        hard_limit=hard_limit,
-    )
+    raw = str(os.getenv(env_var) or "").strip()
+    try:
+        configured = int(raw) if raw else None
+    except ValueError:
+        configured = None
+    default_value = gpu_default if normalize_device_name(device) in {"cuda", "mps"} else cpu_default
+    value = configured if configured is not None else default_value
+    return max(1, min(int(value), hard_limit))
 
 
 def _auto_detect_device() -> str | None:
@@ -92,15 +100,22 @@ def _validated_device_choice(value: str) -> str:
 
 
 def _available_devices() -> dict[str, bool]:
-    return _shared_runtime._available_devices()
+    try:
+        torch = importlib.import_module("torch")
+    except Exception:
+        return {"cpu": True, "cuda": False, "mps": False}
 
+    cuda_available = False
+    try:
+        cuda_available = bool(getattr(torch.cuda, "is_available", lambda: False)())
+    except Exception:
+        cuda_available = False
 
-__all__ = [
-    "batch_size_for_device",
-    "normalize_device_name",
-    "parallel_worker_count",
-    "resolve_inference_device",
-    "runtime_device_status",
-    "importlib",
-    "_available_devices",
-]
+    mps_available = False
+    try:
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps_backend is not None:
+            mps_available = bool(getattr(mps_backend, "is_available", lambda: False)())
+    except Exception:
+        mps_available = False
+    return {"cpu": True, "cuda": cuda_available, "mps": mps_available}

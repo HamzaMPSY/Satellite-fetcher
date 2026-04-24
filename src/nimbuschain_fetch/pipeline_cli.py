@@ -5,11 +5,12 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+import uuid
 
-from nimbuschain_mask_service.client import MaskServiceClient
-from nimbuschain_zarr_service.cube import build_grouped_time_cubes, build_time_cube
-from nimbuschain_zarr_service.oci_storage import OCIStorageError, OCIStore, is_oci_uri, parse_oci_uri
-from nimbuschain_zarr_service.service import ZarrConversionService
+from nimbuschain_shared.clients.mask import MaskServiceClient
+from nimbuschain_shared.clients.zarr import ZarrServiceClient
+from nimbuschain_shared.oci import OCIStorageError, OCIStore, is_oci_uri, parse_oci_uri
+from nimbuschain_shared.zarr import ConversionError
 
 
 def _json_default(value: Any) -> Any:
@@ -85,6 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--product-type", default=None)
     parser.add_argument("--stage-dir", default="./data/downloads/staged")
     parser.add_argument("--zarr-dir", default="./data/downloads/zarr")
+    parser.add_argument("--zarr-service-url", required=True)
     parser.add_argument("--mask-types", default=None, help="Comma-separated: water,cloud")
     parser.add_argument("--mask-service-url", default=None)
     parser.add_argument(
@@ -111,11 +113,18 @@ def run(args: argparse.Namespace) -> int:
     cube_mode, legacy_grouped_mode = _normalize_cube_mode(args.cube_mode)
     grouped_cube_build = bool(args.group_by_tile or legacy_grouped_mode)
 
-    converter = ZarrConversionService()
+    zarr_service_url = str(args.zarr_service_url or "").strip()
+    if not zarr_service_url:
+        raise ValueError("zarr_service_url is required.")
+
+    converter = ZarrServiceClient(service_url=zarr_service_url)
     mask_client: MaskServiceClient | None = None
     requested_mask_types = _mask_types(args.mask_types)
     if requested_mask_types:
-        mask_client = MaskServiceClient(service_url=str(args.mask_service_url or "").strip() or None)
+        mask_service_url = str(args.mask_service_url or "").strip()
+        if not mask_service_url:
+            raise ValueError("mask_service_url is required when masking is enabled.")
+        mask_client = MaskServiceClient(service_url=mask_service_url)
 
     raw_items: list[dict[str, Any]] = []
     converted_items: list[dict[str, Any]] = []
@@ -128,6 +137,9 @@ def run(args: argparse.Namespace) -> int:
             scene_id = _scene_id_from_uri(local_raw_uri)
             output_uri = str((zarr_dir / f"{scene_id}.zarr").resolve())
             written_uri, data_family, summary, dataset_summary = converter.convert(
+                job_id=scene_id,
+                pipeline_id=scene_id,
+                trace_id=uuid.uuid4().hex,
                 provider=str(args.provider).strip().lower(),
                 collection=str(args.collection).strip(),
                 product_type=str(args.product_type).strip() or None if args.product_type is not None else None,
@@ -177,16 +189,22 @@ def run(args: argparse.Namespace) -> int:
                 raise ValueError(
                     "--cube-output-uri is required when building a single explicit cube."
                 )
-            cube_result = build_time_cube(
-                cube_source_uris,
-                str(args.cube_output_uri).strip(),
+            cube_result = converter.build_cube(
+                job_id="manual-cube-build",
+                pipeline_id="manual-cube-build",
+                trace_id=uuid.uuid4().hex,
+                source_zarr_uris=cube_source_uris,
+                output_uri=str(args.cube_output_uri).strip(),
                 include_ancillary=not bool(args.skip_ancillary),
                 include_masks=bool(args.include_masks_in_cube),
             )
         elif cube_mode != "none" and grouped_cube_build:
-            cube_result = build_grouped_time_cubes(
-                cube_source_uris,
-                str(args.cube_output_dir).strip(),
+            cube_result = converter.build_grouped_cubes(
+                job_id="manual-grouped-cube-build",
+                pipeline_id="manual-grouped-cube-build",
+                trace_id=uuid.uuid4().hex,
+                source_zarr_uris=cube_source_uris,
+                output_dir=str(args.cube_output_dir).strip(),
                 include_ancillary=not bool(args.skip_ancillary),
                 include_masks=bool(args.include_masks_in_cube),
                 stage_label=cube_mode,
@@ -210,6 +228,7 @@ def run(args: argparse.Namespace) -> int:
         )
         return 0
     finally:
+        converter.close()
         if mask_client is not None:
             mask_client.close()
 

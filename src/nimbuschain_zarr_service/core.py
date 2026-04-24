@@ -14,21 +14,19 @@ import zipfile
 
 import numpy as np
 
+from nimbuschain_shared.zarr import (
+    ChunkShape,
+    ConversionDependencyError,
+    ConversionError,
+    ZARR_FORMAT_VERSION,
+    _coerce_timestamp,
+)
 from nimbuschain_zarr_service.oci_storage import (
     OCIStorageError,
     OCIStore,
     is_oci_uri,
 )
-from nimbuschain_zarr_service.schema import ChunkShape, ZARR_FORMAT_VERSION
 from nimbuschain_zarr_service.utils.tile_math import TileMath
-
-
-class ConversionError(ValueError):
-    """Raised when the raw product cannot be converted."""
-
-
-class ConversionDependencyError(RuntimeError):
-    """Raised when a required runtime dependency is missing."""
 
 
 class CleanupBundle:
@@ -1127,18 +1125,6 @@ def _derive_spatial_coords(
     x = c + a * (np.arange(width, dtype=np.float64) + 0.5)
     y = f + e * (np.arange(height, dtype=np.float64) + 0.5)
     return x, y
-
-
-def _coerce_timestamp(value: str | None) -> datetime:
-    if not value:
-        return datetime.now(timezone.utc)
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return datetime.now(timezone.utc)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _band_nodata_value(src: Any, source_band_index: int) -> float | int | None:

@@ -10,12 +10,15 @@ WORKDIR /app
 
 RUN useradd --create-home --uid 10001 appuser
 
-COPY pyproject.toml README.md /app/
-COPY src /app/src
+COPY requirements/ui.txt /app/requirements/ui.txt
+COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
+COPY src/nimbuschain_fetch /app/src/nimbuschain_fetch
+COPY src/nimbuschain_fetch_ui /app/src/nimbuschain_fetch_ui
+COPY src/nimbuschain_shared /app/src/nimbuschain_shared
 COPY data/Landsat-tiles /app/data/Landsat-tiles
 COPY data/Sentinel-2-tiles /app/data/Sentinel-2-tiles
 
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir ".[ui]"
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r /app/requirements/ui.txt
 
 USER appuser
 

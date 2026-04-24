@@ -14,10 +14,13 @@ RUN apt-get update && \
 RUN useradd --create-home --uid 10001 appuser
 
 COPY pyproject.toml README.md /app/
-COPY src /app/src
+COPY requirements/zarr-service.txt /app/requirements/zarr-service.txt
+COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
+COPY src/nimbuschain_zarr_service /app/src/nimbuschain_zarr_service
+COPY src/nimbuschain_shared /app/src/nimbuschain_shared
 
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir ".[zarr-service]"
+    pip install --no-cache-dir -r /app/requirements/zarr-service.txt
 
 USER appuser
 
