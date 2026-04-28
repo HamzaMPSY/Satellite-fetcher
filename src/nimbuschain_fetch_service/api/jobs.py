@@ -5,7 +5,8 @@ from datetime import datetime
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from nimbuschain_fetch.engine.nimbus_fetcher import JobNotFoundError, NimbusFetcher
+from nimbuschain_fetch.application.api_services import JobControlService, JobQueryService, JobSubmissionService
+from nimbuschain_fetch.engine.nimbus_fetcher import JobNotFoundError
 from nimbuschain_fetch.models import ProviderName
 from nimbuschain_fetch.provider_status import get_provider_status
 from nimbuschain_fetch.models import (
@@ -19,7 +20,12 @@ from nimbuschain_fetch.models import (
     JobStatusResponse,
 )
 from nimbuschain_fetch.settings import Settings
-from nimbuschain_fetch_service.dependencies import get_fetcher, get_runtime_settings
+from nimbuschain_fetch_service.dependencies import (
+    get_job_control_service,
+    get_job_query_service,
+    get_job_submission_service,
+    get_runtime_settings,
+)
 from nimbuschain_fetch_service.observability import (
     record_job_cancellation,
     record_job_submission,
@@ -31,7 +37,7 @@ router = APIRouter(prefix="/v1", tags=["jobs"])
 @router.post("/jobs", response_model=JobCreatedResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     request: JobCreateRequest,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: JobSubmissionService = Depends(get_job_submission_service),
     settings: Settings = Depends(get_runtime_settings),
 ) -> JobCreatedResponse:
     _ensure_provider_submission_ready(request, settings)
@@ -43,7 +49,7 @@ async def create_job(
 @router.post("/jobs/batch", response_model=BatchJobCreatedResponse, status_code=status.HTTP_201_CREATED)
 async def create_batch_jobs(
     request: BatchJobCreateRequest,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: JobSubmissionService = Depends(get_job_submission_service),
     settings: Settings = Depends(get_runtime_settings),
 ) -> BatchJobCreatedResponse:
     for item in request.jobs:
@@ -57,7 +63,7 @@ async def create_batch_jobs(
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 def get_job(
     job_id: str,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: JobQueryService = Depends(get_job_query_service),
 ) -> JobStatusResponse:
     try:
         return fetcher.get_job(job_id)
@@ -68,11 +74,12 @@ def get_job(
 @router.delete("/jobs/{job_id}")
 async def cancel_job(
     job_id: str,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    query_service: JobQueryService = Depends(get_job_query_service),
+    control_service: JobControlService = Depends(get_job_control_service),
 ) -> dict[str, object]:
     try:
-        status = fetcher.get_job(job_id)
-        cancel_requested = await fetcher.cancel_job(job_id)
+        status = query_service.get_job(job_id)
+        cancel_requested = await control_service.cancel_job(job_id)
     except JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.") from exc
     if cancel_requested:
@@ -83,7 +90,7 @@ async def cancel_job(
 @router.post("/jobs/{job_id}/resume", response_model=JobResumeResponse)
 async def resume_job(
     job_id: str,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: JobControlService = Depends(get_job_control_service),
 ) -> JobResumeResponse:
     try:
         return await anyio.to_thread.run_sync(fetcher.resume_job, job_id)
@@ -95,7 +102,7 @@ async def resume_job(
 
 @router.post("/jobs/reset-active")
 async def reset_active_jobs(
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: JobControlService = Depends(get_job_control_service),
 ) -> dict[str, object]:
     return await fetcher.reset_runtime_state()
 
@@ -103,7 +110,7 @@ async def reset_active_jobs(
 @router.get("/jobs/{job_id}/result", response_model=JobResultResponse)
 def get_job_result(
     job_id: str,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: JobQueryService = Depends(get_job_query_service),
 ) -> JobResultResponse:
     try:
         return fetcher.get_result(job_id)
@@ -127,7 +134,7 @@ def list_jobs(
     sort_desc: bool = True,
     page: int = 1,
     page_size: int = 20,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: JobQueryService = Depends(get_job_query_service),
 ) -> JobListResponse:
     states = tuple(
         item.strip()

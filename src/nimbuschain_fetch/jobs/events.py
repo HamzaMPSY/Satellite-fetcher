@@ -24,16 +24,16 @@ async def stream_events(
     heartbeat_deadline = monotonic() + max(1.0, heartbeat_seconds)
 
     while True:
-        rows = store.list_events(job_id=job_id, since_id=cursor, limit=200)
+        rows = store.list_event_records(job_id=job_id, since_id=cursor, limit=200)
         if rows:
             for row in rows:
-                cursor = row["id"]
+                cursor = row.id
                 yield JobEvent(
-                    id=row["id"],
-                    job_id=row["job_id"],
-                    type=row["type"],
-                    timestamp=datetime.fromisoformat(row["timestamp"]),
-                    payload=row["payload"],
+                    id=row.id,
+                    job_id=row.job_id,
+                    type=row.type,
+                    timestamp=row.timestamp or datetime.now(timezone.utc),
+                    payload=row.payload,
                 )
             heartbeat_deadline = monotonic() + max(1.0, heartbeat_seconds)
             continue

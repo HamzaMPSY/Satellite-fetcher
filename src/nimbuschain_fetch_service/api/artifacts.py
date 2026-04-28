@@ -8,13 +8,13 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 
-from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
+from nimbuschain_fetch.application.api_services import ArtifactCatalogService
 from nimbuschain_fetch.models import (
     ArtifactListResponse,
     ArtifactRecord,
     ArtifactUpsertRequest,
 )
-from nimbuschain_fetch_service.dependencies import get_fetcher, get_runtime_settings
+from nimbuschain_fetch_service.dependencies import get_artifact_catalog_service, get_runtime_settings
 from nimbuschain_fetch.settings import Settings
 
 router = APIRouter(prefix="/v1", tags=["artifacts"])
@@ -250,7 +250,7 @@ def _matches_artifact_filters(
 @router.post("/artifacts", response_model=ArtifactRecord)
 def upsert_artifact(
     request: ArtifactUpsertRequest,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: ArtifactCatalogService = Depends(get_artifact_catalog_service),
 ) -> ArtifactRecord:
     payload = request.model_copy(update={"artifact_uri": request.artifact_uri.strip()})
     payload = payload.model_copy(
@@ -282,7 +282,7 @@ def list_artifacts(
     include_local: bool = False,
     page: int = 1,
     page_size: int = 20,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: ArtifactCatalogService = Depends(get_artifact_catalog_service),
     settings: Settings = Depends(get_runtime_settings),
 ) -> ArtifactListResponse:
     if include_local:

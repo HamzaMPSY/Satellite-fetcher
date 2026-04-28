@@ -6,6 +6,7 @@ from typing import Any
 
 import requests
 
+from nimbuschain_fetch.ports import MaskExecutionRequest
 from nimbuschain_shared.contracts.mask import MaskApplyRequest
 
 
@@ -92,6 +93,53 @@ class MaskServiceClient:
 
     def apply_masks_to_zarr(self, **kwargs: Any) -> dict[str, Any]:
         request, extras = self._coerce_apply_request(kwargs)
+        return self._apply_request(request, extras=extras)
+
+    def apply_mask_request(
+        self,
+        request: MaskExecutionRequest,
+        *,
+        job_id: str | None = None,
+        stage_callback: Any = None,
+    ) -> dict[str, Any]:
+        return self._apply_request(
+            MaskApplyRequest.model_validate(
+                {
+                    "source_zarr_uri": request.source_zarr_uri,
+                    "provider": request.provider,
+                    "collection": request.collection,
+                    "product_type": request.product_type,
+                    "scene_id": request.scene_id,
+                    "acquisition_datetime": request.acquisition_datetime,
+                    "dataset_summary": dict(request.dataset_summary or {}),
+                    "mask_types": list(request.mask_types or []),
+                    "fail_on_error": bool(request.fail_on_error),
+                    "cloud": {
+                        "backend": request.backend,
+                        "threshold": request.threshold,
+                        "overwrite": request.overwrite,
+                        "inference_device": request.inference_device,
+                        "include_shadows": request.include_shadows,
+                    },
+                    "water": {
+                        "backend": request.water_backend,
+                        "overwrite": request.water_overwrite,
+                        "inference_device": request.water_inference_device,
+                    },
+                }
+            ),
+            extras={
+                "job_id": job_id,
+                "stage_callback": stage_callback,
+            },
+        )
+
+    def _apply_request(
+        self,
+        request: MaskApplyRequest,
+        *,
+        extras: dict[str, Any],
+    ) -> dict[str, Any]:
         assert self._session is not None
         progress_stop = threading.Event()
         progress_thread: threading.Thread | None = None

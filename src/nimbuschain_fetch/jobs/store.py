@@ -4,6 +4,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
+from nimbuschain_fetch.domain.records import (
+    ArtifactRowRecord,
+    JobEventRecord,
+    JobResultRecord,
+    JobRowRecord,
+    WorkerHeartbeatRecord,
+)
+
 
 @dataclass(slots=True)
 class JobListFilters:
@@ -52,10 +60,16 @@ class JobStore(Protocol):
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         ...
 
+    def get_job_record(self, job_id: str) -> JobRowRecord | None:
+        ...
+
     def update_job(self, job_id: str, **fields: Any) -> None:
         ...
 
     def list_jobs(self, filters: JobListFilters) -> tuple[list[dict[str, Any]], int]:
+        ...
+
+    def list_job_records(self, filters: JobListFilters) -> tuple[list[JobRowRecord], int]:
         ...
 
     def append_event(
@@ -75,16 +89,36 @@ class JobStore(Protocol):
     ) -> list[dict[str, Any]]:
         ...
 
+    def list_event_records(
+        self,
+        job_id: str | None,
+        since_id: int | None,
+        limit: int = 200,
+    ) -> list[JobEventRecord]:
+        ...
+
     def set_result(self, job_id: str, result_payload: dict[str, Any]) -> None:
+        ...
+
+    def set_result_record(self, result: JobResultRecord) -> None:
         ...
 
     def get_result(self, job_id: str) -> dict[str, Any] | None:
         ...
 
+    def get_result_record(self, job_id: str) -> JobResultRecord | None:
+        ...
+
     def upsert_artifact(self, artifact_payload: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def upsert_artifact_record(self, artifact: ArtifactRowRecord) -> ArtifactRowRecord:
+        ...
+
     def list_artifacts(self, filters: ArtifactListFilters) -> tuple[list[dict[str, Any]], int]:
+        ...
+
+    def list_artifact_records(self, filters: ArtifactListFilters) -> tuple[list[ArtifactRowRecord], int]:
         ...
 
     def requeue_incomplete_jobs(self) -> list[str]:
@@ -99,7 +133,17 @@ class JobStore(Protocol):
     def upsert_worker_heartbeat(self, worker_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def upsert_worker_heartbeat_record(
+        self,
+        worker_id: str,
+        payload: dict[str, Any],
+    ) -> WorkerHeartbeatRecord:
+        ...
+
     def list_workers(self) -> list[dict[str, Any]]:
+        ...
+
+    def list_worker_records(self) -> list[WorkerHeartbeatRecord]:
         ...
 
     def prune_stale_workers(self, stale_after_seconds: int) -> int:

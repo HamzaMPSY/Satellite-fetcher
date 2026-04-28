@@ -5,8 +5,8 @@ import json
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
-from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
-from nimbuschain_fetch_service.dependencies import get_fetcher
+from nimbuschain_fetch.application.api_services import EventStreamService
+from nimbuschain_fetch_service.dependencies import get_event_stream_service
 
 router = APIRouter(prefix="/v1", tags=["events"])
 
@@ -15,7 +15,7 @@ router = APIRouter(prefix="/v1", tags=["events"])
 async def events(
     job_id: str | None = None,
     since: int | None = None,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: EventStreamService = Depends(get_event_stream_service),
 ) -> StreamingResponse:
     async def event_stream():
         async for event in fetcher.stream_events(job_id=job_id, since=since):

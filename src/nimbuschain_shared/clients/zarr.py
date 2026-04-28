@@ -5,6 +5,12 @@ from typing import Any
 
 import requests
 
+from nimbuschain_fetch.ports import (
+    CubeBuildRequest,
+    GroupedCubeBuildRequest,
+    ZarrConversionRequest,
+)
+
 
 class ZarrServiceClient:
     """Thin HTTP client for the standalone Zarr conversion service."""
@@ -27,6 +33,23 @@ class ZarrServiceClient:
 
     def schema(self) -> tuple[int, dict[str, Any]]:
         return self._get_json("/schema")
+
+    def convert_request(
+        self,
+        request: ZarrConversionRequest,
+    ) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+        return self.convert(
+            job_id=request.job_id,
+            pipeline_id=request.pipeline_id,
+            trace_id=request.trace_id,
+            provider=request.provider,
+            collection=request.collection,
+            scene_id=request.scene_id,
+            raw_uri=request.raw_uri,
+            output_uri=request.output_uri,
+            product_type=request.product_type,
+            progress_callback=request.progress_callback,
+        )
 
     def convert(
         self,
@@ -116,6 +139,24 @@ class ZarrServiceClient:
             raise RuntimeError("Zarr service cube build response did not include cube_summary.")
         return summary
 
+    def build_grouped_cubes_request(
+        self,
+        request: GroupedCubeBuildRequest,
+    ) -> dict[str, Any]:
+        return self.build_grouped_cubes(
+            job_id=request.job_id,
+            pipeline_id=request.pipeline_id,
+            trace_id=request.trace_id,
+            source_zarr_uris=request.source_zarr_uris,
+            output_dir=request.output_dir,
+            include_ancillary=request.include_ancillary,
+            include_masks=request.include_masks,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            stage_label=request.stage_label,
+            progress_callback=request.progress_callback,
+        )
+
     def build_cube(
         self,
         *,
@@ -151,6 +192,21 @@ class ZarrServiceClient:
         if not summary:
             raise RuntimeError("Zarr service cube build response did not include cube_summary.")
         return summary
+
+    def build_cube_request(
+        self,
+        request: CubeBuildRequest,
+    ) -> dict[str, Any]:
+        return self.build_cube(
+            job_id=request.job_id,
+            pipeline_id=request.pipeline_id,
+            trace_id=request.trace_id,
+            source_zarr_uris=request.source_zarr_uris,
+            output_uri=request.output_uri,
+            include_ancillary=request.include_ancillary,
+            include_masks=request.include_masks,
+            progress_callback=request.progress_callback,
+        )
 
     def inspect_dataset(self, *, zarr_uri: str) -> dict[str, Any]:
         response = self._session.post(

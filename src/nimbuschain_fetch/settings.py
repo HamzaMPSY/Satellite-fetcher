@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     nimbus_mask_service_url: str | None = Field(default=None, alias="NIMBUS_MASK_SERVICE_URL")
     nimbus_zarr_service_url: str | None = Field(default=None, alias="NIMBUS_ZARR_SERVICE_URL")
     nimbus_runtime_role: str = Field(default="all", alias="NIMBUS_RUNTIME_ROLE")
+    nimbus_executor_backend: str = Field(default="inprocess", alias="NIMBUS_EXECUTOR_BACKEND")
     nimbus_max_jobs: int = Field(default=4, alias="NIMBUS_MAX_JOBS", ge=1, le=128)
     nimbus_queue_poll_seconds: float = Field(
         default=1.0,

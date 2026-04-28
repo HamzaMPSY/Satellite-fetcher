@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 
-from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
+from nimbuschain_fetch.application.api_services import JobQueryService
 from nimbuschain_fetch.models import JobState
 
 
@@ -59,7 +57,7 @@ def record_job_cancellation(provider: str) -> None:
     JOB_CANCELLATIONS_TOTAL.labels(provider=pr).inc()
 
 
-def update_job_state_gauges(fetcher: NimbusFetcher) -> None:
+def update_job_state_gauges(fetcher: JobQueryService) -> None:
     for state in JobState:
         response = fetcher.list_jobs(
             state=state.value,
@@ -72,7 +70,6 @@ def update_job_state_gauges(fetcher: NimbusFetcher) -> None:
         JOB_STATE_GAUGE.labels(state=state.value).set(float(response.total))
 
 
-def render_metrics(fetcher: NimbusFetcher) -> bytes:
+def render_metrics(fetcher: JobQueryService) -> bytes:
     update_job_state_gauges(fetcher)
     return generate_latest()
-

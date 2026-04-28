@@ -8,6 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from nimbuschain_fetch.domain.records import (
+    ArtifactRowRecord,
+    JobEventRecord,
+    JobResultRecord,
+    JobRowRecord,
+    WorkerHeartbeatRecord,
+)
 from nimbuschain_fetch.jobs.store import ArtifactListFilters, JobListFilters
 
 
@@ -282,6 +289,12 @@ class SQLiteJobStore:
             return None
         return self._row_to_job(row)
 
+    def get_job_record(self, job_id: str) -> JobRowRecord | None:
+        row = self.get_job(job_id)
+        if row is None:
+            return None
+        return JobRowRecord.from_row(row)
+
     def update_job(self, job_id: str, **fields: Any) -> None:
         if not fields:
             return
@@ -372,6 +385,10 @@ class SQLiteJobStore:
         total = int(total_row["n"]) if total_row else 0
         return [self._row_to_job(row) for row in rows], total
 
+    def list_job_records(self, filters: JobListFilters) -> tuple[list[JobRowRecord], int]:
+        rows, total = self.list_jobs(filters)
+        return [JobRowRecord.from_row(row) for row in rows], total
+
     def append_event(
         self,
         job_id: str,
@@ -430,6 +447,17 @@ class SQLiteJobStore:
             for row in rows
         ]
 
+    def list_event_records(
+        self,
+        job_id: str | None,
+        since_id: int | None,
+        limit: int = 200,
+    ) -> list[JobEventRecord]:
+        return [
+            JobEventRecord.from_row(row)
+            for row in self.list_events(job_id=job_id, since_id=since_id, limit=limit)
+        ]
+
     def set_result(self, job_id: str, result_payload: dict[str, Any]) -> None:
         now = self._utc_now()
         with self._lock:
@@ -445,6 +473,9 @@ class SQLiteJobStore:
             )
             self._conn.commit()
 
+    def set_result_record(self, result: JobResultRecord) -> None:
+        self.set_result(result.job_id, result.to_row())
+
     def get_result(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
@@ -453,6 +484,12 @@ class SQLiteJobStore:
         if not row:
             return None
         return json.loads(row["result_json"])
+
+    def get_result_record(self, job_id: str) -> JobResultRecord | None:
+        row = self.get_result(job_id)
+        if row is None:
+            return None
+        return JobResultRecord.from_row(job_id, row)
 
     @staticmethod
     def _row_to_artifact(row: sqlite3.Row) -> dict[str, Any]:
@@ -552,6 +589,9 @@ class SQLiteJobStore:
             ).fetchone()
         return self._row_to_artifact(row)
 
+    def upsert_artifact_record(self, artifact: ArtifactRowRecord) -> ArtifactRowRecord:
+        return ArtifactRowRecord.from_row(self.upsert_artifact(artifact.to_row()))
+
     def list_artifacts(self, filters: ArtifactListFilters) -> tuple[list[dict[str, Any]], int]:
         where: list[str] = []
         params: list[Any] = []
@@ -600,6 +640,10 @@ class SQLiteJobStore:
             ).fetchall()
         total = int(total_row["n"]) if total_row else 0
         return [self._row_to_artifact(row) for row in rows], total
+
+    def list_artifact_records(self, filters: ArtifactListFilters) -> tuple[list[ArtifactRowRecord], int]:
+        rows, total = self.list_artifacts(filters)
+        return [ArtifactRowRecord.from_row(row) for row in rows], total
 
     def requeue_incomplete_jobs(self) -> list[str]:
         """Requeue jobs left in running/cancel_requested states after restart."""
@@ -817,12 +861,22 @@ class SQLiteJobStore:
             raise RuntimeError(f"Failed to upsert worker heartbeat for '{worker_id}'.")
         return self._row_to_worker(row)
 
+    def upsert_worker_heartbeat_record(
+        self,
+        worker_id: str,
+        payload: dict[str, Any],
+    ) -> WorkerHeartbeatRecord:
+        return WorkerHeartbeatRecord.from_row(self.upsert_worker_heartbeat(worker_id, payload))
+
     def list_workers(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM workers ORDER BY last_seen_at DESC"
             ).fetchall()
         return [self._row_to_worker(row) for row in rows]
+
+    def list_worker_records(self) -> list[WorkerHeartbeatRecord]:
+        return [WorkerHeartbeatRecord.from_row(row) for row in self.list_workers()]
 
     def prune_stale_workers(self, stale_after_seconds: int) -> int:
         cutoff = (

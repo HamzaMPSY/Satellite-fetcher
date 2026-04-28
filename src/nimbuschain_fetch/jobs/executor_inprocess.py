@@ -48,11 +48,15 @@ class InProcessExecutor(ExecutorBackend):
         if not self._started:
             return
         self._started = False
+        current_loop = asyncio.get_running_loop()
+        current_loop_tasks: list[asyncio.Task[None]] = []
         for task in self._workers:
             task.cancel()
-        if self._workers:
+            if task.get_loop() is current_loop:
+                current_loop_tasks.append(task)
+        if current_loop_tasks:
             try:
-                await asyncio.gather(*self._workers, return_exceptions=True)
+                await asyncio.gather(*current_loop_tasks, return_exceptions=True)
             except RuntimeError:
                 # Defensive guard for teardown paths where the event loop is already closing.
                 pass

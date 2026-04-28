@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 import requests
 
-from nimbuschain_fetch.engine.nimbus_fetcher import JobNotFoundError, NimbusFetcher
+from nimbuschain_fetch.application.api_services import ConversionService
+from nimbuschain_fetch.engine.nimbus_fetcher import JobNotFoundError
 from nimbuschain_fetch.models import (
     JobCloudMaskRequest,
     JobCloudMaskResponse,
@@ -19,7 +20,7 @@ from nimbuschain_fetch.models import (
 from nimbuschain_fetch.settings import Settings
 from nimbuschain_shared.clients.mask import MaskServiceClient
 from nimbuschain_shared.clients.zarr import ZarrServiceClient
-from nimbuschain_fetch_service.dependencies import get_fetcher, get_runtime_settings
+from nimbuschain_fetch_service.dependencies import get_conversion_service, get_runtime_settings
 
 router = APIRouter(prefix="/v1", tags=["converter"])
 
@@ -111,7 +112,7 @@ def get_mask_schema(settings: Settings = Depends(get_runtime_settings)) -> dict[
 async def convert_job_output(
     job_id: str,
     request: JobConvertRequest,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: ConversionService = Depends(get_conversion_service),
 ) -> JobStatusResponse:
     try:
         return await anyio.to_thread.run_sync(fetcher.convert_existing_job, job_id, request)
@@ -125,7 +126,7 @@ async def convert_job_output(
 async def mask_job_output(
     job_id: str,
     request: JobMaskRequest,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: ConversionService = Depends(get_conversion_service),
 ) -> JobMaskResponse:
     try:
         return await anyio.to_thread.run_sync(fetcher.apply_mask_existing_job, job_id, request)
@@ -142,7 +143,7 @@ async def mask_job_output(
 async def watermask_job_output(
     job_id: str,
     request: JobWaterMaskRequest,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: ConversionService = Depends(get_conversion_service),
 ) -> JobWaterMaskResponse:
     try:
         return await anyio.to_thread.run_sync(fetcher.apply_watermask_existing_job, job_id, request)
@@ -158,7 +159,7 @@ async def watermask_job_output(
 async def cloudmask_job_output(
     job_id: str,
     request: JobCloudMaskRequest,
-    fetcher: NimbusFetcher = Depends(get_fetcher),
+    fetcher: ConversionService = Depends(get_conversion_service),
 ) -> JobCloudMaskResponse:
     try:
         return await anyio.to_thread.run_sync(fetcher.apply_cloud_mask_existing_job, job_id, request)
