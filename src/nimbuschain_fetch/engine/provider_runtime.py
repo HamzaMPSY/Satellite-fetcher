@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
-from nimbuschain_fetch.download.download_manager import DownloadManager
 from nimbuschain_fetch.geometry.aoi import parse_aoi
 from nimbuschain_fetch.models import DownloadProductsRequest, JobCreateRequest, PipelineState, SearchDownloadRequest
 
@@ -16,46 +15,32 @@ def run_provider_job(
     progress_callback: Any,
     retry_callback: Any,
     is_cancelled: Any,
-    download_manager_cls: type[DownloadManager] = DownloadManager,
+    download_manager_cls: type[Any],
 ) -> dict[str, Any]:
     provider_name = rt._provider_name(request.provider)
     download_strategy = str(getattr(request, "download_strategy", "default") or "default").strip().lower() or "default"
     data_plane_limit = rt.settings.provider_data_plane_limits_map.get(provider_name, 1)
-
-    download_manager_kwargs: dict[str, Any] = dict(
-        max_concurrent=data_plane_limit,
+    download_manager = rt._build_provider_download_manager(
+        provider_name=provider_name,
+        data_plane_limit=data_plane_limit,
         progress_callback=progress_callback,
         cancel_checker=is_cancelled,
         retry_callback=retry_callback,
+        requested_download_strategy=download_strategy,
+        download_manager_cls=download_manager_cls,
     )
-    if provider_name == "copernicus":
-        download_manager_kwargs.update(
-            max_concurrent=min(data_plane_limit, 2),
-            max_retries=5,
-            initial_delay=2.0,
-            backoff_factor=1.5,
-            connect_timeout=30.0,
-            chunk_size=128 * 1024,
-            max_connections=50,
-            max_connections_per_host=2,
-        )
-    elif provider_name == "usgs":
-        download_manager_kwargs.update(
-            max_concurrent=min(data_plane_limit, 2),
-            initial_delay=2.0,
-            backoff_factor=1.5,
-            connect_timeout=30.0,
-            chunk_size=128 * 1024,
-            max_connections=50,
-            max_connections_per_host=2,
-        )
-
-    download_manager = download_manager_cls(**download_manager_kwargs)
-    provider = rt._build_provider(provider_name, download_manager)
-    if provider_name == "copernicus":
-        setattr(provider, "download_strategy", download_strategy)
+    provider = rt._build_provider(
+        provider_name,
+        download_manager,
+        requested_download_strategy=download_strategy,
+    )
 
     if isinstance(request, SearchDownloadRequest):
+        provider.configure_job(
+            collection=request.collection,
+            product_type=request.product_type,
+            download_strategy=download_strategy,
+        )
         if is_cancelled():
             raise rt.job_cancelled_error_cls("cancelled")
         rt._update_pipeline(
@@ -106,11 +91,7 @@ def run_provider_job(
                 "output_dir": str(output_dir),
                 "job_type": request.job_type,
                 "download_strategy": download_strategy,
-                **(
-                    dict(provider.plan_download_metadata(len(product_ids)))
-                    if hasattr(provider, "plan_download_metadata")
-                    else {}
-                ),
+                **dict(provider.plan_download_metadata(len(product_ids))),
             },
             event_type="job.downloading",
             event_payload={"products_found": len(product_ids)},
@@ -132,7 +113,7 @@ def run_provider_job(
                 },
             }
 
-        if rt._supports_download_coordinator(provider_name, provider):
+        if rt._supports_download_coordinator(provider):
             coordinator_result = rt._download_with_coordinator(
                 job_id=job_id,
                 provider_name=provider_name,
@@ -149,7 +130,7 @@ def run_provider_job(
             provider_download_metadata = dict(coordinator_result.metadata or {})
         else:
             paths = provider.download_products(product_ids=product_ids, output_dir=str(output_dir))
-            provider_download_metadata = dict(getattr(provider, "last_download_metadata", {}) or {})
+            provider_download_metadata = dict(provider.download_metadata() or {})
         return {
             "paths": paths,
             "metadata": {
@@ -166,8 +147,10 @@ def run_provider_job(
         }
 
     request = cast(DownloadProductsRequest, request)
-    if hasattr(provider, "dataset"):
-        setattr(provider, "dataset", request.collection)
+    provider.configure_job(
+        collection=request.collection,
+        download_strategy=download_strategy,
+    )
     rt._update_pipeline(
         job_id,
         pipeline_state=PipelineState.downloading,
@@ -181,16 +164,12 @@ def run_provider_job(
             "output_dir": str(output_dir),
             "job_type": request.job_type,
             "download_strategy": download_strategy,
-            **(
-                dict(provider.plan_download_metadata(len(request.product_ids)))
-                if hasattr(provider, "plan_download_metadata")
-                else {}
-            ),
+            **dict(provider.plan_download_metadata(len(request.product_ids))),
         },
         event_type="job.downloading",
         event_payload={"products_requested": len(request.product_ids)},
     )
-    if rt._supports_download_coordinator(provider_name, provider):
+    if rt._supports_download_coordinator(provider):
         coordinator_result = rt._download_with_coordinator(
             job_id=job_id,
             provider_name=provider_name,
@@ -207,7 +186,7 @@ def run_provider_job(
         provider_download_metadata = dict(coordinator_result.metadata or {})
     else:
         paths = provider.download_products(product_ids=request.product_ids, output_dir=str(output_dir))
-        provider_download_metadata = dict(getattr(provider, "last_download_metadata", {}) or {})
+        provider_download_metadata = dict(provider.download_metadata() or {})
     return {
         "paths": paths,
         "metadata": {

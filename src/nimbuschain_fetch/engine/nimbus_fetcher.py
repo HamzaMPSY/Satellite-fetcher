@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import os
 import socket
 import threading
@@ -17,22 +16,13 @@ from nimbuschain_fetch.application.artifact_registry import ArtifactRegistryServ
 from nimbuschain_fetch.application.conversion import ManualConversionService
 from nimbuschain_fetch.application.job_execution import (
     CallbackJobExecutionHandler,
-    JobExecutionContext,
     JobExecutionRegistry,
 )
 from nimbuschain_fetch.domain.records import JobResultRecord, JobRowRecord
 from nimbuschain_fetch.application.pipeline_state import PipelineStateService
 from nimbuschain_fetch.application.workflows import FetchJobWorkflowService, MaskJobWorkflowService
-from nimbuschain_fetch.download.coordinator import (
-    DownloadBatchResult,
-    DownloadCoordinator,
-)
-from nimbuschain_fetch.download.download_manager import (
-    CancelChecker,
-    DownloadManager,
-    ProgressCallback,
-    RetryCallback,
-)
+from nimbuschain_fetch.download.coordinator import DownloadCoordinator
+from nimbuschain_fetch.download.download_manager import DownloadManager
 from nimbuschain_fetch.engine.conversion_support import FetcherConversionSupport
 from nimbuschain_fetch.engine.conversion_policy_support import FetcherConversionPolicySupport
 from nimbuschain_fetch.engine.cube_support import FetcherCubeSupport
@@ -50,7 +40,6 @@ from nimbuschain_fetch.engine.progress_support import FetcherProgressSupport
 from nimbuschain_fetch.engine.provider_support import FetcherProviderSupport
 from nimbuschain_fetch.engine.status_timeline_support import FetcherStatusTimelineSupport
 from nimbuschain_fetch.engine.store_record_support import FetcherStoreRecordSupport
-from nimbuschain_fetch.engine.telemetry_support import FetcherTelemetrySupport
 from nimbuschain_fetch.engine.worker_runtime_support import FetcherWorkerRuntimeSupport
 from nimbuschain_fetch.engine.zarr_context_support import FetcherZarrContextSupport
 from nimbuschain_fetch.ports import (
@@ -60,27 +49,10 @@ from nimbuschain_fetch.ports import (
 )
 from nimbuschain_fetch.jobs.store import JobStore
 from nimbuschain_fetch.models import (
-    ArtifactListResponse,
-    ArtifactRecord,
-    ArtifactType,
-    ArtifactUpsertRequest,
-    BatchJobCreateRequest,
-    JobCloudMaskRequest,
-    JobCloudMaskResponse,
-    JobConvertRequest,
     JobCreateRequest,
-    JobListResponse,
-    JobMaskRequest,
-    JobMaskResponse,
-    JobResultResponse,
-    JobResumeResponse,
-    JobState,
     JobStatusResponse,
-    JobWaterMaskRequest,
-    JobWaterMaskResponse,
     PipelineState,
     ProviderName,
-    SearchDownloadRequest,
 )
 from nimbuschain_fetch.registries import ExecutorRegistry, ProviderRegistry, StoreRegistry
 from nimbuschain_fetch.settings import Settings, get_settings
@@ -141,6 +113,14 @@ def _download_with_coordinator_delegate(self, *args: Any, **kwargs: Any):
         *args,
         **kwargs,
         coordinator_cls=DownloadCoordinator,
+    )
+
+
+def _build_provider_download_manager_delegate(self, *args: Any, **kwargs: Any):
+    kwargs.setdefault("download_manager_cls", DownloadManager)
+    return self._provider_support.build_provider_download_manager(
+        *args,
+        **kwargs,
     )
 
 
@@ -583,10 +563,9 @@ class NimbusFetcher:
 
     @staticmethod
     def _supports_download_coordinator(
-        provider_name: str,
         provider: Any,
     ) -> bool:
-        return FetcherDownloadCoordinatorSupport.supports(provider_name, provider)
+        return FetcherDownloadCoordinatorSupport.supports(provider)
 
     def _normalize_historical_job_row(self, row: dict[str, Any]) -> dict[str, Any]:
         return self._normalization_support.normalize_historical_job_row(row)
@@ -814,6 +793,7 @@ NimbusFetcher.convert_existing_job = _delegate_method("_conversion_support", "co
 NimbusFetcher._execute_job = _delegate_async_method("_lifecycle_support", "execute_job")
 NimbusFetcher._run_provider_job = _run_provider_job_delegate
 NimbusFetcher._build_provider = _delegate_method("_provider_support", "build_provider")
+NimbusFetcher._build_provider_download_manager = _build_provider_download_manager_delegate
 NimbusFetcher._download_coordinator_instance = _download_coordinator_instance_delegate
 NimbusFetcher._download_with_coordinator = _download_with_coordinator_delegate
 NimbusFetcher._mark_cancelled = _delegate_method("_provider_support", "mark_cancelled")

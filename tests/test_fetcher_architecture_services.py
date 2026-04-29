@@ -15,6 +15,7 @@ from nimbuschain_fetch.domain.workflow_models import MaskWorkflowItem, MaskWorkf
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.jobs.executor_base import ExecutorBackend
 from nimbuschain_fetch.models import ArtifactType, JobStatusResponse, PipelineState
+from nimbuschain_fetch.ports import ProviderCapabilities
 from nimbuschain_fetch.registries import ExecutorRegistry, ProviderRegistry, StoreRegistry
 from nimbuschain_fetch.settings import Settings
 
@@ -253,6 +254,19 @@ def test_fetcher_get_result_reads_typed_store_record() -> None:
 class FakeProvider:
     settings: Settings
     download_manager: Any
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities()
+
+    def configure_job(self, *, collection=None, product_type=None, download_strategy="default") -> None:
+        _ = (collection, product_type, download_strategy)
+
+    def plan_download_metadata(self, product_count: int) -> dict[str, object]:
+        _ = product_count
+        return {}
+
+    def download_metadata(self) -> dict[str, object]:
+        return {}
 
     def search_products(self, collection: str, product_type: str, start_date: str, end_date: str, aoi: Any, tile_id: str | None = None) -> list[str]:
         _ = (collection, product_type, start_date, end_date, aoi, tile_id)

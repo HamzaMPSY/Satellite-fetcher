@@ -3,16 +3,18 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from shapely.geometry.base import BaseGeometry
 
-from nimbuschain_fetch.download.coordinator import DownloadBatchResult
 from nimbuschain_fetch.download.download_manager import CancelChecker, ProgressCallback, RetryCallback
 from nimbuschain_fetch.jobs.executor_base import ExecutorBackend
 from nimbuschain_fetch.jobs.store import JobStore
 from nimbuschain_fetch.models import ArtifactListResponse, ArtifactRecord, ArtifactUpsertRequest
 from nimbuschain_fetch.settings import Settings
+
+if TYPE_CHECKING:
+    from nimbuschain_fetch.download.coordinator import DownloadBatchResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +77,55 @@ class MaskExecutionRequest:
     water_overwrite: bool = True
     water_inference_device: str | None = None
     fail_on_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    supports_download_coordinator: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderDownloadManagerConfig:
+    max_concurrent: int
+    max_retries: int = 5
+    initial_delay: float = 2.0
+    backoff_factor: float = 1.5
+    max_retry_delay: float = 120.0
+    connect_timeout: float = 30.0
+    read_timeout: float | None = None
+    chunk_size: int = 128 * 1024
+    max_connections: int | None = 50
+    max_connections_per_host: int | None = 2
+    enable_resume: bool = True
+    min_resume_size: int = 1024 * 1024
+    gateway_timeout_retries: int = 3
+    gateway_timeout_floor_delay: float = 8.0
+    progress_callback: ProgressCallback | None = None
+    cancel_checker: CancelChecker | None = None
+    retry_callback: RetryCallback | None = None
+    bandwidth_limiter: Any | None = None
+
+    def to_kwargs(self) -> dict[str, Any]:
+        return {
+            "max_concurrent": self.max_concurrent,
+            "max_retries": self.max_retries,
+            "initial_delay": self.initial_delay,
+            "backoff_factor": self.backoff_factor,
+            "max_retry_delay": self.max_retry_delay,
+            "connect_timeout": self.connect_timeout,
+            "read_timeout": self.read_timeout,
+            "chunk_size": self.chunk_size,
+            "max_connections": self.max_connections,
+            "max_connections_per_host": self.max_connections_per_host,
+            "enable_resume": self.enable_resume,
+            "min_resume_size": self.min_resume_size,
+            "gateway_timeout_retries": self.gateway_timeout_retries,
+            "gateway_timeout_floor_delay": self.gateway_timeout_floor_delay,
+            "progress_callback": self.progress_callback,
+            "cancel_checker": self.cancel_checker,
+            "retry_callback": self.retry_callback,
+            "bandwidth_limiter": self.bandwidth_limiter,
+        }
 
 
 @runtime_checkable
@@ -203,6 +254,18 @@ class ArtifactRegistryPort(Protocol):
 
 @runtime_checkable
 class ProviderPort(Protocol):
+    def capabilities(self) -> ProviderCapabilities:
+        ...
+
+    def configure_job(
+        self,
+        *,
+        collection: str | None = None,
+        product_type: str | None = None,
+        download_strategy: str = "default",
+    ) -> None:
+        ...
+
     def search_products(
         self,
         collection: str,
@@ -215,6 +278,12 @@ class ProviderPort(Protocol):
         ...
 
     def download_products(self, product_ids: list[str], output_dir: str) -> list[str]:
+        ...
+
+    def plan_download_metadata(self, product_count: int) -> dict[str, Any]:
+        ...
+
+    def download_metadata(self) -> dict[str, Any]:
         ...
 
 
@@ -231,11 +300,55 @@ class CoordinatorAwareProviderPort(ProviderPort, Protocol):
         retry_callback: RetryCallback | None,
         cancel_checker: CancelChecker | None,
         download_strategy: str,
-    ) -> DownloadBatchResult:
+    ) -> "DownloadBatchResult":
+        ...
+
+
+@runtime_checkable
+class ProviderDefinitionPort(Protocol):
+    def download_manager_config(
+        self,
+        *,
+        settings: Settings,
+        data_plane_limit: int,
+        progress_callback: ProgressCallback | None,
+        cancel_checker: CancelChecker | None,
+        retry_callback: RetryCallback | None,
+        requested_download_strategy: str,
+    ) -> ProviderDownloadManagerConfig:
+        ...
+
+    def create_provider(
+        self,
+        *,
+        settings: Settings,
+        download_manager: Any,
+        requested_download_strategy: str,
+    ) -> ProviderPort:
+        ...
+
+    def single_download_manager_config(
+        self,
+        *,
+        settings: Settings,
+        progress_callback: ProgressCallback | None,
+        cancel_checker: CancelChecker | None,
+        retry_callback: RetryCallback | None,
+        bandwidth_limiter: Any | None,
+    ) -> ProviderDownloadManagerConfig:
+        ...
+
+    def handle_retry_feedback(
+        self,
+        *,
+        coordinator: Any,
+        reason: str,
+        retry_after: float | None,
+        merged_context: dict[str, Any],
+    ) -> None:
         ...
 
 
 StoreFactory = Callable[[Settings], JobStore]
 ExecutorFactory = Callable[..., ExecutorBackend]
-ProviderFactory = Callable[[Settings, Any], ProviderPort]
-ProviderRegistryMapping = Mapping[str, type[Any] | ProviderFactory]
+ProviderRegistryMapping = Mapping[str, type[Any] | ProviderDefinitionPort]

@@ -260,9 +260,24 @@ def test_download_coordinator_usgs_download_scheduler_accepts_prepared_queued_ta
 def test_download_coordinator_final_metadata_includes_download_window(tmp_path: Path) -> None:
     coordinator = DownloadCoordinator(_make_settings(tmp_path))
     try:
+        class _FakeProvider:
+            def finalize_coordinator_batch_metadata(self, *, base, rows, coordinator):
+                _ = coordinator
+                account_assignments: dict[str, int] = {}
+                for row in rows:
+                    label = str(row.get("account_label") or "").strip()
+                    if label:
+                        account_assignments[label] = account_assignments.get(label, 0) + 1
+                base["account_pool_assignments"] = [
+                    {"account_label": label, "product_count": count}
+                    for label, count in sorted(account_assignments.items())
+                ]
+                base["account_pool_selected_accounts"] = len(base["account_pool_assignments"])
+                return base
+
         metadata = coordinator._final_metadata_for_batch(
             provider_name="copernicus",
-            provider=object(),  # type: ignore[arg-type]
+            provider=_FakeProvider(),  # type: ignore[arg-type]
             rows=[
                 {
                     "status": "done",

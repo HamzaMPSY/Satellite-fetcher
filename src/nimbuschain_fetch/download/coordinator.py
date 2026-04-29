@@ -11,7 +11,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from nimbuschain_fetch.download.download_manager import (
     CancelChecker,
@@ -22,6 +22,7 @@ from nimbuschain_fetch.download.download_manager import (
 )
 from nimbuschain_fetch.providers.copernicus import CopernicusProvider
 from nimbuschain_fetch.providers.usgs import UsgsProvider
+from nimbuschain_fetch.registries import ProviderRegistry
 from nimbuschain_fetch.settings import Settings
 
 
@@ -84,6 +85,7 @@ class DownloadCoordinatorStore:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._closed = False
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -194,6 +196,7 @@ class DownloadCoordinatorStore:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             try:
                 self._conn.close()
             except sqlite3.ProgrammingError:
@@ -318,10 +321,15 @@ class DownloadCoordinatorStore:
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM download_tasks WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
+            if self._closed:
+                return None
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM download_tasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            except sqlite3.ProgrammingError:
+                return None
         return self._row_to_task(row)
 
     def list_tasks(self, task_ids: list[str]) -> list[dict[str, Any]]:
@@ -329,14 +337,19 @@ class DownloadCoordinatorStore:
             return []
         placeholders = ", ".join("?" for _ in task_ids)
         with self._lock:
-            rows = self._conn.execute(
-                f"""
-                SELECT * FROM download_tasks
-                WHERE task_id IN ({placeholders})
-                ORDER BY created_at ASC
-                """,
-                task_ids,
-            ).fetchall()
+            if self._closed:
+                return []
+            try:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT * FROM download_tasks
+                    WHERE task_id IN ({placeholders})
+                    ORDER BY created_at ASC
+                    """,
+                    task_ids,
+                ).fetchall()
+            except sqlite3.ProgrammingError:
+                return []
         return [self._row_to_task(row) for row in rows if row]
 
     def list_job_tasks(self, *, provider: str, job_id: str) -> list[dict[str, Any]]:
@@ -474,15 +487,20 @@ class DownloadCoordinatorStore:
         assignments = ", ".join(f"{name} = ?" for name in normalized)
         params = [*normalized.values(), task_id]
         with self._lock:
-            self._conn.execute(
-                f"UPDATE download_tasks SET {assignments} WHERE task_id = ?",
-                params,
-            )
-            self._conn.commit()
-            row = self._conn.execute(
-                "SELECT * FROM download_tasks WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
+            if self._closed:
+                return {}
+            try:
+                self._conn.execute(
+                    f"UPDATE download_tasks SET {assignments} WHERE task_id = ?",
+                    params,
+                )
+                self._conn.commit()
+                row = self._conn.execute(
+                    "SELECT * FROM download_tasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            except sqlite3.ProgrammingError:
+                return {}
         return self._row_to_task(row) or {}
 
     def cancel_pending_tasks(
@@ -496,28 +514,33 @@ class DownloadCoordinatorStore:
         placeholders = ", ".join("?" for _ in task_ids)
         now = self._utc_now()
         with self._lock:
-            self._conn.execute(
-                f"""
-                UPDATE download_tasks
-                SET status = ?,
-                    error_text = ?,
-                    updated_at = ?,
-                    finished_at = ?
-                WHERE task_id IN ({placeholders})
-                  AND status NOT IN (?, ?, ?)
-                """,
-                [
-                    TASK_STATUS_CANCELLED,
-                    str(reason or "Download cancelled.").strip(),
-                    now,
-                    now,
-                    *task_ids,
-                    TASK_STATUS_DONE,
-                    TASK_STATUS_FAILED,
-                    TASK_STATUS_CANCELLED,
-                ],
-            )
-            self._conn.commit()
+            if self._closed:
+                return
+            try:
+                self._conn.execute(
+                    f"""
+                    UPDATE download_tasks
+                    SET status = ?,
+                        error_text = ?,
+                        updated_at = ?,
+                        finished_at = ?
+                    WHERE task_id IN ({placeholders})
+                      AND status NOT IN (?, ?, ?)
+                    """,
+                    [
+                        TASK_STATUS_CANCELLED,
+                        str(reason or "Download cancelled.").strip(),
+                        now,
+                        now,
+                        *task_ids,
+                        TASK_STATUS_DONE,
+                        TASK_STATUS_FAILED,
+                        TASK_STATUS_CANCELLED,
+                    ],
+                )
+                self._conn.commit()
+            except sqlite3.ProgrammingError:
+                return
 
     def cancel_all_non_terminal_tasks(
         self,
@@ -525,20 +548,25 @@ class DownloadCoordinatorStore:
         reason: str = "Download cancelled by runtime reset.",
     ) -> list[str]:
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT task_id
-                FROM download_tasks
-                WHERE status IN (?, ?, ?, ?)
-                ORDER BY created_at ASC
-                """,
-                (
-                    TASK_STATUS_QUEUED,
-                    TASK_STATUS_PREPARING,
-                    TASK_STATUS_READY,
-                    TASK_STATUS_DOWNLOADING,
-                ),
-            ).fetchall()
+            if self._closed:
+                return []
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT task_id
+                    FROM download_tasks
+                    WHERE status IN (?, ?, ?, ?)
+                    ORDER BY created_at ASC
+                    """,
+                    (
+                        TASK_STATUS_QUEUED,
+                        TASK_STATUS_PREPARING,
+                        TASK_STATUS_READY,
+                        TASK_STATUS_DOWNLOADING,
+                    ),
+                ).fetchall()
+            except sqlite3.ProgrammingError:
+                return []
         task_ids = [str(row["task_id"]) for row in rows if row and str(row["task_id"]).strip()]
         self.cancel_pending_tasks(task_ids, reason=reason)
         return task_ids
@@ -547,6 +575,7 @@ class DownloadCoordinatorStore:
 class DownloadCoordinator:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._provider_registry = ProviderRegistry()
         self.store = DownloadCoordinatorStore(settings.download_coordinator_db_path)
         self.store.reset_inflight_tasks()
 
@@ -554,6 +583,7 @@ class DownloadCoordinator:
         self._runtime_contexts: dict[str, _TaskRuntimeContext] = {}
         self._job_round_robin: dict[str, deque[str]] = defaultdict(deque)
         self._copernicus_account_round_robin: deque[str] = deque()
+        self._worker_threads: set[threading.Thread] = set()
         self._closed = False
         self._started = False
         self._scheduler_thread: threading.Thread | None = None
@@ -843,9 +873,16 @@ class DownloadCoordinator:
         with self._condition:
             self._closed = True
             self._condition.notify_all()
+        self.store.cancel_all_non_terminal_tasks(reason="Download coordinator shutting down.")
         if self._scheduler_thread is not None:
             self._scheduler_thread.join(timeout=2.0)
             self._scheduler_thread = None
+        with self._condition:
+            worker_threads = list(self._worker_threads)
+        for thread in worker_threads:
+            join = getattr(thread, "join", None)
+            if callable(join):
+                join(timeout=30.0)
         self.store.close()
         self._started = False
 
@@ -944,21 +981,11 @@ class DownloadCoordinator:
         product_ids: list[str],
         download_strategy: str,
     ) -> dict[str, Any]:
-        if provider_name == "copernicus":
-            metadata = dict(provider.plan_download_metadata(len(product_ids)))
-            metadata["download_strategy"] = str(download_strategy or "default").strip().lower() or "default"
-            metadata["control_plane_limit"] = int(self.settings.provider_control_plane_limits_map.get("copernicus", 2))
-            metadata["data_plane_limit"] = int(self.settings.provider_data_plane_limits_map.get("copernicus", 32))
-            metadata["global_download_limit"] = int(self.settings.nimbus_download_global_limit)
-            return metadata
-
-        return {
-            "download_strategy": "adaptive_local",
-            "control_plane_limit": int(self.settings.provider_control_plane_limits_map.get("usgs", 1)),
-            "data_plane_limit": int(self.settings.provider_data_plane_limits_map.get("usgs", self._usgs_window_max)),
-            "data_plane_initial": int(min(2, self._usgs_window_max)),
-            "global_download_limit": int(self.settings.nimbus_download_global_limit),
-        }
+        _ = provider_name
+        return provider.coordinator_submission_metadata(
+            product_count=len(product_ids),
+            download_strategy=download_strategy,
+        )
 
     def _wait_for_batch(
         self,
@@ -1026,40 +1053,12 @@ class DownloadCoordinator:
         base["download_tasks_total"] = len(rows)
         base["download_bytes_total"] = sum(max(0, int(row.get("bytes_total") or 0)) for row in rows)
         base["download_bytes_downloaded"] = sum(max(0, int(row.get("bytes_downloaded") or 0)) for row in rows)
-        if provider_name == "copernicus":
-            failures = [
-                f"{row.get('account_label') or 'unknown'}: {row.get('error_text') or 'failed'}"
-                for row in rows
-                if str(row.get("status") or "") == TASK_STATUS_FAILED
-            ]
-            account_assignments: dict[str, int] = defaultdict(int)
-            for row in rows:
-                label = str(row.get("account_label") or "").strip()
-                if label:
-                    account_assignments[label] += 1
-            base["account_pool_assignments"] = [
-                {"account_label": label, "product_count": count}
-                for label, count in sorted(account_assignments.items())
-            ]
-            base["account_pool_selected_accounts"] = len(base["account_pool_assignments"])
-            if base["account_pool_selected_accounts"] > 1:
-                base.pop("account_pool_fallback_reason", None)
-            base["account_pool_failures"] = failures
-            return base
-
-        base.update(
-            {
-                "download_strategy": "adaptive_local",
-                "usgs_control_plane_limit": int(self.settings.provider_control_plane_limits_map.get("usgs", 1)),
-                "usgs_data_plane_limit": int(self._usgs_window_max),
-                "usgs_adaptive_window_final": int(self._usgs_window_current),
-                "usgs_adaptive_window_peak": int(self._usgs_window_peak),
-                "usgs_preparing_count": sum(
-                    1 for row in rows if str(row.get("status") or "") == TASK_STATUS_PREPARING
-                ),
-            }
+        _ = provider_name
+        return provider.finalize_coordinator_batch_metadata(
+            base=base,
+            rows=rows,
+            coordinator=self,
         )
-        return base
 
     def _scheduler_loop(self) -> None:
         while True:
@@ -1218,12 +1217,11 @@ class DownloadCoordinator:
             finished_at=None,
             error_text=None,
         )
-        threading.Thread(
+        self._start_worker_thread(
             target=self._run_copernicus_task,
             args=(task["task_id"], account),
             name=f"copernicus-download-{label}",
-            daemon=True,
-        ).start()
+        )
         return True
 
     def _try_launch_usgs_prepare_task(self) -> bool:
@@ -1255,12 +1253,11 @@ class DownloadCoordinator:
             finished_at=None,
             error_text=None,
         )
-        threading.Thread(
+        self._start_worker_thread(
             target=self._run_usgs_prepare_task,
             args=(task["task_id"],),
             name="usgs-prepare",
-            daemon=True,
-        ).start()
+        )
         return True
 
     def _try_launch_usgs_download_task(self) -> bool:
@@ -1295,17 +1292,42 @@ class DownloadCoordinator:
             finished_at=None,
             error_text=None,
         )
-        threading.Thread(
+        self._start_worker_thread(
             target=self._run_usgs_download_task,
             args=(task["task_id"],),
             name="usgs-download",
-            daemon=True,
-        ).start()
+        )
         return True
 
     def _runtime_context_for_task(self, task_id: str) -> _TaskRuntimeContext:
         with self._condition:
             return self._runtime_contexts.get(task_id) or _TaskRuntimeContext(None, None, None)
+
+    def _start_worker_thread(
+        self,
+        *,
+        target: Any,
+        args: tuple[Any, ...],
+        name: str,
+    ) -> None:
+        def _runner(*thread_args: Any) -> None:
+            try:
+                target(*thread_args)
+            finally:
+                current = threading.current_thread()
+                with self._condition:
+                    self._worker_threads.discard(current)
+                    self._condition.notify_all()
+
+        thread = threading.Thread(
+            target=_runner,
+            args=args,
+            name=name,
+            daemon=True,
+        )
+        with self._condition:
+            self._worker_threads.add(thread)
+        thread.start()
 
     def _preserve_cancelled_task(self, task_id: str) -> bool:
         task = self.store.get_task(task_id) or {}
@@ -1389,20 +1411,14 @@ class DownloadCoordinator:
             error_text=str(reason or "").strip(),
         )
 
-        provider_name = str(task.get("provider") or "").strip().lower()
         normalized_reason = str(reason or "").strip().lower()
-        if provider_name == "copernicus" and normalized_reason == "http_429":
-            label = str(merged_context.get("account_label") or "primary").strip() or "primary"
-            with self._condition:
-                self._copernicus_account_cooldown_until[label] = time.monotonic() + max(
-                    float(retry_after or 0.0),
-                    5.0,
-                )
-        if provider_name == "usgs" and normalized_reason in {"http_429", "http_500", "http_502", "http_503", "http_504"}:
-            with self._condition:
-                self._usgs_window_current = max(1, self._usgs_window_current // 2 or 1)
-                self._usgs_cooldown_until = time.monotonic() + max(float(retry_after or 0.0), 5.0)
-                self._usgs_success_streak = 0
+        provider_name = str(task.get("provider") or "").strip().lower()
+        self._provider_registry.definition(provider_name).handle_retry_feedback(
+            coordinator=self,
+            reason=normalized_reason,
+            retry_after=retry_after,
+            merged_context=merged_context,
+        )
 
         runtime = self._runtime_context_for_task(task_id)
         if runtime.retry_callback is not None:
@@ -1439,37 +1455,14 @@ class DownloadCoordinator:
             context=context,
         )
 
-        if provider_name == "copernicus":
-            return DownloadManager(
-                max_concurrent=1,
-                max_retries=5,
-                initial_delay=2.0,
-                backoff_factor=1.5,
-                max_retry_delay=120.0,
-                connect_timeout=30.0,
-                chunk_size=128 * 1024,
-                max_connections=4,
-                max_connections_per_host=1,
-                progress_callback=progress_callback,
-                cancel_checker=runtime.cancel_checker,
-                retry_callback=retry_callback,
-                bandwidth_limiter=self._bandwidth_limiter,
-            )
-        return DownloadManager(
-            max_concurrent=1,
-            max_retries=5,
-            initial_delay=2.0,
-            backoff_factor=1.5,
-            max_retry_delay=120.0,
-            connect_timeout=30.0,
-            chunk_size=128 * 1024,
-            max_connections=4,
-            max_connections_per_host=1,
+        config = self._provider_registry.definition(provider_name).single_download_manager_config(
+            settings=self.settings,
             progress_callback=progress_callback,
             cancel_checker=runtime.cancel_checker,
             retry_callback=retry_callback,
             bandwidth_limiter=self._bandwidth_limiter,
         )
+        return DownloadManager(**config.to_kwargs())
 
     @staticmethod
     def _is_retryable_error(exc: Exception) -> bool:

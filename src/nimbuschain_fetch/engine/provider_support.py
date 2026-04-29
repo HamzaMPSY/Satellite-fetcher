@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from nimbuschain_fetch.download.coordinator import DownloadBatchResult, DownloadCoordinator
+from nimbuschain_fetch.download.download_manager import DownloadManager
 from nimbuschain_fetch.engine.provider_runtime import run_provider_job
 from nimbuschain_fetch.models import JobCreateRequest, JobState, PipelineState, ProviderName
 
@@ -42,12 +43,41 @@ class FetcherProviderSupport:
             return value.value
         return str(value).strip().lower()
 
-    def build_provider(self, provider_name: str, download_manager: Any):
+    def build_provider(
+        self,
+        provider_name: str,
+        download_manager: Any,
+        *,
+        requested_download_strategy: str = "default",
+    ):
         return self._rt._provider_registry.create(
             provider_name,
             settings=self._rt.settings,
             download_manager=download_manager,
+            requested_download_strategy=requested_download_strategy,
         )
+
+    def build_provider_download_manager(
+        self,
+        *,
+        provider_name: str,
+        data_plane_limit: int,
+        progress_callback: Any,
+        cancel_checker: Any,
+        retry_callback: Any,
+        requested_download_strategy: str,
+        download_manager_cls: type[DownloadManager],
+    ) -> DownloadManager:
+        config = self._rt._provider_registry.download_manager_config(
+            provider_name,
+            settings=self._rt.settings,
+            data_plane_limit=data_plane_limit,
+            progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
+            retry_callback=retry_callback,
+            requested_download_strategy=requested_download_strategy,
+        )
+        return download_manager_cls(**config.to_kwargs())
 
     def download_coordinator_instance(self, *, coordinator_cls: type[DownloadCoordinator] = DownloadCoordinator) -> DownloadCoordinator:
         if self._rt._download_coordinator is None:
@@ -56,11 +86,9 @@ class FetcherProviderSupport:
 
     @staticmethod
     def supports_download_coordinator(
-        provider_name: str,
         provider: Any,
     ) -> bool:
-        _ = provider_name
-        return callable(getattr(provider, "download_with_coordinator", None))
+        return bool(provider.capabilities().supports_download_coordinator)
 
     def download_with_coordinator(
         self,

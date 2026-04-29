@@ -11,6 +11,7 @@ from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
 
 from nimbuschain_fetch.download.download_manager import DownloadManager
+from nimbuschain_fetch.ports import ProviderCapabilities, ProviderDownloadManagerConfig
 from nimbuschain_fetch.providers.base import ProviderBase
 from nimbuschain_fetch.settings import Settings
 try:
@@ -42,6 +43,31 @@ except ModuleNotFoundError:
 
 
 class UsgsProvider(ProviderBase):
+    @classmethod
+    def download_manager_config(
+        cls,
+        *,
+        settings: Settings,
+        data_plane_limit: int,
+        progress_callback,
+        cancel_checker,
+        retry_callback,
+        requested_download_strategy: str,
+    ) -> ProviderDownloadManagerConfig:
+        _ = (settings, requested_download_strategy)
+        return ProviderDownloadManagerConfig(
+            max_concurrent=min(max(1, int(data_plane_limit)), 2),
+            initial_delay=2.0,
+            backoff_factor=1.5,
+            connect_timeout=30.0,
+            chunk_size=128 * 1024,
+            max_connections=50,
+            max_connections_per_host=2,
+            progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
+            retry_callback=retry_callback,
+        )
+
     def __init__(self, settings: Settings, download_manager: DownloadManager):
         self.settings = settings
         self.download_manager = download_manager
@@ -58,6 +84,20 @@ class UsgsProvider(ProviderBase):
             raise ValueError("USGS credentials are missing in environment variables.")
 
         self.get_access_token()
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(supports_download_coordinator=True)
+
+    def configure_job(
+        self,
+        *,
+        collection: str | None = None,
+        product_type: str | None = None,
+        download_strategy: str = "default",
+    ) -> None:
+        _ = (product_type, download_strategy)
+        if collection:
+            self.dataset = str(collection).strip()
 
     def get_access_token(self) -> str:
         payload = {"username": self.username, "token": self.token}
@@ -381,3 +421,59 @@ class UsgsProvider(ProviderBase):
             "refresh_token_callback": self.get_access_token,
         }
         return self.download_manager.download_products(payload, output_dir=output_dir)
+
+    def download_metadata(self) -> dict[str, Any]:
+        return {}
+
+    def coordinator_submission_metadata(
+        self,
+        *,
+        product_count: int,
+        download_strategy: str,
+    ) -> dict[str, Any]:
+        _ = product_count
+        return {
+            "download_strategy": str(download_strategy or "adaptive_local").strip().lower() or "adaptive_local",
+            "control_plane_limit": int(self.settings.provider_control_plane_limits_map.get("usgs", 1)),
+            "data_plane_limit": int(self.settings.provider_data_plane_limits_map.get("usgs", 1)),
+            "data_plane_initial": int(min(2, max(1, int(self.settings.provider_data_plane_limits_map.get("usgs", 1))))),
+            "global_download_limit": int(self.settings.nimbus_download_global_limit),
+        }
+
+    def finalize_coordinator_batch_metadata(
+        self,
+        *,
+        base: dict[str, Any],
+        rows: list[dict[str, Any]],
+        coordinator: Any,
+    ) -> dict[str, Any]:
+        base.update(
+            {
+                "download_strategy": "adaptive_local",
+                "usgs_control_plane_limit": int(coordinator.settings.provider_control_plane_limits_map.get("usgs", 1)),
+                "usgs_data_plane_limit": int(coordinator._usgs_window_max),
+                "usgs_adaptive_window_final": int(coordinator._usgs_window_current),
+                "usgs_adaptive_window_peak": int(coordinator._usgs_window_peak),
+                "usgs_preparing_count": sum(
+                    1 for row in rows if str(row.get("status") or "") == "preparing"
+                ),
+            }
+        )
+        return base
+
+    @classmethod
+    def handle_retry_feedback(
+        cls,
+        *,
+        coordinator: Any,
+        reason: str,
+        retry_after: float | None,
+        merged_context: dict[str, Any],
+    ) -> None:
+        _ = merged_context
+        if str(reason or "").strip().lower() not in {"http_429", "http_500", "http_502", "http_503", "http_504"}:
+            return
+        with coordinator._condition:
+            coordinator._usgs_window_current = max(1, coordinator._usgs_window_current // 2 or 1)
+            coordinator._usgs_cooldown_until = time.monotonic() + max(float(retry_after or 0.0), 5.0)
+            coordinator._usgs_success_streak = 0

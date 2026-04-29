@@ -11,11 +11,52 @@ from shapely.geometry.base import BaseGeometry
 
 from nimbuschain_fetch.copernicus_query import build_copernicus_filter
 from nimbuschain_fetch.download.download_manager import DownloadManager
+from nimbuschain_fetch.ports import ProviderCapabilities, ProviderDownloadManagerConfig
 from nimbuschain_fetch.providers.base import ProviderBase
 from nimbuschain_fetch.settings import Settings
 
 
 class CopernicusProvider(ProviderBase):
+    @classmethod
+    def download_manager_config(
+        cls,
+        *,
+        settings: Settings,
+        data_plane_limit: int,
+        progress_callback,
+        cancel_checker,
+        retry_callback,
+        requested_download_strategy: str,
+    ) -> ProviderDownloadManagerConfig:
+        _ = (settings, requested_download_strategy)
+        return ProviderDownloadManagerConfig(
+            max_concurrent=min(max(1, int(data_plane_limit)), 2),
+            max_retries=5,
+            initial_delay=2.0,
+            backoff_factor=1.5,
+            connect_timeout=30.0,
+            chunk_size=128 * 1024,
+            max_connections=50,
+            max_connections_per_host=2,
+            progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
+            retry_callback=retry_callback,
+        )
+
+    @classmethod
+    def create_provider(
+        cls,
+        *,
+        settings: Settings,
+        download_manager: DownloadManager,
+        requested_download_strategy: str,
+    ) -> "CopernicusProvider":
+        return cls(
+            settings,
+            download_manager,
+            download_strategy=requested_download_strategy,
+        )
+
     def __init__(
         self,
         settings: Settings,
@@ -41,6 +82,19 @@ class CopernicusProvider(ProviderBase):
 
         if not self.username or not self.password:
             raise ValueError("Copernicus credentials are missing in environment variables.")
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(supports_download_coordinator=True)
+
+    def configure_job(
+        self,
+        *,
+        collection: str | None = None,
+        product_type: str | None = None,
+        download_strategy: str = "default",
+    ) -> None:
+        _ = (collection, product_type)
+        self.download_strategy = str(download_strategy or "default").strip().lower() or "default"
 
     def _account_pool_requested(self) -> bool:
         return self.download_strategy == "copernicus_account_pool"
@@ -450,3 +504,68 @@ class CopernicusProvider(ProviderBase):
         if self._account_pool_requested():
             return self._download_products_with_account_pool(product_ids, output_dir)
         return self._download_products_single_account(product_ids, output_dir)
+
+    def download_metadata(self) -> dict[str, Any]:
+        return dict(self.last_download_metadata or {})
+
+    def coordinator_submission_metadata(
+        self,
+        *,
+        product_count: int,
+        download_strategy: str,
+    ) -> dict[str, Any]:
+        metadata = super().coordinator_submission_metadata(
+            product_count=product_count,
+            download_strategy=download_strategy,
+        )
+        metadata["control_plane_limit"] = int(self.settings.provider_control_plane_limits_map.get("copernicus", 2))
+        metadata["data_plane_limit"] = int(self.settings.provider_data_plane_limits_map.get("copernicus", 32))
+        metadata["global_download_limit"] = int(self.settings.nimbus_download_global_limit)
+        return metadata
+
+    def finalize_coordinator_batch_metadata(
+        self,
+        *,
+        base: dict[str, Any],
+        rows: list[dict[str, Any]],
+        coordinator: Any,
+    ) -> dict[str, Any]:
+        _ = coordinator
+        failures = [
+            f"{row.get('account_label') or 'unknown'}: {row.get('error_text') or 'failed'}"
+            for row in rows
+            if str(row.get("status") or "") == "failed"
+        ]
+        account_assignments: dict[str, int] = {}
+        for row in rows:
+            label = str(row.get("account_label") or "").strip()
+            if not label:
+                continue
+            account_assignments[label] = account_assignments.get(label, 0) + 1
+        base["account_pool_assignments"] = [
+            {"account_label": label, "product_count": count}
+            for label, count in sorted(account_assignments.items())
+        ]
+        base["account_pool_selected_accounts"] = len(base["account_pool_assignments"])
+        if base["account_pool_selected_accounts"] > 1:
+            base.pop("account_pool_fallback_reason", None)
+        base["account_pool_failures"] = failures
+        return base
+
+    @classmethod
+    def handle_retry_feedback(
+        cls,
+        *,
+        coordinator: Any,
+        reason: str,
+        retry_after: float | None,
+        merged_context: dict[str, Any],
+    ) -> None:
+        if str(reason or "").strip().lower() != "http_429":
+            return
+        label = str(merged_context.get("account_label") or "primary").strip() or "primary"
+        with coordinator._condition:
+            coordinator._copernicus_account_cooldown_until[label] = time.monotonic() + max(
+                float(retry_after or 0.0),
+                5.0,
+            )

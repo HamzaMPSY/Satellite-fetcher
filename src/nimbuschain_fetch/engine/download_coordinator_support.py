@@ -197,9 +197,8 @@ class FetcherDownloadCoordinatorSupport:
         return self._rt._download_coordinator
 
     @staticmethod
-    def supports(provider_name: str, provider: Any) -> bool:
-        _ = provider_name
-        return callable(getattr(provider, "download_with_coordinator", None))
+    def supports(provider: Any) -> bool:
+        return bool(provider.capabilities().supports_download_coordinator)
 
     def download_with_coordinator(
         self,

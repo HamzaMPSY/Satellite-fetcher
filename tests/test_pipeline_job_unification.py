@@ -23,6 +23,7 @@ from nimbuschain_fetch.models import (
     ProviderName,
     SearchDownloadRequest,
 )
+from nimbuschain_fetch.ports import ProviderCapabilities
 from nimbuschain_fetch.settings import Settings, get_settings
 from nimbuschain_fetch_service.api.artifacts import router as artifacts_router
 from nimbuschain_fetch_service.api.converter import router as converter_router
@@ -32,6 +33,19 @@ class FakeCopernicusProvider:
     def __init__(self, settings, download_manager):
         self.settings = settings
         self.download_manager = download_manager
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities()
+
+    def configure_job(self, *, collection=None, product_type=None, download_strategy="default") -> None:
+        _ = (collection, product_type, download_strategy)
+
+    def plan_download_metadata(self, product_count: int) -> dict[str, object]:
+        _ = product_count
+        return {}
+
+    def download_metadata(self) -> dict[str, object]:
+        return {}
 
     def search_products(
         self,

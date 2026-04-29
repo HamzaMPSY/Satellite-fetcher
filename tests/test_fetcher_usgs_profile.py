@@ -7,6 +7,7 @@ from pathlib import Path
 from nimbuschain_fetch.download.download_manager import DownloadManager
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.models import DownloadProductsRequest, ProviderName
+from nimbuschain_fetch.ports import ProviderCapabilities
 from nimbuschain_fetch.providers.copernicus import CopernicusProvider
 from nimbuschain_fetch.settings import Settings
 
@@ -14,6 +15,20 @@ from nimbuschain_fetch.settings import Settings
 class _FakeProvider:
     def __init__(self) -> None:
         self.dataset = None
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities()
+
+    def configure_job(self, *, collection=None, product_type=None, download_strategy="default") -> None:
+        _ = (product_type, download_strategy)
+        self.dataset = collection
+
+    def plan_download_metadata(self, product_count: int) -> dict[str, object]:
+        _ = product_count
+        return {}
+
+    def download_metadata(self) -> dict[str, object]:
+        return {}
 
     def download_products(self, product_ids, output_dir):
         return [str(Path(output_dir) / "product.tar")]
@@ -36,7 +51,7 @@ def test_usgs_provider_job_uses_conservative_legacy_like_download_profile(monkey
             captured.update(kwargs)
 
     monkeypatch.setattr("nimbuschain_fetch.engine.nimbus_fetcher.DownloadManager", _FakeDownloadManager)
-    monkeypatch.setattr(fetcher, "_build_provider", lambda provider_name, download_manager: _FakeProvider())
+    monkeypatch.setattr(fetcher, "_build_provider", lambda provider_name, download_manager, **kwargs: _FakeProvider())
     monkeypatch.setattr(fetcher, "_update_pipeline", lambda *args, **kwargs: None)
 
     request = DownloadProductsRequest(
@@ -85,7 +100,7 @@ def test_copernicus_provider_job_uses_legacy_download_profile_from_old_zip(
             captured.update(kwargs)
 
     monkeypatch.setattr("nimbuschain_fetch.engine.nimbus_fetcher.DownloadManager", _FakeDownloadManager)
-    monkeypatch.setattr(fetcher, "_build_provider", lambda provider_name, download_manager: _FakeProvider())
+    monkeypatch.setattr(fetcher, "_build_provider", lambda provider_name, download_manager, **kwargs: _FakeProvider())
     monkeypatch.setattr(fetcher, "_update_pipeline", lambda *args, **kwargs: None)
 
     request = DownloadProductsRequest(
@@ -383,11 +398,21 @@ def test_fetcher_propagates_copernicus_account_pool_strategy(monkeypatch, tmp_pa
                 "account_pool_per_account_concurrency": 4,
             }
 
+        def capabilities(self) -> ProviderCapabilities:
+            return ProviderCapabilities()
+
+        def configure_job(self, *, collection=None, product_type=None, download_strategy="default") -> None:
+            _ = (collection, product_type)
+            self.download_strategy = str(download_strategy or "default")
+
         def plan_download_metadata(self, product_count: int) -> dict[str, object]:
             return {
                 "account_pool_selected_accounts": 2,
                 "account_pool_per_account_concurrency": 4,
             }
+
+        def download_metadata(self) -> dict[str, object]:
+            return dict(self.last_download_metadata)
 
         def download_products(self, product_ids, output_dir):
             return [str(Path(output_dir) / "product.tar")]
@@ -395,7 +420,7 @@ def test_fetcher_propagates_copernicus_account_pool_strategy(monkeypatch, tmp_pa
     fake_provider = _FakeCopernicusProvider()
 
     monkeypatch.setattr("nimbuschain_fetch.engine.nimbus_fetcher.DownloadManager", _FakeDownloadManager)
-    monkeypatch.setattr(fetcher, "_build_provider", lambda provider_name, download_manager: fake_provider)
+    monkeypatch.setattr(fetcher, "_build_provider", lambda provider_name, download_manager, **kwargs: fake_provider)
     monkeypatch.setattr(fetcher, "_update_pipeline", lambda *args, **kwargs: None)
 
     request = DownloadProductsRequest(
