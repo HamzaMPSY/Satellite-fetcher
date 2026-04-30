@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from nimbuschain_mask_service.models import IntegrationPolicyRecord, MaskModelSchemaRecord, RegistryStatusRecord
+
 MASK_ROOT = "masks"
 WATER_MASK_NAME = "water"
 WATER_MASK_PATH = f"{MASK_ROOT}/water"
@@ -34,13 +36,13 @@ class ProbabilityMaskSpec:
     notes: tuple[str, ...]
 
 
-def _integration_policy() -> dict[str, Any]:
-    return {
-        "public_api": "backend_only",
-        "pipeline_stage": "manual_post_zarr",
-        "storage_policy": "write masks directly into the selected existing zarr under masks/",
-        "mask_contract_version": "v2",
-    }
+def _integration_policy() -> IntegrationPolicyRecord:
+    return IntegrationPolicyRecord(
+        public_api="backend_only",
+        pipeline_stage="manual_post_zarr",
+        storage_policy="write masks directly into the selected existing zarr under masks/",
+        mask_contract_version="v2",
+    )
 
 
 def default_mask_model() -> dict[str, Any]:
@@ -82,15 +84,15 @@ def default_mask_model() -> dict[str, Any]:
         dtype="float32",
         notes=("Water probability values are stored in [0, 1] as a debug/quality layer.",),
     )
-    return {
-        "status": "ok",
-        "integration_policy": _integration_policy(),
-        "backends": registry_status(),
-        "water": asdict(water),
-        "cloud": asdict(cloud),
-        "cloud_probability": asdict(cloud_probability),
-        "water_probability": asdict(water_probability),
-        "input_policy": {
+    return MaskModelSchemaRecord(
+        status="ok",
+        integration_policy=_integration_policy(),
+        backends=RegistryStatusRecord.from_mapping(registry_status()),
+        water=asdict(water),
+        cloud=asdict(cloud),
+        cloud_probability=asdict(cloud_probability),
+        water_probability=asdict(water_probability),
+        input_policy={
             "sentinel-2": {
                 "water": ["B04", "B03", "B02", "B08"],
                 "cloud": ["B02", "B03", "B04", "B08", "B11", "B12"],
@@ -104,4 +106,4 @@ def default_mask_model() -> dict[str, Any]:
                 "cloud": ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"],
             },
         },
-    }
+    ).to_dict()

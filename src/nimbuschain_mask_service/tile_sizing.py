@@ -4,6 +4,11 @@ import math
 import os
 from typing import Any
 
+from nimbuschain_mask_service.models import (
+    DatasetSummaryRecord,
+    TileSizingDecision,
+    TileSizingPolicyStatus,
+)
 from nimbuschain_mask_service.runtime import normalize_device_name
 from nimbuschain_shared.resolution import target_pixel_size_for
 
@@ -18,13 +23,18 @@ def choose_mask_tile_sizing(
     provider: str | None,
     collection: str | None,
     product_type: str | None,
-    dataset_summary: dict[str, Any] | None,
+    dataset_summary: dict[str, Any] | DatasetSummaryRecord | None,
     device: str | None,
     backend_name: str | None = None,
     model_patch_size: int | None = None,
     env_var: str,
-) -> dict[str, Any]:
+) -> TileSizingDecision:
     normalized_kind = str(mask_kind or "").strip().lower()
+    summary_record = (
+        dataset_summary
+        if isinstance(dataset_summary, DatasetSummaryRecord)
+        else DatasetSummaryRecord.from_mapping(dataset_summary)
+    )
     if normalized_kind not in {"cloud", "water"}:
         raise ValueError(f"Unsupported mask kind for tile sizing: {mask_kind}")
 
@@ -33,10 +43,10 @@ def choose_mask_tile_sizing(
     normalized_device = normalize_device_name(device)
     normalized_backend = str(backend_name or "").strip().lower() or None
     collection_family = _collection_family(normalized_provider, normalized_collection)
-    scene_height, scene_width = _scene_shape(dataset_summary)
+    scene_height, scene_width = _scene_shape(summary_record)
     scene_max_dim = max(scene_height, scene_width, 1)
     target_pixel_size_meters = _target_pixel_size_meters(
-        dataset_summary=dataset_summary,
+        dataset_summary=summary_record,
         provider=normalized_provider,
         collection=normalized_collection,
     )
@@ -106,32 +116,32 @@ def choose_mask_tile_sizing(
     )
 
 
-def cloud_tile_sizing_policy_status() -> dict[str, Any]:
-    return {
-        "mode": "fixed_default",
-        "env_var": "NIMBUS_CLOUDMASK_TILE_SIZE",
-        "env_override": str(os.getenv("NIMBUS_CLOUDMASK_TILE_SIZE") or "").strip() or None,
-        "default_tile_size": _FIXED_DEFAULT_TILE_SIZE,
-        "patch_quantum": _CLOUD_PATCH_QUANTUM,
-        "selection_rule": "Use 512 unless NIMBUS_CLOUDMASK_TILE_SIZE overrides it.",
-    }
+def cloud_tile_sizing_policy_status() -> TileSizingPolicyStatus:
+    return TileSizingPolicyStatus(
+        mode="fixed_default",
+        env_var="NIMBUS_CLOUDMASK_TILE_SIZE",
+        env_override=str(os.getenv("NIMBUS_CLOUDMASK_TILE_SIZE") or "").strip() or None,
+        default_tile_size=_FIXED_DEFAULT_TILE_SIZE,
+        patch_quantum=_CLOUD_PATCH_QUANTUM,
+        selection_rule="Use 512 unless NIMBUS_CLOUDMASK_TILE_SIZE overrides it.",
+    )
 
 
-def water_tile_sizing_policy_status(*, model_patch_size: int | None = None) -> dict[str, Any]:
+def water_tile_sizing_policy_status(*, model_patch_size: int | None = None) -> TileSizingPolicyStatus:
     if model_patch_size is None:
         raw_patch_size = str(os.getenv("NIMBUS_WATERMASK_INFERENCE_PATCH_SIZE") or "").strip()
         parsed_patch_size = _parse_int(raw_patch_size)
     else:
         parsed_patch_size = model_patch_size
     patch_size = _patch_quantum(mask_kind="water", model_patch_size=parsed_patch_size)
-    return {
-        "mode": "fixed_default",
-        "env_var": "NIMBUS_WATERMASK_TILE_SIZE",
-        "env_override": str(os.getenv("NIMBUS_WATERMASK_TILE_SIZE") or "").strip() or None,
-        "default_tile_size": _FIXED_DEFAULT_TILE_SIZE,
-        "patch_quantum": patch_size,
-        "selection_rule": "Use 512 unless NIMBUS_WATERMASK_TILE_SIZE overrides it.",
-    }
+    return TileSizingPolicyStatus(
+        mode="fixed_default",
+        env_var="NIMBUS_WATERMASK_TILE_SIZE",
+        env_override=str(os.getenv("NIMBUS_WATERMASK_TILE_SIZE") or "").strip() or None,
+        default_tile_size=_FIXED_DEFAULT_TILE_SIZE,
+        patch_quantum=patch_size,
+        selection_rule="Use 512 unless NIMBUS_WATERMASK_TILE_SIZE overrides it.",
+    )
 
 
 def _decision_payload(
@@ -155,7 +165,7 @@ def _decision_payload(
     max_patch_multiple: int | None,
     requested_env_value: int | None,
     invalid_env_value: str | None,
-) -> dict[str, Any]:
+) -> TileSizingDecision:
     scene_max_dim = max(scene_height, scene_width, 1)
     scene_area_pixels = max(1, scene_height * scene_width)
     scene_ground_span_meters = (
@@ -179,45 +189,44 @@ def _decision_payload(
         else None
     )
     estimated_tiles_long_axis = max(1, int(math.ceil(scene_max_dim / max(1, tile_size))))
-    return {
-        "source": source,
-        "mask_kind": mask_kind,
-        "provider": provider,
-        "collection": collection,
-        "collection_family": collection_family,
-        "product_type": str(product_type or "").strip() or None,
-        "backend": backend_name,
-        "device": device,
-        "tile_size": int(tile_size),
-        "default_tile_size": _FIXED_DEFAULT_TILE_SIZE,
-        "scene_shape": [int(scene_height), int(scene_width)],
-        "scene_max_dimension": int(scene_max_dim),
-        "scene_area_pixels": int(scene_area_pixels),
-        "target_pixel_size_meters": target_pixel_size_meters,
-        "scene_ground_span_meters": scene_ground_span_meters,
-        "tile_ground_span_meters": tile_ground_span_meters,
-        "target_tiles_long_axis": target_tiles_long_axis,
-        "target_tile_pixels": target_tile_pixels,
-        "target_tile_ground_span_meters": target_tile_ground_span_meters,
-        "estimated_tiles_long_axis": estimated_tiles_long_axis,
-        "model_patch_size": int(patch_quantum),
-        "snap_multiple": int(patch_quantum),
-        "patch_multiple": patch_multiple,
-        "min_patch_multiple": min_patch_multiple,
-        "max_patch_multiple": max_patch_multiple,
-        "requested_env_value": requested_env_value,
-        "invalid_env_value": invalid_env_value,
-    }
+    return TileSizingDecision(
+        source=source,
+        mask_kind=mask_kind,
+        provider=provider,
+        collection=collection,
+        collection_family=collection_family,
+        product_type=str(product_type or "").strip() or None,
+        backend=backend_name,
+        device=device,
+        tile_size=int(tile_size),
+        default_tile_size=_FIXED_DEFAULT_TILE_SIZE,
+        scene_shape=[int(scene_height), int(scene_width)],
+        scene_max_dimension=int(scene_max_dim),
+        scene_area_pixels=int(scene_area_pixels),
+        target_pixel_size_meters=target_pixel_size_meters,
+        scene_ground_span_meters=scene_ground_span_meters,
+        tile_ground_span_meters=tile_ground_span_meters,
+        target_tiles_long_axis=target_tiles_long_axis,
+        target_tile_pixels=target_tile_pixels,
+        target_tile_ground_span_meters=target_tile_ground_span_meters,
+        estimated_tiles_long_axis=estimated_tiles_long_axis,
+        model_patch_size=int(patch_quantum),
+        snap_multiple=int(patch_quantum),
+        patch_multiple=patch_multiple,
+        min_patch_multiple=min_patch_multiple,
+        max_patch_multiple=max_patch_multiple,
+        requested_env_value=requested_env_value,
+        invalid_env_value=invalid_env_value,
+    )
 
 
 def _target_pixel_size_meters(
     *,
-    dataset_summary: dict[str, Any] | None,
+    dataset_summary: DatasetSummaryRecord,
     provider: str,
     collection: str,
 ) -> float | None:
-    summary = dict(dataset_summary or {})
-    pixel_size = summary.get("pixel_size") or summary.get("reference_pixel_size")
+    pixel_size = dataset_summary.pixel_size or dataset_summary.reference_pixel_size
     if isinstance(pixel_size, (list, tuple)):
         for value in pixel_size:
             try:
@@ -233,9 +242,8 @@ def _target_pixel_size_meters(
     return float(resolved) if resolved is not None else None
 
 
-def _scene_shape(dataset_summary: dict[str, Any] | None) -> tuple[int, int]:
-    summary = dict(dataset_summary or {})
-    shape = list(summary.get("shape") or [])
+def _scene_shape(dataset_summary: DatasetSummaryRecord) -> tuple[int, int]:
+    shape = list(dataset_summary.shape)
     if len(shape) >= 4:
         return max(0, int(shape[2])), max(0, int(shape[3]))
     if len(shape) >= 2:

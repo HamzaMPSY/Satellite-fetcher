@@ -1,0 +1,89 @@
+@startuml
+title Nimbus Fetch Service - Records, Metadata, Store Boundary
+top to bottom direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+skinparam nodesep 25
+skinparam ranksep 35
+hide empty members
+
+package "Store Boundary" {
+  interface JobStore
+  class JobListFilters
+  class ArtifactListFilters
+  class MongoJobStore
+  class SQLiteJobStore
+}
+
+package "Typed Records" {
+  class JobRowRecord
+  class JobResultRecord
+  class ArtifactRowRecord
+  class JobEventRecord
+  class WorkerHeartbeatRecord
+}
+
+package "Typed Metadata" {
+  class PipelineMetadataRecord
+  class ConversionMetadataRecord
+  class MaskStateRecord
+  class ConversionItemRecord
+}
+
+package "Workflow Value Objects" {
+  class MaskWorkflowItem
+  class MaskWorkflowSummary
+}
+
+package "Services Using Typed Records" {
+  class FetcherStoreRecordSupport
+  class PipelineStateService
+  class ArtifactRegistryService
+  class ManualConversionService
+  class FetchJobWorkflowService
+}
+
+JobStore --> JobListFilters
+JobStore --> ArtifactListFilters
+JobStore --> JobRowRecord
+JobStore --> JobResultRecord
+JobStore --> ArtifactRowRecord
+JobStore --> JobEventRecord
+JobStore --> WorkerHeartbeatRecord
+
+MongoJobStore ..|> JobStore
+SQLiteJobStore ..|> JobStore
+
+FetcherStoreRecordSupport --> JobStore
+FetcherStoreRecordSupport --> JobRowRecord
+FetcherStoreRecordSupport --> JobResultRecord
+
+PipelineStateService --> JobStore
+PipelineStateService --> JobRowRecord
+PipelineStateService --> PipelineMetadataRecord
+
+ArtifactRegistryService --> JobStore
+ArtifactRegistryService --> ArtifactRowRecord
+
+ManualConversionService --> JobRowRecord
+ManualConversionService --> JobResultRecord
+ManualConversionService --> PipelineMetadataRecord
+ManualConversionService --> ConversionMetadataRecord
+
+FetchJobWorkflowService --> JobResultRecord
+FetchJobWorkflowService --> PipelineMetadataRecord
+FetchJobWorkflowService --> ConversionMetadataRecord
+FetchJobWorkflowService --> MaskWorkflowItem
+FetchJobWorkflowService --> MaskWorkflowSummary
+
+PipelineMetadataRecord --> MaskStateRecord
+ConversionMetadataRecord --> ConversionItemRecord
+MaskWorkflowSummary --> MaskWorkflowItem
+
+note bottom
+This diagram focuses on the typed boundary introduced to
+reduce raw dict[str, Any] flow across persistence and workflow code.
+end note
+
+@enduml

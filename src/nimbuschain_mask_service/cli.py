@@ -6,7 +6,7 @@ import sys
 from typing import Any
 
 from nimbuschain_shared.clients.mask import MaskServiceClient
-from nimbuschain_mask_service.io import open_zarr_group, read_context
+from nimbuschain_mask_service.zarr_context import open_zarr_group, read_context
 from nimbuschain_shared.zarr import ConversionError
 
 

@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+from nimbuschain_mask_service.models import CloudInferenceSummary
 from nimbuschain_mask_service.runtime import batch_size_for_device, resolve_inference_device
 from nimbuschain_mask_service.sensor_mapping import SensorMaskSpec
 
@@ -16,7 +17,7 @@ from nimbuschain_mask_service.sensor_mapping import SensorMaskSpec
 class CloudMaskResult:
     probability: np.ndarray
     mask: np.ndarray
-    summary: dict[str, Any]
+    summary: CloudInferenceSummary
 
 
 _OMNICLOUDMASK_MODEL_CACHE: dict[tuple[str, int, str, bool, str, str], tuple[Any, ...]] = {}
@@ -199,18 +200,18 @@ def _run_heuristic(
     return CloudMaskResult(
         probability=probability.astype(np.float32, copy=False),
         mask=mask,
-        summary={
-            "backend": "heuristic",
-            "sensor": sensor.sensor_key,
-            "cloud_fraction": cloud_fraction,
-            "cloud_only_fraction": cloud_only_fraction,
-            "shadow_fraction": shadow_fraction,
-            "includes_shadows": bool(include_shadows),
-            "shadow_threshold": float(shadow_threshold),
-            "threshold_used": float(effective_threshold),
-            "sensor_recipe": sensor.sensor_key,
-            "valid_pixels": int(valid_pixels),
-        },
+        summary=CloudInferenceSummary(
+            backend="heuristic",
+            sensor=sensor.sensor_key,
+            cloud_fraction=cloud_fraction,
+            cloud_only_fraction=cloud_only_fraction,
+            shadow_fraction=shadow_fraction,
+            includes_shadows=bool(include_shadows),
+            shadow_threshold=float(shadow_threshold),
+            threshold_used=float(effective_threshold),
+            sensor_recipe=sensor.sensor_key,
+            valid_pixels=int(valid_pixels),
+        ),
     )
 
 
@@ -289,30 +290,30 @@ def _run_omnicloudmask(
     return CloudMaskResult(
         probability=probability,
         mask=mask,
-        summary={
-            "backend": "omnicloudmask",
-            "sensor": sensor.sensor_key,
-            "cloud_fraction": cloud_fraction,
-            "cloud_only_fraction": cloud_only_fraction,
-            "shadow_fraction": shadow_fraction,
-            "includes_shadows": bool(include_shadows),
-            "class_labels": {
+        summary=CloudInferenceSummary(
+            backend="omnicloudmask",
+            sensor=sensor.sensor_key,
+            cloud_fraction=cloud_fraction,
+            cloud_only_fraction=cloud_only_fraction,
+            shadow_fraction=shadow_fraction,
+            includes_shadows=bool(include_shadows),
+            class_labels={
                 "0": "clear",
                 "1": "thick_cloud",
                 "2": "thin_cloud",
                 "3": "cloud_shadow",
             },
-            "class_histogram": _class_histogram(class_map, valid_mask=valid_mask),
-            "confidence_available": confidence_cube is not None,
-            "inference_device": device or "auto",
-            "mask_source": "class_map",
-            "probability_source": "confidence_cube" if confidence_cube is not None else "class_map",
-            "threshold_for_mask": None,
-            "requested_threshold": float(threshold),
-            "valid_pixels": int(valid_pixels),
-            "batch_size": int(batch_size),
-            "preloaded_models": bool(preloaded_models),
-        },
+            class_histogram=_class_histogram(class_map, valid_mask=valid_mask),
+            confidence_available=confidence_cube is not None,
+            inference_device=device or "auto",
+            mask_source="class_map",
+            probability_source="confidence_cube" if confidence_cube is not None else "class_map",
+            threshold_for_mask=None,
+            requested_threshold=float(threshold),
+            valid_pixels=int(valid_pixels),
+            batch_size=int(batch_size),
+            preloaded_models=bool(preloaded_models),
+        ),
     )
 
 
@@ -602,8 +603,8 @@ def _apply_validity_to_outputs(
     mask: np.ndarray,
     valid_mask: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    probability_array = np.asarray(probability, dtype=np.float32, copy=False)
-    mask_array = np.asarray(mask, dtype=np.uint8, copy=False)
+    probability_array = np.asarray(probability, dtype=np.float32)
+    mask_array = np.asarray(mask, dtype=np.uint8)
     if valid_mask is None:
         return probability_array, mask_array, int(mask_array.size)
     valid = np.asarray(valid_mask, dtype=bool)
@@ -620,8 +621,8 @@ def _apply_validity_to_outputs(
 
 def _max_filter2d(array: np.ndarray, *, radius: int) -> np.ndarray:
     if radius <= 0:
-        return np.asarray(array, dtype=np.float32, copy=False)
-    src = np.asarray(array, dtype=np.float32, copy=False)
+        return np.asarray(array, dtype=np.float32)
+    src = np.asarray(array, dtype=np.float32)
     padded = np.pad(src, radius, mode="edge")
     height, width = src.shape
     result = np.zeros_like(src, dtype=np.float32)
