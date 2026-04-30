@@ -15,12 +15,33 @@ from nimbuschain_zarr_service.core import (
     ConversionError,
     _build_quadkey_metadata,
     _coerce_timestamp,
-    _derive_spatial_coords,
     _open_existing_output_store,
     _prepare_output_store,
     is_oci_uri,
-    resolve_output_path,
 )
+from nimbuschain_zarr_service.cube_support import (
+    clean_optional_text as _clean_optional_text,
+    coerce_date_only as _coerce_date_only,
+    copy_time_slice_in_chunks as _copy_time_slice_in_chunks,
+    default_scene_id as _default_scene_id,
+    normalize_label as _normalize_label,
+    normalize_public_uri as _normalize_public_uri,
+    normalized_chunk_shape as _normalized_chunk_shape,
+    read_label_array as _read_label_array,
+    resolve_acquisition_time as _resolve_acquisition_time,
+    sanitize_layer_metadata as _sanitize_layer_metadata,
+    sanitize_mask_array_attrs as _sanitize_mask_array_attrs,
+    string_array as _string_array,
+    time_slice_block_count as _time_slice_block_count,
+)
+from nimbuschain_zarr_service.models import (
+    CubeBuildSummaryRecord,
+    GroupedCubeItemRecord,
+    GroupedCubeSkippedRecord,
+    GroupedCubeSummaryRecord,
+)
+from nimbuschain_zarr_service.spatial_support import derive_spatial_coords as _derive_spatial_coords
+from nimbuschain_zarr_service.storage_support import resolve_output_path
 from nimbuschain_zarr_service.schema import ChunkShape, ZARR_FORMAT_VERSION
 
 
@@ -326,38 +347,31 @@ def build_time_cube(
 
     zarr.consolidate_metadata(output_store)
 
-    cube_summary: dict[str, Any] = {
-        "zarr_uri": public_uri,
-        "cube_kind": "time_series",
-        "source_scene_count": source_count,
-        "source_zarr_uris": list(source_uris),
-        "band_names": list(baseline.band_names),
-        "shape": [source_count, band_count, height, width],
-        "time_values": list(time_values),
-        "scene_ids": list(scene_ids),
-        "provider": baseline.provider,
-        "collection": baseline.collection,
-        "product_type": baseline.product_type,
-        "data_family": baseline.data_family,
-        "crs": baseline.crs,
-        "transform": baseline.transform,
-        "pixel_size": baseline.reference_pixel_size,
-        "dimensions": ["time", "band", "y", "x"],
-        "ancillary_written": ancillary is not None,
-        "ancillary_layer_names": list(ancillary_layer_names),
-        "masks_written": bool(mask_arrays),
-        "mask_layer_names": list(mask_layer_names),
-    }
-    if quadkey_attrs:
-        cube_summary.update(
-            {
-                "quadkey_schema_version": quadkey_attrs.get("quadkey_schema_version"),
-                "quadkey_coverage_mode": quadkey_attrs.get("quadkey_coverage_mode"),
-                "quadkey_zoom_index": quadkey_attrs.get("quadkey_zoom_index"),
-                "quadkeys_index": list(quadkey_attrs.get("quadkeys_index") or []),
-            }
-        )
-    return cube_summary
+    return CubeBuildSummaryRecord(
+        zarr_uri=public_uri,
+        cube_kind="time_series",
+        source_scene_count=source_count,
+        source_zarr_uris=list(source_uris),
+        band_names=list(baseline.band_names),
+        shape=[source_count, band_count, height, width],
+        time_values=list(time_values),
+        scene_ids=list(scene_ids),
+        provider=baseline.provider,
+        collection=baseline.collection,
+        product_type=baseline.product_type,
+        data_family=baseline.data_family,
+        crs=baseline.crs,
+        transform=baseline.transform,
+        pixel_size=baseline.reference_pixel_size,
+        ancillary_written=ancillary is not None,
+        ancillary_layer_names=list(ancillary_layer_names),
+        masks_written=bool(mask_arrays),
+        mask_layer_names=list(mask_layer_names),
+        quadkey_schema_version=quadkey_attrs.get("quadkey_schema_version") if quadkey_attrs else None,
+        quadkey_coverage_mode=quadkey_attrs.get("quadkey_coverage_mode") if quadkey_attrs else None,
+        quadkey_zoom_index=quadkey_attrs.get("quadkey_zoom_index") if quadkey_attrs else None,
+        quadkeys_index=list(quadkey_attrs.get("quadkeys_index") or []) if quadkey_attrs else [],
+    ).to_dict()
 
 
 def build_grouped_time_cubes(
@@ -372,14 +386,10 @@ def build_grouped_time_cubes(
     progress_callback: CubeProgressCallback | None = None,
 ) -> dict[str, Any]:
     if not source_zarr_uris:
-        return {
-            "status": "skipped",
-            "reason": "no_source_zarrs",
-            "cube_outputs": [],
-            "items": [],
-            "tiles_built": [],
-            "tiles_skipped": [],
-        }
+        return GroupedCubeSummaryRecord(
+            status="skipped",
+            reason="no_source_zarrs",
+        ).to_dict()
 
     resolved_include_masks = _include_masks_for_stage(stage_label) if include_masks is None else bool(include_masks)
 
@@ -395,14 +405,10 @@ def build_grouped_time_cubes(
         if _scene_within_date_range(scene, start_date=start_bound, end_date=end_bound)
     ]
     if not filtered_scenes:
-        return {
-            "status": "skipped",
-            "reason": "no_scenes_in_date_range",
-            "cube_outputs": [],
-            "items": [],
-            "tiles_built": [],
-            "tiles_skipped": [],
-        }
+        return GroupedCubeSummaryRecord(
+            status="skipped",
+            reason="no_scenes_in_date_range",
+        ).to_dict()
 
     grouped: dict[str, list[SourceScene]] = {}
     for scene in filtered_scenes:
@@ -422,11 +428,11 @@ def build_grouped_time_cubes(
         unique_scenes, skipped_duplicates = _deduplicate_scenes_by_time(ordered)
         if len(unique_scenes) < 2:
             tiles_skipped.append(
-                {
-                    "group_key": group_key,
-                    "reason": "fewer_than_two_unique_times",
-                    "candidate_scene_ids": [scene.scene_id for scene in ordered],
-                }
+                GroupedCubeSkippedRecord(
+                    group_key=group_key,
+                    reason="fewer_than_two_unique_times",
+                    candidate_scene_ids=[scene.scene_id for scene in ordered],
+                ).to_dict()
             )
             continue
         buildable_groups.append((group_key, unique_scenes, skipped_duplicates))
@@ -466,29 +472,54 @@ def build_grouped_time_cubes(
         )
         cube_outputs.append(str(summary["zarr_uri"]))
         items.append(
-            {
-                **summary,
-                "group_key": group_key,
-                "skipped_duplicate_scene_ids": skipped_duplicates,
-            }
+            GroupedCubeItemRecord(
+                summary=CubeBuildSummaryRecord(
+                    zarr_uri=str(summary["zarr_uri"]),
+                    cube_kind=str(summary["cube_kind"]),
+                    source_scene_count=int(summary["source_scene_count"]),
+                    source_zarr_uris=list(summary.get("source_zarr_uris") or []),
+                    band_names=list(summary.get("band_names") or []),
+                    shape=list(summary.get("shape") or []),
+                    time_values=list(summary.get("time_values") or []),
+                    scene_ids=list(summary.get("scene_ids") or []),
+                    provider=summary.get("provider"),
+                    collection=summary.get("collection"),
+                    product_type=summary.get("product_type"),
+                    data_family=summary.get("data_family"),
+                    crs=summary.get("crs"),
+                    transform=summary.get("transform"),
+                    pixel_size=summary.get("pixel_size"),
+                    dimensions=list(summary.get("dimensions") or ["time", "band", "y", "x"]),
+                    ancillary_written=bool(summary.get("ancillary_written")),
+                    ancillary_layer_names=list(summary.get("ancillary_layer_names") or []),
+                    masks_written=bool(summary.get("masks_written")),
+                    mask_layer_names=list(summary.get("mask_layer_names") or []),
+                    quadkey_schema_version=summary.get("quadkey_schema_version"),
+                    quadkey_coverage_mode=summary.get("quadkey_coverage_mode"),
+                    quadkey_zoom_index=summary.get("quadkey_zoom_index"),
+                    quadkeys_index=list(summary.get("quadkeys_index") or []),
+                ),
+                group_key=group_key,
+                skipped_duplicate_scene_ids=skipped_duplicates,
+            ).to_dict()
         )
         tiles_built.append(group_key)
 
     status = "written" if cube_outputs else "skipped"
     reason = "" if cube_outputs else "no_groups_with_multiple_times"
-    return {
-        "status": status,
-        "reason": reason,
-        "cube_outputs": cube_outputs,
-        "items": items,
-        "tiles_built": tiles_built,
-        "tiles_skipped": tiles_skipped,
-        "stage_label": str(stage_label or "").strip() or None,
-        "date_range": {
+    return GroupedCubeSummaryRecord(
+        status=status,
+        reason=reason,
+        cube_outputs=cube_outputs,
+        items=items,
+        tiles_built=tiles_built,
+        tiles_skipped=tiles_skipped,
+        stage_label=str(stage_label or "").strip() or None,
+        date_range={
             "start_date": start_bound.isoformat() if start_bound else None,
             "end_date": end_bound.isoformat() if end_bound else None,
         },
-    }
+    ).to_dict()
 
 
 def _load_source_scene(source_zarr_uri: str, *, include_ancillary: bool) -> SourceScene:
@@ -743,238 +774,6 @@ def _coords_equal(left: np.ndarray | None, right: np.ndarray | None) -> bool:
     if left is None or right is None:
         return False
     return bool(np.array_equal(left, right))
-
-
-def _copy_time_slice_in_chunks(
-    source_array: Any,
-    target_array: Any,
-    *,
-    source_time_index: int,
-    target_time_index: int,
-    layer_name: str,
-    label_names: list[str] | None = None,
-    blocks_written: int = 0,
-    total_blocks: int | None = None,
-    progress_callback: CubeProgressCallback | None = None,
-) -> int:
-    shape = tuple(int(value) for value in target_array.shape)
-    chunk_shape = _normalized_chunk_shape(target_array)
-
-    if len(shape) == 4:
-        band_count = int(shape[1])
-        height = int(shape[2])
-        width = int(shape[3])
-        band_chunk = max(1, int(chunk_shape[1]))
-        y_chunk = max(1, int(chunk_shape[2]))
-        x_chunk = max(1, int(chunk_shape[3]))
-        for band_start in range(0, band_count, band_chunk):
-            band_stop = min(band_count, band_start + band_chunk)
-            band_name = None
-            if label_names and band_stop - band_start == 1 and band_start < len(label_names):
-                band_name = str(label_names[band_start])
-            for y0 in range(0, height, y_chunk):
-                y1 = min(height, y0 + y_chunk)
-                for x0 in range(0, width, x_chunk):
-                    x1 = min(width, x0 + x_chunk)
-                    target_array[
-                        target_time_index,
-                        band_start:band_stop,
-                        y0:y1,
-                        x0:x1,
-                    ] = source_array[
-                        source_time_index,
-                        band_start:band_stop,
-                        y0:y1,
-                        x0:x1,
-                    ]
-                    blocks_written += 1
-                    if progress_callback is not None:
-                        progress_callback(
-                            {
-                                "layer_name": layer_name,
-                                "band_name": band_name,
-                                "blocks_written": blocks_written,
-                                "total_blocks": int(total_blocks or 0),
-                                "fraction": (
-                                    min(1.0, max(0.0, blocks_written / total_blocks))
-                                    if total_blocks
-                                    else 1.0
-                                ),
-                            }
-                        )
-        return blocks_written
-
-    if len(shape) == 3:
-        height = int(shape[1])
-        width = int(shape[2])
-        y_chunk = max(1, int(chunk_shape[1]))
-        x_chunk = max(1, int(chunk_shape[2]))
-        for y0 in range(0, height, y_chunk):
-            y1 = min(height, y0 + y_chunk)
-            for x0 in range(0, width, x_chunk):
-                x1 = min(width, x0 + x_chunk)
-                target_array[
-                    target_time_index,
-                    y0:y1,
-                    x0:x1,
-                ] = source_array[
-                    source_time_index,
-                    y0:y1,
-                    x0:x1,
-                ]
-                blocks_written += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        {
-                            "layer_name": layer_name,
-                            "blocks_written": blocks_written,
-                            "total_blocks": int(total_blocks or 0),
-                            "fraction": (
-                                min(1.0, max(0.0, blocks_written / total_blocks))
-                                if total_blocks
-                                else 1.0
-                            ),
-                        }
-                    )
-        return blocks_written
-
-    raise ConversionError(
-        "Cube arrays must use either the (time, band, y, x) or (time, y, x) layout."
-    )
-
-
-def _time_slice_block_count(array: Any) -> int:
-    shape = tuple(int(value) for value in array.shape)
-    chunk_shape = _normalized_chunk_shape(array)
-
-    if len(shape) == 4:
-        return (
-            math.ceil(shape[1] / max(1, int(chunk_shape[1])))
-            * math.ceil(shape[2] / max(1, int(chunk_shape[2])))
-            * math.ceil(shape[3] / max(1, int(chunk_shape[3])))
-        )
-    if len(shape) == 3:
-        return (
-            math.ceil(shape[1] / max(1, int(chunk_shape[1])))
-            * math.ceil(shape[2] / max(1, int(chunk_shape[2])))
-        )
-    raise ConversionError(
-        "Cube arrays must use either the (time, band, y, x) or (time, y, x) layout."
-    )
-
-
-def _normalized_chunk_shape(array: Any) -> tuple[int, ...]:
-    shape = tuple(int(value) for value in array.shape)
-    raw_chunks = getattr(array, "chunks", None)
-    if not isinstance(raw_chunks, (list, tuple)) or len(raw_chunks) != len(shape):
-        return shape
-
-    normalized: list[int] = []
-    for size, chunk in zip(shape, raw_chunks):
-        chunk_size = int(chunk or size)
-        normalized.append(min(int(size), max(1, chunk_size)))
-    return tuple(normalized)
-
-
-def _read_label_array(group: Any, key: str) -> list[str]:
-    if key not in group:
-        return []
-    values = group[key][:]
-    try:
-        items = values.tolist()
-    except Exception:
-        items = list(values)
-    return [_normalize_label(item) for item in items]
-
-
-def _normalize_label(value: Any) -> str:
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except Exception:
-            return value.decode(errors="replace")
-    return str(value)
-
-
-def _resolve_acquisition_time(
-    attrs: dict[str, Any],
-    time_values: list[str],
-    source_zarr_uri: str,
-) -> str:
-    candidates = [
-        str(attrs.get("acquisition_datetime") or "").strip(),
-        time_values[0] if time_values else "",
-    ]
-    for candidate in candidates:
-        if candidate:
-            return _coerce_timestamp(candidate).isoformat()
-    raise ConversionError(f"Source Zarr is missing acquisition time metadata: {source_zarr_uri}")
-
-
-def _default_scene_id(source_zarr_uri: str) -> str:
-    if is_oci_uri(source_zarr_uri):
-        return str(source_zarr_uri).rstrip("/").split("/")[-1] or "scene"
-    return resolve_output_path(source_zarr_uri).stem or "scene"
-
-
-def _normalize_public_uri(source_zarr_uri: str) -> str:
-    if is_oci_uri(source_zarr_uri):
-        return source_zarr_uri
-    return str(resolve_output_path(source_zarr_uri))
-
-
-def _string_array(values: list[str]) -> np.ndarray:
-    width = max(1, max(len(str(value)) for value in values))
-    return np.asarray([str(value) for value in values], dtype=f"<U{width}")
-
-
-def _sanitize_layer_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    sanitized: dict[str, Any] = {}
-    for layer_name, raw_payload in dict(metadata or {}).items():
-        payload = dict(raw_payload or {})
-        payload.pop("path", None)
-        sanitized[str(layer_name)] = payload
-    return sanitized
-
-
-def _sanitize_mask_array_attrs(attrs: dict[str, Any]) -> dict[str, Any]:
-    sanitized = dict(attrs or {})
-    sanitized["dimensions"] = ["time", "y", "x"]
-    sanitized.pop("created_at", None)
-    sanitized.pop("written_at", None)
-    sanitized.pop("summary", None)
-
-    metadata = dict(sanitized.get("metadata") or {})
-    for key in [
-        "scene_id",
-        "input_zarr_uri",
-        "output_zarr_uri",
-        "artifact_uri",
-        "status_path",
-        "work_dir",
-    ]:
-        metadata.pop(key, None)
-    if metadata:
-        sanitized["metadata"] = metadata
-    else:
-        sanitized.pop("metadata", None)
-    return sanitized
-
-
-def _clean_optional_text(value: Any) -> str | None:
-    text = str(value or "").strip()
-    return text or None
-
-
-def _coerce_date_only(value: str | date | None) -> date | None:
-    if value is None:
-        return None
-    if isinstance(value, date):
-        return value
-    text = str(value).strip()
-    if not text:
-        return None
-    return _coerce_timestamp(text).date()
 
 
 def _include_masks_for_stage(stage_label: str | None) -> bool:

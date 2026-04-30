@@ -6,6 +6,7 @@ from typing import Any
 
 import yaml
 from nimbuschain_shared.resolution import target_pixel_size_for as shared_target_pixel_size_for
+from nimbuschain_zarr_service.models import CollectionProductSpecRecord, ConverterConfigRecord
 
 
 def _config_candidates() -> list[Path]:
@@ -22,6 +23,10 @@ def load_converter_config() -> dict[str, Any]:
         if candidate.exists():
             return yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
     raise FileNotFoundError("nimbuschain_zarr_service config.yaml not found")
+
+
+def load_converter_config_record() -> ConverterConfigRecord:
+    return ConverterConfigRecord.from_mapping(load_converter_config())
 
 
 def resolution_policy() -> dict[str, Any]:
@@ -70,3 +75,21 @@ def get_copernicus_product_spec(collection: str, product_type: str) -> dict[str,
 def get_landsat_product_spec(collection: str, product_type: str) -> dict[str, Any]:
     config = load_converter_config().get("usgs", {})
     return dict((((config.get(collection) or {}).get(product_type)) or {}))
+
+
+def get_copernicus_product_spec_record(collection: str, product_type: str) -> CollectionProductSpecRecord:
+    return CollectionProductSpecRecord(
+        provider="copernicus",
+        collection=collection,
+        product_type=product_type,
+        payload=get_copernicus_product_spec(collection, product_type),
+    )
+
+
+def get_landsat_product_spec_record(collection: str, product_type: str) -> CollectionProductSpecRecord:
+    return CollectionProductSpecRecord(
+        provider="usgs",
+        collection=collection,
+        product_type=product_type,
+        payload=get_landsat_product_spec(collection, product_type),
+    )

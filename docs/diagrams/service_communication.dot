@@ -1,0 +1,68 @@
+digraph ServiceCommunication {
+  graph [
+    rankdir=LR,
+    splines=ortho,
+    pad=0.35,
+    nodesep=0.55,
+    ranksep=0.9,
+    bgcolor="white",
+    fontname="Helvetica",
+    fontsize=20,
+    label="Nimbus Services Communication",
+    labelloc=t,
+    labeljust=c
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fillcolor="#F8FAFC",
+    color="#334155",
+    penwidth=1.4,
+    fontname="Helvetica",
+    fontsize=14,
+    margin="0.16,0.10"
+  ];
+
+  edge [
+    color="#475569",
+    penwidth=1.4,
+    fontname="Helvetica",
+    fontsize=12,
+    arrowsize=0.8
+  ];
+
+  user [label="User / UI / Client", fillcolor="#E0F2FE"];
+  api [label="Nimbus Fetch API\nnimbuschain_fetch_service", fillcolor="#DBEAFE"];
+  fetcher [label="Nimbus Fetch Runtime\nnimbuschain_fetch", fillcolor="#DBEAFE"];
+  providers [label="External Providers\nCopernicus / USGS", fillcolor="#FCE7F3"];
+  zarr [label="Nimbus Zarr Service\nnimbuschain_zarr_service", fillcolor="#DCFCE7"];
+  mask [label="Nimbus Mask Service\nnimbuschain_mask_service", fillcolor="#FEF3C7"];
+  shared [label="Shared Storage / Artifacts\nraw bundles, zarr stores, masks", shape=cylinder, fillcolor="#F1F5F9"];
+  contracts [label="nimbuschain_shared\ncontracts + clients + conventions", fillcolor="#EDE9FE"];
+
+  user -> api [label="HTTP"];
+  api -> fetcher [label="job submission\nstatus / orchestration"];
+
+  fetcher -> providers [label="search + download"];
+  providers -> fetcher [label="raw product bundles"];
+  fetcher -> shared [label="persist raw bundle\nartifact metadata"];
+
+  fetcher -> zarr [label="HTTP /convert\nConvertRequest"];
+  zarr -> shared [label="read raw_uri"];
+  zarr -> shared [label="write zarr_uri\n+ dataset summary"];
+  zarr -> fetcher [label="ConvertResponse"];
+
+  fetcher -> mask [label="HTTP /apply\nMaskApplyRequest"];
+  mask -> shared [label="read source_zarr_uri"];
+  mask -> shared [label="write cloud/water\nmask layers"];
+  mask -> fetcher [label="mask result payload"];
+
+  api -> contracts [style=dashed, label="uses shared contracts"];
+  fetcher -> contracts [style=dashed, label="uses shared clients / models"];
+  zarr -> contracts [style=dashed, label="uses shared contracts"];
+  mask -> contracts [style=dashed, label="uses shared contracts"];
+
+  { rank=same; zarr; mask; }
+  { rank=same; shared; contracts; }
+}

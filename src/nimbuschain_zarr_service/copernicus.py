@@ -15,16 +15,15 @@ from nimbuschain_zarr_service.config_loader import (
 )
 from nimbuschain_zarr_service.core import (
     ConversionError,
-    PreparedSource,
-    TargetGrid,
     attach_layer_array,
     build_standard_dataset,
     load_aligned_raster_stack,
-    prepare_source,
     stream_raster_product_to_zarr,
     summarize_dataset,
     write_dataset_to_zarr,
 )
+from nimbuschain_zarr_service.models import GridMetadataRecord, ProductNormalizationSummaryRecord
+from nimbuschain_zarr_service.storage_support import PreparedSource, TargetGrid, prepare_source
 from nimbuschain_zarr_service.sentinel1_raw import (
     build_sentinel1_raw_dataset,
     convert_sentinel1_raw_to_zarr,
@@ -162,12 +161,13 @@ def convert_copernicus_to_zarr(
                     scene_id=resolved_scene_id,
                     output_uri=output_uri,
                 )
+                summary = dict(summary)
                 summary["scene_id"] = resolved_scene_id
                 summary["source_kind"] = extracted.source_kind
                 summary["raw_path"] = str(extracted.raw_path)
                 if scene_id != resolved_scene_id:
                     summary["requested_scene_id"] = scene_id
-                return written_uri, "sar", summary, dataset_summary
+                return written_uri, "sar", summary, dict(dataset_summary)
 
             dataset, summary = _build_sentinel1_dataset(
                 extracted,
@@ -182,7 +182,7 @@ def convert_copernicus_to_zarr(
                 data_family=str(summary.get("data_family", "unknown")),
                 zarr_uri=written_uri,
             )
-            return written_uri, str(summary.get("data_family", "unknown")), summary, dataset_summary
+            return written_uri, str(summary.get("data_family", "unknown")), summary, dataset_summary.to_dict()
 
         dataset, summary = _build_generic_netcdf_dataset(
             extracted,
@@ -196,7 +196,7 @@ def convert_copernicus_to_zarr(
             data_family=str(summary.get("data_family", "unknown")),
             zarr_uri=written_uri,
         )
-        return written_uri, str(summary.get("data_family", "unknown")), summary, dataset_summary
+        return written_uri, str(summary.get("data_family", "unknown")), summary, dataset_summary.to_dict()
     finally:
         if extracted.cleanup is not None:
             extracted.cleanup.cleanup()
@@ -246,8 +246,8 @@ def _build_sentinel2_dataset(
     )
     acquisition = _extract_timestamp_from_scene_id(scene_id, prefix="S2")
     dataset = build_standard_dataset(
-        arrays=imagery_stack["arrays"],
-        band_names=imagery_stack["band_names"],
+        arrays=imagery_stack.arrays,
+        band_names=imagery_stack.band_names,
         acquisition_datetime=acquisition,
         metadata={
             "provider": provider,
@@ -257,22 +257,22 @@ def _build_sentinel2_dataset(
             "product_type": s2_product_type,
             "product_level": _s2_product_level(scene_id),
             "data_family": "optical",
-            "crs": imagery_stack["crs"],
-            "transform": imagery_stack["transform"],
-            "reference_band": imagery_stack["reference_band"],
-            "reference_pixel_size": imagery_stack["pixel_size"],
-            "band_metadata": imagery_stack["band_metadata"],
+            "crs": imagery_stack.crs,
+            "transform": imagery_stack.transform,
+            "reference_band": imagery_stack.reference_band,
+            "reference_pixel_size": imagery_stack.pixel_size,
+            "band_metadata": imagery_stack.band_metadata_dict,
         },
     )
     ancillary_metadata: dict[str, Any] = {}
     if ordered_ancillary:
         target_grid = TargetGrid(
-            height=int(imagery_stack["height"]),
-            width=int(imagery_stack["width"]),
-            crs=imagery_stack["crs"],
-            transform=imagery_stack["transform"],
-            pixel_size=imagery_stack["pixel_size"],
-            reference_band=imagery_stack["reference_band"],
+            height=int(imagery_stack.height),
+            width=int(imagery_stack.width),
+            crs=imagery_stack.crs,
+            transform=imagery_stack.transform,
+            pixel_size=imagery_stack.pixel_size,
+            reference_band=imagery_stack.reference_band,
         )
         ancillary_stack = load_aligned_raster_stack(
             ancillary_paths,
@@ -284,14 +284,23 @@ def _build_sentinel2_dataset(
         )
         dataset = attach_layer_array(
             dataset,
-            arrays=ancillary_stack["arrays"],
-            layer_names=ancillary_stack["band_names"],
+            arrays=ancillary_stack.arrays,
+            layer_names=ancillary_stack.band_names,
             acquisition_datetime=acquisition,
             variable_name="ancillary",
             coord_name="ancillary_layer",
         )
-        ancillary_metadata = ancillary_stack["band_metadata"]
+        ancillary_metadata = ancillary_stack.band_metadata_dict
 
+    grid = GridMetadataRecord(
+        height=int(imagery_stack.height),
+        width=int(imagery_stack.width),
+        dtype=str(imagery_stack.dtype),
+        crs=imagery_stack.crs,
+        transform=imagery_stack.transform,
+        pixel_size=imagery_stack.pixel_size,
+        reference_band=imagery_stack.reference_band,
+    )
     summary = _summarize_optical_product(
         provider=provider,
         collection=collection,
@@ -302,17 +311,9 @@ def _build_sentinel2_dataset(
         acquisition=acquisition,
         extracted=extracted,
         imagery_paths=imagery_paths,
-        imagery_band_names=imagery_stack["band_names"],
-        imagery_metadata=imagery_stack["band_metadata"],
-        grid={
-            "height": imagery_stack["height"],
-            "width": imagery_stack["width"],
-            "dtype": imagery_stack["dtype"],
-            "crs": imagery_stack["crs"],
-            "transform": imagery_stack["transform"],
-            "pixel_size": imagery_stack["pixel_size"],
-            "reference_band": imagery_stack["reference_band"],
-        },
+        imagery_band_names=imagery_stack.band_names,
+        imagery_metadata=imagery_stack.band_metadata_dict,
+        grid=grid,
         target_pixel_size=target_pixel_size,
         ancillary_paths=ancillary_paths,
         ancillary_layer_names=ordered_ancillary,
@@ -365,6 +366,15 @@ def _convert_sentinel2_to_zarr(
         ancillary_categorical_layers=_S2_CATEGORICAL_LAYER_TOKENS.intersection(ordered_ancillary),
         progress_callback=progress_callback,
     )
+    grid = GridMetadataRecord(
+        height=int(dataset_summary.shape[2]),
+        width=int(dataset_summary.shape[3]),
+        dtype=str(dataset_summary.dtype or "unknown"),
+        crs=dataset_summary.crs,
+        transform=dataset_summary.transform,
+        pixel_size=dataset_summary.pixel_size,
+        reference_band=reference_band,
+    )
     summary = _summarize_optical_product(
         provider=provider,
         collection=collection,
@@ -375,25 +385,18 @@ def _convert_sentinel2_to_zarr(
         acquisition=acquisition,
         extracted=extracted,
         imagery_paths=imagery_paths,
-        imagery_band_names=list(dataset_summary["band_names"]),
-        imagery_metadata=dict(dataset_summary.get("band_metadata") or {}),
-        grid={
-            "height": int(dataset_summary["shape"][2]),
-            "width": int(dataset_summary["shape"][3]),
-            "dtype": str(dataset_summary.get("dtype") or "unknown"),
-            "crs": dataset_summary.get("crs"),
-            "transform": dataset_summary.get("transform"),
-            "pixel_size": dataset_summary.get("pixel_size"),
-            "reference_band": reference_band,
-        },
+        imagery_band_names=list(dataset_summary.band_names),
+        imagery_metadata=dict(dataset_summary.band_metadata or {}),
+        grid=grid,
         target_pixel_size=target_pixel_size,
         ancillary_paths=ancillary_paths,
-        ancillary_layer_names=list(dataset_summary.get("ancillary_layer_names") or []),
-        ancillary_metadata=dict(dataset_summary.get("ancillary_metadata") or {}),
+        ancillary_layer_names=list(dataset_summary.ancillary_layer_names or []),
+        ancillary_metadata=dict(dataset_summary.ancillary_metadata or {}),
     )
+    dataset_summary_dict = dataset_summary.to_dict()
     if requested_scene_id and requested_scene_id != scene_id:
         summary["requested_scene_id"] = requested_scene_id
-    return written_uri, "optical", summary, dataset_summary
+    return written_uri, "optical", summary, dataset_summary_dict
 
 
 def _build_sentinel1_dataset(
@@ -440,8 +443,8 @@ def _build_sentinel1_dataset(
     )
     acquisition = _extract_timestamp_from_scene_id(scene_id, prefix="S1")
     dataset = build_standard_dataset(
-        arrays=imagery_stack["arrays"].astype(np.float32),
-        band_names=imagery_stack["band_names"],
+        arrays=imagery_stack.arrays.astype(np.float32),
+        band_names=imagery_stack.band_names,
         acquisition_datetime=acquisition,
         metadata={
             "provider": provider,
@@ -452,21 +455,21 @@ def _build_sentinel1_dataset(
             "product_mode": _s1_mode(scene_id),
             "product_token": _s1_product_token(scene_id),
             "data_family": "sar",
-            "crs": imagery_stack["crs"],
-            "transform": imagery_stack["transform"],
-            "reference_band": imagery_stack["reference_band"],
-            "reference_pixel_size": imagery_stack["pixel_size"],
-            "band_metadata": imagery_stack["band_metadata"],
+            "crs": imagery_stack.crs,
+            "transform": imagery_stack.transform,
+            "reference_band": imagery_stack.reference_band,
+            "reference_pixel_size": imagery_stack.pixel_size,
+            "band_metadata": imagery_stack.band_metadata_dict,
         },
     )
     ancillary_metadata: dict[str, Any] = {}
     if ordered_ancillary:
         target_grid = TargetGrid(
-            height=int(imagery_stack["height"]),
-            width=int(imagery_stack["width"]),
-            crs=imagery_stack["crs"],
-            transform=imagery_stack["transform"],
-            pixel_size=imagery_stack["pixel_size"],
+            height=int(imagery_stack.height),
+            width=int(imagery_stack.width),
+            crs=imagery_stack.crs,
+            transform=imagery_stack.transform,
+            pixel_size=imagery_stack.pixel_size,
             reference_band=reference_band,
         )
         ancillary_stack = load_aligned_raster_stack(
@@ -478,22 +481,22 @@ def _build_sentinel1_dataset(
         )
         dataset = attach_layer_array(
             dataset,
-            arrays=ancillary_stack["arrays"].astype(np.float32),
-            layer_names=ancillary_stack["band_names"],
+            arrays=ancillary_stack.arrays.astype(np.float32),
+            layer_names=ancillary_stack.band_names,
             acquisition_datetime=acquisition,
             variable_name="ancillary",
             coord_name="ancillary_layer",
         )
-        ancillary_metadata = ancillary_stack["band_metadata"]
+        ancillary_metadata = ancillary_stack.band_metadata_dict
         dataset.attrs.update(
             {
-                "ancillary_layer_names": list(ancillary_stack["band_names"]),
+                "ancillary_layer_names": list(ancillary_stack.band_names),
                 "ancillary_dimensions": ["time", "ancillary_layer", "y", "x"],
                 "ancillary_shape": [
                     1,
-                    len(ancillary_stack["band_names"]),
-                    int(imagery_stack["height"]),
-                    int(imagery_stack["width"]),
+                    len(ancillary_stack.band_names),
+                    int(imagery_stack.height),
+                    int(imagery_stack.width),
                 ],
                 "ancillary_metadata": ancillary_metadata,
             }
@@ -509,18 +512,18 @@ def _build_sentinel1_dataset(
         "product_token": _s1_product_token(scene_id),
         "product_level": "sar",
         "product_id": scene_id,
-        "normalized_band_order": imagery_stack["band_names"],
+        "normalized_band_order": imagery_stack.band_names,
         "resolution_policy_meters": target_pixel_size,
         "band_sources": {
             band: str(path.relative_to(extracted.root)) for band, path in imagery_paths.items()
         },
         "band_resampling": {
-            band: imagery_stack["band_metadata"][band]["resampled_to_reference"]
-            for band in imagery_stack["band_names"]
+            band: imagery_stack.band_metadata_dict[band]["resampled_to_reference"]
+            for band in imagery_stack.band_names
         },
         "band_native_pixel_size": {
-            band: imagery_stack["band_metadata"][band]["source_pixel_size"]
-            for band in imagery_stack["band_names"]
+            band: imagery_stack.band_metadata_dict[band]["source_pixel_size"]
+            for band in imagery_stack.band_names
         },
         "ancillary_layer_names": ordered_ancillary,
         "ancillary_sources": {
@@ -536,16 +539,16 @@ def _build_sentinel1_dataset(
         },
         "acquisition_datetime": acquisition,
         "grid": {
-            "height": imagery_stack["height"],
-            "width": imagery_stack["width"],
-            "dtype": imagery_stack["dtype"],
-            "crs": imagery_stack["crs"],
-            "transform": imagery_stack["transform"],
-            "pixel_size": imagery_stack["pixel_size"],
-            "reference_band": imagery_stack["reference_band"],
+            "height": imagery_stack.height,
+            "width": imagery_stack.width,
+            "dtype": imagery_stack.dtype,
+            "crs": imagery_stack.crs,
+            "transform": imagery_stack.transform,
+            "pixel_size": imagery_stack.pixel_size,
+            "reference_band": imagery_stack.reference_band,
         },
         "validation": {
-            "imagery_layer_count": len(imagery_stack["band_names"]),
+            "imagery_layer_count": len(imagery_stack.band_names),
             "ancillary_layer_count": len(ordered_ancillary),
         },
     }
@@ -781,54 +784,52 @@ def _summarize_optical_product(
     imagery_paths: dict[str, Path],
     imagery_band_names: list[str],
     imagery_metadata: dict[str, Any],
-    grid: dict[str, Any],
+    grid: GridMetadataRecord,
     target_pixel_size: float | None,
     ancillary_paths: dict[str, Path],
     ancillary_layer_names: list[str],
     ancillary_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "provider": provider,
-        "collection": collection,
-        "scene_id": scene_id,
-        "product_id": product_id,
-        "product_type": product_type,
-        "product_level": product_level,
-        "data_family": "optical",
-        "source_kind": extracted.source_kind,
-        "raw_path": str(extracted.raw_path),
-        "normalized_band_order": imagery_band_names,
-        "resolution_policy_meters": target_pixel_size,
-        "band_sources": {
-            band: str(path.relative_to(extracted.root)) for band, path in imagery_paths.items()
-        },
-        "band_resampling": {
+    return ProductNormalizationSummaryRecord(
+        provider=provider,
+        collection=collection,
+        scene_id=scene_id,
+        product_id=product_id,
+        product_type=product_type,
+        product_level=product_level,
+        data_family="optical",
+        source_kind=extracted.source_kind,
+        raw_path=str(extracted.raw_path),
+        acquisition_datetime=acquisition,
+        normalized_band_order=list(imagery_band_names),
+        resolution_policy_meters=target_pixel_size,
+        band_sources={band: str(path.relative_to(extracted.root)) for band, path in imagery_paths.items()},
+        band_resampling={
             band: imagery_metadata.get(band, {}).get("resampled_to_reference")
             for band in imagery_band_names
         },
-        "band_native_pixel_size": {
+        band_native_pixel_size={
             band: imagery_metadata.get(band, {}).get("source_pixel_size")
             for band in imagery_band_names
         },
-        "ancillary_layer_names": ancillary_layer_names,
-        "ancillary_sources": {
+        ancillary_layer_names=list(ancillary_layer_names),
+        ancillary_sources={
             layer: str(path.relative_to(extracted.root)) for layer, path in ancillary_paths.items()
         },
-        "ancillary_resampling": {
+        ancillary_resampling={
             layer: ancillary_metadata.get(layer, {}).get("resampled_to_reference")
             for layer in ancillary_layer_names
         },
-        "ancillary_native_pixel_size": {
+        ancillary_native_pixel_size={
             layer: ancillary_metadata.get(layer, {}).get("source_pixel_size")
             for layer in ancillary_layer_names
         },
-        "acquisition_datetime": acquisition,
-        "grid": grid,
-        "validation": {
+        grid=grid.to_dict(),
+        validation={
             "imagery_layer_count": len(imagery_band_names),
             "ancillary_layer_count": len(ancillary_layer_names),
         },
-    }
+    ).to_dict()
 
 
 def _extract_timestamp_from_scene_id(scene_id: str, *, prefix: str) -> str | None:

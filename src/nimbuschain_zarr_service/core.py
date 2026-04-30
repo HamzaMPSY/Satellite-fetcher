@@ -1,16 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
-from urllib.parse import unquote, urlparse
 import os
-import shutil
-import tarfile
-import zipfile
 
 import numpy as np
 
@@ -21,138 +15,29 @@ from nimbuschain_shared.zarr import (
     ZARR_FORMAT_VERSION,
     _coerce_timestamp,
 )
-from nimbuschain_zarr_service.oci_storage import (
-    OCIStorageError,
-    OCIStore,
-    is_oci_uri,
+from nimbuschain_zarr_service.models import (
+    DatasetZarrSummaryRecord,
+    RasterBandMetadataRecord,
+    RasterStackRecord,
+)
+from nimbuschain_zarr_service.oci_storage import is_oci_uri
+from nimbuschain_zarr_service.spatial_support import (
+    band_nodata_value as _band_nodata_value,
+    derive_spatial_coords as _derive_spatial_coords,
+    serialize_metadata_scalar as _serialize_metadata_scalar,
+    target_nodata_value as _target_nodata_value,
+)
+from nimbuschain_zarr_service.storage_support import (
+    CleanupBundle,
+    PreparedSource,
+    TargetGrid,
+    open_existing_output_store as _open_existing_output_store,
+    prepare_output_store as _prepare_output_store,
+    prepare_source,
+    resolve_local_path,
+    resolve_output_path,
 )
 from nimbuschain_zarr_service.utils.tile_math import TileMath
-
-
-class CleanupBundle:
-    """Composable cleanup handler for staged and extracted temporary sources."""
-
-    def __init__(self, *entries: TemporaryDirectory[str]) -> None:
-        self._entries: list[TemporaryDirectory[str]] = list(entries)
-
-    def add(self, entry: TemporaryDirectory[str]) -> None:
-        self._entries.append(entry)
-
-    def cleanup(self) -> None:
-        while self._entries:
-            entry = self._entries.pop()
-            try:
-                entry.cleanup()
-            except Exception:
-                continue
-
-
-@dataclass(frozen=True)
-class PreparedSource:
-    root: Path
-    source_kind: str
-    raw_path: Path
-    cleanup: CleanupBundle | TemporaryDirectory[str] | None = None
-
-
-@dataclass(frozen=True)
-class TargetGrid:
-    height: int
-    width: int
-    crs: str | None
-    transform: list[float] | tuple[float, ...]
-    pixel_size: list[float] | tuple[float, ...] | None = None
-    reference_band: str | None = None
-
-
-def resolve_local_path(raw_uri: str) -> Path:
-    if raw_uri.startswith("file://"):
-        parsed = urlparse(raw_uri)
-        candidate = Path(unquote(parsed.path)).expanduser().resolve()
-        if candidate.exists():
-            return candidate
-        mapped = _fallback_mounted_data_path(candidate)
-        if mapped is not None:
-            return mapped
-        return candidate
-    parsed = urlparse(raw_uri)
-    if parsed.scheme:
-        raise ConversionError(
-            "Only local file paths are supported by the Zarr converter in v1."
-        )
-    candidate = Path(raw_uri).expanduser().resolve()
-    if candidate.exists():
-        return candidate
-    mapped = _fallback_mounted_data_path(candidate)
-    if mapped is not None:
-        return mapped
-    return candidate
-
-
-def prepare_source(raw_uri: str, *, label: str) -> PreparedSource:
-    cleanup_bundle: CleanupBundle | None = None
-    if _is_remote_uri(raw_uri):
-        raw_path, cleanup_bundle = _stage_remote_source(raw_uri, label=label)
-    else:
-        raw_path = resolve_local_path(raw_uri)
-    if not raw_path.exists():
-        raise ConversionError(f"{label} source not found: {raw_path}")
-
-    if raw_path.is_dir():
-        return PreparedSource(
-            root=raw_path,
-            source_kind="directory",
-            raw_path=raw_path,
-            cleanup=cleanup_bundle,
-        )
-
-    if raw_path.is_file() and raw_path.suffix.lower() == ".nc":
-        if cleanup_bundle is not None:
-            return PreparedSource(
-                root=raw_path.parent,
-                source_kind="netcdf",
-                raw_path=raw_path,
-                cleanup=cleanup_bundle,
-            )
-        tmp_dir = TemporaryDirectory(prefix=f"nimbus_{label}_")
-        copied = Path(tmp_dir.name) / raw_path.name
-        shutil.copy2(raw_path, copied)
-        return PreparedSource(
-            root=Path(tmp_dir.name),
-            source_kind="netcdf",
-            raw_path=raw_path,
-            cleanup=CleanupBundle(tmp_dir),
-        )
-
-    if zipfile.is_zipfile(raw_path):
-        tmp_dir = TemporaryDirectory(prefix=f"nimbus_{label}_")
-        with zipfile.ZipFile(raw_path) as archive:
-            archive.extractall(tmp_dir.name)
-        cleanup = cleanup_bundle or CleanupBundle()
-        cleanup.add(tmp_dir)
-        return PreparedSource(
-            root=Path(tmp_dir.name),
-            source_kind="zip",
-            raw_path=raw_path,
-            cleanup=cleanup,
-        )
-
-    if tarfile.is_tarfile(raw_path):
-        tmp_dir = TemporaryDirectory(prefix=f"nimbus_{label}_")
-        with tarfile.open(raw_path) as archive:
-            archive.extractall(tmp_dir.name)
-        cleanup = cleanup_bundle or CleanupBundle()
-        cleanup.add(tmp_dir)
-        return PreparedSource(
-            root=Path(tmp_dir.name),
-            source_kind="tar",
-            raw_path=raw_path,
-            cleanup=cleanup,
-        )
-
-    raise ConversionError(
-        f"Unsupported {label} source. Expected a directory, zip, or tar archive."
-    )
 
 
 def load_aligned_raster_stack(
@@ -163,7 +48,7 @@ def load_aligned_raster_stack(
     categorical_bands: set[str] | None = None,
     target_pixel_size: float | None = None,
     target_grid: TargetGrid | None = None,
-) -> dict[str, Any]:
+) -> RasterStackRecord:
     try:
         import rasterio
         from rasterio.errors import RasterioIOError
@@ -275,42 +160,42 @@ def load_aligned_raster_stack(
 
                 arrays.append(data)
                 available_bands.append(expanded_name)
-                band_metadata[expanded_name] = {
-                    "path": str(band_path),
-                    "source_layer": band_name,
-                    "source_band_index": int(source_band_index),
-                    "source_raster_band_count": int(src.count),
-                    "dtype": str(src.dtypes[source_band_index - 1]),
-                    "source_height": int(src.height),
-                    "source_width": int(src.width),
-                    "source_crs": src_crs,
-                    "source_transform": list(src_transform)[:6],
-                    "source_pixel_size": src_pixel_size,
-                    "reference_native_pixel_size": native_ref_pixel_size,
-                    "reference_pixel_size": ref_pixel_size,
-                    "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
-                    "resampled_to_reference": bool(resampled),
-                    "categorical": bool(band_name in categorical_bands),
-                    "source_nodata": _serialize_metadata_scalar(source_nodata),
-                    "target_nodata": _serialize_metadata_scalar(target_nodata),
-                }
+                band_metadata[expanded_name] = RasterBandMetadataRecord(
+                    path=str(band_path),
+                    source_layer=band_name,
+                    source_band_index=int(source_band_index),
+                    source_raster_band_count=int(src.count),
+                    dtype=str(src.dtypes[source_band_index - 1]),
+                    source_height=int(src.height),
+                    source_width=int(src.width),
+                    source_crs=src_crs,
+                    source_transform=list(src_transform)[:6],
+                    source_pixel_size=src_pixel_size,
+                    reference_native_pixel_size=native_ref_pixel_size,
+                    reference_pixel_size=ref_pixel_size,
+                    target_pixel_size_requested=(float(target_pixel_size) if target_pixel_size is not None else None),
+                    resampled_to_reference=bool(resampled),
+                    categorical=bool(band_name in categorical_bands),
+                    source_nodata=_serialize_metadata_scalar(source_nodata),
+                    target_nodata=_serialize_metadata_scalar(target_nodata),
+                )
 
     if not arrays:
         raise ConversionError("No valid raster bands were loaded.")
 
     stacked = np.stack(arrays, axis=0)
-    return {
-        "arrays": stacked,
-        "band_names": available_bands,
-        "height": ref_height,
-        "width": ref_width,
-        "dtype": str(stacked.dtype),
-        "crs": ref_crs,
-        "transform": list(ref_transform)[:6],
-        "pixel_size": ref_pixel_size,
-        "reference_band": ref_name,
-        "band_metadata": band_metadata,
-    }
+    return RasterStackRecord(
+        arrays=stacked,
+        band_names=available_bands,
+        height=ref_height,
+        width=ref_width,
+        dtype=str(stacked.dtype),
+        crs=ref_crs,
+        transform=list(ref_transform)[:6],
+        pixel_size=ref_pixel_size,
+        reference_band=ref_name,
+        band_metadata=band_metadata,
+    )
 
 
 def inspect_aligned_raster_stack(
@@ -321,7 +206,7 @@ def inspect_aligned_raster_stack(
     categorical_bands: set[str] | None = None,
     target_pixel_size: float | None = None,
     target_grid: TargetGrid | None = None,
-) -> dict[str, Any]:
+) -> RasterStackRecord:
     try:
         import rasterio
         from rasterio.transform import array_bounds, from_origin
@@ -389,25 +274,25 @@ def inspect_aligned_raster_stack(
             for expanded_name, source_band_index in _expand_raster_layer_names(band_name, src.count):
                 source_nodata = _band_nodata_value(src, source_band_index)
                 target_nodata = _target_nodata_value(src, source_band_index)
-                band_metadata[expanded_name] = {
-                    "path": str(band_path),
-                    "source_layer": band_name,
-                    "source_band_index": int(source_band_index),
-                    "source_raster_band_count": int(src.count),
-                    "dtype": str(src.dtypes[source_band_index - 1]),
-                    "source_height": int(src.height),
-                    "source_width": int(src.width),
-                    "source_crs": src_crs,
-                    "source_transform": list(src_transform)[:6],
-                    "source_pixel_size": src_pixel_size,
-                    "reference_native_pixel_size": native_ref_pixel_size,
-                    "reference_pixel_size": ref_pixel_size,
-                    "target_pixel_size_requested": float(target_pixel_size) if target_pixel_size is not None else None,
-                    "resampled_to_reference": bool(resampled),
-                    "categorical": bool(band_name in categorical_bands),
-                    "source_nodata": _serialize_metadata_scalar(source_nodata),
-                    "target_nodata": _serialize_metadata_scalar(target_nodata),
-                }
+                band_metadata[expanded_name] = RasterBandMetadataRecord(
+                    path=str(band_path),
+                    source_layer=band_name,
+                    source_band_index=int(source_band_index),
+                    source_raster_band_count=int(src.count),
+                    dtype=str(src.dtypes[source_band_index - 1]),
+                    source_height=int(src.height),
+                    source_width=int(src.width),
+                    source_crs=src_crs,
+                    source_transform=list(src_transform)[:6],
+                    source_pixel_size=src_pixel_size,
+                    reference_native_pixel_size=native_ref_pixel_size,
+                    reference_pixel_size=ref_pixel_size,
+                    target_pixel_size_requested=(float(target_pixel_size) if target_pixel_size is not None else None),
+                    resampled_to_reference=bool(resampled),
+                    categorical=bool(band_name in categorical_bands),
+                    source_nodata=_serialize_metadata_scalar(source_nodata),
+                    target_nodata=_serialize_metadata_scalar(target_nodata),
+                )
                 dtype_candidates.append(np.dtype(src.dtypes[source_band_index - 1]))
                 available_bands.append(expanded_name)
 
@@ -415,17 +300,17 @@ def inspect_aligned_raster_stack(
         raise ConversionError("No valid raster bands were discovered for streaming conversion.")
 
     common_dtype = np.result_type(*dtype_candidates)
-    return {
-        "band_names": available_bands,
-        "height": ref_height,
-        "width": ref_width,
-        "dtype": str(common_dtype),
-        "crs": ref_crs,
-        "transform": list(ref_transform)[:6],
-        "pixel_size": ref_pixel_size,
-        "reference_band": ref_name,
-        "band_metadata": band_metadata,
-    }
+    return RasterStackRecord(
+        band_names=available_bands,
+        height=ref_height,
+        width=ref_width,
+        dtype=str(common_dtype),
+        crs=ref_crs,
+        transform=list(ref_transform)[:6],
+        pixel_size=ref_pixel_size,
+        reference_band=ref_name,
+        band_metadata=band_metadata,
+    )
 
 
 def build_standard_dataset(
@@ -583,7 +468,7 @@ def stream_raster_stack_to_zarr(
     array_name: str = "imagery",
     coord_name: str = "band",
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, DatasetZarrSummaryRecord]:
     try:
         import rasterio
         from rasterio.enums import Resampling
@@ -606,13 +491,13 @@ def stream_raster_stack_to_zarr(
         target_pixel_size=target_pixel_size,
         target_grid=target_grid,
     )
-    band_names = list(stack["band_names"])
-    height = int(stack["height"])
-    width = int(stack["width"])
-    transform = stack["transform"]
+    band_names = list(stack.band_names)
+    height = int(stack.height)
+    width = int(stack.width)
+    transform = stack.transform
     affine_transform = Affine(*transform)
-    crs = stack["crs"]
-    band_metadata = dict(stack["band_metadata"])
+    crs = stack.crs
+    band_metadata = stack.band_metadata
     chunk_spec = ChunkShape()
     chunks = (
         min(chunk_spec.time, 1),
@@ -646,7 +531,7 @@ def stream_raster_stack_to_zarr(
         array_name,
         shape=(1, len(band_names), height, width),
         chunks=chunks,
-        dtype=np.dtype(stack["dtype"]),
+        dtype=np.dtype(stack.dtype),
         compressor=compressor,
     )
     root.create_array(
@@ -671,13 +556,13 @@ def stream_raster_stack_to_zarr(
             {
                 "dimensions": ["time", coord_name, "y", "x"],
                 "shape": [1, len(band_names), height, width],
-                "dtype": str(np.dtype(stack["dtype"])),
+                "dtype": str(np.dtype(stack.dtype)),
                 "crs": crs,
                 "transform": transform,
-                "reference_band": stack["reference_band"],
-                "reference_pixel_size": stack["pixel_size"],
+                "reference_band": stack.reference_band,
+                "reference_pixel_size": stack.pixel_size,
                 "acquisition_datetime": timestamp.isoformat(),
-                "band_metadata": band_metadata,
+                "band_metadata": stack.band_metadata_dict,
             }
         )
         if output_mode == "w":
@@ -687,7 +572,7 @@ def stream_raster_stack_to_zarr(
                 width=width,
                 height=height,
                 time_values=[timestamp.isoformat()],
-                pixel_size=stack["pixel_size"],
+                pixel_size=stack.pixel_size,
             )
             if quadkey_attrs:
                 root.attrs.update(quadkey_attrs)
@@ -697,7 +582,7 @@ def stream_raster_stack_to_zarr(
                 "ancillary_layer_names": band_names,
                 "ancillary_dimensions": ["time", coord_name, "y", "x"],
                 "ancillary_shape": [1, len(band_names), height, width],
-                "ancillary_metadata": band_metadata,
+                "ancillary_metadata": stack.band_metadata_dict,
             }
         )
 
@@ -727,14 +612,14 @@ def stream_raster_stack_to_zarr(
     _emit_chunk_progress(band_index=None, band_name=None)
     for band_index, band_name in enumerate(band_names):
         band_info = band_metadata[band_name]
-        band_path = Path(str(band_info["path"]))
-        source_band_index = int(band_info.get("source_band_index") or 1)
+        band_path = Path(str(band_info.path))
+        source_band_index = int(band_info.source_band_index or 1)
         with rasterio.open(band_path) as src:
             read_handle: Any = src
             vrt: Any = None
-            if band_info["resampled_to_reference"]:
+            if band_info.resampled_to_reference:
                 resampling = (
-                    Resampling.nearest if band_info.get("categorical") else Resampling.bilinear
+                    Resampling.nearest if band_info.categorical else Resampling.bilinear
                 )
                 vrt = WarpedVRT(
                     src,
@@ -763,23 +648,24 @@ def stream_raster_stack_to_zarr(
                     vrt.close()
 
     zarr.consolidate_metadata(output_store)
-    dataset_summary = {
-        "data_family": str(metadata.get("data_family", "unknown")),
-        "zarr_uri": public_uri,
-        "dimensions": ["time", coord_name, "y", "x"],
-        "shape": [1, len(band_names), height, width],
-        "band_names": band_names,
-        f"{coord_name}_names": band_names,
-        "time_values": [timestamp.isoformat()],
-        "dtype": str(np.dtype(stack["dtype"])),
-        "crs": crs,
-        "transform": transform,
-        "pixel_size": stack["pixel_size"],
-        "band_metadata": band_metadata,
-    }
-    if quadkey_attrs:
-        dataset_summary.update(_quadkey_summary_from_attrs(quadkey_attrs))
-    return public_uri, dataset_summary
+    quadkey_summary = _quadkey_summary_from_attrs(quadkey_attrs) if quadkey_attrs else {}
+    return public_uri, DatasetZarrSummaryRecord(
+        data_family=str(metadata.get("data_family", "unknown")),
+        zarr_uri=public_uri,
+        dimensions=["time", coord_name, "y", "x"],
+        shape=[1, len(band_names), height, width],
+        band_names=band_names,
+        time_values=[timestamp.isoformat()],
+        dtype=str(np.dtype(stack.dtype)),
+        crs=crs,
+        transform=transform,
+        pixel_size=stack.pixel_size,
+        band_metadata=stack.band_metadata_dict,
+        quadkey_schema_version=quadkey_summary.get("quadkey_schema_version"),
+        quadkey_coverage_mode=quadkey_summary.get("quadkey_coverage_mode"),
+        quadkey_zoom_index=quadkey_summary.get("quadkey_zoom_index"),
+        quadkeys_index=list(quadkey_summary.get("quadkeys_index") or []),
+    )
 
 
 def stream_raster_product_to_zarr(
@@ -796,7 +682,7 @@ def stream_raster_product_to_zarr(
     ancillary_layer_names: list[str] | None = None,
     ancillary_categorical_layers: set[str] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, DatasetZarrSummaryRecord]:
     has_ancillary = bool(ancillary_band_paths and ancillary_layer_names)
     imagery_span = 0.9 if has_ancillary else 1.0
 
@@ -830,19 +716,35 @@ def stream_raster_product_to_zarr(
         progress_callback=_forward_progress(offset=0.0, span=imagery_span),
     )
     target_grid = TargetGrid(
-        height=int(imagery_summary["shape"][2]),
-        width=int(imagery_summary["shape"][3]),
-        crs=imagery_summary.get("crs"),
-        transform=list(imagery_summary.get("transform") or []),
-        pixel_size=list(imagery_summary.get("pixel_size") or []),
+        height=int(imagery_summary.shape[2]),
+        width=int(imagery_summary.shape[3]),
+        crs=imagery_summary.crs,
+        transform=list(imagery_summary.transform or []),
+        pixel_size=list(imagery_summary.pixel_size or []),
         reference_band=reference_band,
     )
 
-    product_summary = dict(imagery_summary)
-    product_summary["ancillary_layer_names"] = []
-    product_summary["ancillary_dimensions"] = ["time", "ancillary_layer", "y", "x"]
-    product_summary["ancillary_shape"] = [1, 0, int(imagery_summary["shape"][2]), int(imagery_summary["shape"][3])]
-    product_summary["ancillary_metadata"] = {}
+    product_summary = DatasetZarrSummaryRecord(
+        data_family=imagery_summary.data_family,
+        zarr_uri=imagery_summary.zarr_uri,
+        dimensions=list(imagery_summary.dimensions),
+        shape=list(imagery_summary.shape),
+        band_names=list(imagery_summary.band_names),
+        time_values=list(imagery_summary.time_values),
+        dtype=imagery_summary.dtype,
+        crs=imagery_summary.crs,
+        transform=imagery_summary.transform,
+        pixel_size=imagery_summary.pixel_size,
+        band_metadata=dict(imagery_summary.band_metadata),
+        ancillary_layer_names=[],
+        ancillary_dimensions=["time", "ancillary_layer", "y", "x"],
+        ancillary_shape=[1, 0, int(imagery_summary.shape[2]), int(imagery_summary.shape[3])],
+        ancillary_metadata={},
+        quadkey_schema_version=imagery_summary.quadkey_schema_version,
+        quadkey_coverage_mode=imagery_summary.quadkey_coverage_mode,
+        quadkey_zoom_index=imagery_summary.quadkey_zoom_index,
+        quadkeys_index=list(imagery_summary.quadkeys_index),
+    )
 
     if ancillary_band_paths and ancillary_layer_names:
         _, ancillary_summary = stream_raster_stack_to_zarr(
@@ -863,10 +765,27 @@ def stream_raster_product_to_zarr(
                 span=max(0.0, 1.0 - imagery_span),
             ),
         )
-        product_summary["ancillary_layer_names"] = list(ancillary_summary["band_names"])
-        product_summary["ancillary_dimensions"] = list(ancillary_summary["dimensions"])
-        product_summary["ancillary_shape"] = list(ancillary_summary["shape"])
-        product_summary["ancillary_metadata"] = dict(ancillary_summary.get("band_metadata") or {})
+        product_summary = DatasetZarrSummaryRecord(
+            data_family=product_summary.data_family,
+            zarr_uri=product_summary.zarr_uri,
+            dimensions=list(product_summary.dimensions),
+            shape=list(product_summary.shape),
+            band_names=list(product_summary.band_names),
+            time_values=list(product_summary.time_values),
+            dtype=product_summary.dtype,
+            crs=product_summary.crs,
+            transform=product_summary.transform,
+            pixel_size=product_summary.pixel_size,
+            band_metadata=dict(product_summary.band_metadata),
+            ancillary_layer_names=list(ancillary_summary.band_names),
+            ancillary_dimensions=list(ancillary_summary.dimensions),
+            ancillary_shape=list(ancillary_summary.shape),
+            ancillary_metadata=dict(ancillary_summary.band_metadata),
+            quadkey_schema_version=product_summary.quadkey_schema_version,
+            quadkey_coverage_mode=product_summary.quadkey_coverage_mode,
+            quadkey_zoom_index=product_summary.quadkey_zoom_index,
+            quadkeys_index=list(product_summary.quadkeys_index),
+        )
     elif progress_callback is not None:
         progress_callback(
             {
@@ -882,44 +801,16 @@ def stream_raster_product_to_zarr(
     return written_uri, product_summary
 
 
-def resolve_output_path(output_uri: str) -> Path:
-    if output_uri.startswith("file://"):
-        parsed = urlparse(output_uri)
-        candidate = Path(unquote(parsed.path)).expanduser().resolve()
-        if candidate.exists() or candidate.parent.exists():
-            return candidate
-        mapped = _fallback_mounted_data_output(candidate)
-        return mapped if mapped is not None else candidate
-    parsed = urlparse(output_uri)
-    if parsed.scheme:
-        raise ConversionError(
-            "Only local file paths can be resolved with resolve_output_path()."
-        )
-    candidate = Path(output_uri).expanduser().resolve()
-    if candidate.exists() or candidate.parent.exists():
-        return candidate
-    mapped = _fallback_mounted_data_output(candidate)
-    return mapped if mapped is not None else candidate
-
-
-def summarize_dataset(dataset: "xr.Dataset", *, data_family: str, zarr_uri: str) -> dict[str, Any]:
+def summarize_dataset(dataset: "xr.Dataset", *, data_family: str, zarr_uri: str) -> DatasetZarrSummaryRecord:
     imagery = dataset["imagery"]
-    summary = {
-        "data_family": data_family,
-        "zarr_uri": zarr_uri,
-        "dimensions": list(imagery.dims),
-        "shape": [int(size) for size in imagery.shape],
-        "band_names": [str(item) for item in imagery.coords["band"].values.tolist()],
-        "time_values": [str(item) for item in imagery.coords["time"].values.tolist()],
-        "crs": dataset.attrs.get("crs"),
-        "transform": dataset.attrs.get("transform"),
-        "pixel_size": dataset.attrs.get("reference_pixel_size"),
-    }
+    ancillary_layer_names: list[str] = []
+    ancillary_dimensions: list[str] = []
+    ancillary_shape: list[int] = []
     if "ancillary" in dataset:
         ancillary = dataset["ancillary"]
-        summary["ancillary_dimensions"] = list(ancillary.dims)
-        summary["ancillary_shape"] = [int(size) for size in ancillary.shape]
-        summary["ancillary_layer_names"] = [
+        ancillary_dimensions = list(ancillary.dims)
+        ancillary_shape = [int(size) for size in ancillary.shape]
+        ancillary_layer_names = [
             str(item) for item in ancillary.coords["ancillary_layer"].values.tolist()
         ]
     quadkey_attrs = _build_quadkey_metadata(
@@ -930,9 +821,25 @@ def summarize_dataset(dataset: "xr.Dataset", *, data_family: str, zarr_uri: str)
         time_values=[str(item) for item in imagery.coords["time"].values.tolist()],
         pixel_size=dataset.attrs.get("reference_pixel_size"),
     )
-    if quadkey_attrs:
-        summary.update(_quadkey_summary_from_attrs(quadkey_attrs))
-    return summary
+    quadkey_summary = _quadkey_summary_from_attrs(quadkey_attrs) if quadkey_attrs else {}
+    return DatasetZarrSummaryRecord(
+        data_family=data_family,
+        zarr_uri=zarr_uri,
+        dimensions=list(imagery.dims),
+        shape=[int(size) for size in imagery.shape],
+        band_names=[str(item) for item in imagery.coords["band"].values.tolist()],
+        time_values=[str(item) for item in imagery.coords["time"].values.tolist()],
+        crs=dataset.attrs.get("crs"),
+        transform=dataset.attrs.get("transform"),
+        pixel_size=dataset.attrs.get("reference_pixel_size"),
+        ancillary_layer_names=ancillary_layer_names,
+        ancillary_dimensions=ancillary_dimensions,
+        ancillary_shape=ancillary_shape,
+        quadkey_schema_version=quadkey_summary.get("quadkey_schema_version"),
+        quadkey_coverage_mode=quadkey_summary.get("quadkey_coverage_mode"),
+        quadkey_zoom_index=quadkey_summary.get("quadkey_zoom_index"),
+        quadkeys_index=list(quadkey_summary.get("quadkeys_index") or []),
+    )
 
 
 def _quadkey_index_zoom() -> int:
@@ -1109,159 +1016,6 @@ def _bbox_to_quadkeys(
     return sorted(set(quadkeys))
 
 
-def _derive_spatial_coords(
-    transform_values: Any,
-    *,
-    width: int,
-    height: int,
-) -> tuple["np.ndarray | None", "np.ndarray | None"]:
-    import numpy as np
-
-    if not isinstance(transform_values, (list, tuple)) or len(transform_values) < 6:
-        return None, None
-    a, b, c, d, e, f = [float(v) for v in transform_values[:6]]
-    if b != 0.0 or d != 0.0:
-        return None, None
-    x = c + a * (np.arange(width, dtype=np.float64) + 0.5)
-    y = f + e * (np.arange(height, dtype=np.float64) + 0.5)
-    return x, y
-
-
-def _band_nodata_value(src: Any, source_band_index: int) -> float | int | None:
-    nodata_values = getattr(src, "nodatavals", None)
-    value = None
-    if isinstance(nodata_values, (list, tuple)) and len(nodata_values) >= source_band_index:
-        value = nodata_values[source_band_index - 1]
-    if value is None:
-        value = getattr(src, "nodata", None)
-    return _serialize_metadata_scalar(value)
-
-
-def _target_nodata_value(src: Any, source_band_index: int) -> float | int:
-    source_nodata = _band_nodata_value(src, source_band_index)
-    if source_nodata is not None:
-        return source_nodata
-    dtype = np.dtype(src.dtypes[source_band_index - 1])
-    if np.issubdtype(dtype, np.floating):
-        return np.nan
-    return dtype.type(0).item()
-
-
-def _serialize_metadata_scalar(value: Any) -> float | int | None:
-    if value is None:
-        return None
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, float):
-        if not np.isfinite(value):
-            return None
-        return float(value)
-    if isinstance(value, int):
-        return int(value)
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(numeric):
-        return None
-    integer = int(numeric)
-    if abs(numeric - integer) < 1e-9:
-        return integer
-    return numeric
-
-
-def _fallback_mounted_data_path(candidate: Path) -> Path | None:
-    # When running in containers, host absolute paths are unavailable.
-    # We map any path containing /data/downloads/... to the mounted /data/downloads.
-    parts = list(candidate.parts)
-    for idx in range(len(parts) - 1):
-        if parts[idx] == "data" and parts[idx + 1] == "downloads":
-            suffix = parts[idx + 2 :]
-            mapped = Path("/data/downloads").joinpath(*suffix)
-            if mapped.exists():
-                return mapped
-            return None
-    return None
-
-
-def _fallback_mounted_data_output(candidate: Path) -> Path | None:
-    parts = list(candidate.parts)
-    for idx in range(len(parts)):
-        if parts[idx] == "data":
-            suffix = parts[idx + 1 :]
-            if not suffix:
-                return Path("/data")
-            return Path("/data").joinpath(*suffix)
-    return None
-
-
-def _is_remote_uri(uri: str) -> bool:
-    parsed = urlparse(str(uri or "").strip())
-    return bool(parsed.scheme and parsed.scheme.lower() not in {"", "file"})
-
-
-def _stage_remote_source(raw_uri: str, *, label: str) -> tuple[Path, CleanupBundle]:
-    if is_oci_uri(raw_uri):
-        return _stage_oci_source(raw_uri, label=label)
-    raise ConversionError(f"Unsupported remote source URI: {raw_uri}")
-
-
-def _stage_oci_source(raw_uri: str, *, label: str) -> tuple[Path, CleanupBundle]:
-    try:
-        store, parsed = OCIStore.from_uri(raw_uri)
-    except OCIStorageError as exc:
-        raise ConversionDependencyError(str(exc)) from exc
-
-    staging_dir = TemporaryDirectory(prefix=f"nimbus_{label}_oci_")
-    cleanup = CleanupBundle(staging_dir)
-    staging_root = Path(staging_dir.name)
-
-    if store.is_file(parsed.path):
-        local_path = staging_root / Path(parsed.path).name
-        store.download_file(parsed.path, local_path)
-        return local_path, cleanup
-
-    if store.is_dir(parsed.path):
-        dest_name = Path(parsed.path.rstrip("/")).name or "source"
-        local_root = staging_root / dest_name
-        store.download_tree(parsed.path, local_root)
-        return local_root, cleanup
-
-    raise ConversionError(f"OCI source not found: {raw_uri}")
-
-
-def _prepare_output_store(output_uri: str) -> tuple[Any, str]:
-    if is_oci_uri(output_uri):
-        try:
-            store, parsed = OCIStore.from_uri(output_uri)
-        except OCIStorageError as exc:
-            raise ConversionDependencyError(str(exc)) from exc
-        store.delete(parsed.path, recursive=True)
-        return store.get_mapper(parsed.path, create=True), output_uri
-
-    output_path = resolve_output_path(output_uri)
-    if output_path.exists() and output_path.is_file():
-        raise ConversionError(f"Output path is a file, expected a directory: {output_path}")
-    if output_path.exists():
-        shutil.rmtree(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    return output_path, str(output_path)
-
-
-def _open_existing_output_store(output_uri: str) -> Any:
-    if is_oci_uri(output_uri):
-        try:
-            store, parsed = OCIStore.from_uri(output_uri)
-        except OCIStorageError as exc:
-            raise ConversionDependencyError(str(exc)) from exc
-        if not store.exists(parsed.path):
-            raise ConversionError(f"Output store does not exist yet: {output_uri}")
-        return store.get_mapper(parsed.path, create=False)
-
-    output_path = resolve_output_path(output_uri)
-    if not output_path.exists():
-        raise ConversionError(f"Output store does not exist yet: {output_path}")
-    return output_path
 
 
 def _expand_raster_layer_names(layer_name: str, source_band_count: int) -> list[tuple[str, int]]:

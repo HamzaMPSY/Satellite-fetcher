@@ -13,14 +13,13 @@ from nimbuschain_zarr_service.config_loader import (
 from nimbuschain_zarr_service.core import (
     ConversionDependencyError,
     ConversionError,
-    PreparedSource,
-    TargetGrid,
     attach_layer_array,
     build_standard_dataset,
     load_aligned_raster_stack,
-    prepare_source,
     stream_raster_product_to_zarr,
 )
+from nimbuschain_zarr_service.models import GridMetadataRecord, LandsatNormalizationSummaryRecord
+from nimbuschain_zarr_service.storage_support import PreparedSource, TargetGrid, prepare_source
 
 
 class LandsatNormalizationError(ConversionError):
@@ -138,10 +137,10 @@ def build_landsat_dataset(
             product_id=product_id,
         )
         dataset = build_standard_dataset(
-            arrays=imagery_stack["arrays"],
-            band_names=imagery_stack["band_names"],
-            acquisition_datetime=acquisition,
-            metadata={
+        arrays=imagery_stack.arrays,
+        band_names=imagery_stack.band_names,
+        acquisition_datetime=acquisition,
+        metadata={
                 "provider": provider,
                 "collection": collection,
                 "scene_id": normalized_scene_id,
@@ -151,11 +150,11 @@ def build_landsat_dataset(
                 "satellite": satellite_code,
                 "product_level": product_level,
                 "data_family": "optical",
-                "crs": imagery_stack["crs"],
-                "transform": imagery_stack["transform"],
-                "reference_band": imagery_stack["reference_band"],
-                "reference_pixel_size": imagery_stack["pixel_size"],
-                "band_metadata": imagery_stack["band_metadata"],
+                "crs": imagery_stack.crs,
+                "transform": imagery_stack.transform,
+                "reference_band": imagery_stack.reference_band,
+                "reference_pixel_size": imagery_stack.pixel_size,
+                "band_metadata": imagery_stack.band_metadata_dict,
                 "radiometric_metadata": radiometric_metadata,
             },
         )
@@ -163,12 +162,12 @@ def build_landsat_dataset(
         ordered_ancillary = _ordered_landsat_ancillary_layers(ancillary_paths)
         if ordered_ancillary:
             target_grid = TargetGrid(
-                height=int(imagery_stack["height"]),
-                width=int(imagery_stack["width"]),
-                crs=imagery_stack["crs"],
-                transform=imagery_stack["transform"],
-                pixel_size=imagery_stack["pixel_size"],
-                reference_band=imagery_stack["reference_band"],
+                height=int(imagery_stack.height),
+                width=int(imagery_stack.width),
+                crs=imagery_stack.crs,
+                transform=imagery_stack.transform,
+                pixel_size=imagery_stack.pixel_size,
+                reference_band=imagery_stack.reference_band,
             )
             ancillary_stack = load_aligned_raster_stack(
                 ancillary_paths,
@@ -179,14 +178,32 @@ def build_landsat_dataset(
             )
             dataset = attach_layer_array(
                 dataset,
-                arrays=ancillary_stack["arrays"],
-                layer_names=ancillary_stack["band_names"],
+                arrays=ancillary_stack.arrays,
+                layer_names=ancillary_stack.band_names,
                 acquisition_datetime=acquisition,
                 variable_name="ancillary",
                 coord_name="ancillary_layer",
             )
-            ancillary_metadata = ancillary_stack["band_metadata"]
+            ancillary_metadata = ancillary_stack.band_metadata_dict
 
+        grid = GridMetadataRecord(
+            height=int(imagery_stack.height),
+            width=int(imagery_stack.width),
+            dtype=str(imagery_stack.dtype),
+            crs=imagery_stack.crs,
+            transform=imagery_stack.transform,
+            pixel_size=imagery_stack.pixel_size,
+            reference_band=imagery_stack.reference_band,
+        )
+        grid = GridMetadataRecord(
+            height=int(dataset_summary.shape[2]),
+            width=int(dataset_summary.shape[3]),
+            dtype=str(dataset_summary.dtype or "unknown"),
+            crs=dataset_summary.crs,
+            transform=dataset_summary.transform,
+            pixel_size=dataset_summary.pixel_size,
+            reference_band=reference_band,
+        )
         summary = _summarize_landsat_product(
             provider=provider,
             collection=collection,
@@ -199,17 +216,9 @@ def build_landsat_dataset(
             acquisition=acquisition,
             extracted=extracted,
             imagery_paths=imagery_paths,
-            imagery_band_names=imagery_stack["band_names"],
-            imagery_metadata=imagery_stack["band_metadata"],
-            grid={
-                "height": imagery_stack["height"],
-                "width": imagery_stack["width"],
-                "dtype": imagery_stack["dtype"],
-                "crs": imagery_stack["crs"],
-                "transform": imagery_stack["transform"],
-                "pixel_size": imagery_stack["pixel_size"],
-                "reference_band": imagery_stack["reference_band"],
-            },
+            imagery_band_names=imagery_stack.band_names,
+            imagery_metadata=imagery_stack.band_metadata_dict,
+            grid=grid,
             target_pixel_size=target_pixel_size,
             radiometric_metadata=radiometric_metadata,
             ancillary_paths=ancillary_paths,
@@ -340,26 +349,18 @@ def convert_landsat_to_zarr(
             acquisition=acquisition,
             extracted=extracted,
             imagery_paths=imagery_paths,
-            imagery_band_names=list(dataset_summary["band_names"]),
-            imagery_metadata=dict(dataset_summary.get("band_metadata") or {}),
-            grid={
-                "height": int(dataset_summary["shape"][2]),
-                "width": int(dataset_summary["shape"][3]),
-                "dtype": str(dataset_summary.get("dtype") or "unknown"),
-                "crs": dataset_summary.get("crs"),
-                "transform": dataset_summary.get("transform"),
-                "pixel_size": dataset_summary.get("pixel_size"),
-                "reference_band": reference_band,
-            },
+            imagery_band_names=list(dataset_summary.band_names),
+            imagery_metadata=dict(dataset_summary.band_metadata),
+            grid=grid,
             target_pixel_size=target_pixel_size,
             radiometric_metadata=radiometric_metadata,
             ancillary_paths=ancillary_paths,
-            ancillary_layer_names=list(dataset_summary.get("ancillary_layer_names") or []),
-            ancillary_metadata=dict(dataset_summary.get("ancillary_metadata") or {}),
+            ancillary_layer_names=list(dataset_summary.ancillary_layer_names or []),
+            ancillary_metadata=dict(dataset_summary.ancillary_metadata or {}),
         )
         if normalized_scene_id != scene_id:
             summary["requested_scene_id"] = scene_id
-        return written_uri, "optical", summary, dataset_summary
+        return written_uri, "optical", summary, dataset_summary.to_dict()
     finally:
         if extracted.cleanup is not None:
             extracted.cleanup.cleanup()
@@ -647,55 +648,53 @@ def _summarize_landsat_product(
     imagery_paths: dict[str, Path],
     imagery_band_names: list[str],
     imagery_metadata: dict[str, Any],
-    grid: dict[str, Any],
+    grid: GridMetadataRecord,
     target_pixel_size: float | None,
     radiometric_metadata: dict[str, Any],
     ancillary_paths: dict[str, Path],
     ancillary_layer_names: list[str],
     ancillary_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "provider": provider,
-        "collection": collection,
-        "scene_id": scene_id,
-        "product_id": product_id,
-        "product_type": product_type,
-        "product_type_short": product_type_short,
-        "satellite": satellite_code,
-        "product_level": product_level,
-        "data_family": "optical",
-        "source_kind": extracted.source_kind,
-        "raw_path": str(extracted.raw_path),
-        "normalized_band_order": imagery_band_names,
-        "resolution_policy_meters": target_pixel_size,
-        "radiometric_metadata": radiometric_metadata,
-        "band_sources": {
-            band: str(path.relative_to(extracted.root)) for band, path in imagery_paths.items()
-        },
-        "band_resampling": {
+    return LandsatNormalizationSummaryRecord(
+        provider=provider,
+        collection=collection,
+        scene_id=scene_id,
+        product_id=product_id,
+        product_type=product_type,
+        product_type_short=product_type_short,
+        satellite=satellite_code,
+        product_level=product_level,
+        data_family="optical",
+        source_kind=extracted.source_kind,
+        raw_path=str(extracted.raw_path),
+        acquisition_datetime=acquisition,
+        normalized_band_order=list(imagery_band_names),
+        resolution_policy_meters=target_pixel_size,
+        radiometric_metadata=dict(radiometric_metadata),
+        band_sources={band: str(path.relative_to(extracted.root)) for band, path in imagery_paths.items()},
+        band_resampling={
             band: imagery_metadata.get(band, {}).get("resampled_to_reference")
             for band in imagery_band_names
         },
-        "band_native_pixel_size": {
+        band_native_pixel_size={
             band: imagery_metadata.get(band, {}).get("source_pixel_size")
             for band in imagery_band_names
         },
-        "ancillary_layer_names": ancillary_layer_names,
-        "ancillary_sources": {
+        ancillary_layer_names=list(ancillary_layer_names),
+        ancillary_sources={
             layer: str(path.relative_to(extracted.root)) for layer, path in ancillary_paths.items()
         },
-        "ancillary_resampling": {
+        ancillary_resampling={
             layer: ancillary_metadata.get(layer, {}).get("resampled_to_reference")
             for layer in ancillary_layer_names
         },
-        "ancillary_native_pixel_size": {
+        ancillary_native_pixel_size={
             layer: ancillary_metadata.get(layer, {}).get("source_pixel_size")
             for layer in ancillary_layer_names
         },
-        "acquisition_datetime": acquisition,
-        "grid": grid,
-        "validation": {
+        grid=grid.to_dict(),
+        validation={
             "imagery_layer_count": len(imagery_band_names),
             "ancillary_layer_count": len(ancillary_layer_names),
         },
-    }
+    ).to_dict()
