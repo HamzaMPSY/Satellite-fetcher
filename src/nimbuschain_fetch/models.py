@@ -5,8 +5,14 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
+from nimbuschain_fetch.domain.metadata import (
+    ConversionMetadataRecord,
+    PayloadRecord,
+    PipelineMetadataRecord,
+    StringMapRecord,
+)
 from nimbuschain_fetch.geometry.aoi import validate_aoi_payload
 
 
@@ -222,9 +228,9 @@ class JobStatusResponse(BaseModel):
     pipeline_state: PipelineState = PipelineState.queued
     pipeline_step: str | None = None
     pipeline_progress: float | None = Field(default=None, ge=0, le=100)
-    pipeline_timeline: dict[str, Any] = Field(default_factory=dict)
-    pipeline_metadata: dict[str, Any] = Field(default_factory=dict)
-    conversion_metadata: dict[str, Any] = Field(default_factory=dict)
+    pipeline_timeline: PayloadRecord | dict[str, Any] = Field(default_factory=PayloadRecord)
+    pipeline_metadata: PipelineMetadataRecord | dict[str, Any] = Field(default_factory=PipelineMetadataRecord)
+    conversion_metadata: ConversionMetadataRecord | dict[str, Any] = Field(default_factory=ConversionMetadataRecord)
     raw_outputs: list[str] = Field(default_factory=list)
     zarr_outputs: list[str] = Field(default_factory=list)
     cube_outputs: list[str] = Field(default_factory=list)
@@ -251,6 +257,33 @@ class JobStatusResponse(BaseModel):
     provider: ProviderName
     collection: str
 
+    @field_validator("pipeline_timeline", mode="before")
+    @classmethod
+    def _coerce_pipeline_timeline(cls, value: Any) -> PayloadRecord:
+        if isinstance(value, PayloadRecord):
+            return value
+        return PayloadRecord.from_mapping(value)
+
+    @field_validator("pipeline_metadata", mode="before")
+    @classmethod
+    def _coerce_pipeline_metadata(cls, value: Any) -> PipelineMetadataRecord:
+        if isinstance(value, PipelineMetadataRecord):
+            return value
+        return PipelineMetadataRecord.from_mapping(value)
+
+    @field_validator("conversion_metadata", mode="before")
+    @classmethod
+    def _coerce_conversion_metadata(cls, value: Any) -> ConversionMetadataRecord:
+        if isinstance(value, ConversionMetadataRecord):
+            return value
+        return ConversionMetadataRecord.from_mapping(value)
+
+    @field_serializer("pipeline_timeline", "pipeline_metadata", "conversion_metadata")
+    def _serialize_payload_field(self, value: PayloadRecord | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(value, PayloadRecord):
+            return value.to_dict()
+        return dict(value or {})
+
 
 class JobResultResponse(BaseModel):
     job_id: str
@@ -265,11 +298,54 @@ class JobResultResponse(BaseModel):
     masked_zarr_outputs: list[str] = Field(default_factory=list)
     watermask_outputs: list[str] = Field(default_factory=list)
     cloudmask_outputs: list[str] = Field(default_factory=list)
-    checksums: dict[str, str] = Field(default_factory=dict)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    manifest_entry: dict[str, Any] = Field(default_factory=dict)
-    pipeline_metadata: dict[str, Any] = Field(default_factory=dict)
-    conversion_metadata: dict[str, Any] = Field(default_factory=dict)
+    checksums: StringMapRecord | dict[str, str] = Field(default_factory=StringMapRecord)
+    metadata: PayloadRecord | dict[str, Any] = Field(default_factory=PayloadRecord)
+    manifest_entry: PayloadRecord | dict[str, Any] = Field(default_factory=PayloadRecord)
+    pipeline_metadata: PipelineMetadataRecord | dict[str, Any] = Field(default_factory=PipelineMetadataRecord)
+    conversion_metadata: ConversionMetadataRecord | dict[str, Any] = Field(default_factory=ConversionMetadataRecord)
+
+    @field_validator("checksums", mode="before")
+    @classmethod
+    def _coerce_checksums(cls, value: Any) -> StringMapRecord:
+        if isinstance(value, StringMapRecord):
+            return value
+        return StringMapRecord.from_mapping(value)
+
+    @field_validator("metadata", "manifest_entry", mode="before")
+    @classmethod
+    def _coerce_payload_fields(cls, value: Any) -> PayloadRecord:
+        if isinstance(value, PayloadRecord):
+            return value
+        return PayloadRecord.from_mapping(value)
+
+    @field_validator("pipeline_metadata", mode="before")
+    @classmethod
+    def _coerce_result_pipeline_metadata(cls, value: Any) -> PipelineMetadataRecord:
+        if isinstance(value, PipelineMetadataRecord):
+            return value
+        return PipelineMetadataRecord.from_mapping(value)
+
+    @field_validator("conversion_metadata", mode="before")
+    @classmethod
+    def _coerce_result_conversion_metadata(cls, value: Any) -> ConversionMetadataRecord:
+        if isinstance(value, ConversionMetadataRecord):
+            return value
+        return ConversionMetadataRecord.from_mapping(value)
+
+    @field_serializer("checksums")
+    def _serialize_checksums(self, value: StringMapRecord | dict[str, str]) -> dict[str, str]:
+        if isinstance(value, StringMapRecord):
+            return value.to_dict()
+        return {str(key): str(item) for key, item in dict(value or {}).items()}
+
+    @field_serializer("metadata", "manifest_entry", "pipeline_metadata", "conversion_metadata")
+    def _serialize_result_payload_field(
+        self,
+        value: PayloadRecord | dict[str, Any],
+    ) -> dict[str, Any]:
+        if isinstance(value, PayloadRecord):
+            return value.to_dict()
+        return dict(value or {})
 
 
 class JobConvertRequest(BaseModel):
@@ -331,12 +407,25 @@ class JobMaskResponse(BaseModel):
     source_zarr_uri: str
     masked_zarr_uri: str | None = None
     mask_types: list[str] = Field(default_factory=list)
-    water_mask: dict[str, Any] = Field(default_factory=dict)
-    cloud_mask: dict[str, Any] = Field(default_factory=dict)
+    water_mask: PayloadRecord | dict[str, Any] = Field(default_factory=PayloadRecord)
+    cloud_mask: PayloadRecord | dict[str, Any] = Field(default_factory=PayloadRecord)
     masked_zarr_outputs: list[str] = Field(default_factory=list)
     watermask_outputs: list[str] = Field(default_factory=list)
     cloudmask_outputs: list[str] = Field(default_factory=list)
     job: JobStatusResponse
+
+    @field_validator("water_mask", "cloud_mask", mode="before")
+    @classmethod
+    def _coerce_mask_payload(cls, value: Any) -> PayloadRecord:
+        if isinstance(value, PayloadRecord):
+            return value
+        return PayloadRecord.from_mapping(value)
+
+    @field_serializer("water_mask", "cloud_mask")
+    def _serialize_mask_payload(self, value: PayloadRecord | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(value, PayloadRecord):
+            return value.to_dict()
+        return dict(value or {})
 
 
 class JobWaterMaskResponse(JobMaskResponse):
@@ -388,7 +477,7 @@ class ArtifactUpsertRequest(BaseModel):
     dimensions: list[str] = Field(default_factory=list)
     shape: list[int] = Field(default_factory=list)
     size_bytes: int | None = Field(default=None, ge=0)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: PayloadRecord | dict[str, Any] = Field(default_factory=PayloadRecord)
 
     @field_validator("collection")
     @classmethod
@@ -398,6 +487,19 @@ class ArtifactUpsertRequest(BaseModel):
         if not COLLECTION_RE.match(value):
             raise ValueError("Invalid collection format.")
         return value
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def _coerce_artifact_upsert_metadata(cls, value: Any) -> PayloadRecord:
+        if isinstance(value, PayloadRecord):
+            return value
+        return PayloadRecord.from_mapping(value)
+
+    @field_serializer("metadata")
+    def _serialize_artifact_upsert_metadata(self, value: PayloadRecord | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(value, PayloadRecord):
+            return value.to_dict()
+        return dict(value or {})
 
 
 class ArtifactRecord(BaseModel):
@@ -415,9 +517,22 @@ class ArtifactRecord(BaseModel):
     dimensions: list[str] = Field(default_factory=list)
     shape: list[int] = Field(default_factory=list)
     size_bytes: int | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: PayloadRecord | dict[str, Any] = Field(default_factory=PayloadRecord)
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def _coerce_artifact_metadata(cls, value: Any) -> PayloadRecord:
+        if isinstance(value, PayloadRecord):
+            return value
+        return PayloadRecord.from_mapping(value)
+
+    @field_serializer("metadata")
+    def _serialize_artifact_metadata(self, value: PayloadRecord | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(value, PayloadRecord):
+            return value.to_dict()
+        return dict(value or {})
 
 
 class ArtifactListResponse(BaseModel):

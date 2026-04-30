@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 
 def _as_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -11,8 +12,31 @@ def _as_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 @dataclass(slots=True)
-class PipelineMetadataRecord:
+class PayloadRecord(Mapping[str, Any]):
     payload: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> "PayloadRecord":
+        return cls(payload=_as_payload(value))
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.payload)
+
+    def __getitem__(self, key: str) -> Any:
+        return self.payload[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.payload)
+
+    def __len__(self) -> int:
+        return len(self.payload)
+
+    def __bool__(self) -> bool:
+        return bool(self.payload)
+
+
+@dataclass(slots=True)
+class PipelineMetadataRecord(PayloadRecord):
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "PipelineMetadataRecord":
@@ -60,13 +84,9 @@ class PipelineMetadataRecord:
         merged.update(_as_payload(other))
         return PipelineMetadataRecord(payload=merged)
 
-    def to_dict(self) -> dict[str, Any]:
-        return dict(self.payload)
-
 
 @dataclass(slots=True)
-class ConversionMetadataRecord:
-    payload: dict[str, Any] = field(default_factory=dict)
+class ConversionMetadataRecord(PayloadRecord):
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "ConversionMetadataRecord":
@@ -109,9 +129,6 @@ class ConversionMetadataRecord:
         merged = dict(self.payload)
         merged.update(_as_payload(other))
         return ConversionMetadataRecord(payload=merged)
-
-    def to_dict(self) -> dict[str, Any]:
-        return dict(self.payload)
 
 
 @dataclass(slots=True)
@@ -199,3 +216,35 @@ class ConversionItemRecord:
                 else {}
             ),
         )
+
+
+@dataclass(slots=True)
+class StringMapRecord(Mapping[str, str]):
+    payload: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> "StringMapRecord":
+        if not isinstance(value, Mapping):
+            return cls()
+        return cls(
+            payload={
+                str(key): str(item)
+                for key, item in value.items()
+                if str(key).strip()
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.payload)
+
+    def __getitem__(self, key: str) -> str:
+        return self.payload[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.payload)
+
+    def __len__(self) -> int:
+        return len(self.payload)
+
+    def __bool__(self) -> bool:
+        return bool(self.payload)

@@ -18,6 +18,15 @@ from nimbuschain_fetch.models import ArtifactType, JobStatusResponse, PipelineSt
 from nimbuschain_fetch.ports import ProviderCapabilities
 from nimbuschain_fetch.registries import ExecutorRegistry, ProviderRegistry, StoreRegistry
 from nimbuschain_fetch.settings import Settings
+from nimbuschain_fetch_service.services import (
+    FetcherArtifactCatalogService,
+    FetcherConversionService,
+    FetcherEventStreamService,
+    FetcherJobControlService,
+    FetcherJobQueryService,
+    FetcherJobSubmissionService,
+    create_fetch_service_container,
+)
 
 
 class DummyStore:
@@ -248,6 +257,70 @@ def test_fetcher_get_result_reads_typed_store_record() -> None:
     assert result.job_id == "job-r"
     assert result.zarr_outputs == ["/tmp/out.zarr"]
     assert result.metadata["source_job_id"] == "src-1"
+
+
+def test_fetch_service_container_wraps_fetcher_in_role_specific_adapters() -> None:
+    class FakeFetcherRuntime:
+        async def submit_job(self, request: Any) -> str:
+            _ = request
+            return "job-1"
+
+        async def submit_batch(self, request: Any) -> list[str]:
+            _ = request
+            return ["job-1"]
+
+        def get_job(self, job_id: str) -> str:
+            return f"status:{job_id}"
+
+        def get_result(self, job_id: str) -> str:
+            return f"result:{job_id}"
+
+        def list_jobs(self, **kwargs: Any) -> dict[str, Any]:
+            return dict(kwargs)
+
+        async def cancel_job(self, job_id: str) -> bool:
+            return job_id == "job-1"
+
+        def resume_job(self, job_id: str) -> str:
+            return f"resume:{job_id}"
+
+        async def reset_runtime_state(self) -> dict[str, object]:
+            return {"reset": True}
+
+        def stream_events(self, *, job_id: str | None, since: int | None) -> tuple[str | None, int | None]:
+            return (job_id, since)
+
+        def upsert_artifact(self, request: Any) -> Any:
+            return request
+
+        def list_artifacts(self, **kwargs: Any) -> dict[str, Any]:
+            return dict(kwargs)
+
+        def convert_existing_job(self, job_id: str, request: Any, continue_pipeline: bool = False) -> tuple[Any, ...]:
+            return (job_id, request, continue_pipeline)
+
+        def apply_mask_existing_job(self, job_id: str, request: Any) -> tuple[str, Any]:
+            return (job_id, request)
+
+        def apply_watermask_existing_job(self, job_id: str, request: Any) -> tuple[str, Any]:
+            return (job_id, request)
+
+        def apply_cloud_mask_existing_job(self, job_id: str, request: Any) -> tuple[str, Any]:
+            return (job_id, request)
+
+    fetcher = FakeFetcherRuntime()
+
+    container = create_fetch_service_container(fetcher)
+
+    assert isinstance(container.job_submission, FetcherJobSubmissionService)
+    assert isinstance(container.job_query, FetcherJobQueryService)
+    assert isinstance(container.job_control, FetcherJobControlService)
+    assert isinstance(container.event_stream, FetcherEventStreamService)
+    assert isinstance(container.artifact_catalog, FetcherArtifactCatalogService)
+    assert isinstance(container.conversion, FetcherConversionService)
+    assert container.job_submission is not fetcher
+    assert container.job_query is not fetcher
+    assert container.job_control is not fetcher
 
 
 @dataclass

@@ -8,7 +8,12 @@ from typing import Any
 import anyio
 
 from nimbuschain_fetch.application.job_execution import JobExecutionContext
-from nimbuschain_fetch.domain.metadata import ConversionMetadataRecord, MaskStateRecord, PipelineMetadataRecord
+from nimbuschain_fetch.domain.metadata import (
+    ConversionMetadataRecord,
+    MaskStateRecord,
+    PayloadRecord,
+    PipelineMetadataRecord,
+)
 from nimbuschain_fetch.domain.records import JobResultRecord
 from nimbuschain_fetch.domain.workflow_models import MaskWorkflowItem, MaskWorkflowSummary
 from nimbuschain_fetch.download.download_manager import DownloadCancelled
@@ -1006,9 +1011,9 @@ class FetchJobWorkflowService:
             if len(mask_items) == 1:
                 mask_state = MaskStateRecord.from_sources(item_conversion.to_dict(), item_pipeline.to_dict())
                 mask_summary.masked_zarr_uri = item_pipeline.masked_zarr_uri or zarr_outputs[0]
-                mask_summary.water_mask = dict(mask_state.water_mask)
-                mask_summary.cloud_mask = dict(mask_state.cloud_mask)
-                mask_summary.mask_quality = dict(mask_state.mask_quality)
+                mask_summary.water_mask = PayloadRecord.from_mapping(mask_state.water_mask)
+                mask_summary.cloud_mask = PayloadRecord.from_mapping(mask_state.cloud_mask)
+                mask_summary.mask_quality = PayloadRecord.from_mapping(mask_state.mask_quality)
         mask_summary_payload = mask_summary.to_payload()
         final_pipeline_metadata_record = final_pipeline_metadata_record.merged_with(
             {

@@ -4,6 +4,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping
 
+from nimbuschain_fetch.domain.metadata import (
+    ConversionMetadataRecord,
+    PayloadRecord,
+    PipelineMetadataRecord,
+    StringMapRecord,
+)
+
 
 def _as_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
@@ -36,6 +43,18 @@ def _as_datetime(value: Any) -> datetime | None:
     return None
 
 
+def _payload_record_dict(value: PayloadRecord | Mapping[str, Any] | Any) -> dict[str, Any]:
+    if isinstance(value, PayloadRecord):
+        return value.to_dict()
+    return _as_dict(value)
+
+
+def _string_map_record_dict(value: StringMapRecord | Mapping[str, Any] | Any) -> dict[str, str]:
+    if isinstance(value, StringMapRecord):
+        return value.to_dict()
+    return StringMapRecord.from_mapping(value).to_dict()
+
+
 @dataclass(slots=True)
 class JobRowRecord:
     job_id: str
@@ -49,9 +68,9 @@ class JobRowRecord:
     pipeline_state: str | None = None
     pipeline_step: str | None = None
     pipeline_progress: float | None = None
-    request: dict[str, Any] = field(default_factory=dict)
-    pipeline_metadata: dict[str, Any] = field(default_factory=dict)
-    conversion_metadata: dict[str, Any] = field(default_factory=dict)
+    request: PayloadRecord | dict[str, Any] = field(default_factory=PayloadRecord)
+    pipeline_metadata: PipelineMetadataRecord | dict[str, Any] = field(default_factory=PipelineMetadataRecord)
+    conversion_metadata: ConversionMetadataRecord | dict[str, Any] = field(default_factory=ConversionMetadataRecord)
     raw_outputs: list[str] = field(default_factory=list)
     zarr_outputs: list[str] = field(default_factory=list)
     cube_outputs: list[str] = field(default_factory=list)
@@ -70,6 +89,14 @@ class JobRowRecord:
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, PayloadRecord):
+            self.request = PayloadRecord.from_mapping(self.request)
+        if not isinstance(self.pipeline_metadata, PipelineMetadataRecord):
+            self.pipeline_metadata = PipelineMetadataRecord.from_mapping(self.pipeline_metadata)
+        if not isinstance(self.conversion_metadata, ConversionMetadataRecord):
+            self.conversion_metadata = ConversionMetadataRecord.from_mapping(self.conversion_metadata)
+
     @classmethod
     def from_row(cls, row: Mapping[str, Any] | None) -> "JobRowRecord":
         payload = _as_dict(row)
@@ -85,9 +112,9 @@ class JobRowRecord:
             pipeline_state=str(payload.get("pipeline_state") or "").strip() or None,
             pipeline_step=str(payload.get("pipeline_step") or "").strip() or None,
             pipeline_progress=float(payload.get("pipeline_progress")) if payload.get("pipeline_progress") is not None else None,
-            request=_as_dict(payload.get("request")),
-            pipeline_metadata=_as_dict(payload.get("pipeline_metadata")),
-            conversion_metadata=_as_dict(payload.get("conversion_metadata")),
+            request=PayloadRecord.from_mapping(payload.get("request")),
+            pipeline_metadata=PipelineMetadataRecord.from_mapping(payload.get("pipeline_metadata")),
+            conversion_metadata=ConversionMetadataRecord.from_mapping(payload.get("conversion_metadata")),
             raw_outputs=_as_str_list(payload.get("raw_outputs")),
             zarr_outputs=_as_str_list(payload.get("zarr_outputs")),
             cube_outputs=_as_str_list(payload.get("cube_outputs")),
@@ -120,9 +147,9 @@ class JobRowRecord:
             "pipeline_state": self.pipeline_state,
             "pipeline_step": self.pipeline_step,
             "pipeline_progress": self.pipeline_progress,
-            "request": dict(self.request),
-            "pipeline_metadata": dict(self.pipeline_metadata),
-            "conversion_metadata": dict(self.conversion_metadata),
+            "request": _payload_record_dict(self.request),
+            "pipeline_metadata": _payload_record_dict(self.pipeline_metadata),
+            "conversion_metadata": _payload_record_dict(self.conversion_metadata),
             "raw_outputs": list(self.raw_outputs),
             "zarr_outputs": list(self.zarr_outputs),
             "cube_outputs": list(self.cube_outputs),
@@ -153,11 +180,23 @@ class JobResultRecord:
     masked_zarr_outputs: list[str] = field(default_factory=list)
     watermask_outputs: list[str] = field(default_factory=list)
     cloudmask_outputs: list[str] = field(default_factory=list)
-    checksums: dict[str, Any] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    manifest_entry: dict[str, Any] = field(default_factory=dict)
-    pipeline_metadata: dict[str, Any] = field(default_factory=dict)
-    conversion_metadata: dict[str, Any] = field(default_factory=dict)
+    checksums: StringMapRecord | dict[str, str] = field(default_factory=StringMapRecord)
+    metadata: PayloadRecord | dict[str, Any] = field(default_factory=PayloadRecord)
+    manifest_entry: PayloadRecord | dict[str, Any] = field(default_factory=PayloadRecord)
+    pipeline_metadata: PipelineMetadataRecord | dict[str, Any] = field(default_factory=PipelineMetadataRecord)
+    conversion_metadata: ConversionMetadataRecord | dict[str, Any] = field(default_factory=ConversionMetadataRecord)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.checksums, StringMapRecord):
+            self.checksums = StringMapRecord.from_mapping(self.checksums)
+        if not isinstance(self.metadata, PayloadRecord):
+            self.metadata = PayloadRecord.from_mapping(self.metadata)
+        if not isinstance(self.manifest_entry, PayloadRecord):
+            self.manifest_entry = PayloadRecord.from_mapping(self.manifest_entry)
+        if not isinstance(self.pipeline_metadata, PipelineMetadataRecord):
+            self.pipeline_metadata = PipelineMetadataRecord.from_mapping(self.pipeline_metadata)
+        if not isinstance(self.conversion_metadata, ConversionMetadataRecord):
+            self.conversion_metadata = ConversionMetadataRecord.from_mapping(self.conversion_metadata)
 
     @classmethod
     def from_row(cls, job_id: str, row: Mapping[str, Any] | None) -> "JobResultRecord":
@@ -171,11 +210,11 @@ class JobResultRecord:
             masked_zarr_outputs=_as_str_list(payload.get("masked_zarr_outputs")),
             watermask_outputs=_as_str_list(payload.get("watermask_outputs")),
             cloudmask_outputs=_as_str_list(payload.get("cloudmask_outputs")),
-            checksums=_as_dict(payload.get("checksums")),
-            metadata=_as_dict(payload.get("metadata")),
-            manifest_entry=_as_dict(payload.get("manifest_entry")),
-            pipeline_metadata=_as_dict(payload.get("pipeline_metadata")),
-            conversion_metadata=_as_dict(payload.get("conversion_metadata")),
+            checksums=StringMapRecord.from_mapping(payload.get("checksums")),
+            metadata=PayloadRecord.from_mapping(payload.get("metadata")),
+            manifest_entry=PayloadRecord.from_mapping(payload.get("manifest_entry")),
+            pipeline_metadata=PipelineMetadataRecord.from_mapping(payload.get("pipeline_metadata")),
+            conversion_metadata=ConversionMetadataRecord.from_mapping(payload.get("conversion_metadata")),
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -188,11 +227,11 @@ class JobResultRecord:
             "masked_zarr_outputs": list(self.masked_zarr_outputs),
             "watermask_outputs": list(self.watermask_outputs),
             "cloudmask_outputs": list(self.cloudmask_outputs),
-            "checksums": dict(self.checksums),
-            "metadata": dict(self.metadata),
-            "manifest_entry": dict(self.manifest_entry),
-            "pipeline_metadata": dict(self.pipeline_metadata),
-            "conversion_metadata": dict(self.conversion_metadata),
+            "checksums": _string_map_record_dict(self.checksums),
+            "metadata": _payload_record_dict(self.metadata),
+            "manifest_entry": _payload_record_dict(self.manifest_entry),
+            "pipeline_metadata": _payload_record_dict(self.pipeline_metadata),
+            "conversion_metadata": _payload_record_dict(self.conversion_metadata),
         }
 
 
@@ -212,7 +251,11 @@ class ArtifactRowRecord:
     dimensions: list[str] = field(default_factory=list)
     shape: list[int] = field(default_factory=list)
     size_bytes: int | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: PayloadRecord | dict[str, Any] = field(default_factory=PayloadRecord)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.metadata, PayloadRecord):
+            self.metadata = PayloadRecord.from_mapping(self.metadata)
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any] | None) -> "ArtifactRowRecord":
@@ -237,7 +280,7 @@ class ArtifactRowRecord:
             dimensions=_as_str_list(payload.get("dimensions")),
             shape=_as_int_list(payload.get("shape")),
             size_bytes=normalized_size,
-            metadata=_as_dict(payload.get("metadata")),
+            metadata=PayloadRecord.from_mapping(payload.get("metadata")),
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -256,7 +299,7 @@ class ArtifactRowRecord:
             "dimensions": list(self.dimensions),
             "shape": list(self.shape),
             "size_bytes": self.size_bytes,
-            "metadata": dict(self.metadata),
+            "metadata": _payload_record_dict(self.metadata),
         }
 
 

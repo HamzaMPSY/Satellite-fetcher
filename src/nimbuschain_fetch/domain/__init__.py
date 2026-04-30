@@ -2,7 +2,9 @@ from nimbuschain_fetch.domain.metadata import (
     ConversionItemRecord,
     ConversionMetadataRecord,
     MaskStateRecord,
+    PayloadRecord,
     PipelineMetadataRecord,
+    StringMapRecord,
 )
 from nimbuschain_fetch.domain.records import (
     ArtifactRowRecord,
@@ -23,6 +25,8 @@ __all__ = [
     "MaskStateRecord",
     "MaskWorkflowItem",
     "MaskWorkflowSummary",
+    "PayloadRecord",
     "PipelineMetadataRecord",
+    "StringMapRecord",
     "WorkerHeartbeatRecord",
 ]

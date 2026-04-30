@@ -12,6 +12,11 @@ from nimbuschain_fetch.application.api_services import (
 )
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.settings import Settings
+from nimbuschain_fetch_service.artifact_service import LocalArtifactOverlayService
+from nimbuschain_fetch_service.services import (
+    FetchServiceContainer,
+    create_fetch_service_container,
+)
 
 
 def get_fetcher(request: Request) -> NimbusFetcher:
@@ -22,6 +27,14 @@ def get_fetcher(request: Request) -> NimbusFetcher:
             detail="Fetcher is not ready.",
         )
     return fetcher
+
+
+def get_service_container(request: Request) -> FetchServiceContainer:
+    services = getattr(request.app.state, "services", None)
+    if services is not None:
+        return services
+    fetcher = get_fetcher(request)
+    return create_fetch_service_container(fetcher)
 
 
 def get_runtime_settings(request: Request) -> Settings:
@@ -35,24 +48,29 @@ def get_runtime_settings(request: Request) -> Settings:
 
 
 def get_job_submission_service(request: Request) -> JobSubmissionService:
-    return get_fetcher(request)
+    return get_service_container(request).job_submission
 
 
 def get_job_query_service(request: Request) -> JobQueryService:
-    return get_fetcher(request)
+    return get_service_container(request).job_query
 
 
 def get_job_control_service(request: Request) -> JobControlService:
-    return get_fetcher(request)
+    return get_service_container(request).job_control
 
 
 def get_event_stream_service(request: Request) -> EventStreamService:
-    return get_fetcher(request)
+    return get_service_container(request).event_stream
 
 
 def get_artifact_catalog_service(request: Request) -> ArtifactCatalogService:
-    return get_fetcher(request)
+    return get_service_container(request).artifact_catalog
 
 
 def get_conversion_service(request: Request) -> ConversionService:
-    return get_fetcher(request)
+    return get_service_container(request).conversion
+
+
+def get_local_artifact_overlay_service(request: Request) -> LocalArtifactOverlayService:
+    settings = get_runtime_settings(request)
+    return LocalArtifactOverlayService(data_dir=settings.nimbus_data_dir)
