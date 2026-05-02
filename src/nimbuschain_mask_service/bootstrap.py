@@ -22,7 +22,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="NimbusChain Mask Service",
         version="0.1.0",
-        description="Internal/dev-only mask runtime harness for Zarr-derived masks.",
+        description="Mask runtime harness for Zarr-derived masks.",
         lifespan=lifespan,
     )
     app.include_router(router)
