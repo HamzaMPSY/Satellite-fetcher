@@ -6,8 +6,8 @@ from typing import Any
 
 import requests
 
-from nimbuschain_fetch.ports import MaskExecutionRequest
 from nimbuschain_shared.contracts.mask import MaskApplyRequest
+from nimbuschain_shared.dto import MaskExecutionRequest
 
 
 class MaskServiceClient:

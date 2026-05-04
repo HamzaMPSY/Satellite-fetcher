@@ -5,12 +5,14 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import re
 from pathlib import Path
+import ssl
 import threading
 from time import monotonic
 from typing import Any, Callable
 from urllib.parse import unquote
 
 import aiohttp
+import certifi
 
 
 class DownloadCancelled(Exception):
@@ -118,7 +120,9 @@ class DownloadManager:
             connect=self.connect_timeout,
             sock_read=self.read_timeout,
         )
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
         connector = aiohttp.TCPConnector(
+            ssl=ssl_context,
             limit=self.max_connections if self.max_connections is not None else max(10, self.max_concurrent * 4),
             limit_per_host=(
                 self.max_connections_per_host

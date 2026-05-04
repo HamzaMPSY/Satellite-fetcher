@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -12,73 +12,16 @@ from nimbuschain_fetch.jobs.executor_base import ExecutorBackend
 from nimbuschain_fetch.jobs.store import JobStore
 from nimbuschain_fetch.models import ArtifactListResponse, ArtifactRecord, ArtifactUpsertRequest
 from nimbuschain_fetch.settings import Settings
+from nimbuschain_shared.dto import (
+    CubeBuildRequest,
+    GroupedCubeBuildRequest,
+    MaskExecutionRequest,
+    ZarrConversionRequest,
+)
 
 if TYPE_CHECKING:
     from nimbuschain_fetch.download.coordinator import DownloadBatchResult
-
-
-@dataclass(frozen=True, slots=True)
-class ZarrConversionRequest:
-    job_id: str
-    pipeline_id: str
-    trace_id: str
-    provider: str
-    collection: str
-    scene_id: str
-    raw_uri: str
-    output_uri: str
-    product_type: str | None = None
-    progress_callback: Callable[[dict[str, Any]], None] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class GroupedCubeBuildRequest:
-    job_id: str
-    pipeline_id: str
-    trace_id: str
-    source_zarr_uris: list[str]
-    output_dir: str
-    include_ancillary: bool = True
-    include_masks: bool | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-    stage_label: str | None = None
-    progress_callback: Callable[[dict[str, Any]], None] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CubeBuildRequest:
-    job_id: str
-    pipeline_id: str
-    trace_id: str
-    source_zarr_uris: list[str]
-    output_uri: str
-    include_ancillary: bool = True
-    include_masks: bool = False
-    progress_callback: Callable[[dict[str, Any]], None] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class MaskExecutionRequest:
-    source_zarr_uri: str
-    provider: str
-    collection: str
-    product_type: str | None
-    scene_id: str
-    acquisition_datetime: str | None
-    dataset_summary: dict[str, Any] = field(default_factory=dict)
-    mask_types: list[str] = field(default_factory=list)
-    backend: str = "auto"
-    threshold: float | None = None
-    overwrite: bool = True
-    inference_device: str | None = None
-    include_shadows: bool = True
-    water_backend: str = "auto"
-    water_overwrite: bool = True
-    water_inference_device: str | None = None
-    fail_on_error: bool = False
-
-
+ 
 @dataclass(frozen=True, slots=True)
 class ProviderCapabilities:
     supports_download_coordinator: bool = False

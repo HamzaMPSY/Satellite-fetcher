@@ -5,7 +5,7 @@ from typing import Any
 
 import requests
 
-from nimbuschain_fetch.ports import (
+from nimbuschain_shared.dto import (
     CubeBuildRequest,
     GroupedCubeBuildRequest,
     ZarrConversionRequest,

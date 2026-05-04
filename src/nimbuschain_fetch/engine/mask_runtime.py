@@ -6,7 +6,7 @@ from typing import Any
 
 from nimbuschain_fetch.domain.metadata import ConversionMetadataRecord, PipelineMetadataRecord
 from nimbuschain_fetch.models import PipelineState
-from nimbuschain_fetch.ports import MaskExecutionRequest
+from nimbuschain_shared.dto import MaskExecutionRequest
 
 
 def _call_mask_method(method: Any, **kwargs: Any) -> Any:

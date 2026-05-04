@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from nimbuschain_fetch.engine.conversion_runtime import convert_raw_outputs
-from nimbuschain_fetch.ports import ZarrConversionRequest
+from nimbuschain_shared.dto import ZarrConversionRequest
 
 
 class FetcherConversionSupport:

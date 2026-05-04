@@ -7,7 +7,7 @@ from typing import Any
 
 from nimbuschain_fetch.domain.metadata import PipelineMetadataRecord
 from nimbuschain_fetch.models import ArtifactType, PipelineState
-from nimbuschain_fetch.ports import GroupedCubeBuildRequest
+from nimbuschain_shared.dto import GroupedCubeBuildRequest
 from nimbuschain_shared.runtime import normalize_device_name, resolve_inference_device
 
 
