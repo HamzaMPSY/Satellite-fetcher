@@ -133,6 +133,31 @@ def test_download_coordinator_store_cancel_all_non_terminal_tasks(tmp_path: Path
     store.close()
 
 
+def test_download_coordinator_store_recovers_from_corrupted_sqlite_file(tmp_path: Path) -> None:
+    db_path = tmp_path / "download-coordinator.db"
+    db_path.write_bytes(b"not-a-real-sqlite-database")
+
+    store = DownloadCoordinatorStore(db_path)
+    try:
+        task = store.ensure_task(
+            task_id="task-recovered",
+            provider="copernicus",
+            job_id="job-recovered",
+            collection="SENTINEL-2",
+            product_id="scene-recovered",
+            output_dir=str(tmp_path / "downloads"),
+            metadata={},
+        )
+        recovered_row = store.get_task(str(task["task_id"])) or {}
+
+        assert recovered_row["status"] == TASK_STATUS_QUEUED
+        backups = sorted(tmp_path.glob("download-coordinator.db.corrupt-*"))
+        assert backups
+        assert backups[0].read_bytes() == b"not-a-real-sqlite-database"
+    finally:
+        store.close()
+
+
 def test_download_coordinator_round_robin_interleaves_jobs(tmp_path: Path) -> None:
     coordinator = DownloadCoordinator(_make_settings(tmp_path))
     try:

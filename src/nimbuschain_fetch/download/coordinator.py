@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import shutil
 import sqlite3
 import threading
@@ -46,6 +47,8 @@ ACTIVE_COORDINATOR_TASK_STATUSES = (
     TASK_STATUS_DOWNLOADING,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class DownloadBatchResult:
@@ -86,9 +89,78 @@ class DownloadCoordinatorStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._closed = False
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+        self._conn = self._open_connection()
+        self._initialize_store()
+
+    def _open_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _initialize_store(self) -> None:
+        recovery_attempted = False
+        while True:
+            try:
+                self._init_schema()
+                self._verify_integrity()
+                return
+            except sqlite3.DatabaseError as exc:
+                self._safe_close_connection()
+                if recovery_attempted or not self._looks_like_corruption(exc):
+                    raise
+                backup_path = self._rotate_corrupted_db()
+                logger.warning(
+                    "download coordinator db at %s was corrupted (%s); rotated to %s and recreated a fresh store",
+                    self._db_path,
+                    exc,
+                    backup_path,
+                )
+                self._conn = self._open_connection()
+                recovery_attempted = True
+
+    @staticmethod
+    def _looks_like_corruption(exc: sqlite3.DatabaseError) -> bool:
+        message = str(exc).strip().lower()
+        return any(
+            marker in message
+            for marker in (
+                "database disk image is malformed",
+                "file is not a database",
+                "malformed",
+                "not a database",
+            )
+        )
+
+    def _verify_integrity(self) -> None:
+        with self._lock:
+            row = self._conn.execute("PRAGMA quick_check;").fetchone()
+        result = str(row[0] if row else "").strip().lower()
+        if result and result != "ok":
+            raise sqlite3.DatabaseError(f"sqlite integrity check failed: {result}")
+
+    def _rotate_corrupted_db(self) -> Path:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = self._db_path.with_name(f"{self._db_path.name}.corrupt-{timestamp}")
+        related_paths = [
+            self._db_path,
+            Path(f"{self._db_path}-wal"),
+            Path(f"{self._db_path}-shm"),
+        ]
+        backup_related = [
+            backup_path,
+            Path(f"{backup_path}-wal"),
+            Path(f"{backup_path}-shm"),
+        ]
+        for source_path, target_path in zip(related_paths, backup_related):
+            if source_path.exists():
+                source_path.replace(target_path)
+        return backup_path
+
+    def _safe_close_connection(self) -> None:
+        try:
+            self._conn.close()
+        except (AttributeError, sqlite3.ProgrammingError):
+            return
 
     def _init_schema(self) -> None:
         with self._lock:
