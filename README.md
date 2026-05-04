@@ -68,8 +68,9 @@ End-to-end Landsat 8/9 → Sentinel-2 harmonisation that produces 10 m analysi
 ## Environment setup
 
 ```bash
-git clone [https://github.com/<your-org>/sen2like_reimplementation.git](https://github.com/HamzaMPSY/Satellite-fetcher/tree/feature/sen2like_reimplementation)
-cd sen2like_reimplementation
+git clone https://github.com/HamzaMPSY/Satellite-fetcher.git
+cd Satellite-fetcher
+git checkout feature/sen2like_reimplementation
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
