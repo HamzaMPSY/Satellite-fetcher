@@ -1,24 +1,25 @@
-FROM python:3.11-slim AS runtime
+ARG PYTHON_BASE=python:3.11.11-slim-bookworm
+FROM ${PYTHON_BASE} AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/appuser \
     PYTHONPATH=/app/src
 
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libexpat1 && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN useradd --create-home --uid 10001 appuser
+    apt-get install -y --no-install-recommends ca-certificates libexpat1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
 COPY requirements/mask-service.txt /app/requirements/mask-service.txt
 COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
-COPY src/nimbuschain_mask_service /app/src/nimbuschain_mask_service
-COPY src/nimbuschain_shared /app/src/nimbuschain_shared
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements/mask-service.txt
+RUN python -m pip install -r /app/requirements/mask-service.txt
+COPY --chown=appuser:appuser src/nimbuschain_mask_service /app/src/nimbuschain_mask_service
+COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared
 
 USER appuser
 

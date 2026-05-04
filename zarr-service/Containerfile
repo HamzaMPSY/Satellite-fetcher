@@ -1,26 +1,25 @@
-FROM python:3.11-slim
+ARG PYTHON_BASE=python:3.11.11-slim-bookworm
+FROM ${PYTHON_BASE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/appuser \
     PYTHONPATH=/app/src
 
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libexpat1 openjdk-21-jre && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends ca-certificates libexpat1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
-RUN useradd --create-home --uid 10001 appuser
-
-COPY pyproject.toml README.md /app/
 COPY requirements/zarr-service.txt /app/requirements/zarr-service.txt
 COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
-COPY src/nimbuschain_zarr_service /app/src/nimbuschain_zarr_service
-COPY src/nimbuschain_shared /app/src/nimbuschain_shared
-
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements/zarr-service.txt
+RUN python -m pip install -r /app/requirements/zarr-service.txt
+COPY --chown=appuser:appuser src/nimbuschain_zarr_service /app/src/nimbuschain_zarr_service
+COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared
 
 USER appuser
 
