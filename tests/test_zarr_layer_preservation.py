@@ -402,6 +402,9 @@ def test_landsat_converter_accepts_strict_satellite_prefixed_product_type(
     assert Path(written_uri).exists()
     assert normalization_summary["product_type"] == "L1TP"
     assert normalization_summary["product_type_short"] == "9L1TP"
+    assert normalization_summary["grid"]["reference_band"]
+    assert normalization_summary["grid"]["width"] > 0
+    assert normalization_summary["grid"]["height"] > 0
     group = zarr.open_group(str(written_uri), mode="r")
     assert group.attrs["product_type"] == "L1TP"
     assert group.attrs["product_type_short"] == "9L1TP"

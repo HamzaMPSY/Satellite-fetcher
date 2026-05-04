@@ -105,3 +105,72 @@ def test_canonicalize_usgs_product_type_strips_satellite_digit() -> None:
     assert canonicalize_usgs_product_type("8L2SP") == "L2SP"
     assert canonicalize_usgs_product_type("L1TP") == "L1TP"
     assert NimbusFetcher._normalize_product_type_for_zarr("9L1TP") == "L1TP"
+
+
+def test_prepare_download_product_uses_entity_id_when_scene_name_missing(monkeypatch):
+    monkeypatch.setattr(UsgsProvider, "get_access_token", lambda self: "api-key")
+    provider = UsgsProvider(settings=_make_settings(), download_manager=_DummyDownloadManager())
+    provider.dataset = "landsat_ot_c2_l1"
+    monkeypatch.setattr(
+        UsgsProvider,
+        "_resolve_bundle_downloads",
+        lambda self, product_ids: [{"entityId": product_ids[0], "productId": "bundle-1"}],
+    )
+
+    responses = iter(
+        [
+            {"availableDownloads": [{"entityId": "LC91990252026116LGN00", "url": "https://example.test/usgs_landsat_ot_c2_l1_0.tar"}]},
+        ]
+    )
+
+    def _fake_resolve_or_request(self, endpoint, data):
+        _ = (endpoint, data)
+        return next(responses)
+
+    monkeypatch.setattr(UsgsProvider, "_send_request", _fake_resolve_or_request)
+
+    prepared = provider.prepare_download_product("LC91990252026116LGN00")
+
+    assert prepared["status"] == "ready"
+    assert prepared["file_name"] == "LC91990252026116LGN00.tar"
+
+
+def test_download_products_uses_distinct_names_without_scene_cache(monkeypatch):
+    monkeypatch.setattr(UsgsProvider, "get_access_token", lambda self: "api-key")
+    provider = UsgsProvider(settings=_make_settings(), download_manager=_DummyDownloadManager())
+    provider.dataset = "landsat_ot_c2_l1"
+    monkeypatch.setattr(
+        UsgsProvider,
+        "_resolve_bundle_downloads",
+        lambda self, product_ids: [
+            {"entityId": "LC91990252026116LGN00", "productId": "bundle-1"},
+            {"entityId": "LC91990262026116LGN00", "productId": "bundle-2"},
+        ],
+    )
+
+    responses = iter(
+        [
+            {
+                "availableDownloads": [
+                    {"entityId": "LC91990252026116LGN00", "url": "https://example.test/usgs_landsat_ot_c2_l1_0.tar"},
+                    {"entityId": "LC91990262026116LGN00", "url": "https://example.test/usgs_landsat_ot_c2_l1_0.tar"},
+                ]
+            },
+        ]
+    )
+
+    def _fake_resolve_or_request(self, endpoint, data):
+        _ = (endpoint, data)
+        return next(responses)
+
+    monkeypatch.setattr(UsgsProvider, "_send_request", _fake_resolve_or_request)
+
+    _, payload = provider.download_products(
+        ["LC91990252026116LGN00", "LC91990262026116LGN00"],
+        output_dir="/tmp/out",
+    )
+
+    assert payload["file_names"] == [
+        "LC91990252026116LGN00.tar",
+        "LC91990262026116LGN00.tar",
+    ]

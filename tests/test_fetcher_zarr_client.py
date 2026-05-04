@@ -4,7 +4,7 @@ import asyncio
 from datetime import date
 
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
-from nimbuschain_fetch.models import JobStatusResponse, ProviderName, SearchDownloadRequest
+from nimbuschain_fetch.models import JobConvertRequest, JobStatusResponse, ProviderName, SearchDownloadRequest
 from nimbuschain_fetch.settings import Settings
 from nimbuschain_shared.clients.zarr import ZarrServiceClient
 import pytest
@@ -264,6 +264,92 @@ def test_resume_job_retries_failed_zarr_step(monkeypatch, tmp_path) -> None:
     assert response.resumed_job_id == job_id
     assert response.spawned_new_job is False
     assert response.job.pipeline_state == "zarr_written"
+
+
+def test_manual_conversion_marks_job_failed_when_resumed_zarr_step_errors(monkeypatch, tmp_path) -> None:
+    fetcher = NimbusFetcher(settings=_sqlite_settings(tmp_path, NIMBUS_ZARR_SERVICE_URL="http://nimbus-zarr:8010"))
+    request = SearchDownloadRequest(
+        job_type="search_download",
+        provider=ProviderName.copernicus,
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        start_date=date(2026, 4, 1),
+        end_date=date(2026, 4, 2),
+        aoi={"wkt": "POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))"},
+    )
+    job_id = "resume-zarr-error-state"
+    fetcher.store.create_job(
+        job_id=job_id,
+        job_type=request.job_type,
+        provider=request.provider.value,
+        collection=request.collection,
+        request_payload=request.model_dump(mode="json"),
+    )
+    fetcher.store.update_job(
+        job_id,
+        state="failed",
+        pipeline_state="zarr_failed",
+        pipeline_step="zarr_failed",
+        raw_outputs=["/tmp/raw-scene.zip"],
+        errors=["Initial Zarr conversion failed."],
+    )
+
+    monkeypatch.setattr(fetcher, "_convert_raw_outputs", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        fetcher.convert_existing_job(job_id, JobConvertRequest())
+
+    row = fetcher.store.get_job(job_id) or {}
+    result = fetcher.store.get_result(job_id) or {}
+    assert row["state"] == "failed"
+    assert row["pipeline_state"] == "zarr_failed"
+    assert row["pipeline_step"] == "zarr_failed"
+    assert row["errors"] == ["boom"]
+    assert result["conversion_metadata"]["status"] == "failed"
+    assert result["conversion_metadata"]["error"] == "boom"
+
+
+def test_manual_conversion_marks_job_cancelled_when_resume_is_cancelled(monkeypatch, tmp_path) -> None:
+    fetcher = NimbusFetcher(settings=_sqlite_settings(tmp_path, NIMBUS_ZARR_SERVICE_URL="http://nimbus-zarr:8010"))
+    request = SearchDownloadRequest(
+        job_type="search_download",
+        provider=ProviderName.copernicus,
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        start_date=date(2026, 4, 1),
+        end_date=date(2026, 4, 2),
+        aoi={"wkt": "POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))"},
+    )
+    job_id = "resume-zarr-cancel-state"
+    fetcher.store.create_job(
+        job_id=job_id,
+        job_type=request.job_type,
+        provider=request.provider.value,
+        collection=request.collection,
+        request_payload=request.model_dump(mode="json"),
+    )
+    fetcher.store.update_job(
+        job_id,
+        state="failed",
+        pipeline_state="zarr_failed",
+        pipeline_step="zarr_failed",
+        raw_outputs=["/tmp/raw-scene.zip"],
+        errors=["Initial Zarr conversion failed."],
+    )
+
+    monkeypatch.setattr(
+        fetcher,
+        "_convert_raw_outputs",
+        lambda *args, **kwargs: (_ for _ in ()).throw(fetcher.job_cancelled_error_cls("cancelled")),
+    )
+
+    status = fetcher.convert_existing_job(job_id, JobConvertRequest())
+
+    row = fetcher.store.get_job(job_id) or {}
+    assert status.state == "cancelled"
+    assert row["state"] == "cancelled"
+    assert row["pipeline_state"] == "cancelled"
+    assert row["pipeline_step"] == "cancelled"
 
 
 def test_failed_mask_job_exposes_resume_metadata(tmp_path) -> None:

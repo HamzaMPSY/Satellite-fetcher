@@ -337,6 +337,15 @@ def convert_landsat_to_zarr(
             ancillary_layer_names=ordered_ancillary,
             progress_callback=progress_callback,
         )
+        grid = GridMetadataRecord(
+            height=int(dataset_summary.shape[2]),
+            width=int(dataset_summary.shape[3]),
+            dtype=str(dataset_summary.dtype or "unknown"),
+            crs=dataset_summary.crs,
+            transform=dataset_summary.transform,
+            pixel_size=dataset_summary.pixel_size,
+            reference_band=reference_band,
+        )
         summary = _summarize_landsat_product(
             provider=provider,
             collection=collection,

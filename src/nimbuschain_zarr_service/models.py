@@ -427,7 +427,7 @@ class LandsatNormalizationSummaryRecord(ProductNormalizationSummaryRecord):
     radiometric_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        payload = super().to_dict()
+        payload = ProductNormalizationSummaryRecord.to_dict(self)
         payload.update(
             {
                 "product_type_short": self.product_type_short,

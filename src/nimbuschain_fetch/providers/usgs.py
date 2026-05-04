@@ -295,7 +295,12 @@ class UsgsProvider(ProviderBase):
         url: str,
         fallback_index: int = 0,
     ) -> str:
-        preferred_name = self.scene_names.get(entity_id) or f"usgs_{self.dataset}_{fallback_index}"
+        normalized_entity_id = str(entity_id or "").strip()
+        preferred_name = (
+            self.scene_names.get(normalized_entity_id)
+            or normalized_entity_id
+            or f"usgs_{self.dataset}_{fallback_index}"
+        )
         path_name = Path(unquote(urlparse(url).path)).name.strip()
         suffixes = "".join(Path(path_name).suffixes) if path_name else ""
         if suffixes and "." not in Path(preferred_name).name:
