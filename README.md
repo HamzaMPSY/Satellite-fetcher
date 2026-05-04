@@ -3,10 +3,10 @@
 NimbusChain Fetch is a multi-service satellite data platform composed of:
 
 - a FastAPI orchestrator for jobs, events, artifacts and health
-- a worker that executes Copernicus and USGS downloads
-- a Streamlit UI for AOI selection, pipeline tracking and manual Zarr conversion
-- an internal Zarr conversion runtime used by the worker and exposed through the backend API
-- an internal mask service for cloud and water masking on existing Zarr outputs
+- a worker that executes Copernicus and USGS jobs in the background
+- a Streamlit UI for AOI selection, pipeline tracking and manual operations
+- a standalone Zarr conversion service reached over HTTP
+- a standalone mask service for cloud and water masking reached over HTTP
 
 The repository is intentionally small in scope: it focuses on raw scene acquisition, operational monitoring, and conversion to a normalized `time, band, y, x` Zarr layout.
 
@@ -21,14 +21,133 @@ The repository is intentionally small in scope: it focuses on raw scene acquisit
 - run locally with Podman or Docker-compatible compose
 - deploy to Minikube with the provided Kubernetes manifests
 
+## Architecture overview
+
+NimbusChain Fetch is organized around one public backend and two internal compute services.
+
+```text
+Browser
+  -> nimbus-ui
+       -> nimbus-api
+            -> MongoDB or SQLite job store
+            -> nimbus-worker
+            -> nimbus-zarr (HTTP)
+            -> nimbus-mask (HTTP)
+```
+
+Runtime responsibilities:
+
+- `nimbus-ui`
+  User-facing Streamlit application for AOI selection, preview, job submission, monitoring, and manual actions.
+- `nimbus-api`
+  Public FastAPI entrypoint. It validates requests, exposes `/v1/...` endpoints, serves health/status, and orchestrates jobs through the shared fetch engine.
+- `nimbus-worker`
+  Background runtime role that polls the job store, claims queued jobs, executes provider downloads, updates pipeline state, and triggers remote conversion/masking work.
+- `nimbus-zarr`
+  Dedicated conversion microservice that reads raw products and writes normalized Zarr outputs.
+- `nimbus-mask`
+  Dedicated masking microservice that applies cloud and/or water inference to existing Zarr outputs.
+
+One important implementation detail is that `nimbus-api` and `nimbus-worker` share the same core orchestration package and image, but they run with different runtime roles. They do not communicate with each other over HTTP; they coordinate through the persisted job store and worker heartbeats.
+
+## Service communication
+
+The current communication model is:
+
+- UI -> API: HTTP
+- API -> UI: HTTP responses plus server-sent events for live job/event updates
+- API/worker -> job store: direct persistence calls through the configured store backend
+- Fetch engine -> Zarr service: HTTP through `ZarrServiceClient`
+- Fetch engine -> mask service: HTTP through `MaskServiceClient`
+
+In practice this means:
+
+- the UI only talks to the fetch API
+- the fetch API is the only public control-plane surface
+- the worker performs background execution by reading and updating shared job state
+- conversion and masking are delegated to dedicated internal services over HTTP
+
+## DTOs and contracts
+
+There are several layers of models in the codebase:
+
+- public API DTOs
+  Used by the UI and external callers for `/v1/jobs`, `/v1/events`, `/v1/artifacts`, `/v1/jobs/{job_id}/convert`, and mask-related endpoints
+- internal service-to-service HTTP contracts
+  Used between the fetch engine and the standalone Zarr/mask services
+- internal orchestration DTOs
+  Used inside the fetch engine and shared clients before serializing to HTTP payloads
+- persistence/domain records
+  Used to store jobs, events, results, artifacts, and worker state in MongoDB or SQLite
+
+This separation is intentional: public API models are not the same thing as the internal wire contracts used between services, and neither of those are the same as the stored domain records.
+
+### Zarr service communication
+
+The fetch side calls the Zarr service over HTTP for:
+
+- health and readiness checks
+- schema discovery
+- raw-to-Zarr conversion
+- grouped cube building
+- single cube building
+- dataset inspection
+
+The request payloads carry identifiers and conversion context such as:
+
+- `job_id`
+- `pipeline_id`
+- `trace_id`
+- `provider`
+- `collection`
+- `product_type`
+- `scene_id`
+- `raw_uri`
+- `output_uri`
+
+The response returns structured conversion metadata such as:
+
+- `zarr_uri`
+- `data_family`
+- `band_names`
+- `dimensions`
+- ancillary layer information
+- normalization and dataset summaries
+
+### Mask service communication
+
+The fetch side calls the mask service over HTTP for:
+
+- health checks
+- schema discovery
+- remote masking
+- progress polling during masking
+
+The masking request contains structured fields such as:
+
+- `source_zarr_uri`
+- `output_zarr_uri`
+- `provider`
+- `collection`
+- `product_type`
+- `scene_id`
+- `acquisition_datetime`
+- `dataset_summary`
+- `mask_types`
+- cloud options
+- water options
+
+The mask service returns structured masking results and exposes progress events that the fetch side can translate back into job-level pipeline updates.
+
 ## Repository map
 
 ```text
-src/nimbuschain_fetch/            Core engine, providers, worker, stores
-src/nimbuschain_fetch_service/    FastAPI API layer and public converter endpoints
+src/nimbuschain_fetch/            Core engine, workflows, providers, worker, stores
+src/nimbuschain_fetch_service/    FastAPI API layer and public orchestration endpoints
 src/nimbuschain_fetch_ui/         Streamlit frontend
-src/nimbuschain_zarr_service/     Internal Zarr conversion runtime/library
-src/nimbuschain_mask_service/     Cloud and water masking runtime/service
+src/nimbuschain_zarr_service/     Standalone Zarr conversion service
+src/nimbuschain_mask_service/     Standalone cloud/water mask service
+src/nimbuschain_shared/           Shared clients, DTOs, contracts, and runtime helpers
 
 Containerfile                     API/worker image
 ui/Containerfile                  UI image
@@ -50,7 +169,7 @@ cd /path/to/Satellite-fetcher
 cp .env.example .env
 ```
 
-Then start the API/worker/UI/runtime services with the container or host-process commands appropriate for your environment.
+Then start the API, worker, UI, Zarr service, and mask service with the container or host-process commands appropriate for your environment.
 
 ## Health endpoints
 
