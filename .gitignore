@@ -41,3 +41,4 @@ docs/MASTER_DIAGRAM.md
 docs/aoi_morocco_landsat.wkt
 docs/*/*.png
 docs/*
+tests/*

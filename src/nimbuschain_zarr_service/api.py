@@ -84,11 +84,11 @@ def convert(
     }
 
     def _progress_logger(progress) -> None:
-        payload = progress.to_dict()
-        stage = str(payload.get("stage") or "").strip() or "unknown"
-        array_name = str(payload.get("array_name") or "").strip()
-        band_name = str(payload.get("band_name") or "").strip()
-        fraction = float(payload.get("fraction") or 0.0)
+        progress_payload = progress.to_dict()
+        stage = str(progress_payload.get("stage") or "").strip() or "unknown"
+        array_name = str(progress_payload.get("array_name") or "").strip()
+        band_name = str(progress_payload.get("band_name") or "").strip()
+        fraction = float(progress_payload.get("fraction") or 0.0)
         bucket = int(min(100, max(0, fraction * 100)) // 5)
 
         should_log = (
@@ -114,8 +114,8 @@ def convert(
             array_name or "-",
             band_name or "-",
             fraction,
-            payload.get("blocks_written"),
-            payload.get("total_blocks"),
+            progress_payload.get("blocks_written"),
+            progress_payload.get("total_blocks"),
             extra={"request_id": request_id},
         )
 
@@ -209,7 +209,7 @@ def build_grouped_cubes(payload: BuildGroupedCubesRequest, request: Request) -> 
         extra={"request_id": request_id},
     )
     try:
-        cube_summary = CubeSummaryRecord.from_mapping(build_grouped_time_cubes(
+        cube_summary = dict(build_grouped_time_cubes(
             list(payload.source_zarr_uris),
             payload.output_dir,
             include_ancillary=bool(payload.include_ancillary),
@@ -217,7 +217,7 @@ def build_grouped_cubes(payload: BuildGroupedCubesRequest, request: Request) -> 
             start_date=payload.start_date,
             end_date=payload.end_date,
             stage_label=payload.stage_label,
-        )).to_dict()
+        ) or {})
     except ConversionError as exc:
         logger.warning(
             "grouped_cube_build_rejected job_id=%s pipeline_id=%s reason=%s",
