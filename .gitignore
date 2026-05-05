@@ -19,6 +19,7 @@ env/
 # Pipeline outputs (these can be multi-GB — never commit)
 output_pipeline/
 test_output/
+output*
 *.log
 data/
 
