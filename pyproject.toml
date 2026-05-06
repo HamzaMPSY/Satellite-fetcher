@@ -60,6 +60,7 @@ zarr-service = []
 [project.scripts]
 nimbuschain-fetch = "nimbuschain_fetch.cli:main"
 nimbuschain-vm-pipeline = "nimbuschain_fetch.pipeline_cli:main"
+nimbuschain-stage = "nimbuschain_fetch.stage_cli:main"
 nimbuschain-worker = "nimbuschain_fetch.worker:main"
 nimbuschain-api-service = "nimbuschain_fetch_service.main:run"
 nimbuschain-zarr-service = "nimbuschain_zarr_service.main:run"

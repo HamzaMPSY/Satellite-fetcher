@@ -158,9 +158,11 @@ class PipelineConfigurationError(ValueError):
 
 class PipelineOrchestrator:
     def __init__(self, stages: Sequence[PipelineStage]):
+        self._stage_order = [stage.name for stage in stages]
         self._stages = {stage.name: stage for stage in stages}
         if len(self._stages) != len(stages):
             raise PipelineConfigurationError("Pipeline stages must have unique names.")
+        self._stage_position = {name: index for index, name in enumerate(self._stage_order)}
         self._validate_dependencies()
 
     @property
@@ -173,9 +175,12 @@ class PipelineOrchestrator:
         ordered: list[str] = []
         while remaining:
             ready = sorted(
-                name
-                for name in remaining
-                if all(dep not in remaining for dep in self._stages[name].depends_on)
+                (
+                    name
+                    for name in remaining
+                    if all(dep not in remaining for dep in self._stages[name].depends_on)
+                ),
+                key=lambda name: self._stage_position[name],
             )
             if not ready:
                 raise PipelineConfigurationError(
