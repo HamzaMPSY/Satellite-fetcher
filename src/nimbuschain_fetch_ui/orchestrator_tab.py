@@ -278,7 +278,41 @@ def render_orchestrator_tab(
             st.code(invocation.stderr, language="text")
 
 
-def _render_payload(payload: dict[str, Any], *, return_code: int | None) -> None:
+def render_pipeline_plan_summary(
+    *,
+    provider_label: str,
+    collection: str,
+    product_type: str,
+    mask_types: list[str] | tuple[str, ...],
+    cube_mode: str,
+) -> None:
+    provider = PROVIDER_CLI_MAP.get(provider_label, provider_label.lower())
+    payload = _dry_plan_payload(
+        selected_provider=provider,
+        selected_collection=collection,
+        selected_product=product_type,
+        mask_types=list(mask_types),
+        cube_mode=cube_mode,
+        target_stage="full",
+        sen2like_service_url=os.getenv("NIMBUS_SEN2LIKE_SERVICE_URL") or None,
+    )
+    _render_payload(
+        payload,
+        return_code=None,
+        eyebrow="Selected job path",
+        title="Pipeline plan",
+        show_json=False,
+    )
+
+
+def _render_payload(
+    payload: dict[str, Any],
+    *,
+    return_code: int | None,
+    eyebrow: str = "CLI runtime",
+    title: str = "Modular pipeline plan",
+    show_json: bool = True,
+) -> None:
     stages = _stages_from_payload(payload)
     results = {
         str(item.get("name")): item
@@ -306,9 +340,9 @@ def _render_payload(payload: dict[str, Any], *, return_code: int | None) -> None
     st.markdown(
         "<div class='nimbus-orch-shell'>"
         "<div class='nimbus-orch-head'>"
-        "<div><span class='nimbus-orch-eyebrow'>CLI runtime</span>"
-        "<h3>Modular pipeline plan</h3></div>"
-        f"<div class='nimbus-orch-return'>exit {return_code if return_code is not None else '-'}</div>"
+        f"<div><span class='nimbus-orch-eyebrow'>{html.escape(eyebrow)}</span>"
+        f"<h3>{html.escape(title)}</h3></div>"
+        f"<div class='nimbus-orch-return'>{_return_badge(return_code)}</div>"
         "</div>"
         f"<div class='nimbus-orch-metrics'>{metric_html}</div>"
         f"{_stage_cards_html(stages, results)}"
@@ -316,9 +350,13 @@ def _render_payload(payload: dict[str, Any], *, return_code: int | None) -> None
         unsafe_allow_html=True,
     )
 
-    if payload:
+    if show_json and payload:
         with st.expander("JSON payload", expanded=False):
             st.json(payload)
+
+
+def _return_badge(return_code: int | None) -> str:
+    return f"exit {return_code}" if return_code is not None else "preview"
 
 
 def _stage_cards_html(stages: list[dict[str, Any]], results: dict[str, dict[str, Any]]) -> str:

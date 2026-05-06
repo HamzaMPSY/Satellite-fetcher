@@ -123,7 +123,7 @@ from nimbuschain_fetch_ui.provider_auth import (
     provider_preview_error_payload,
     select_provider_status,
 )
-from nimbuschain_fetch_ui.orchestrator_tab import render_orchestrator_tab
+from nimbuschain_fetch_ui.orchestrator_tab import render_pipeline_plan_summary
 from nimbuschain_fetch_ui.results_tab import render_results_tab
 from nimbuschain_fetch_ui.runtime_status import (
     format_status_timestamp as _format_status_timestamp,
@@ -3911,30 +3911,17 @@ def main():
 
     st.markdown(
         """<div style='display:flex;align-items:center;gap:14px;margin-bottom:4px;'>
-        <div style='font-size:1.6rem;background:linear-gradient(135deg,#38bdf8,#2dd4bf);width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(56,189,248,0.35);'>🛰️</div>
-        <div><div style='font-size:1.25rem;font-weight:700;color:#e2e8f0;'>NimbusChain Orchestrator</div><div style='font-size:0.72rem;color:#64748b;letter-spacing:.04em;'>Stage CLI · FastAPI jobs · Podman services</div></div>
+        <div style='font-size:1.05rem;font-weight:800;background:linear-gradient(135deg,#38bdf8,#2dd4bf);color:#020617;width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(56,189,248,0.35);'>NC</div>
+        <div><div style='font-size:1.25rem;font-weight:700;color:#e2e8f0;'>NimbusChain Pipeline</div><div style='font-size:0.72rem;color:#64748b;letter-spacing:.04em;'>AOI · Pipeline jobs · Runtime monitoring</div></div>
     </div>""",
         unsafe_allow_html=True,
     )
 
     download_provider_api = PROVIDER_CLI_MAP.get(provider)
 
-    tab_orchestrator, tab_map, tab_launch, tab_downloads, tab_res, tab_set = st.tabs(
-        ["Orchestrator", "AOI & Tiles", "Preview & API Jobs", "Downloads & Queue", "Results", "Settings"]
+    tab_map, tab_launch, tab_downloads, tab_res, tab_set = st.tabs(
+        ["AOI & Tiles", "Pipeline Job", "Downloads & Queue", "Results", "Settings"]
     )
-
-    with tab_orchestrator:
-        effective_product_type = str(product)
-        if provider == "USGS":
-            effective_product_type = _resolve_usgs_product_type(
-                selected_product_type=str(product),
-                selected_satellite=str(_ss("usgs_satellite", "Any")),
-            )
-        render_orchestrator_tab(
-            provider_label=provider,
-            collection=str(satellite).split(" ")[0],
-            product_type=effective_product_type,
-        )
 
     with tab_map:
         aoi_geom = parse_geometry(_ss("geometry_text", ""))
@@ -4322,6 +4309,14 @@ def main():
                 st.warning(
                     "Cube building needs at least two available acquisition dates in the current preview. Refresh preview or widen the search dates first."
                 )
+
+        render_pipeline_plan_summary(
+            provider_label=provider,
+            collection=collection,
+            product_type=str(effective_product_type),
+            mask_types=requested_download_mask_types,
+            cube_mode=selected_cube_mode,
+        )
 
         d1, d2 = st.columns([2, 1])
         with d1:
