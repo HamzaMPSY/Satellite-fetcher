@@ -1,4 +1,4 @@
-ARG SEN2LIKE_BASE=ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
+ARG SEN2LIKE_BASE=python:3.11.11-slim-bookworm
 FROM ${SEN2LIKE_BASE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -11,7 +11,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/src:/app/sen2like \
     NIMBUS_SEN2LIKE_VENDOR_DIR=/app/sen2like \
     NIMBUS_SEN2LIKE_WORK_DIR=/data/downloads/sen2like \
-    LANDSAT_UPSAMPLING_BASE=/app/sen2like
+    LANDSAT_UPSAMPLING_BASE=/app/sen2like \
+    GDAL_CONFIG=/usr/bin/gdal-config \
+    CPLUS_INCLUDE_PATH=/usr/include/gdal \
+    C_INCLUDE_PATH=/usr/include/gdal
 
 WORKDIR /app
 
@@ -20,18 +23,25 @@ RUN apt-get update && \
       build-essential \
       ca-certificates \
       default-jre-headless \
+      gdal-bin \
+      libexpat1 \
+      libgdal-dev \
+      libgeos-dev \
+      libproj-dev \
       libspatialindex-dev \
-      python3-pip \
-      python3-venv && \
+      pkg-config \
+      proj-bin && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m venv /opt/venv && \
     useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
-COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
 COPY sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/requirements.txt /app/requirements/sen2like-upstream.txt
-RUN python -m pip install --upgrade pip setuptools wheel && \
-    python -m pip install -r /app/requirements/runtime-common.txt && \
-    python -m pip install -r /app/requirements/sen2like-upstream.txt
+RUN python -m pip install --upgrade pip "setuptools<81" wheel && \
+    grep -viE '^(GDAL|podman-compose|opencv-python-headless|pyrasterframes|zarr)==' \
+      /app/requirements/sen2like-upstream.txt > /app/requirements/sen2like-container.txt && \
+    printf '%s\n' 'opencv-python-headless==4.10.0.84' >> /app/requirements/sen2like-container.txt && \
+    printf '%s\n' 'zarr==3.0.10' >> /app/requirements/sen2like-container.txt && \
+    python -m pip install -r /app/requirements/sen2like-container.txt
 
 COPY --chown=appuser:appuser src/nimbuschain_sen2like_service /app/src/nimbuschain_sen2like_service
 COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared
