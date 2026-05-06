@@ -123,6 +123,7 @@ from nimbuschain_fetch_ui.provider_auth import (
     provider_preview_error_payload,
     select_provider_status,
 )
+from nimbuschain_fetch_ui.orchestrator_tab import render_orchestrator_tab
 from nimbuschain_fetch_ui.results_tab import render_results_tab
 from nimbuschain_fetch_ui.runtime_status import (
     format_status_timestamp as _format_status_timestamp,
@@ -3911,16 +3912,29 @@ def main():
     st.markdown(
         """<div style='display:flex;align-items:center;gap:14px;margin-bottom:4px;'>
         <div style='font-size:1.6rem;background:linear-gradient(135deg,#38bdf8,#2dd4bf);width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(56,189,248,0.35);'>🛰️</div>
-        <div><div style='font-size:1.25rem;font-weight:700;color:#e2e8f0;'>Satellite Imagery Downloader</div><div style='font-size:0.72rem;color:#64748b;letter-spacing:.04em;'>Legacy UI + API Jobs Runtime</div></div>
+        <div><div style='font-size:1.25rem;font-weight:700;color:#e2e8f0;'>NimbusChain Orchestrator</div><div style='font-size:0.72rem;color:#64748b;letter-spacing:.04em;'>Stage CLI · FastAPI jobs · Podman services</div></div>
     </div>""",
         unsafe_allow_html=True,
     )
 
     download_provider_api = PROVIDER_CLI_MAP.get(provider)
 
-    tab_map, tab_launch, tab_downloads, tab_res, tab_set = st.tabs(
-        ["🗺️ AOI & Tiles", "🚀 Preview & Launch", "⬇️ Downloads & Queue", "📂 Results", "🔧 Settings"]
+    tab_orchestrator, tab_map, tab_launch, tab_downloads, tab_res, tab_set = st.tabs(
+        ["Orchestrator", "AOI & Tiles", "Preview & API Jobs", "Downloads & Queue", "Results", "Settings"]
     )
+
+    with tab_orchestrator:
+        effective_product_type = str(product)
+        if provider == "USGS":
+            effective_product_type = _resolve_usgs_product_type(
+                selected_product_type=str(product),
+                selected_satellite=str(_ss("usgs_satellite", "Any")),
+            )
+        render_orchestrator_tab(
+            provider_label=provider,
+            collection=str(satellite).split(" ")[0],
+            product_type=effective_product_type,
+        )
 
     with tab_map:
         aoi_geom = parse_geometry(_ss("geometry_text", ""))

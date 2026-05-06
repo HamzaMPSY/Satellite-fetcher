@@ -142,6 +142,159 @@ iframe[title="leaflet_map"] {
     border-radius: 14px !important;
     box-shadow: var(--shadow) !important;
 }
+.nimbus-section-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 0 0 10px 0;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: rgba(9, 15, 29, 0.78);
+}
+.nimbus-section-title span {
+    font-size: 0.94rem;
+    font-weight: 700;
+    color: var(--text);
+}
+.nimbus-section-title strong {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+}
+.nimbus-orch-shell {
+    margin: 12px 0;
+    padding: 16px;
+    border-radius: 14px;
+    border: 1px solid rgba(56, 189, 248, 0.16);
+    background: linear-gradient(180deg, rgba(8, 14, 28, 0.96), rgba(5, 9, 18, 0.98));
+    box-shadow: var(--shadow);
+}
+.nimbus-orch-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+.nimbus-orch-eyebrow {
+    display: block;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    color: #7dd3fc;
+    margin-bottom: 4px;
+}
+.nimbus-orch-head h3 {
+    margin: 0;
+    font-size: 1rem;
+    line-height: 1.3;
+    color: #f8fafc;
+}
+.nimbus-orch-return {
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    color: #94a3b8;
+    font: 0.72rem 'JetBrains Mono', monospace;
+    background: rgba(15, 23, 42, 0.72);
+}
+.nimbus-orch-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.nimbus-orch-metric {
+    padding: 9px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(15, 23, 42, 0.62);
+}
+.nimbus-orch-metric span {
+    display: block;
+    font-size: 0.64rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: #7b8da8;
+    text-transform: uppercase;
+}
+.nimbus-orch-metric strong {
+    display: block;
+    margin-top: 4px;
+    color: var(--text);
+    font-size: 0.92rem;
+}
+.nimbus-orch-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+    gap: 10px;
+}
+.nimbus-orch-stage {
+    min-height: 132px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    background: rgba(9, 15, 29, 0.88);
+    overflow: hidden;
+}
+.nimbus-orch-stage.is-succeeded { border-color: rgba(34, 197, 94, 0.34); }
+.nimbus-orch-stage.is-skipped { border-color: rgba(245, 158, 11, 0.34); }
+.nimbus-orch-stage.is-failed { border-color: rgba(248, 113, 113, 0.42); }
+.nimbus-orch-stage.is-running { border-color: rgba(56, 189, 248, 0.42); }
+.nimbus-orch-stage-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.nimbus-orch-stage-top span {
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(56, 189, 248, 0.12);
+    color: #7dd3fc;
+    font: 0.68rem 'JetBrains Mono', monospace;
+}
+.nimbus-orch-stage-top strong {
+    color: #f8fafc;
+    font-size: 0.88rem;
+}
+.nimbus-orch-stage p {
+    flex: 1;
+    margin: 0;
+    color: #94a3b8;
+    font-size: 0.74rem;
+    line-height: 1.35;
+}
+.nimbus-orch-stage-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    color: #cbd5e1;
+    font: 0.68rem 'JetBrains Mono', monospace;
+    text-transform: uppercase;
+}
+.nimbus-orch-stage code {
+    display: block;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 0.66rem;
+    color: #94a3b8 !important;
+    background: rgba(2, 6, 23, 0.68) !important;
+    padding: 6px 7px;
+}
 .nimbus-pipeline-shell {
     position: relative;
     margin: 12px 0 10px 0;
