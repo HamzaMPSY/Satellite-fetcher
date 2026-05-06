@@ -41,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--collection", required=True)
         command.add_argument("--product-type", default=None)
         command.add_argument("--mask-types", default="")
+        command.add_argument("--sen2like-service-url", default=None)
         command.add_argument(
             "--cube-mode",
             default="none",
@@ -65,6 +66,11 @@ def _options_from_args(args: argparse.Namespace) -> PipelineOptions:
         product_type=str(args.product_type).strip() or None if args.product_type else None,
         mask_types=_mask_types(args.mask_types),
         cube_mode=str(args.cube_mode),
+        sen2like_service_url=(
+            str(args.sen2like_service_url).strip() or None
+            if args.sen2like_service_url
+            else None
+        ),
     )
 
 

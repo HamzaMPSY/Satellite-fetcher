@@ -25,7 +25,13 @@ def test_stage_cli_plan_outputs_json(capsys) -> None:
 
     assert code == 0
     assert payload["status"] == "planned"
-    assert [stage["name"] for stage in payload["stages"]] == ["fetch", "zarr", "mask", "cube"]
+    assert [stage["name"] for stage in payload["stages"]] == [
+        "fetch",
+        "sen2like",
+        "zarr",
+        "mask",
+        "cube",
+    ]
 
 
 def test_stage_cli_run_stage_outputs_timed_results(capsys) -> None:

@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from nimbuschain_fetch.pipeline.core import FunctionStage, PipelineContext, StageResult
+from nimbuschain_fetch.pipeline.core import (
+    FunctionStage,
+    PipelineContext,
+    PipelineStage,
+    StageResult,
+)
+from nimbuschain_fetch.pipeline.sen2like import Sen2LikeStage
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +19,7 @@ class PipelineOptions:
     product_type: str | None = None
     mask_types: tuple[str, ...] = field(default_factory=tuple)
     cube_mode: str = "none"
+    sen2like_service_url: str | None = None
 
     @property
     def normalized_provider(self) -> str:
@@ -26,7 +33,7 @@ class PipelineOptions:
         raise ValueError("cube_mode must be one of: none, before_mask, after_mask.")
 
 
-def build_default_pipeline_stages(options: PipelineOptions) -> list[FunctionStage]:
+def build_default_pipeline_stages(options: PipelineOptions) -> list[PipelineStage]:
     cube_depends_on = ("mask",) if options.normalized_cube_mode == "after_mask" else ("zarr",)
     mask_depends_on = ("cube",) if options.normalized_cube_mode == "before_mask" else ("zarr",)
 
@@ -36,6 +43,7 @@ def build_default_pipeline_stages(options: PipelineOptions) -> list[FunctionStag
             _placeholder_stage("fetch"),
             skip_reason="fetch_stage_disabled",
         ),
+        Sen2LikeStage(service_url=options.sen2like_service_url),
         FunctionStage(
             "zarr",
             _placeholder_stage("zarr"),
