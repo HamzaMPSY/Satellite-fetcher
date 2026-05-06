@@ -16,6 +16,8 @@ Browser
 
 The UI never executes downloads directly. It submits jobs to the API. The worker owns execution from search to download to Zarr conversion. The mask service owns cloud and water masking on existing Zarr outputs. The Zarr package is reused as worker-internal conversion logic, while the backend exposes converter and mask health/schema endpoints for the UI.
 
+The production job runtime is still Nimbus-first: public routes keep using the existing API, worker, job store and `NimbusFetcher` behavior. The new `nimbuschain_fetch.pipeline` package is an incremental orchestration foundation for splitting the runtime into explicit stages without changing those public contracts.
+
 ## 2. Runtime responsibilities
 
 ### `nimbus-ui`
@@ -48,6 +50,7 @@ Key folders:
 - `src/nimbuschain_fetch_service/main.py`: FastAPI entrypoint
 - `src/nimbuschain_fetch_service/api/`: routers
 - `src/nimbuschain_fetch/engine/`: orchestration engine
+- `src/nimbuschain_fetch/pipeline/`: modular stage/DAG foundation and local stage CLI support
 - `src/nimbuschain_fetch/jobs/`: job store implementations
 
 ### `nimbus-worker`
@@ -63,6 +66,7 @@ Main role:
 Key code:
 - `src/nimbuschain_fetch/worker.py`
 - `src/nimbuschain_fetch/providers/`
+- `src/nimbuschain_fetch/stage_cli.py`
 
 ### `nimbus-zarr` runtime
 
@@ -95,6 +99,42 @@ Key code:
 - `src/nimbuschain_mask_service/omniwater.py`
 - `src/nimbuschain_mask_service/io.py`
 
+### Modular pipeline foundation
+
+Main role:
+- describe the future job flow as independent stages with dependencies
+- record one `StageResult` per stage, including status, outputs, metadata, errors and duration
+- provide a local CLI for inspecting a plan or running a target stage with its dependencies
+- prepare the Landsat normalization hook without forcing the full Sen2Like service into the current runtime
+
+Current default stage graph:
+
+```text
+fetch
+  -> sen2like hook (USGS/Landsat only, optional service URL)
+  -> zarr
+       -> mask? / cube? (ordered by cube_mode)
+```
+
+In this foundation phase, `zarr` still depends directly on `fetch` so a missing Sen2Like service URL does not block existing job behavior. The next migration can make `zarr` consume the normalized Sen2Like output for Landsat when the service is ready.
+
+The `sen2like` stage currently behaves as a hook. For USGS/Landsat jobs, it is skipped with `sen2like_service_url_missing` when `NIMBUS_SEN2LIKE_SERVICE_URL` is not configured. When the URL is present, the stage records that the service is configured; the actual HTTP client and microservice execution are reserved for the next migration step.
+
+Local CLI examples:
+
+```bash
+python -m nimbuschain_fetch.stage_cli plan \
+  --provider usgs \
+  --collection landsat_ot_c2_l2 \
+  --product-type L2SP
+
+python -m nimbuschain_fetch.stage_cli run-stage \
+  --provider usgs \
+  --collection landsat_ot_c2_l2 \
+  --product-type L2SP \
+  --stage sen2like
+```
+
 ## 3. Data flow
 
 ### Download flow
@@ -112,6 +152,19 @@ UI form
   -> events + pipeline status updates emitted
   -> UI reads jobs/events/results
 ```
+
+### Target modular flow
+
+```text
+fetcher
+  -> sen2like normalization for Landsat products
+  -> Zarr conversion
+  -> optional masking
+  -> optional cube build
+  -> artifacts, events and per-stage timing persisted under the job lineage
+```
+
+This is the intended migration path, not a public API break. Each stage should eventually be executable from the worker or from the local CLI, and each stage should return a structured result with elapsed time.
 
 ### Zarr conversion flow
 
@@ -143,6 +196,8 @@ existing Zarr output
 
 - `src/nimbuschain_fetch/`
   Core domain logic, providers, worker logic, storage contracts.
+- `src/nimbuschain_fetch/pipeline/`
+  Stage protocol, DAG orchestration, default stage graph and optional Sen2Like hook.
 - `src/nimbuschain_fetch_service/`
   Public API layer over the engine, stores, and converter-facing routes.
 - `src/nimbuschain_fetch_ui/`
@@ -151,6 +206,16 @@ existing Zarr output
   Conversion logic reused by the worker and converter routes.
 - `src/nimbuschain_mask_service/`
   Internal masking runtime and remote/client adapter.
+
+### Import boundaries
+
+- UI code may import UI helpers and API clients, but should not import provider download engines, Zarr writers or mask inference internals.
+- API routers may import service/engine contracts and job stores, but should keep public DTOs stable.
+- Worker code may orchestrate providers and internal clients, but stage implementations should keep provider, conversion, mask and cube concerns separated.
+- Zarr code should own product-to-Zarr conversion only.
+- Mask code should own cloud/water masking only.
+- Shared code should be small and contract-like: middleware, DTOs, clients and pipeline stage primitives. A service should not import another service's FastAPI implementation.
+
 ### Infrastructure and operations
 
 - `Containerfile`
