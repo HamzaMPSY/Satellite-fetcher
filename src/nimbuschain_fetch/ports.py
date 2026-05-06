@@ -111,6 +111,10 @@ class ConverterPort(Protocol):
         start_date: str | None = None,
         end_date: str | None = None,
         stage_label: str | None = None,
+        cube_layout: str = "grouped_time",
+        target_crs: str | None = None,
+        target_resolution_m: int = 10,
+        overlap_policy: str = "least_cloud",
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         ...

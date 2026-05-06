@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from collections.abc import Callable
 import math
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from affine import Affine
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.warp import reproject, transform_bounds
 
 import numpy as np
 
@@ -81,6 +87,15 @@ class SourceScene:
 
 
 CubeProgressCallback = Callable[[dict[str, Any]], None]
+
+@dataclass(frozen=True)
+class MosaicGrid:
+    crs: str
+    transform: list[float]
+    width: int
+    height: int
+    x_coords: np.ndarray
+    y_coords: np.ndarray
 
 
 def build_time_cube(
@@ -832,3 +847,697 @@ def _cube_output_name(
         if safe_stage:
             suffix = f"_{safe_stage}"
     return f"cube_{safe_group}_{start_stamp}_{end_stamp}{suffix}.zarr"
+
+#helpers for the multi tiles cube building 
+
+#compute the spatial bounds of a scene fro, its raster transform and image size return (left, bottom, right, top)
+def _scene_bounds(scene: SourceScene) -> tuple[float, float, float, float]:
+    if not isinstance(scene.transform, (list, tuple)) or len(scene.transform) < 6:
+        raise ConversionError(f"Scene has no usable transform: {scene.zarr_uri}")
+    a, b, c, d, e, f = [float(v) for v in scene.transform[:6]]
+    if b != 0.0 or d != 0.0:
+        raise ConversionError(f"Rotated transforms are not supported yet: {scene.zarr_uri}")
+
+    width = int(scene.imagery_shape[3])
+    height = int(scene.imagery_shape[2])
+
+    left = c
+    right = c + a * width
+    top = f
+    bottom = f + e * height
+
+    return (
+        min(left, right),
+        min(bottom, top),
+        max(left, right),
+        max(bottom, top),
+    )
+
+#To choose the most common  CRS 
+def _choose_target_crs(scenes: list[SourceScene], explicit_crs: str | None) -> tuple[str, str]:
+    if explicit_crs:
+        return str(CRS.from_user_input(explicit_crs)), "explicit"
+
+    values = [
+        str(CRS.from_user_input(scene.crs))
+        for scene in scenes
+        if scene.crs is not None and str(scene.crs).strip()
+    ]
+    if not values:
+        raise ConversionError("Could not determine target CRS from source scenes.")
+
+    target_crs_value, _ = Counter(values).most_common(1)[0]
+    return target_crs_value, "dominant_source_crs"
+
+#To build one common output grid for all the scenes that is large enough to contain all input scenes after being expressed in the same CRS
+def _build_mosaic_grid(
+        scenes: list[SourceScene],
+        *,
+        target_crs: str,
+        resolution_m: int,
+) -> MosaicGrid:
+    min_x = math.inf
+    min_y = math.inf
+    max_x = -math.inf
+    max_y = -math.inf
+
+    for scene in scenes:
+        if not scene.crs:
+            raise ConversionError(f"Scene has no CRS: {scene.zarr_uri}")
+        left, bottom, right, top = _scene_bounds(scene)
+        tx_left, tx_bottom, tx_right, tx_top = transform_bounds(
+            scene.crs,
+            target_crs,
+            left,
+            bottom,
+            right,
+            top,
+            densify_pts=21,
+        )
+
+        min_x = min(min_x, tx_left)
+        min_y = min(min_y, tx_bottom)
+        max_x = max(max_x, tx_right)
+        max_y = max(max_y, tx_top)
+
+    res = float(resolution_m)
+    snapped_min_x = math.floor(min_x / res) * res
+    snapped_min_y = math.floor(min_y / res) * res
+    snapped_max_x = math.ceil(max_x / res) * res
+    snapped_max_y = math.ceil(max_y / res) * res
+
+    width = int(round((snapped_max_x - snapped_min_x) / res))
+    height = int(round((snapped_max_y - snapped_min_y) / res))
+    if width <= 0 or height <= 0:
+        raise ConversionError("Mosaic grid extent is empty.")
+
+    transform = [res, 0.0, snapped_min_x, 0.0, -res, snapped_max_y]
+    x_coords, y_coords = _derive_spatial_coords(transform, width=width, height=height)
+    if x_coords is None or y_coords is None:
+        raise ConversionError("Could not derive mosaic x/y coordinates.")
+
+    return MosaicGrid(
+        crs=target_crs,
+        transform=transform,
+        width=width,
+        height=height,
+        x_coords=x_coords,
+        y_coords=y_coords,
+    )
+
+
+#To group scenes by day and return these grps by chronolpgical order 
+def _group_scenes_by_utc_day(
+    scenes: list[SourceScene],
+    *,
+    start_date: date | None,
+    end_date: date | None,
+) -> list[tuple[str, list[SourceScene]]]:
+    grouped: dict[str, list[SourceScene]] = defaultdict(list)
+    for scene in scenes:
+        scene_day = _coerce_timestamp(scene.acquisition_time).date()
+        if start_date and scene_day < start_date:
+            continue
+        if end_date and scene_day > end_date:
+            continue
+        grouped[scene_day.isoformat()].append(scene)
+
+    return [(day, sorted(items, key=lambda item: item.sort_key)) for day, items in sorted(grouped.items())]
+
+#A cloud score heler
+def _least_cloud_score_from_ancillary(
+    warped_ancillary: np.ndarray | None,
+    ancillary_layer_names: list[str],
+) -> np.ndarray | None:
+    if warped_ancillary is None or not ancillary_layer_names:
+        return None
+
+    if "CLDPRB" in ancillary_layer_names:
+        idx = ancillary_layer_names.index("CLDPRB")
+        values = warped_ancillary[idx].astype(np.float32, copy=False)
+        return np.where(np.isfinite(values), values, np.inf)
+
+    if "SCL" in ancillary_layer_names:
+        idx = ancillary_layer_names.index("SCL")
+        scl = warped_ancillary[idx]
+        clear = np.isin(scl, [4, 5, 6])  # vegetation, bare soil, water
+        return np.where(clear, 0.0, 100.0).astype(np.float32, copy=False)
+
+    return None
+
+
+def _least_cloud_score(
+    *,
+    warped_cloud_probability: np.ndarray | None,
+    warped_cloud_mask: np.ndarray | None,
+    warped_ancillary: np.ndarray | None,
+    ancillary_layer_names: list[str],
+) -> np.ndarray | None:
+    if warped_cloud_probability is not None:
+        values = warped_cloud_probability.astype(np.float32, copy=False)
+        return np.where(np.isfinite(values), values, np.inf)
+
+    if warped_cloud_mask is not None:
+        mask = warped_cloud_mask.astype(np.float32, copy=False)
+        return np.where(np.isfinite(mask), np.where(mask > 0, 100.0, 0.0), np.inf)
+
+    del warped_ancillary, ancillary_layer_names
+    return None
+
+
+def _warp_scene_stack(
+    source_root: Any,
+    scene: SourceScene,
+    *,
+    target_grid: MosaicGrid,
+    include_ancillary: bool,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    src_transform = Affine(*[float(v) for v in scene.transform[:6]])
+    dst_transform = Affine(*[float(v) for v in target_grid.transform[:6]])
+
+    imagery_src = np.asarray(source_root["imagery"][0], dtype=np.float32)
+    imagery_dst = np.full(
+        (imagery_src.shape[0], target_grid.height, target_grid.width),
+        np.nan,
+        dtype=np.float32,
+    )
+
+    for band_index in range(imagery_src.shape[0]):
+        reproject(
+            source=imagery_src[band_index],
+            destination=imagery_dst[band_index],
+            src_transform=src_transform,
+            src_crs=scene.crs,
+            dst_transform=dst_transform,
+            dst_crs=target_grid.crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+
+    ancillary_dst: np.ndarray | None = None
+    if include_ancillary and "ancillary" in source_root and scene.ancillary_layer_names:
+        ancillary_src = np.asarray(source_root["ancillary"][0], dtype=np.float32)
+        ancillary_dst = np.full(
+            (ancillary_src.shape[0], target_grid.height, target_grid.width),
+            np.nan,
+            dtype=np.float32,
+        )
+        for layer_index, layer_name in enumerate(scene.ancillary_layer_names):
+            layer_resampling = (
+                Resampling.nearest
+                if layer_name in {"SCL", "CLD", "SNW", "TCI"}
+                else Resampling.bilinear
+            )
+            reproject(
+                source=ancillary_src[layer_index],
+                destination=ancillary_dst[layer_index],
+                src_transform=src_transform,
+                src_crs=scene.crs,
+                dst_transform=dst_transform,
+                dst_crs=target_grid.crs,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=layer_resampling,
+            )
+
+    cloud_mask_dst: np.ndarray | None = None
+    cloud_probability_dst: np.ndarray | None = None
+    if "masks" in source_root:
+        masks_group = source_root["masks"]
+
+        if "cloud" in masks_group:
+            cloud_src = np.asarray(masks_group["cloud"][0], dtype=np.float32)
+            cloud_mask_dst = np.full(
+                (target_grid.height, target_grid.width),
+                np.nan,
+                dtype=np.float32,
+            )
+            reproject(
+                source=cloud_src,
+                destination=cloud_mask_dst,
+                src_transform=src_transform,
+                src_crs=scene.crs,
+                dst_transform=dst_transform,
+                dst_crs=target_grid.crs,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=Resampling.nearest,
+            )
+
+        if "cloud_probability" in masks_group:
+            probability_src = np.asarray(masks_group["cloud_probability"][0], dtype=np.float32)
+            cloud_probability_dst = np.full(
+                (target_grid.height, target_grid.width),
+                np.nan,
+                dtype=np.float32,
+            )
+            reproject(
+                source=probability_src,
+                destination=cloud_probability_dst,
+                src_transform=src_transform,
+                src_crs=scene.crs,
+                dst_transform=dst_transform,
+                dst_crs=target_grid.crs,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=Resampling.nearest,
+            )
+
+    return imagery_dst, ancillary_dst, cloud_mask_dst, cloud_probability_dst
+
+
+def _iter_grid_windows(*, width: int, height: int, chunk_x: int, chunk_y: int) -> list[tuple[int, int, int, int]]:
+    windows: list[tuple[int, int, int, int]] = []
+    for row_off in range(0, height, chunk_y):
+        win_h = min(chunk_y, height - row_off)
+        for col_off in range(0, width, chunk_x):
+            win_w = min(chunk_x, width - col_off)
+            windows.append((row_off, col_off, win_h, win_w))
+    return windows
+
+
+def _scene_source_window_for_target_window(
+    scene: SourceScene,
+    *,
+    target_grid: MosaicGrid,
+    row_off: int,
+    col_off: int,
+    win_h: int,
+    win_w: int,
+    pad_pixels: int = 2,
+) -> tuple[int, int, int, int] | None:
+    src_transform = Affine(*[float(v) for v in scene.transform[:6]])
+    dst_transform = Affine(*[float(v) for v in target_grid.transform[:6]])
+    dst_window_transform = dst_transform * Affine.translation(col_off, row_off)
+
+    left = dst_window_transform.c
+    top = dst_window_transform.f
+    right = left + dst_window_transform.a * win_w
+    bottom = top + dst_window_transform.e * win_h
+
+    min_x = min(left, right)
+    max_x = max(left, right)
+    min_y = min(bottom, top)
+    max_y = max(bottom, top)
+
+    src_min_x, src_min_y, src_max_x, src_max_y = transform_bounds(
+        target_grid.crs,
+        scene.crs,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        densify_pts=21,
+    )
+
+    inv_src = ~src_transform
+    col_a, row_a = inv_src * (src_min_x, src_max_y)
+    col_b, row_b = inv_src * (src_max_x, src_min_y)
+
+    min_col = int(math.floor(min(col_a, col_b))) - pad_pixels
+    max_col = int(math.ceil(max(col_a, col_b))) + pad_pixels
+    min_row = int(math.floor(min(row_a, row_b))) - pad_pixels
+    max_row = int(math.ceil(max(row_a, row_b))) + pad_pixels
+
+    src_height = int(scene.imagery_shape[2])
+    src_width = int(scene.imagery_shape[3])
+    min_col = max(0, min_col)
+    min_row = max(0, min_row)
+    max_col = min(src_width, max_col)
+    max_row = min(src_height, max_row)
+
+    if min_col >= max_col or min_row >= max_row:
+        return None
+    return min_row, max_row, min_col, max_col
+
+
+def _warp_scene_window(
+    source_root: Any,
+    scene: SourceScene,
+    *,
+    target_grid: MosaicGrid,
+    row_off: int,
+    col_off: int,
+    win_h: int,
+    win_w: int,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    band_count = int(scene.imagery_shape[1])
+    imagery_dst = np.full((band_count, win_h, win_w), np.nan, dtype=np.float32)
+
+    src_window = _scene_source_window_for_target_window(
+        scene,
+        target_grid=target_grid,
+        row_off=row_off,
+        col_off=col_off,
+        win_h=win_h,
+        win_w=win_w,
+    )
+    if src_window is None:
+        return imagery_dst, None, None
+
+    min_row, max_row, min_col, max_col = src_window
+    src_transform = Affine(*[float(v) for v in scene.transform[:6]]) * Affine.translation(min_col, min_row)
+    dst_transform = Affine(*[float(v) for v in target_grid.transform[:6]]) * Affine.translation(col_off, row_off)
+
+    for band_index in range(band_count):
+        source_band = np.asarray(
+            source_root["imagery"][0, band_index, min_row:max_row, min_col:max_col],
+            dtype=np.float32,
+        )
+        reproject(
+            source=source_band,
+            destination=imagery_dst[band_index],
+            src_transform=src_transform,
+            src_crs=scene.crs,
+            dst_transform=dst_transform,
+            dst_crs=target_grid.crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+
+    cloud_mask_dst: np.ndarray | None = None
+    cloud_probability_dst: np.ndarray | None = None
+    if "masks" in source_root:
+        masks_group = source_root["masks"]
+        if "cloud" in masks_group:
+            cloud_src = np.asarray(
+                masks_group["cloud"][0, min_row:max_row, min_col:max_col],
+                dtype=np.float32,
+            )
+            cloud_mask_dst = np.full((win_h, win_w), np.nan, dtype=np.float32)
+            reproject(
+                source=cloud_src,
+                destination=cloud_mask_dst,
+                src_transform=src_transform,
+                src_crs=scene.crs,
+                dst_transform=dst_transform,
+                dst_crs=target_grid.crs,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=Resampling.nearest,
+            )
+
+        if "cloud_probability" in masks_group:
+            probability_src = np.asarray(
+                masks_group["cloud_probability"][0, min_row:max_row, min_col:max_col],
+                dtype=np.float32,
+            )
+            cloud_probability_dst = np.full((win_h, win_w), np.nan, dtype=np.float32)
+            reproject(
+                source=probability_src,
+                destination=cloud_probability_dst,
+                src_transform=src_transform,
+                src_crs=scene.crs,
+                dst_transform=dst_transform,
+                dst_crs=target_grid.crs,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=Resampling.nearest,
+            )
+
+    return imagery_dst, cloud_mask_dst, cloud_probability_dst
+
+
+def build_daily_mosaic_cube(
+    source_zarr_uris: list[str],
+    output_uri: str,
+    *,
+    include_ancillary: bool = True,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+    target_crs: str | None = None,
+    target_resolution_m: int = 10,
+    overlap_policy: str = "least_cloud",
+    progress_callback: CubeProgressCallback | None = None,
+) -> dict[str, Any]:
+    try:
+        import zarr
+        from numcodecs import Blosc
+    except ImportError as exc:
+        raise ConversionDependencyError(
+            f"Cube-building dependencies are unavailable ({exc}). Ensure zarr and numcodecs are installed."
+        ) from exc
+
+    if not source_zarr_uris:
+        raise ConversionError("At least one source Zarr store is required to build a cube.")
+
+    scenes = [_load_source_scene(uri, include_ancillary=include_ancillary) for uri in source_zarr_uris]
+    if not scenes:
+        raise ConversionError("At least one source Zarr store is required to build a cube.")
+
+    baseline = scenes[0]
+    normalized_collection = str(baseline.collection or "").strip().upper()
+    normalized_product = str(baseline.product_type or "").strip().upper()
+    if "SENTINEL-2" not in normalized_collection and not normalized_product.startswith("S2"):
+        raise ConversionError("Daily mosaic cube is currently supported only for Sentinel-2 scene Zarr inputs.")
+
+    for scene in scenes[1:]:
+        _ensure_same(scene.band_names, baseline.band_names, field_name="band_names", scene=scene)
+        _ensure_same(scene.provider, baseline.provider, field_name="provider", scene=scene)
+        _ensure_same(scene.collection, baseline.collection, field_name="collection", scene=scene)
+        _ensure_same(scene.product_type, baseline.product_type, field_name="product_type", scene=scene)
+
+    start_bound = _coerce_date_only(start_date)
+    end_bound = _coerce_date_only(end_date)
+    if start_bound and end_bound and end_bound < start_bound:
+        raise ConversionError("Cube end date must be greater or equal to cube start date.")
+
+    grouped_days = _group_scenes_by_utc_day(
+        scenes,
+        start_date=start_bound,
+        end_date=end_bound,
+    )
+    if not grouped_days:
+        raise ConversionError("No scenes matched the requested date range.")
+
+    resolved_crs, crs_policy = _choose_target_crs(
+        [scene for _, day_scenes in grouped_days for scene in day_scenes],
+        target_crs,
+    )
+    mosaic_grid = _build_mosaic_grid(
+        [scene for _, day_scenes in grouped_days for scene in day_scenes],
+        target_crs=resolved_crs,
+        resolution_m=target_resolution_m,
+    )
+
+    time_values = [f"{day}T00:00:00+00:00" for day, _ in grouped_days]
+    band_names = list(baseline.band_names)
+    time_count = len(grouped_days)
+    band_count = len(band_names)
+    scene_index_lookup = {scene.scene_id: index for index, scene in enumerate(scenes)}
+
+    output_store, public_uri = _prepare_output_store(output_uri)
+    root = zarr.open_group(output_store, mode="w", zarr_format=2)
+    compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
+
+    imagery = root.create_array(
+        "imagery",
+        shape=(time_count, band_count, mosaic_grid.height, mosaic_grid.width),
+        chunks=(
+            1,
+            min(4, band_count),
+            min(512, mosaic_grid.height),
+            min(512, mosaic_grid.width),
+        ),
+        dtype=np.float32,
+        compressor=compressor,
+        fill_value=np.float32(np.nan),
+    )
+    best_score = root.create_array(
+        "best_cloud_score",
+        shape=(time_count, mosaic_grid.height, mosaic_grid.width),
+        chunks=(1, min(512, mosaic_grid.height), min(512, mosaic_grid.width)),
+        dtype=np.float32,
+        compressor=compressor,
+        fill_value=np.float32(np.inf),
+    )
+    scene_choice = root.create_array(
+        "source_scene_index",
+        shape=(time_count, mosaic_grid.height, mosaic_grid.width),
+        chunks=(1, min(512, mosaic_grid.height), min(512, mosaic_grid.width)),
+        dtype=np.int32,
+        compressor=compressor,
+        fill_value=-1,
+    )
+
+    root.create_array("time", data=_string_array(time_values), overwrite=True)
+    root.create_array("band", data=_string_array(band_names), overwrite=True)
+    root.create_array("x", data=mosaic_grid.x_coords, overwrite=True)
+    root.create_array("y", data=mosaic_grid.y_coords, overwrite=True)
+    root.create_array("source_scene_id", data=_string_array([scene.scene_id for scene in scenes]), overwrite=True)
+
+    chunk_y = int(imagery.chunks[2]) if imagery.chunks and len(imagery.chunks) >= 4 else min(512, mosaic_grid.height)
+    chunk_x = int(imagery.chunks[3]) if imagery.chunks and len(imagery.chunks) >= 4 else min(512, mosaic_grid.width)
+    windows = _iter_grid_windows(
+        width=mosaic_grid.width,
+        height=mosaic_grid.height,
+        chunk_x=max(1, chunk_x),
+        chunk_y=max(1, chunk_y),
+    )
+    total_windows = len(windows) * max(1, time_count)
+    processed_windows = 0
+
+    root.attrs.update(
+        {
+            "cube_kind": "daily_mosaic",
+            "build_status": "writing",
+            "shape": [time_count, band_count, mosaic_grid.height, mosaic_grid.width],
+        }
+    )
+
+    try:
+        for time_index, (day_label, day_scenes) in enumerate(grouped_days):
+            for row_off, col_off, win_h, win_w in windows:
+                window_imagery = np.full((band_count, win_h, win_w), np.nan, dtype=np.float32)
+                window_score = np.full((win_h, win_w), np.inf, dtype=np.float32)
+                window_choice = np.full((win_h, win_w), -1, dtype=np.int32)
+                window_rank = np.full((win_h, win_w), -1, dtype=np.int64)
+
+                for scene in day_scenes:
+                    source_store = _open_existing_output_store(scene.zarr_uri)
+                    source_root = zarr.open_group(source_store, mode="r", zarr_format=2)
+
+                    warped_imagery, warped_cloud_mask, warped_cloud_probability = _warp_scene_window(
+                        source_root,
+                        scene,
+                        target_grid=mosaic_grid,
+                        row_off=row_off,
+                        col_off=col_off,
+                        win_h=win_h,
+                        win_w=win_w,
+                    )
+
+                    valid_mask = np.any(np.isfinite(warped_imagery), axis=0)
+                    if not np.any(valid_mask):
+                        continue
+
+                    candidate_score = _least_cloud_score(
+                        warped_cloud_probability=warped_cloud_probability,
+                        warped_cloud_mask=warped_cloud_mask,
+                        warped_ancillary=None,
+                        ancillary_layer_names=[],
+                    )
+                    if overlap_policy == "least_cloud" and candidate_score is None:
+                        raise ConversionError(
+                            "least_cloud overlap policy requires OmniCloudMask outputs in the source Zarr. "
+                            f"Missing masks/cloud_probability or masks/cloud for scene: {scene.scene_id}"
+                        )
+                    if candidate_score is None or overlap_policy != "least_cloud":
+                        candidate_score = np.full((win_h, win_w), 0.0, dtype=np.float32)
+
+                    scene_rank = int(_coerce_timestamp(scene.acquisition_time).timestamp())
+
+                    replace_mask = valid_mask & (candidate_score < window_score)
+                    tie_mask = valid_mask & np.isfinite(candidate_score) & (candidate_score == window_score)
+
+                    if overlap_policy == "latest":
+                        replace_mask |= tie_mask & (scene_rank > window_rank)
+                    elif overlap_policy == "earliest":
+                        replace_mask |= tie_mask & ((window_rank < 0) | (scene_rank < window_rank))
+                    elif overlap_policy == "first_valid":
+                        replace_mask |= tie_mask & (window_choice < 0)
+                    else:
+                        replace_mask |= tie_mask & (scene_rank > window_rank)
+
+                    if np.any(replace_mask):
+                        window_imagery[:, replace_mask] = warped_imagery[:, replace_mask]
+                        window_score[replace_mask] = candidate_score[replace_mask]
+                        window_choice[replace_mask] = scene_index_lookup[scene.scene_id]
+                        window_rank[replace_mask] = scene_rank
+
+                imagery[time_index, :, row_off : row_off + win_h, col_off : col_off + win_w] = window_imagery
+                best_score[time_index, row_off : row_off + win_h, col_off : col_off + win_w] = window_score
+                scene_choice[time_index, row_off : row_off + win_h, col_off : col_off + win_w] = window_choice
+
+                processed_windows += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "daily_mosaic",
+                            "group_key": day_label,
+                            "group_index": time_index + 1,
+                            "group_total": time_count,
+                            "window_row_offset": row_off,
+                            "window_col_offset": col_off,
+                            "window_height": win_h,
+                            "window_width": win_w,
+                            "window_index": processed_windows,
+                            "window_total": total_windows,
+                            "fraction": processed_windows / total_windows if total_windows else 1.0,
+                        }
+                    )
+    except Exception as exc:
+        root.attrs.update(
+            {
+                "build_status": "failed",
+                "build_error": str(exc),
+            }
+        )
+        raise
+
+    root.attrs.update(
+        {
+            "zarr_format_version": ZARR_FORMAT_VERSION,
+            "cube_kind": "daily_mosaic",
+            "build_status": "written",
+            "source_scene_count": len(scenes),
+            "provider": baseline.provider,
+            "collection": baseline.collection,
+            "product_type": baseline.product_type,
+            "data_family": baseline.data_family,
+            "dimensions": ["time", "band", "y", "x"],
+            "shape": [time_count, band_count, mosaic_grid.height, mosaic_grid.width],
+            "dtype": "float32",
+            "band_names": list(band_names),
+            "crs": mosaic_grid.crs,
+            "transform": mosaic_grid.transform,
+            "reference_band": baseline.reference_band,
+            "reference_pixel_size": [float(target_resolution_m), float(target_resolution_m)],
+            "time_start": time_values[0],
+            "time_end": time_values[-1],
+            "time_granularity": "daily",
+            "mosaic_enabled": True,
+            "mosaic_grid_policy": "union_extent",
+            "mosaic_crs_policy": crs_policy,
+            "mosaic_resolution_m": int(target_resolution_m),
+            "mosaic_overlap_policy": str(overlap_policy),
+            "mosaic_overlap_fallback_policy": "latest",
+            "cloud_score_source_priority": [
+                "masks/cloud_probability",
+                "masks/cloud",
+            ],
+            "source_scene_ids": [scene.scene_id for scene in scenes],
+        }
+    )
+
+    zarr.consolidate_metadata(output_store)
+
+    return CubeBuildSummaryRecord(
+        zarr_uri=public_uri,
+        cube_kind="daily_mosaic",
+        source_scene_count=len(scenes),
+        source_zarr_uris=list(source_zarr_uris),
+        band_names=list(band_names),
+        shape=[time_count, band_count, mosaic_grid.height, mosaic_grid.width],
+        time_values=list(time_values),
+        scene_ids=[scene.scene_id for scene in scenes],
+        provider=baseline.provider,
+        collection=baseline.collection,
+        product_type=baseline.product_type,
+        data_family=baseline.data_family,
+        crs=mosaic_grid.crs,
+        transform=mosaic_grid.transform,
+        pixel_size=[float(target_resolution_m), float(target_resolution_m)],
+        dimensions=["time", "band", "y", "x"],
+        ancillary_written=False,
+        ancillary_layer_names=[],
+        masks_written=True,
+        mask_layer_names=["best_cloud_score", "source_scene_index"],
+        time_granularity="daily",
+        mosaic_overlap_policy=str(overlap_policy),
+        mosaic_crs_policy=crs_policy,
+        mosaic_resolution_m=int(target_resolution_m),
+        nodata=None,
+    ).to_dict()

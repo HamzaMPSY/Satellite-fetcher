@@ -96,6 +96,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cube-output-uri", default=None)
     parser.add_argument("--cube-output-dir", default="./data/downloads/zarr/cubes/manual")
+    parser.add_argument("--cube-layout", choices=["grouped_time", "daily_mosaic"], default="grouped_time")
+    parser.add_argument("--cube-target-crs", default=None)
+    parser.add_argument("--cube-target-resolution-m", type=int, default=10)
+    parser.add_argument(
+        "--cube-overlap-policy",
+        choices=["least_cloud", "latest", "earliest", "first_valid"],
+        default="least_cloud",
+    )
     parser.add_argument(
         "--group-by-tile",
         action="store_true",
@@ -208,6 +216,10 @@ def run(args: argparse.Namespace) -> int:
                 include_ancillary=not bool(args.skip_ancillary),
                 include_masks=bool(args.include_masks_in_cube),
                 stage_label=cube_mode,
+                cube_layout=str(args.cube_layout).strip(),
+                target_crs=str(args.cube_target_crs).strip() or None if args.cube_target_crs is not None else None,
+                target_resolution_m=int(args.cube_target_resolution_m),
+                overlap_policy=str(args.cube_overlap_policy).strip(),
             )
 
         print(
