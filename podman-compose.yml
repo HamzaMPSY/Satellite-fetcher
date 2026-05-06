@@ -6,8 +6,8 @@ x-runtime-env: &runtime-env
   NIMBUS_MONGODB_DB: ${NIMBUS_MONGODB_DB:-nimbuschain_fetch}
   NIMBUS_DATA_DIR: /data/downloads
   NIMBUS_ZARRMASK_DIR: /data/downloads/zarrmask
-  NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-}
-  NIMBUS_ZARR_SERVICE_URL: ${NIMBUS_ZARR_SERVICE_URL:-}
+  NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-http://nimbus-mask:8020}
+  NIMBUS_ZARR_SERVICE_URL: ${NIMBUS_ZARR_SERVICE_URL:-http://nimbus-zarr:8010}
   NIMBUS_MAX_JOBS: ${NIMBUS_MAX_JOBS:-4}
   NIMBUS_LOG_LEVEL: ${NIMBUS_LOG_LEVEL:-INFO}
   NIMBUS_LOG_JSON: ${NIMBUS_LOG_JSON:-false}
@@ -59,7 +59,7 @@ services:
       NIMBUS_MAX_REQUEST_MB: ${NIMBUS_MAX_REQUEST_MB:-10}
     volumes: *runtime-volumes
     healthcheck:
-      test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8000/v1/health'))"]
+      test: ["CMD-SHELL", "python -c \"import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8000/v1/health'))\""]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -108,7 +108,7 @@ services:
     volumes:
       - ./data:/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501')"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501')\""]
       interval: 20s
       timeout: 5s
       retries: 5
@@ -129,7 +129,7 @@ services:
     volumes:
       - ./data:/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8010/readiness'))"]
+      test: ["CMD-SHELL", "python -c \"import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8010/readiness'))\""]
       interval: 20s
       timeout: 5s
       retries: 5
@@ -148,7 +148,7 @@ services:
     ports:
       - "${NIMBUS_MASK_PORT:-8020}:8020"
     healthcheck:
-      test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8020/health'))"]
+      test: ["CMD-SHELL", "python -c \"import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8020/health'))\""]
       interval: 20s
       timeout: 5s
       retries: 5

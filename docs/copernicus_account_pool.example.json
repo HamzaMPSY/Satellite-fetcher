@@ -2,19 +2,13 @@
   "accounts": [
     {
       "label": "secondary-1",
-      "username": "mohammed.kssim20022002@gmail.com",
-      "password": "P@ssw@rdf@rt@st2026"
+      "username": "copernicus-account-1@example.com",
+      "password": "replace-with-password-1"
     },
     {
       "label": "secondary-2",
-      "username": "treshlol202@gmail.com",
-      "password": "Sc4XF,PR,8MBeV!"
-    },
-    {
-      "label": "secondary-3",
-      "username": "mehdi.dinari@oracle.com",
-      "password": "2hJ/iQE58~nidN,"
+      "username": "copernicus-account-2@example.com",
+      "password": "replace-with-password-2"
     }
-    
   ]
 }
