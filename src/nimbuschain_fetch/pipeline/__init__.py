@@ -10,7 +10,11 @@ from nimbuschain_fetch.pipeline.core import (
     StageStatus,
 )
 from nimbuschain_fetch.pipeline.defaults import PipelineOptions, build_default_pipeline_stages
-from nimbuschain_fetch.pipeline.sen2like import Sen2LikeStage, is_landsat_context
+from nimbuschain_fetch.pipeline.sen2like import (
+    Sen2LikeStage,
+    is_landsat_context,
+    is_landsat_selection,
+)
 
 __all__ = [
     "FunctionStage",
@@ -24,4 +28,5 @@ __all__ = [
     "StageStatus",
     "build_default_pipeline_stages",
     "is_landsat_context",
+    "is_landsat_selection",
 ]

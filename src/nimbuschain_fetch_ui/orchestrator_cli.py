@@ -33,7 +33,7 @@ def build_stage_cli_command(
     raw_uri: str | None = None,
     sen2like_service_url: str | None = None,
     sen2like_working_dir: str | None = None,
-    sen2like_workers: int = 4,
+    sen2like_workers: int | None = None,
     python_executable: str | None = None,
 ) -> list[str]:
     if action not in {"plan", "run-stage"}:
@@ -52,9 +52,9 @@ def build_stage_cli_command(
         collection,
         "--cube-mode",
         cube_mode,
-        "--sen2like-workers",
-        str(int(sen2like_workers)),
     ]
+    if sen2like_workers is not None:
+        command.extend(["--sen2like-workers", str(int(sen2like_workers))])
     if job_id:
         command.extend(["--job-id", job_id])
     if product_type:

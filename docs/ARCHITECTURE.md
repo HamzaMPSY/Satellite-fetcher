@@ -2,7 +2,7 @@
 
 ## 1. System overview
 
-NimbusChain Fetch is split into five main runtime components with explicit boundaries, but the backend/orchestrator is the only public API surface.
+NimbusChain Fetch is split into six main runtime components with explicit boundaries, but the backend/orchestrator is the only public API surface.
 
 ```text
 Browser
@@ -33,6 +33,7 @@ Key folders:
 - `src/nimbuschain_fetch_ui/app.py`: Streamlit entrypoint
 - `src/nimbuschain_fetch_ui/component_leaflet.py`: map component bridge
 - `src/nimbuschain_fetch_ui/jobs_helpers.py`: API access and job filtering helpers
+- `src/nimbuschain_fetch_ui/orchestrator_tab.py`: visual wrapper around the modular stage CLI
 - `src/nimbuschain_fetch_ui/zarr_utils.py`: Zarr discovery and registration helpers
 - `src/nimbuschain_fetch_ui/runtime_status.py`: UI runtime status collection and rendering
 
@@ -125,13 +126,14 @@ Main role:
 Current default stage graph:
 
 ```text
-fetch
-  -> sen2like hook (USGS/Landsat only, calls nimbus-sen2like when a raw path exists)
-  -> zarr
-       -> mask? / cube? (ordered by cube_mode)
+Copernicus/Sentinel:
+fetch -> zarr -> mask? / cube? (ordered by cube_mode)
+
+USGS/Landsat:
+fetch -> sen2like -> zarr -> mask? / cube? (ordered by cube_mode)
 ```
 
-In this foundation phase, `zarr` still depends directly on `fetch` so a missing Sen2Like input or service does not block existing job behavior. The next migration can make `zarr` consume the normalized Sen2Like output for Landsat after the worker passes downloaded raw product paths into the stage graph.
+`sen2like` is only present in the stage graph for USGS/Landsat selections. Sentinel/Copernicus jobs never plan or execute that stage. In the local CLI foundation, a missing or skipped Landsat Sen2Like stage blocks downstream target-stage execution because `zarr` depends on the normalized Landsat output. Public job routes still use the existing production runtime until the worker migration is completed.
 
 For USGS/Landsat jobs, the stage is skipped with `sen2like_service_url_missing` when `NIMBUS_SEN2LIKE_SERVICE_URL` is not configured, or `sen2like_input_missing` when no raw Landsat path has been provided yet. When both are present, the stage calls `POST /normalize` on `nimbus-sen2like`.
 
@@ -172,12 +174,13 @@ UI form
 ### Target modular flow
 
 ```text
-fetcher
-  -> sen2like normalization for Landsat products
-  -> Zarr conversion
-  -> optional masking
-  -> optional cube build
-  -> artifacts, events and per-stage timing persisted under the job lineage
+Sentinel/Copernicus:
+fetcher -> Zarr conversion -> optional masking -> optional cube build
+
+USGS/Landsat:
+fetcher -> sen2like normalization -> Zarr conversion -> optional masking -> optional cube build
+
+Both paths persist artifacts, events and per-stage timing under the job lineage.
 ```
 
 This is the intended migration path, not a public API break. Each stage should eventually be executable from the worker or from the local CLI, and each stage should return a structured result with elapsed time.

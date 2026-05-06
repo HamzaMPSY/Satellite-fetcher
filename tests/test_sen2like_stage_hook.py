@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from nimbuschain_fetch.pipeline import PipelineContext, PipelineOrchestrator, StageStatus
 from nimbuschain_fetch.pipeline.defaults import PipelineOptions, build_default_pipeline_stages
-from nimbuschain_fetch.pipeline.sen2like import is_landsat_context
+from nimbuschain_fetch.pipeline.sen2like import is_landsat_context, is_landsat_selection
 import nimbuschain_fetch.pipeline.sen2like as sen2like_module
 
 
@@ -20,6 +20,23 @@ def test_landsat_context_detection_requires_usgs() -> None:
 
     assert is_landsat_context(landsat) is True
     assert is_landsat_context(sentinel) is False
+    assert is_landsat_selection(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+    ) is False
+
+
+def test_default_pipeline_excludes_sen2like_for_sentinel() -> None:
+    options = PipelineOptions(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+    )
+    orchestrator = PipelineOrchestrator(build_default_pipeline_stages(options))
+
+    assert orchestrator.plan() == ["fetch", "zarr", "mask", "cube"]
+    assert "sen2like" not in orchestrator.stages
 
 
 def test_sen2like_stage_skips_landsat_when_service_url_missing() -> None:

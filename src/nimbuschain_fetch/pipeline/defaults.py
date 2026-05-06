@@ -9,7 +9,7 @@ from nimbuschain_fetch.pipeline.core import (
     PipelineStage,
     StageResult,
 )
-from nimbuschain_fetch.pipeline.sen2like import Sen2LikeStage
+from nimbuschain_fetch.pipeline.sen2like import Sen2LikeStage, is_landsat_selection
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,39 +32,54 @@ class PipelineOptions:
             return value
         raise ValueError("cube_mode must be one of: none, before_mask, after_mask.")
 
+    @property
+    def requires_sen2like(self) -> bool:
+        return is_landsat_selection(
+            provider=self.normalized_provider,
+            collection=self.collection,
+            product_type=self.product_type,
+        )
+
 
 def build_default_pipeline_stages(options: PipelineOptions) -> list[PipelineStage]:
+    zarr_depends_on = ("sen2like",) if options.requires_sen2like else ("fetch",)
     cube_depends_on = ("mask",) if options.normalized_cube_mode == "after_mask" else ("zarr",)
     mask_depends_on = ("cube",) if options.normalized_cube_mode == "before_mask" else ("zarr",)
 
-    return [
+    stages: list[PipelineStage] = [
         FunctionStage(
             "fetch",
             _placeholder_stage("fetch"),
             skip_reason="fetch_stage_disabled",
         ),
-        Sen2LikeStage(service_url=options.sen2like_service_url),
-        FunctionStage(
-            "zarr",
-            _placeholder_stage("zarr"),
-            depends_on=("fetch",),
-            skip_reason="zarr_stage_disabled",
-        ),
-        FunctionStage(
-            "mask",
-            _placeholder_stage("mask"),
-            depends_on=mask_depends_on,
-            condition=lambda _context: bool(options.mask_types),
-            skip_reason="mask_types_empty",
-        ),
-        FunctionStage(
-            "cube",
-            _placeholder_stage("cube"),
-            depends_on=cube_depends_on,
-            condition=lambda _context: options.normalized_cube_mode != "none",
-            skip_reason="cube_mode_none",
-        ),
     ]
+    if options.requires_sen2like:
+        stages.append(Sen2LikeStage(service_url=options.sen2like_service_url))
+    stages.extend(
+        [
+            FunctionStage(
+                "zarr",
+                _placeholder_stage("zarr"),
+                depends_on=zarr_depends_on,
+                skip_reason="zarr_stage_disabled",
+            ),
+            FunctionStage(
+                "mask",
+                _placeholder_stage("mask"),
+                depends_on=mask_depends_on,
+                condition=lambda _context: bool(options.mask_types),
+                skip_reason="mask_types_empty",
+            ),
+            FunctionStage(
+                "cube",
+                _placeholder_stage("cube"),
+                depends_on=cube_depends_on,
+                condition=lambda _context: options.normalized_cube_mode != "none",
+                skip_reason="cube_mode_none",
+            ),
+        ]
+    )
+    return stages
 
 
 def _placeholder_stage(stage_name: str):

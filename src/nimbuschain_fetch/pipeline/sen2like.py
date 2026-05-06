@@ -10,13 +10,26 @@ from nimbuschain_fetch.pipeline.core import PipelineContext, StageResult
 Sen2LikeServiceClient: Any | None = None
 
 
-def is_landsat_context(context: PipelineContext) -> bool:
-    provider = context.provider.strip().lower()
-    collection = context.collection.strip().lower()
-    product_type = (context.product_type or "").strip().lower()
-    if provider != "usgs":
+def is_landsat_selection(
+    *,
+    provider: str,
+    collection: str,
+    product_type: str | None = None,
+) -> bool:
+    normalized_provider = provider.strip().lower()
+    normalized_collection = collection.strip().lower()
+    normalized_product_type = (product_type or "").strip().lower()
+    if normalized_provider != "usgs":
         return False
-    return "landsat" in collection or product_type.startswith("l")
+    return "landsat" in normalized_collection or normalized_product_type.startswith("l")
+
+
+def is_landsat_context(context: PipelineContext) -> bool:
+    return is_landsat_selection(
+        provider=context.provider,
+        collection=context.collection,
+        product_type=context.product_type,
+    )
 
 
 @dataclass(frozen=True, slots=True)

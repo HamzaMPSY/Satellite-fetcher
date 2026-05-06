@@ -25,13 +25,31 @@ def test_stage_cli_plan_outputs_json(capsys) -> None:
 
     assert code == 0
     assert payload["status"] == "planned"
-    assert [stage["name"] for stage in payload["stages"]] == [
-        "fetch",
-        "sen2like",
-        "zarr",
-        "mask",
-        "cube",
-    ]
+    assert [stage["name"] for stage in payload["stages"]] == ["fetch", "zarr", "mask", "cube"]
+
+
+def test_stage_cli_plan_includes_sen2like_only_for_landsat(capsys) -> None:
+    code = main(
+        [
+            "plan",
+            "--provider",
+            "usgs",
+            "--collection",
+            "landsat_ot_c2_l2",
+            "--product-type",
+            "L2SP",
+            "--target-stage",
+            "zarr",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert payload["status"] == "planned"
+    assert [stage["name"] for stage in payload["stages"]] == ["fetch", "sen2like", "zarr"]
+    assert payload["stages"][-1]["depends_on"] == ["sen2like"]
 
 
 def test_stage_cli_run_stage_outputs_timed_results(capsys) -> None:
@@ -65,11 +83,11 @@ def test_stage_cli_skips_optional_mask_when_mask_types_are_empty(capsys) -> None
         [
             "run-stage",
             "--provider",
-            "usgs",
+            "copernicus",
             "--collection",
-            "landsat_ot_c2_l2",
+            "SENTINEL-2",
             "--product-type",
-            "L2SP",
+            "S2MSI2A",
             "--stage",
             "mask",
         ]

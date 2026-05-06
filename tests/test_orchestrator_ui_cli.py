@@ -28,6 +28,25 @@ def test_visual_orchestrator_builds_stage_cli_command() -> None:
     assert command[command.index("--sen2like-workers") + 1] == "8"
 
 
+def test_visual_orchestrator_omits_sen2like_options_when_not_needed() -> None:
+    command = build_stage_cli_command(
+        action="plan",
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        job_id="job-2",
+        mask_types=[],
+        cube_mode="none",
+        target_stage="zarr",
+        python_executable="python",
+    )
+
+    assert "--sen2like-service-url" not in command
+    assert "--sen2like-working-dir" not in command
+    assert "--sen2like-workers" not in command
+    assert "--raw-uri" not in command
+
+
 def test_visual_orchestrator_parses_last_json_line() -> None:
     payload, error = parse_stage_cli_payload(
         "log line\n{\"status\":\"planned\",\"stages\":[]}\n",

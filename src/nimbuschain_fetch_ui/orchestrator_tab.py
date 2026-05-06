@@ -7,6 +7,12 @@ from typing import Any
 
 import streamlit as st
 
+from nimbuschain_fetch.pipeline import (
+    PipelineOptions,
+    PipelineOrchestrator,
+    build_default_pipeline_stages,
+    is_landsat_selection,
+)
 from nimbuschain_fetch_ui.constants import PRODUCT_TYPES, PROJECT_ROOT, PROVIDER_CLI_MAP, PROVIDERS
 from nimbuschain_fetch_ui.orchestrator_cli import build_stage_cli_command, run_stage_cli
 
@@ -40,9 +46,13 @@ def render_orchestrator_tab(
 
     defaults = _defaults(provider_label, collection, product_type)
     provider_options = list(PROVIDERS.keys())
-    selected_provider_label = st.session_state.get("orch_provider_label", defaults["provider_label"])
+    selected_provider_label = st.session_state.get(
+        "orch_provider_label",
+        defaults["provider_label"],
+    )
     if selected_provider_label not in provider_options:
         selected_provider_label = provider_options[0]
+        st.session_state["orch_provider_label"] = selected_provider_label
 
     c1, c2, c3, c4 = st.columns([1.1, 1.35, 1.15, 1.1])
     with c1:
@@ -56,6 +66,7 @@ def render_orchestrator_tab(
     selected_collection = st.session_state.get("orch_collection", defaults["collection"])
     if selected_collection not in collection_options and collection_options:
         selected_collection = collection_options[0]
+        st.session_state["orch_collection"] = selected_collection
     with c2:
         selected_collection = st.selectbox(
             "Collection",
@@ -67,6 +78,7 @@ def render_orchestrator_tab(
     selected_product = st.session_state.get("orch_product_type", defaults["product_type"])
     if selected_product not in product_options and product_options:
         selected_product = product_options[0]
+        st.session_state["orch_product_type"] = selected_product
     with c3:
         selected_product = st.selectbox(
             "Product",
@@ -81,30 +93,44 @@ def render_orchestrator_tab(
             key="orch_job_id",
         )
 
+    provider = PROVIDER_CLI_MAP.get(selected_provider_label, selected_provider_label.lower())
+    is_landsat_flow = is_landsat_selection(
+        provider=provider,
+        collection=selected_collection,
+        product_type=selected_product,
+    )
+    target_stage_options = _target_stage_options(is_landsat_flow)
+    if st.session_state.get("orch_target_stage") not in target_stage_options:
+        st.session_state["orch_target_stage"] = "full"
+
     controls_left, controls_right = st.columns([1.2, 1])
     with controls_left:
-        raw_uri = st.text_input(
-            "Raw Landsat path",
-            value=st.session_state.get("orch_raw_uri", ""),
-            placeholder="/data/downloads/raw/LC08_SCENE",
-            key="orch_raw_uri",
-        )
-        sen2like_service_url = st.text_input(
-            "Sen2Like service",
-            value=st.session_state.get(
-                "orch_sen2like_service_url",
-                os.getenv("NIMBUS_SEN2LIKE_SERVICE_URL", "http://nimbus-sen2like:8030"),
-            ),
-            key="orch_sen2like_service_url",
-        )
-        sen2like_working_dir = st.text_input(
-            "Sen2Like work dir",
-            value=st.session_state.get(
-                "orch_sen2like_working_dir",
-                os.getenv("NIMBUS_SEN2LIKE_WORK_DIR", "/data/downloads/sen2like"),
-            ),
-            key="orch_sen2like_working_dir",
-        )
+        raw_uri = ""
+        sen2like_service_url = ""
+        sen2like_working_dir = ""
+        if is_landsat_flow:
+            raw_uri = st.text_input(
+                "Raw Landsat path",
+                value=st.session_state.get("orch_raw_uri", ""),
+                placeholder="/data/downloads/raw/LC08_SCENE",
+                key="orch_raw_uri",
+            )
+            sen2like_service_url = st.text_input(
+                "Sen2Like service",
+                value=st.session_state.get(
+                    "orch_sen2like_service_url",
+                    os.getenv("NIMBUS_SEN2LIKE_SERVICE_URL", "http://nimbus-sen2like:8030"),
+                ),
+                key="orch_sen2like_service_url",
+            )
+            sen2like_working_dir = st.text_input(
+                "Sen2Like work dir",
+                value=st.session_state.get(
+                    "orch_sen2like_working_dir",
+                    os.getenv("NIMBUS_SEN2LIKE_WORK_DIR", "/data/downloads/sen2like"),
+                ),
+                key="orch_sen2like_working_dir",
+            )
     with controls_right:
         mask_types = st.multiselect(
             "Masks",
@@ -125,19 +151,29 @@ def render_orchestrator_tab(
         )
         target_stage = st.selectbox(
             "Target stage",
-            options=["full", "fetch", "sen2like", "zarr", "mask", "cube"],
+            options=target_stage_options,
             key="orch_target_stage",
         )
-        sen2like_workers = st.number_input(
-            "Sen2Like workers",
-            min_value=1,
-            max_value=128,
-            value=int(st.session_state.get("orch_sen2like_workers", 4)),
-            step=1,
-            key="orch_sen2like_workers",
-        )
+        sen2like_workers = int(st.session_state.get("orch_sen2like_workers", 4))
+        if is_landsat_flow:
+            sen2like_workers = int(
+                st.number_input(
+                    "Sen2Like workers",
+                    min_value=1,
+                    max_value=128,
+                    value=sen2like_workers,
+                    step=1,
+                    key="orch_sen2like_workers",
+                )
+            )
 
-    provider = PROVIDER_CLI_MAP.get(selected_provider_label, selected_provider_label.lower())
+    sen2like_kwargs = _sen2like_command_kwargs(
+        enabled=is_landsat_flow,
+        raw_uri=raw_uri,
+        service_url=sen2like_service_url,
+        working_dir=sen2like_working_dir,
+        workers=sen2like_workers,
+    )
     plan_command = build_stage_cli_command(
         action="plan",
         provider=provider,
@@ -147,10 +183,7 @@ def render_orchestrator_tab(
         mask_types=mask_types,
         cube_mode=cube_mode,
         target_stage=None if target_stage == "full" else target_stage,
-        raw_uri=raw_uri.strip() or None,
-        sen2like_service_url=sen2like_service_url.strip() or None,
-        sen2like_working_dir=sen2like_working_dir.strip() or None,
-        sen2like_workers=int(sen2like_workers),
+        **sen2like_kwargs,
     )
     run_command = build_stage_cli_command(
         action="run-stage",
@@ -161,10 +194,7 @@ def render_orchestrator_tab(
         mask_types=mask_types,
         cube_mode=cube_mode,
         run_stage=_default_run_stage(target_stage, cube_mode, mask_types),
-        raw_uri=raw_uri.strip() or None,
-        sen2like_service_url=sen2like_service_url.strip() or None,
-        sen2like_working_dir=sen2like_working_dir.strip() or None,
-        sen2like_workers=int(sen2like_workers),
+        **sen2like_kwargs,
     )
 
     action_cols = st.columns([1, 1, 2])
@@ -182,7 +212,15 @@ def render_orchestrator_tab(
             key="orch_timeout_seconds",
         )
 
-    st.code(" ".join(_shell_quote(item) for item in (run_command if run_clicked else plan_command)), language="bash")
+    with st.expander("CLI command", expanded=False):
+        st.code(
+            " ".join(_shell_quote(item) for item in (run_command if run_clicked else plan_command)),
+            language="bash",
+        )
+
+    current_signature = _command_signature(plan_command, run_command)
+    if st.session_state.get("orch_last_signature") != current_signature:
+        st.session_state.pop("orch_last_invocation", None)
 
     if plan_clicked:
         st.session_state["orch_last_invocation"] = run_stage_cli(
@@ -190,12 +228,14 @@ def render_orchestrator_tab(
             cwd=PROJECT_ROOT,
             timeout_seconds=int(timeout_seconds),
         )
+        st.session_state["orch_last_signature"] = current_signature
     if run_clicked:
         st.session_state["orch_last_invocation"] = run_stage_cli(
             run_command,
             cwd=PROJECT_ROOT,
             timeout_seconds=int(timeout_seconds),
         )
+        st.session_state["orch_last_signature"] = current_signature
 
     invocation = st.session_state.get("orch_last_invocation")
     if invocation is None:
@@ -206,15 +246,16 @@ def render_orchestrator_tab(
             mask_types=mask_types,
             cube_mode=cube_mode,
             target_stage=target_stage,
+            sen2like_service_url=sen2like_kwargs.get("sen2like_service_url"),
         )
-        _render_payload(preview, command=plan_command, return_code=None)
+        _render_payload(preview, return_code=None)
         return
 
     if invocation.error:
         st.error(invocation.error)
     if invocation.return_code not in (0, None):
         st.warning(f"CLI exited with code {invocation.return_code}.")
-    _render_payload(invocation.payload, command=invocation.command, return_code=invocation.return_code)
+    _render_payload(invocation.payload, return_code=invocation.return_code)
     with st.expander("CLI output", expanded=False):
         if invocation.stdout:
             st.code(invocation.stdout, language="json")
@@ -222,9 +263,13 @@ def render_orchestrator_tab(
             st.code(invocation.stderr, language="text")
 
 
-def _render_payload(payload: dict[str, Any], *, command: list[str], return_code: int | None) -> None:
+def _render_payload(payload: dict[str, Any], *, return_code: int | None) -> None:
     stages = _stages_from_payload(payload)
-    results = {str(item.get("name")): item for item in list(payload.get("results") or []) if isinstance(item, dict)}
+    results = {
+        str(item.get("name")): item
+        for item in list(payload.get("results") or [])
+        if isinstance(item, dict)
+    }
     completed = sum(1 for item in results.values() if str(item.get("status")) == "succeeded")
     skipped = sum(1 for item in results.values() if str(item.get("status")) == "skipped")
     failed = sum(1 for item in results.values() if str(item.get("status")) == "failed")
@@ -312,27 +357,20 @@ def _dry_plan_payload(
     mask_types: list[str],
     cube_mode: str,
     target_stage: str,
+    sen2like_service_url: str | None = None,
 ) -> dict[str, Any]:
-    stages = [
-        {"name": "fetch", "depends_on": []},
-        {"name": "sen2like", "depends_on": ["fetch"]},
-        {"name": "zarr", "depends_on": ["fetch"]},
-        {"name": "mask", "depends_on": ["zarr"]},
-        {"name": "cube", "depends_on": ["zarr"]},
-    ]
-    if target_stage != "full":
-        depends_by_name = {stage["name"]: list(stage["depends_on"]) for stage in stages}
-        wanted = set()
-
-        def visit(name: str) -> None:
-            if name in wanted:
-                return
-            wanted.add(name)
-            for dependency in depends_by_name.get(name, []):
-                visit(dependency)
-
-        visit(target_stage)
-        stages = [stage for stage in stages if stage["name"] in wanted]
+    options = PipelineOptions(
+        provider=selected_provider,
+        collection=selected_collection,
+        product_type=selected_product,
+        mask_types=tuple(mask_types),
+        cube_mode=cube_mode,
+        sen2like_service_url=sen2like_service_url,
+    )
+    orchestrator = PipelineOrchestrator(build_default_pipeline_stages(options))
+    stages = orchestrator.describe_plan(
+        target_stage=None if target_stage == "full" else target_stage
+    )
     return {
         "status": "preview",
         "provider": selected_provider,
@@ -342,6 +380,39 @@ def _dry_plan_payload(
         "cube_mode": cube_mode,
         "stages": stages,
     }
+
+
+def _target_stage_options(is_landsat_flow: bool) -> list[str]:
+    stages = ["full", "fetch"]
+    if is_landsat_flow:
+        stages.append("sen2like")
+    stages.extend(["zarr", "mask", "cube"])
+    return stages
+
+
+def _sen2like_command_kwargs(
+    *,
+    enabled: bool,
+    raw_uri: str,
+    service_url: str,
+    working_dir: str,
+    workers: int,
+) -> dict[str, Any]:
+    if not enabled:
+        return {}
+    return {
+        "raw_uri": raw_uri.strip() or None,
+        "sen2like_service_url": service_url.strip() or None,
+        "sen2like_working_dir": working_dir.strip() or None,
+        "sen2like_workers": int(workers),
+    }
+
+
+def _command_signature(
+    plan_command: list[str],
+    run_command: list[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return (tuple(plan_command), tuple(run_command))
 
 
 def _defaults(provider_label: str, collection: str, product_type: str) -> dict[str, str]:
