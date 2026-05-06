@@ -464,6 +464,11 @@ class CubeBuildSummaryRecord:
     quadkey_coverage_mode: Any = None
     quadkey_zoom_index: Any = None
     quadkeys_index: list[str] = field(default_factory=list)
+    time_granularity: str | None = None
+    mosaic_overlap_policy: str | None = None
+    mosaic_crs_policy: str | None = None
+    mosaic_resolution_m: int | None = None
+    nodata: Any = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -491,6 +496,11 @@ class CubeBuildSummaryRecord:
             "quadkey_coverage_mode": self.quadkey_coverage_mode,
             "quadkey_zoom_index": self.quadkey_zoom_index,
             "quadkeys_index": list(self.quadkeys_index),
+            "time_granularity": self.time_granularity,
+            "mosaic_overlap_policy": self.mosaic_overlap_policy,
+            "mosaic_crs_policy": self.mosaic_crs_policy,
+            "mosaic_resolution_m": self.mosaic_resolution_m,
+            "nodata": self.nodata,
         }
 
 

@@ -17,7 +17,7 @@ from nimbuschain_shared.contracts.zarr import (
     InspectDatasetResponse,
 )
 from nimbuschain_zarr_service.constants import APP_VERSION, SERVICE_NAME
-from nimbuschain_zarr_service.cube import build_grouped_time_cubes, build_time_cube
+from nimbuschain_zarr_service.cube import build_daily_mosaic_cube, build_grouped_time_cubes, build_time_cube
 from nimbuschain_zarr_service.dependencies import get_conversion_service
 from nimbuschain_zarr_service.health import health_response, readiness_response, schema_payload
 from nimbuschain_zarr_service.inspection import inspect_dataset_summary
@@ -209,15 +209,47 @@ def build_grouped_cubes(payload: BuildGroupedCubesRequest, request: Request) -> 
         extra={"request_id": request_id},
     )
     try:
-        cube_summary = dict(build_grouped_time_cubes(
-            list(payload.source_zarr_uris),
-            payload.output_dir,
-            include_ancillary=bool(payload.include_ancillary),
-            include_masks=payload.include_masks,
-            start_date=payload.start_date,
-            end_date=payload.end_date,
-            stage_label=payload.stage_label,
-        ) or {})
+        if payload.cube_layout == "daily_mosaic":
+            start_token = str(payload.start_date or "start")
+            end_token = str(payload.end_date or "end")
+            stage_suffix = f"_{payload.stage_label}" if payload.stage_label else ""
+            output_uri = f"{payload.output_dir.rstrip('/')}/daily_mosaic_{start_token}_{end_token}{stage_suffix}.zarr"
+            single_summary = dict(
+                build_daily_mosaic_cube(
+                    list(payload.source_zarr_uris),
+                    output_uri,
+                    include_ancillary=bool(payload.include_ancillary),
+                    start_date=payload.start_date,
+                    end_date=payload.end_date,
+                    target_crs=payload.target_crs,
+                    target_resolution_m=int(payload.target_resolution_m or 10),
+                    overlap_policy=str(payload.overlap_policy or "least_cloud"),
+                )
+                or {}
+            )
+            cube_summary = {
+                "status": "written",
+                "reason": "",
+                "cube_outputs": [single_summary["zarr_uri"]],
+                "items": [single_summary],
+                "tiles_built": [],
+                "tiles_skipped": [],
+                "stage_label": payload.stage_label,
+                "date_range": {
+                    "start_date": payload.start_date,
+                    "end_date": payload.end_date,
+                },
+            }
+        else:
+            cube_summary = dict(build_grouped_time_cubes(
+                list(payload.source_zarr_uris),
+                payload.output_dir,
+                include_ancillary=bool(payload.include_ancillary),
+                include_masks=payload.include_masks,
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                stage_label=payload.stage_label,
+            ) or {})
     except ConversionError as exc:
         logger.warning(
             "grouped_cube_build_rejected job_id=%s pipeline_id=%s reason=%s",

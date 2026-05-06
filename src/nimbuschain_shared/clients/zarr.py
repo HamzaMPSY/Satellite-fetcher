@@ -110,6 +110,10 @@ class ZarrServiceClient:
         start_date: str | None = None,
         end_date: str | None = None,
         stage_label: str | None = None,
+        cube_layout: str = "grouped_time",
+        target_crs: str | None = None,
+        target_resolution_m: int = 10,
+        overlap_policy: str = "least_cloud",
         progress_callback: Any | None = None,
     ) -> dict[str, Any]:
         del progress_callback
@@ -126,6 +130,10 @@ class ZarrServiceClient:
                 "start_date": self._json_value(start_date),
                 "end_date": self._json_value(end_date),
                 "stage_label": stage_label,
+                "cube_layout": cube_layout,
+                "target_crs": target_crs,
+                "target_resolution_m": int(target_resolution_m),
+                "overlap_policy": overlap_policy,
             },
             timeout=(30, None),
         )
@@ -154,6 +162,10 @@ class ZarrServiceClient:
             start_date=request.start_date,
             end_date=request.end_date,
             stage_label=request.stage_label,
+            cube_layout=request.cube_layout,
+            target_crs=request.target_crs,
+            target_resolution_m=request.target_resolution_m,
+            overlap_policy=request.overlap_policy,
             progress_callback=request.progress_callback,
         )
 

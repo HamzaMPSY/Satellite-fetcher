@@ -35,19 +35,6 @@ class ConvertResponse(BaseModel):
     normalization_summary: dict[str, object] | None = None
 
 
-class BuildGroupedCubesRequest(BaseModel):
-    job_id: str = Field(..., min_length=1)
-    pipeline_id: str = Field(..., min_length=1)
-    trace_id: str = Field(..., min_length=1)
-    source_zarr_uris: list[str] = Field(..., min_length=1)
-    output_dir: str = Field(..., min_length=1)
-    include_ancillary: bool = True
-    include_masks: bool | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-    stage_label: str | None = None
-
-
 class BuildGroupedCubesResponse(BaseModel):
     job_id: str
     pipeline_id: str
@@ -82,3 +69,23 @@ class InspectDatasetResponse(BaseModel):
     service: Literal["zarr-converter-service"]
     zarr_uri: str
     dataset_summary: dict[str, Any]
+
+OverlapPolicy = Literal["least_cloud", "latest", "earliest", "first_valid"]
+CubeLayout = Literal["grouped_time", "daily_mosaic"]
+
+
+class BuildGroupedCubesRequest(BaseModel):
+    job_id: str = Field(..., min_length=1)
+    pipeline_id: str = Field(..., min_length=1)
+    trace_id: str = Field(..., min_length=1)
+    source_zarr_uris: list[str] = Field(..., min_length=1)
+    output_dir: str = Field(..., min_length=1)
+    include_ancillary: bool = True
+    include_masks: bool | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    stage_label: str | None = None
+    cube_layout: CubeLayout = "grouped_time"
+    target_crs: str | None = None
+    target_resolution_m: int = 10
+    overlap_policy: OverlapPolicy = "least_cloud"

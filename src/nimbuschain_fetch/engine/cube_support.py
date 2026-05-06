@@ -191,6 +191,10 @@ class FetcherCubeSupport:
                 start_date=cube_start_date,
                 end_date=cube_end_date,
                 stage_label=cube_mode,
+                cube_layout=str(pipeline_metadata.get("cube_layout") or "grouped_time"),
+                target_crs=pipeline_metadata.get("cube_target_crs"),
+                target_resolution_m=int(pipeline_metadata.get("cube_target_resolution_m") or 10),
+                overlap_policy=str(pipeline_metadata.get("cube_overlap_policy") or "least_cloud"),
                 progress_callback=_emit_cube_progress,
             )
             converter = self._rt._converter()
@@ -206,6 +210,10 @@ class FetcherCubeSupport:
                     start_date=cube_request.start_date,
                     end_date=cube_request.end_date,
                     stage_label=cube_request.stage_label,
+                    cube_layout=cube_request.cube_layout,
+                    target_crs=cube_request.target_crs,
+                    target_resolution_m=cube_request.target_resolution_m,
+                    overlap_policy=cube_request.overlap_policy,
                     progress_callback=cube_request.progress_callback,
                 )
         except Exception as exc:
