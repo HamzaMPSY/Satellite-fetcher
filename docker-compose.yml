@@ -8,7 +8,8 @@ x-runtime-env: &runtime-env
   NIMBUS_ZARRMASK_DIR: /data/downloads/zarrmask
   NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-http://nimbus-mask:8020}
   NIMBUS_ZARR_SERVICE_URL: ${NIMBUS_ZARR_SERVICE_URL:-http://nimbus-zarr:8010}
-  NIMBUS_SEN2LIKE_SERVICE_URL: ${NIMBUS_SEN2LIKE_SERVICE_URL:-}
+  NIMBUS_SEN2LIKE_SERVICE_URL: ${NIMBUS_SEN2LIKE_SERVICE_URL:-http://nimbus-sen2like:8030}
+  NIMBUS_SEN2LIKE_WORK_DIR: ${NIMBUS_SEN2LIKE_WORK_DIR:-/data/downloads/sen2like}
   NIMBUS_MAX_JOBS: ${NIMBUS_MAX_JOBS:-4}
   NIMBUS_LOG_LEVEL: ${NIMBUS_LOG_LEVEL:-INFO}
   NIMBUS_LOG_JSON: ${NIMBUS_LOG_JSON:-false}
@@ -135,6 +136,31 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  nimbus-sen2like:
+    build:
+      context: .
+      dockerfile: sen2like-service/Containerfile
+    restart: unless-stopped
+    mem_limit: 8g
+    shm_size: 2g
+    ports:
+      - "${NIMBUS_SEN2LIKE_PORT:-8030}:8030"
+    environment:
+      PYTHONPATH: /app/src:/app/sen2like
+      NIMBUS_DATA_DIR: /data/downloads
+      NIMBUS_SEN2LIKE_WORK_DIR: ${NIMBUS_SEN2LIKE_WORK_DIR:-/data/downloads/sen2like}
+      NIMBUS_SEN2LIKE_VENDOR_DIR: /app/sen2like
+      LANDSAT_UPSAMPLING_BASE: /app/sen2like
+      SPARK_LOCAL_DIRS: /data/downloads/sen2like/spark
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8030/health'))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   nimbus-mask:
     build:

@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+build/
+dist/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# Pipeline outputs (these can be multi-GB — never commit)
+output_pipeline/
+test_output/
+*.log
+data/
+
+# Local virtual environments
+landsat_env/
+
+# Cached pipeline artifacts
+**/_mask_reproj_cache.npy
+**/_mask_reproj_cache.json
+
+# Manifests and checkpoints from runs
+**/manifest.json
+**/manifest.json.corrupt
+**/checkpoint.json
+Geometric_Processing/gri/*.tif
+
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reports
+report.html
+**/report.html
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+

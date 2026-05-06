@@ -69,9 +69,10 @@ nimbuschain-zarr-cube = "nimbuschain_zarr_service.cube_cli:main"
 nimbuschain-oci = "nimbuschain_zarr_service.oci_cli:main"
 nimbuschain-mask-service = "nimbuschain_mask_service.main:run"
 nimbuschain-mask-apply = "nimbuschain_mask_service.cli:main"
+nimbuschain-sen2like-service = "nimbuschain_sen2like_service.main:run"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service", "src/nimbuschain_mask_service", "src/nimbuschain_shared"]
+packages = ["src/nimbuschain_fetch", "src/nimbuschain_fetch_service", "src/nimbuschain_fetch_ui", "src/nimbuschain_zarr_service", "src/nimbuschain_mask_service", "src/nimbuschain_sen2like_service", "src/nimbuschain_shared"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

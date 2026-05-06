@@ -1,0 +1,44 @@
+ARG SEN2LIKE_BASE=ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
+FROM ${SEN2LIKE_BASE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/appuser \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    PYTHONPATH=/app/src:/app/sen2like \
+    NIMBUS_SEN2LIKE_VENDOR_DIR=/app/sen2like \
+    NIMBUS_SEN2LIKE_WORK_DIR=/data/downloads/sen2like \
+    LANDSAT_UPSAMPLING_BASE=/app/sen2like
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      default-jre-headless \
+      libspatialindex-dev \
+      python3-pip \
+      python3-venv && \
+    rm -rf /var/lib/apt/lists/* && \
+    python3 -m venv /opt/venv && \
+    useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin appuser
+
+COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
+COPY sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/requirements.txt /app/requirements/sen2like-upstream.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install -r /app/requirements/runtime-common.txt && \
+    python -m pip install -r /app/requirements/sen2like-upstream.txt
+
+COPY --chown=appuser:appuser src/nimbuschain_sen2like_service /app/src/nimbuschain_sen2like_service
+COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared
+COPY --chown=appuser:appuser sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation /app/sen2like
+
+USER appuser
+
+EXPOSE 8030
+
+CMD ["uvicorn", "nimbuschain_sen2like_service.main:app", "--host", "0.0.0.0", "--port", "8030"]

@@ -10,6 +10,7 @@ Browser
        -> nimbus-api (FastAPI orchestration layer)
             -> MongoDB or SQLite store
             -> nimbus-worker (download + Zarr execution)
+            -> nimbus-sen2like-service (Landsat -> Sentinel-2-like normalization)
             -> nimbus-zarr runtime/library (internal conversion code)
             -> nimbus-mask-service (cloud/water masking runtime)
 ```
@@ -68,6 +69,20 @@ Key code:
 - `src/nimbuschain_fetch/providers/`
 - `src/nimbuschain_fetch/stage_cli.py`
 
+### `nimbus-sen2like-service`
+
+Main role:
+- preserve the vendored PySpark Sen2Like implementation from `Pipeline.py`
+- expose a small FastAPI wrapper for health, readiness, schema and normalization execution
+- run Landsat scene normalization in a dedicated container on port `8030`
+- return structured execution status, output paths, stdout/stderr tails and duration
+
+Key code:
+- `sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/`
+- `sen2like-service/Containerfile`
+- `src/nimbuschain_sen2like_service/`
+- `src/nimbuschain_shared/clients/sen2like.py`
+
 ### `nimbus-zarr` runtime
 
 Main role:
@@ -105,20 +120,20 @@ Main role:
 - describe the future job flow as independent stages with dependencies
 - record one `StageResult` per stage, including status, outputs, metadata, errors and duration
 - provide a local CLI for inspecting a plan or running a target stage with its dependencies
-- prepare the Landsat normalization hook without forcing the full Sen2Like service into the current runtime
+- prepare the Landsat normalization hook and call the Sen2Like service when a raw Landsat path is provided
 
 Current default stage graph:
 
 ```text
 fetch
-  -> sen2like hook (USGS/Landsat only, optional service URL)
+  -> sen2like hook (USGS/Landsat only, calls nimbus-sen2like when a raw path exists)
   -> zarr
        -> mask? / cube? (ordered by cube_mode)
 ```
 
-In this foundation phase, `zarr` still depends directly on `fetch` so a missing Sen2Like service URL does not block existing job behavior. The next migration can make `zarr` consume the normalized Sen2Like output for Landsat when the service is ready.
+In this foundation phase, `zarr` still depends directly on `fetch` so a missing Sen2Like input or service does not block existing job behavior. The next migration can make `zarr` consume the normalized Sen2Like output for Landsat after the worker passes downloaded raw product paths into the stage graph.
 
-The `sen2like` stage currently behaves as a hook. For USGS/Landsat jobs, it is skipped with `sen2like_service_url_missing` when `NIMBUS_SEN2LIKE_SERVICE_URL` is not configured. When the URL is present, the stage records that the service is configured; the actual HTTP client and microservice execution are reserved for the next migration step.
+For USGS/Landsat jobs, the stage is skipped with `sen2like_service_url_missing` when `NIMBUS_SEN2LIKE_SERVICE_URL` is not configured, or `sen2like_input_missing` when no raw Landsat path has been provided yet. When both are present, the stage calls `POST /normalize` on `nimbus-sen2like`.
 
 Local CLI examples:
 
@@ -132,6 +147,7 @@ python -m nimbuschain_fetch.stage_cli run-stage \
   --provider usgs \
   --collection landsat_ot_c2_l2 \
   --product-type L2SP \
+  --raw-uri /data/downloads/raw/LC08_SCENE \
   --stage sen2like
 ```
 

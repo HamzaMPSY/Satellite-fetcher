@@ -40,8 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--provider", required=True, choices=["copernicus", "usgs"])
         command.add_argument("--collection", required=True)
         command.add_argument("--product-type", default=None)
+        command.add_argument("--raw-uri", default=None)
         command.add_argument("--mask-types", default="")
         command.add_argument("--sen2like-service-url", default=None)
+        command.add_argument("--sen2like-working-dir", default=None)
+        command.add_argument("--sen2like-workers", type=int, default=4)
         command.add_argument(
             "--cube-mode",
             default="none",
@@ -84,8 +87,15 @@ def _context_from_args(args: argparse.Namespace, options: PipelineOptions) -> Pi
             "provider": options.normalized_provider,
             "collection": options.collection,
             "product_type": options.product_type,
+            "raw_uri": str(args.raw_uri).strip() or None if args.raw_uri else None,
             "mask_types": list(options.mask_types),
             "cube_mode": options.normalized_cube_mode,
+            "sen2like_working_dir": (
+                str(args.sen2like_working_dir).strip() or None
+                if args.sen2like_working_dir
+                else None
+            ),
+            "sen2like_workers": int(args.sen2like_workers),
         },
     )
 
