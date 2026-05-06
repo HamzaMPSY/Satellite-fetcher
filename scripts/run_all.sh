@@ -60,7 +60,11 @@ echo "Validating compose configuration..."
 
 if [ "$BUILD" -eq 1 ]; then
   echo "Building NimbusChain services..."
-  "$PODMAN_BIN" compose build "${SERVICES[@]}"
+  if [ "${#SERVICES[@]}" -gt 0 ]; then
+    "$PODMAN_BIN" compose build "${SERVICES[@]}"
+  else
+    "$PODMAN_BIN" compose build
+  fi
 fi
 
 UP_ARGS=(up -d)
@@ -69,7 +73,11 @@ if [ "$FORCE_RECREATE" -eq 1 ]; then
 fi
 
 echo "Starting NimbusChain stack..."
-"$PODMAN_BIN" compose "${UP_ARGS[@]}" "${SERVICES[@]}"
+if [ "${#SERVICES[@]}" -gt 0 ]; then
+  "$PODMAN_BIN" compose "${UP_ARGS[@]}" "${SERVICES[@]}"
+else
+  "$PODMAN_BIN" compose "${UP_ARGS[@]}"
+fi
 
 echo
 echo "Running containers:"
@@ -115,5 +123,9 @@ echo
 echo "UI: http://127.0.0.1:8501"
 
 if [ "$FOLLOW_LOGS" -eq 1 ]; then
-  "$PODMAN_BIN" compose logs -f "${SERVICES[@]}"
+  if [ "${#SERVICES[@]}" -gt 0 ]; then
+    "$PODMAN_BIN" compose logs -f "${SERVICES[@]}"
+  else
+    "$PODMAN_BIN" compose logs -f
+  fi
 fi
