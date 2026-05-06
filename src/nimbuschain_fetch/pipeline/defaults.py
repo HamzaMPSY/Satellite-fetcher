@@ -42,8 +42,13 @@ class PipelineOptions:
 
 
 def build_default_pipeline_stages(options: PipelineOptions) -> list[PipelineStage]:
+    has_mask = bool(options.mask_types)
     zarr_depends_on = ("sen2like",) if options.requires_sen2like else ("fetch",)
-    cube_depends_on = ("mask",) if options.normalized_cube_mode == "after_mask" else ("zarr",)
+    cube_depends_on = (
+        ("mask",)
+        if has_mask and options.normalized_cube_mode == "after_mask"
+        else ("zarr",)
+    )
     mask_depends_on = ("cube",) if options.normalized_cube_mode == "before_mask" else ("zarr",)
 
     stages: list[PipelineStage] = [
@@ -55,30 +60,32 @@ def build_default_pipeline_stages(options: PipelineOptions) -> list[PipelineStag
     ]
     if options.requires_sen2like:
         stages.append(Sen2LikeStage(service_url=options.sen2like_service_url))
-    stages.extend(
-        [
-            FunctionStage(
-                "zarr",
-                _placeholder_stage("zarr"),
-                depends_on=zarr_depends_on,
-                skip_reason="zarr_stage_disabled",
-            ),
+    stages.append(
+        FunctionStage(
+            "zarr",
+            _placeholder_stage("zarr"),
+            depends_on=zarr_depends_on,
+            skip_reason="zarr_stage_disabled",
+        )
+    )
+    if has_mask:
+        stages.append(
             FunctionStage(
                 "mask",
                 _placeholder_stage("mask"),
                 depends_on=mask_depends_on,
-                condition=lambda _context: bool(options.mask_types),
-                skip_reason="mask_types_empty",
-            ),
+                skip_reason="mask_stage_disabled",
+            )
+        )
+    if options.normalized_cube_mode != "none":
+        stages.append(
             FunctionStage(
                 "cube",
                 _placeholder_stage("cube"),
                 depends_on=cube_depends_on,
-                condition=lambda _context: options.normalized_cube_mode != "none",
-                skip_reason="cube_mode_none",
-            ),
-        ]
-    )
+                skip_reason="cube_stage_disabled",
+            )
+        )
     return stages
 
 

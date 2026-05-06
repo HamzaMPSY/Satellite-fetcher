@@ -135,6 +135,8 @@ fetch -> sen2like -> zarr -> mask? / cube? (ordered by cube_mode)
 
 `sen2like` is only present in the stage graph for USGS/Landsat selections. Sentinel/Copernicus jobs never plan or execute that stage. In the local CLI foundation, a missing or skipped Landsat Sen2Like stage blocks downstream target-stage execution because `zarr` depends on the normalized Landsat output. Public job routes still use the existing production runtime until the worker migration is completed.
 
+Optional stages are omitted when disabled: no selected mask means no `mask` stage, and `cube_mode=none` means no `cube` stage. For example, a Sentinel run with no mask and no cube is simply `fetch -> zarr`.
+
 For USGS/Landsat jobs, the stage is skipped with `sen2like_service_url_missing` when `NIMBUS_SEN2LIKE_SERVICE_URL` is not configured, or `sen2like_input_missing` when no raw Landsat path has been provided yet. When both are present, the stage calls `POST /normalize` on `nimbus-sen2like`.
 
 Local CLI examples:

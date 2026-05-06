@@ -35,7 +35,7 @@ def test_default_pipeline_excludes_sen2like_for_sentinel() -> None:
     )
     orchestrator = PipelineOrchestrator(build_default_pipeline_stages(options))
 
-    assert orchestrator.plan() == ["fetch", "zarr", "mask", "cube"]
+    assert orchestrator.plan() == ["fetch", "zarr"]
     assert "sen2like" not in orchestrator.stages
 
 

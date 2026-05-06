@@ -99,9 +99,6 @@ def render_orchestrator_tab(
         collection=selected_collection,
         product_type=selected_product,
     )
-    target_stage_options = _target_stage_options(is_landsat_flow)
-    if st.session_state.get("orch_target_stage") not in target_stage_options:
-        st.session_state["orch_target_stage"] = "full"
 
     controls_left, controls_right = st.columns([1.2, 1])
     with controls_left:
@@ -132,12 +129,23 @@ def render_orchestrator_tab(
                 key="orch_sen2like_working_dir",
             )
     with controls_right:
-        mask_types = st.multiselect(
-            "Masks",
-            options=["water", "cloud"],
-            default=st.session_state.get("orch_mask_types", []),
-            key="orch_mask_types",
+        default_mask_mode = st.session_state.get("orch_mask_mode") or _mask_mode_from_types(
+            st.session_state.get("orch_mask_types", [])
         )
+        mask_mode = st.radio(
+            "Masking",
+            options=["none", "water", "cloud", "water_cloud"],
+            index=["none", "water", "cloud", "water_cloud"].index(default_mask_mode),
+            horizontal=True,
+            key="orch_mask_mode",
+            format_func=lambda value: {
+                "none": "No mask",
+                "water": "Water",
+                "cloud": "Cloud",
+                "water_cloud": "Water + cloud",
+            }[value],
+        )
+        mask_types = _mask_types_from_mode(mask_mode)
         cube_mode = st.radio(
             "Cube",
             options=["none", "before_mask", "after_mask"],
@@ -149,6 +157,13 @@ def render_orchestrator_tab(
                 "after_mask": "After mask",
             }[value],
         )
+        target_stage_options = _target_stage_options(
+            is_landsat_flow=is_landsat_flow,
+            has_mask=bool(mask_types),
+            has_cube=cube_mode != "none",
+        )
+        if st.session_state.get("orch_target_stage") not in target_stage_options:
+            st.session_state["orch_target_stage"] = "full"
         target_stage = st.selectbox(
             "Target stage",
             options=target_stage_options,
@@ -382,12 +397,38 @@ def _dry_plan_payload(
     }
 
 
-def _target_stage_options(is_landsat_flow: bool) -> list[str]:
+def _target_stage_options(*, is_landsat_flow: bool, has_mask: bool, has_cube: bool) -> list[str]:
     stages = ["full", "fetch"]
     if is_landsat_flow:
         stages.append("sen2like")
-    stages.extend(["zarr", "mask", "cube"])
+    stages.append("zarr")
+    if has_mask:
+        stages.append("mask")
+    if has_cube:
+        stages.append("cube")
     return stages
+
+
+def _mask_mode_from_types(mask_types: Any) -> str:
+    normalized = {str(item).strip().lower() for item in list(mask_types or []) if item}
+    if normalized == {"water", "cloud"}:
+        return "water_cloud"
+    if normalized == {"water"}:
+        return "water"
+    if normalized == {"cloud"}:
+        return "cloud"
+    return "none"
+
+
+def _mask_types_from_mode(mask_mode: str) -> list[str]:
+    value = str(mask_mode or "none")
+    if value == "water":
+        return ["water"]
+    if value == "cloud":
+        return ["cloud"]
+    if value == "water_cloud":
+        return ["water", "cloud"]
+    return []
 
 
 def _sen2like_command_kwargs(
