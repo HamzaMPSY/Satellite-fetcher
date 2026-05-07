@@ -4,6 +4,7 @@ import nimbuschain_fetch_ui.app as app_module
 from nimbuschain_fetch_ui.app import (
     _conversion_progress_snapshot,
     _cube_mode_from_payload,
+    _display_pipeline_stages,
     _mask_types_from_payload,
     _pipeline_timeline_snapshot,
     _timeline_breakdown_rows,
@@ -129,11 +130,33 @@ def test_timeline_breakdown_rows_group_repeating_convert_steps() -> None:
     assert grouped is True
     assert len(rows) == 2
     assert rows[0]["step"] == "Search Catalog"
-    assert rows[1]["step"] == "Convert Raw Scenes"
+    assert rows[1]["step"] == "Zarr Conversion"
+    assert rows[1]["stage"] == "Zarr"
     assert rows[1]["status"] == "running"
     assert rows[1]["detail"] == (
         "Current action: Write Zarr Chunks · 2/6 completed · 3 active · 3 workers"
     )
+
+
+def test_pipeline_display_stages_match_landsat_dag_vocabulary() -> None:
+    item = {
+        "provider": "usgs",
+        "collection": "landsat_ot_c2_l1",
+        "product_type": "L1TP",
+    }
+    stages = [
+        {"key": "search", "label": "Search", "badge": "SRCH", "status": "done", "duration_seconds": 1.0},
+        {"key": "download", "label": "Download", "badge": "DL", "status": "done", "duration_seconds": 2.0},
+        {"key": "convert", "label": "Convert", "badge": "CNV", "status": "done", "duration_seconds": 3.0},
+        {"key": "ready", "label": "Ready", "badge": "RDY", "status": "done", "duration_seconds": 0.0},
+    ]
+
+    display_stages = _display_pipeline_stages(item, {}, stages)
+
+    assert [stage["key"] for stage in display_stages] == ["fetch", "sen2like", "zarr", "ready"]
+    assert [stage["label"] for stage in display_stages] == ["Fetch", "Sen2Like", "Zarr", "Ready"]
+    assert display_stages[0]["detail_label"] == "Search catalog + download files"
+    assert display_stages[1]["detail_label"] == "Landsat normalized before Zarr"
 
 
 def test_pipeline_timeline_snapshot_heals_terminal_display_gaps(monkeypatch) -> None:

@@ -134,6 +134,10 @@ from nimbuschain_fetch_ui.runtime_status import (
 )
 from nimbuschain_fetch_ui.settings_tab import render_settings_tab
 from nimbuschain_fetch_ui.styling import CUSTOM_CSS
+from nimbuschain_fetch_ui.timeline_display import (
+    display_pipeline_stages as _display_pipeline_stages,
+    display_stage_key as _display_stage_key,
+)
 from nimbuschain_fetch_ui.logging_setup import configure_logging, logger
 from nimbuschain_fetch_ui.data_loaders import (
     load_tiles,
@@ -2384,8 +2388,9 @@ def _pipeline_timeline_snapshot(item: dict[str, Any]) -> dict[str, Any]:
 
 def _current_timeline_stage(item: dict[str, Any]) -> dict[str, Any] | None:
     timeline = _pipeline_timeline_snapshot(item)
-    current_stage_key = str(timeline.get("current_stage") or "").strip().lower()
-    stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    current_stage_key = _display_stage_key(str(timeline.get("current_stage") or "").strip().lower())
+    raw_stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    stages = _display_pipeline_stages(item, timeline, raw_stages)
     for stage in stages:
         if str(stage.get("key") or "").strip().lower() == current_stage_key:
             return stage
@@ -2893,13 +2898,13 @@ def _timeline_breakdown_rows(
         detail_parts.extend(progress_parts)
         rows.append(
             {
-                "step": "Convert Raw Scenes",
+                "step": "Zarr Conversion",
                 "detail": " · ".join(detail_parts) if detail_parts else "-",
                 "status": str(last_step.get("status") or "-"),
                 "started": _format_status_timestamp(first_step.get("started_at")),
                 "finished": _format_status_timestamp(finished_at),
                 "duration": _format_runtime_duration(duration_seconds),
-                "stage": str(last_step.get("group_label") or last_step.get("group") or "Convert"),
+                "stage": "Zarr",
             }
         )
 
@@ -2908,11 +2913,12 @@ def _timeline_breakdown_rows(
 
 def _render_pipeline_timeline(item: dict[str, Any]) -> None:
     timeline = _pipeline_timeline_snapshot(item)
-    stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    raw_stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    stages = _display_pipeline_stages(item, timeline, raw_stages)
     if not stages:
         return
 
-    current_stage_key = str(timeline.get("current_stage") or "").strip().lower()
+    current_stage_key = _display_stage_key(str(timeline.get("current_stage") or "").strip().lower())
     done_count = sum(
         1
         for stage in stages
@@ -2929,20 +2935,29 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         if str(stage.get("status") or "").strip().lower() == "pending"
     )
     stage_progress = (100.0 * done_count / len(stages)) if stages else 0.0
-    current_stage_label = str(timeline.get("current_stage_label") or "").strip() or "Waiting"
+    current_stage = next(
+        (
+            stage
+            for stage in stages
+            if str(stage.get("key") or "").strip().lower() == current_stage_key
+        ),
+        None,
+    )
+    current_stage_label = str((current_stage or {}).get("label") or timeline.get("current_stage_label") or "").strip() or "Waiting"
     mask_types = _normalize_mask_types(_mask_types_from_payload(item))
     cube_mode = str(timeline.get("cube_mode") or _cube_mode_from_payload(item) or "none").strip().lower()
-    flow_bits: list[str] = []
+    flow_bits = [str(stage.get("label") or stage.get("key") or "Stage") for stage in stages]
+    detail_bits: list[str] = []
     if cube_mode == "before_mask":
-        flow_bits.append("Cube before masks")
+        detail_bits.append("cube before masks")
     elif cube_mode == "after_mask":
-        flow_bits.append("Cube after masks")
+        detail_bits.append("cube after masks")
     else:
-        flow_bits.append("Direct Zarr pipeline")
+        detail_bits.append("direct Zarr pipeline")
     if mask_types:
-        flow_bits.append("Masks: " + " + ".join(mask.title() for mask in mask_types))
+        detail_bits.append("masks: " + " + ".join(mask.title() for mask in mask_types))
     else:
-        flow_bits.append("No integrated masks")
+        detail_bits.append("no integrated masks")
 
     overview_cards = [
         ("Complete", f"{done_count}/{len(stages)}"),
@@ -2971,7 +2986,7 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         started_label = _format_status_timestamp(stage.get("started_at"))
         finished_label = _format_status_timestamp(stage.get("finished_at"))
         progress_bits: list[str] = []
-        if stage_key == "convert":
+        if stage_key == "zarr":
             progress_bits = _conversion_progress_parts(item)
 
         detail_line = detail
@@ -3043,9 +3058,9 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         "<div class='nimbus-pipeline-progress'><span style='width:{progress:.2f}%'></span></div>"
         "<div class='nimbus-stage-grid'>{cards}</div>"
         "</div>".format(
-            headline=html.escape(" · ".join(flow_bits)),
+            headline=html.escape(" -> ".join(flow_bits)),
             subtitle=html.escape(
-                f"{done_count} complete · {active_count} live · {waiting_count} waiting"
+                f"{' · '.join(detail_bits)} · {done_count} complete · {active_count} live · {waiting_count} waiting"
             ),
             metrics="".join(
                 (
@@ -3068,7 +3083,7 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
     with st.expander("Step breakdown", expanded=False):
         if convert_rows_grouped:
             st.caption(
-                "Convert rows are grouped here. Repeated write/register events usually mean "
+                "Zarr rows are grouped here. Repeated write/register events usually mean "
                 "different scenes are finishing, not a backend loop."
             )
         st.dataframe(
