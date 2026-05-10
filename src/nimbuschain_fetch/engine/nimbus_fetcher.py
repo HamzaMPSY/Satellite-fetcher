@@ -18,9 +18,10 @@ from nimbuschain_fetch.application.job_execution import (
     CallbackJobExecutionHandler,
     JobExecutionRegistry,
 )
-from nimbuschain_fetch.domain.records import JobResultRecord, JobRowRecord
+from nimbuschain_fetch.application.pipeline_execution import ModularPipelineJobExecutionHandler
 from nimbuschain_fetch.application.pipeline_state import PipelineStateService
 from nimbuschain_fetch.application.workflows import FetchJobWorkflowService, MaskJobWorkflowService
+from nimbuschain_fetch.domain.records import JobResultRecord, JobRowRecord
 from nimbuschain_fetch.download.coordinator import DownloadCoordinator
 from nimbuschain_fetch.download.download_manager import DownloadManager
 from nimbuschain_fetch.engine.conversion_support import FetcherConversionSupport
@@ -230,10 +231,14 @@ class NimbusFetcher:
         self._manual_conversion_service = ManualConversionService(self)
         self._fetch_job_workflow = FetchJobWorkflowService(self)
         self._mask_job_workflow = MaskJobWorkflowService(self)
+        fetch_pipeline_handler = ModularPipelineJobExecutionHandler(
+            runtime=self,
+            workflow=self._fetch_job_workflow,
+        )
         self._job_execution_registry = job_execution_registry or JobExecutionRegistry(
             {
-                "search_download": CallbackJobExecutionHandler(self._fetch_job_workflow.execute_from_context),
-                "download_products": CallbackJobExecutionHandler(self._fetch_job_workflow.execute_from_context),
+                "search_download": fetch_pipeline_handler,
+                "download_products": fetch_pipeline_handler,
                 "mask_existing_zarr": CallbackJobExecutionHandler(self._mask_job_workflow.execute_from_context),
             }
         )

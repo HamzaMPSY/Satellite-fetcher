@@ -539,6 +539,24 @@ iframe[title="leaflet_map"] {
 .nimbus-stage-queued .nimbus-stage-status {
     color: #fde68a;
 }
+.nimbus-stage-skipped {
+    border-color: rgba(148, 163, 184, 0.24);
+    background:
+        radial-gradient(circle at top right, rgba(148, 163, 184, 0.10), transparent 36%),
+        linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(10, 15, 28, 0.98));
+}
+.nimbus-stage-skipped::before {
+    background: linear-gradient(90deg, rgba(148, 163, 184, 0.70), rgba(100, 116, 139, 0.58));
+}
+.nimbus-stage-skipped .nimbus-stage-index,
+.nimbus-stage-skipped .nimbus-stage-badge,
+.nimbus-stage-skipped .nimbus-stage-pill {
+    background: rgba(148, 163, 184, 0.14);
+    color: #cbd5e1;
+}
+.nimbus-stage-skipped .nimbus-stage-status {
+    color: #cbd5e1;
+}
 .nimbus-stage-failed {
     border-color: rgba(248, 113, 113, 0.30);
     background:

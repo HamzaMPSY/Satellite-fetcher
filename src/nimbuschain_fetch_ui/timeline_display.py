@@ -9,6 +9,22 @@ DISPLAY_STAGE_KEY_ALIASES = {
     "convert": "zarr",
 }
 
+STAGE_DISPLAY_DEFAULTS = {
+    "fetch": ("Fetch", "FETCH", "Provider fetch"),
+    "sen2like": ("Sen2Like", "S2L", "Landsat normalization"),
+    "zarr": ("Zarr", "ZARR", "Zarr conversion"),
+    "mask": ("Mask", "MASK", "Integrated masking"),
+    "cube": ("Cube", "CUBE", "Cube builder"),
+}
+
+STAGE_RESULT_STATUS_ALIASES = {
+    "succeeded": "done",
+    "skipped": "skipped",
+    "failed": "failed",
+    "running": "running",
+    "pending": "pending",
+}
+
 
 def display_stage_key(stage_key: str | None) -> str:
     normalized = str(stage_key or "").strip().lower()
@@ -21,6 +37,10 @@ def display_pipeline_stages(
     stages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     del timeline
+    orchestrated_stages = _display_stages_from_stage_results(item)
+    if orchestrated_stages:
+        return orchestrated_stages
+
     display_stages: list[dict[str, Any]] = []
     fetch_buffer: list[dict[str, Any]] = []
 
@@ -55,6 +75,84 @@ def display_pipeline_stages(
     for index, stage in enumerate(display_stages):
         stage["index"] = index
     return display_stages
+
+
+def _display_stages_from_stage_results(item: dict[str, Any]) -> list[dict[str, Any]]:
+    pipeline_metadata = dict(item.get("pipeline_metadata") or {})
+    stage_results = [
+        dict(stage)
+        for stage in list(pipeline_metadata.get("stage_results") or [])
+        if isinstance(stage, dict) and str(stage.get("name") or "").strip()
+    ]
+    if not stage_results:
+        return []
+
+    results_by_name = {
+        str(stage.get("name") or "").strip().lower(): stage
+        for stage in stage_results
+    }
+    ordered_names: list[str] = []
+    for plan_stage in list(pipeline_metadata.get("stage_plan") or []):
+        if not isinstance(plan_stage, dict):
+            continue
+        name = str(plan_stage.get("name") or "").strip().lower()
+        if name and name not in ordered_names:
+            ordered_names.append(name)
+    for result_stage in stage_results:
+        name = str(result_stage.get("name") or "").strip().lower()
+        if name and name not in ordered_names:
+            ordered_names.append(name)
+
+    display_stages = [
+        _stage_result_to_display_stage(name, results_by_name.get(name) or {}, index)
+        for index, name in enumerate(ordered_names)
+    ]
+    return [stage for stage in display_stages if stage.get("key")]
+
+
+def _stage_result_to_display_stage(
+    name: str,
+    result: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    label, badge, default_detail = STAGE_DISPLAY_DEFAULTS.get(
+        name,
+        (name.replace("_", " ").title(), name[:4].upper() or "STEP", name.replace("_", " ").title()),
+    )
+    status = STAGE_RESULT_STATUS_ALIASES.get(
+        str(result.get("status") or "pending").strip().lower(),
+        str(result.get("status") or "pending").strip().lower() or "pending",
+    )
+    outputs = [
+        str(output)
+        for output in list(result.get("outputs") or [])
+        if str(output).strip()
+    ]
+    metadata = dict(result.get("metadata") or {})
+    reason = str(metadata.get("reason") or "").strip()
+    error = str(result.get("error") or "").strip()
+    if error:
+        detail_label = error
+    elif status == "skipped" and reason:
+        detail_label = f"Skipped: {reason.replace('_', ' ')}"
+    elif outputs:
+        detail_label = f"{default_detail} · {len(outputs)} output{'s' if len(outputs) != 1 else ''}"
+    else:
+        detail_label = default_detail
+
+    return {
+        "key": name,
+        "label": label,
+        "badge": badge,
+        "status": status,
+        "started_at": result.get("started_at"),
+        "finished_at": result.get("finished_at"),
+        "duration_seconds": result.get("duration_seconds"),
+        "detail_label": detail_label,
+        "outputs": outputs,
+        "metadata": metadata,
+        "index": index,
+    }
 
 
 def _requires_sen2like(item: dict[str, Any]) -> bool:

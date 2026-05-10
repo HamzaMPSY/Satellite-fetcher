@@ -2398,7 +2398,7 @@ def _current_timeline_stage(item: dict[str, Any]) -> dict[str, Any] | None:
         if str(stage.get("status") or "").strip().lower() in {"running", "queued"}:
             return stage
     for stage in reversed(stages):
-        if str(stage.get("status") or "").strip().lower() in {"done", "failed", "cancelled"}:
+        if str(stage.get("status") or "").strip().lower() in {"done", "skipped", "failed", "cancelled"}:
             return stage
     return None
 
@@ -2922,7 +2922,7 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
     done_count = sum(
         1
         for stage in stages
-        if str(stage.get("status") or "").strip().lower() == "done"
+        if str(stage.get("status") or "").strip().lower() in {"done", "skipped"}
     )
     active_count = sum(
         1
@@ -2943,6 +2943,24 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         ),
         None,
     )
+    if current_stage is None:
+        current_stage = next(
+            (
+                stage
+                for stage in stages
+                if str(stage.get("status") or "").strip().lower() in {"running", "queued"}
+            ),
+            None,
+        )
+    if current_stage is None:
+        current_stage = next(
+            (
+                stage
+                for stage in reversed(stages)
+                if str(stage.get("status") or "").strip().lower() in {"done", "skipped", "failed", "cancelled"}
+            ),
+            None,
+        )
     current_stage_label = str((current_stage or {}).get("label") or timeline.get("current_stage_label") or "").strip() or "Waiting"
     mask_types = _normalize_mask_types(_mask_types_from_payload(item))
     cube_mode = str(timeline.get("cube_mode") or _cube_mode_from_payload(item) or "none").strip().lower()
@@ -2976,6 +2994,7 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
             "queued": "queued",
             "running": "live",
             "done": "done",
+            "skipped": "skipped",
             "failed": "failed",
             "cancelled": "stopped",
         }.get(status_kind, status_kind.replace("_", " "))
@@ -2999,7 +3018,7 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
             meta_pills.extend(progress_bits)
         elif status_kind == "pending":
             detail_line = "Waiting for previous stage"
-        elif status_kind in {"done", "failed", "cancelled"}:
+        elif status_kind in {"done", "skipped", "failed", "cancelled"}:
             when_label = finished_label if finished_label != "-" else started_label
             if duration_label != "-":
                 meta_pills.append(duration_label)
@@ -3010,6 +3029,8 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
             meta_pills.append("blocked")
         elif not meta_pills and status_kind == "queued":
             meta_pills.append("scheduled")
+        elif not meta_pills and status_kind == "skipped":
+            meta_pills.append("not required")
 
         card_classes = ["nimbus-stage-card", f"nimbus-stage-{status_kind}"]
         if stage_key == current_stage_key and status_kind in {"running", "queued"}:

@@ -13,6 +13,7 @@ from nimbuschain_fetch.application.job_execution import (
     JobExecutionContext,
     JobExecutionRegistry,
 )
+from nimbuschain_fetch.application.pipeline_execution import ModularPipelineJobExecutionHandler
 from nimbuschain_fetch.application.pipeline_state import PipelineStateService
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "JobExecutionContext",
     "JobExecutionRegistry",
     "ManualConversionService",
+    "ModularPipelineJobExecutionHandler",
     "JobControlService",
     "JobQueryService",
     "JobSubmissionService",

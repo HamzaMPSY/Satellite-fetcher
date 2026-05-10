@@ -590,6 +590,15 @@ def test_single_job_runs_download_and_zarr_in_one_pipeline(pipeline_runtime) -> 
     assert result.zarr_outputs == final_status.zarr_outputs
     assert len(result.paths) == 3, "Expected raw file, manifest, and zarr output in result paths."
     assert any(path.endswith("manifest.json") for path in result.paths)
+    assert [stage["name"] for stage in result.pipeline_metadata["stage_plan"]] == ["fetch", "zarr"]
+    stage_results = result.pipeline_metadata["stage_results"]
+    assert [stage["name"] for stage in stage_results] == ["fetch", "zarr"]
+    assert {stage["name"]: stage["status"] for stage in stage_results} == {
+        "fetch": "succeeded",
+        "zarr": "succeeded",
+    }
+    assert all(stage["duration_seconds"] >= 0 for stage in stage_results)
+    assert result.pipeline_metadata["orchestrator"]["status"] == "succeeded"
 
     jobs = client.list_jobs(page=1, page_size=20)
     assert jobs.total == 1, "Automatic Zarr conversion must not create a second independent job."
@@ -611,6 +620,7 @@ def test_single_job_runs_download_and_zarr_in_one_pipeline(pipeline_runtime) -> 
     assert "job.downloaded" in event_types
     assert "job.zarr_converting" in event_types
     assert "job.zarr_written" in event_types
+    assert "job.pipeline_orchestrated" in event_types
 
 
 def test_single_job_can_continue_with_integrated_masking(pipeline_runtime) -> None:
@@ -637,6 +647,12 @@ def test_single_job_can_continue_with_integrated_masking(pipeline_runtime) -> No
     assert result.metadata["mask"]["mask_types"] == ["water", "cloud"]
     assert result.pipeline_metadata["mask_mode"] == "integrated"
     assert result.pipeline_metadata["mask_status"] == "written"
+    assert [stage["name"] for stage in result.pipeline_metadata["stage_results"]] == [
+        "fetch",
+        "zarr",
+        "mask",
+    ]
+    assert result.pipeline_metadata["orchestrator"]["status"] == "succeeded"
 
     jobs = client.list_jobs(page=1, page_size=20)
     assert jobs.total == 1, "Integrated masking must stay on the original fetch job."

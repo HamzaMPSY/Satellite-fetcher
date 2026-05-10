@@ -48,6 +48,15 @@ class PipelineStateService:
             merged_pipeline_metadata = dict(
                 pipeline_metadata if pipeline_metadata is not None else existing_pipeline_metadata
             )
+            if pipeline_metadata is not None:
+                for orchestration_key in ("orchestrator", "stage_plan", "stage_results"):
+                    if (
+                        orchestration_key in existing_pipeline_metadata
+                        and orchestration_key not in merged_pipeline_metadata
+                    ):
+                        merged_pipeline_metadata[orchestration_key] = existing_pipeline_metadata[
+                            orchestration_key
+                        ]
             existing_timeline = existing_pipeline_metadata.get("timeline")
             merged_pipeline_metadata["timeline"] = advance_pipeline_timeline(
                 dict(existing_timeline) if isinstance(existing_timeline, dict) else {},

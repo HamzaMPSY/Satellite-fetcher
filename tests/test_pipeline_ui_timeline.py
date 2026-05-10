@@ -159,6 +159,51 @@ def test_pipeline_display_stages_match_landsat_dag_vocabulary() -> None:
     assert display_stages[1]["detail_label"] == "Landsat normalized before Zarr"
 
 
+def test_pipeline_display_prefers_modular_stage_results() -> None:
+    item = {
+        "pipeline_metadata": {
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "sen2like", "depends_on": ["fetch"]},
+                {"name": "zarr", "depends_on": ["sen2like"]},
+            ],
+            "stage_results": [
+                {
+                    "name": "fetch",
+                    "status": "succeeded",
+                    "outputs": ["/data/raw/LC08"],
+                    "duration_seconds": 2.5,
+                },
+                {
+                    "name": "sen2like",
+                    "status": "skipped",
+                    "metadata": {"reason": "sen2like_runtime_not_routed_yet"},
+                    "duration_seconds": 0.0,
+                },
+                {
+                    "name": "zarr",
+                    "status": "succeeded",
+                    "outputs": ["/data/zarr/LC08.zarr"],
+                    "duration_seconds": 5.0,
+                },
+            ],
+        },
+    }
+    legacy_timeline_stages = [
+        {"key": "search", "label": "Search", "status": "done"},
+        {"key": "download", "label": "Download", "status": "done"},
+        {"key": "convert", "label": "Convert", "status": "done"},
+    ]
+
+    display_stages = _display_pipeline_stages(item, {}, legacy_timeline_stages)
+
+    assert [stage["key"] for stage in display_stages] == ["fetch", "sen2like", "zarr"]
+    assert [stage["status"] for stage in display_stages] == ["done", "skipped", "done"]
+    assert display_stages[0]["detail_label"] == "Provider fetch · 1 output"
+    assert display_stages[1]["detail_label"] == "Skipped: sen2like runtime not routed yet"
+    assert display_stages[2]["duration_seconds"] == 5.0
+
+
 def test_pipeline_timeline_snapshot_heals_terminal_display_gaps(monkeypatch) -> None:
     def _stale_refresh(*_args, **_kwargs):
         return {
