@@ -31,6 +31,14 @@ def build_stage_cli_command(
     target_stage: str | None = None,
     run_stage: str | None = None,
     raw_uri: str | None = None,
+    source_zarr_uri: str | None = None,
+    zarr_service_url: str | None = None,
+    mask_service_url: str | None = None,
+    zarr_output_dir: str | None = None,
+    zarr_output_uri: str | None = None,
+    cube_output_dir: str | None = None,
+    cube_output_uri: str | None = None,
+    execute: bool = False,
     sen2like_service_url: str | None = None,
     sen2like_working_dir: str | None = None,
     sen2like_workers: int | None = None,
@@ -64,10 +72,26 @@ def build_stage_cli_command(
         command.extend(["--mask-types", ",".join(normalized_masks)])
     if raw_uri:
         command.extend(["--raw-uri", raw_uri])
+    if source_zarr_uri:
+        command.extend(["--source-zarr-uri", source_zarr_uri])
+    if zarr_service_url:
+        command.extend(["--zarr-service-url", zarr_service_url])
+    if mask_service_url:
+        command.extend(["--mask-service-url", mask_service_url])
+    if zarr_output_dir:
+        command.extend(["--zarr-output-dir", zarr_output_dir])
+    if zarr_output_uri:
+        command.extend(["--zarr-output-uri", zarr_output_uri])
+    if cube_output_dir:
+        command.extend(["--cube-output-dir", cube_output_dir])
+    if cube_output_uri:
+        command.extend(["--cube-output-uri", cube_output_uri])
     if sen2like_service_url:
         command.extend(["--sen2like-service-url", sen2like_service_url])
     if sen2like_working_dir:
         command.extend(["--sen2like-working-dir", sen2like_working_dir])
+    if execute:
+        command.append("--execute")
     if action == "plan" and target_stage:
         command.extend(["--target-stage", target_stage])
     if action == "run-stage":

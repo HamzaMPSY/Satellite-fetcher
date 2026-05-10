@@ -91,9 +91,12 @@ class Sen2LikeStage:
             "landsat_input": landsat_input,
             "sen2like_response": payload,
         }
+        resolved_outputs = outputs or [f"stage://{self.name}/{context.job_id or 'manual'}"]
+        context.set("sen2like_outputs", resolved_outputs)
+        context.set("zarr_inputs", resolved_outputs)
         return StageResult.succeeded_result(
             self.name,
-            outputs=outputs or [f"stage://{self.name}/{context.job_id or 'manual'}"],
+            outputs=resolved_outputs,
             metadata=metadata,
         )
 

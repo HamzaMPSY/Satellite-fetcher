@@ -102,16 +102,37 @@ def render_orchestrator_tab(
 
     controls_left, controls_right = st.columns([1.2, 1])
     with controls_left:
-        raw_uri = ""
+        raw_uri = st.text_input(
+            "Raw product path",
+            value=st.session_state.get("orch_raw_uri", ""),
+            placeholder="/data/downloads/raw/SCENE.SAFE.zip or /data/downloads/raw/LC08_SCENE.tar",
+            key="orch_raw_uri",
+        )
+        source_zarr_uri = st.text_input(
+            "Existing Zarr",
+            value=st.session_state.get("orch_source_zarr_uri", ""),
+            placeholder="/data/downloads/zarr/SCENE.zarr",
+            key="orch_source_zarr_uri",
+        )
+        zarr_service_url = st.text_input(
+            "Zarr service",
+            value=st.session_state.get(
+                "orch_zarr_service_url",
+                os.getenv("NIMBUS_ZARR_SERVICE_URL", "http://nimbus-zarr:8010"),
+            ),
+            key="orch_zarr_service_url",
+        )
+        mask_service_url = st.text_input(
+            "Mask service",
+            value=st.session_state.get(
+                "orch_mask_service_url",
+                os.getenv("NIMBUS_MASK_SERVICE_URL", "http://nimbus-mask:8020"),
+            ),
+            key="orch_mask_service_url",
+        )
         sen2like_service_url = ""
         sen2like_working_dir = ""
         if is_landsat_flow:
-            raw_uri = st.text_input(
-                "Raw Landsat path",
-                value=st.session_state.get("orch_raw_uri", ""),
-                placeholder="/data/downloads/raw/LC08_SCENE",
-                key="orch_raw_uri",
-            )
             sen2like_service_url = st.text_input(
                 "Sen2Like service",
                 value=st.session_state.get(
@@ -209,6 +230,13 @@ def render_orchestrator_tab(
         mask_types=mask_types,
         cube_mode=cube_mode,
         run_stage=_default_run_stage(target_stage, cube_mode, mask_types),
+        raw_uri=raw_uri.strip() or None,
+        source_zarr_uri=source_zarr_uri.strip() or None,
+        zarr_service_url=zarr_service_url.strip() or None,
+        mask_service_url=mask_service_url.strip() or None if mask_types else None,
+        zarr_output_dir=os.getenv("NIMBUS_ZARR_OUTPUT_DIR", "/data/downloads/zarr/manual"),
+        cube_output_dir=os.getenv("NIMBUS_CUBE_OUTPUT_DIR", "/data/downloads/zarr/cubes/manual"),
+        execute=True,
         **sen2like_kwargs,
     )
 
@@ -480,7 +508,6 @@ def _sen2like_command_kwargs(
     if not enabled:
         return {}
     return {
-        "raw_uri": raw_uri.strip() or None,
         "sen2like_service_url": service_url.strip() or None,
         "sen2like_working_dir": working_dir.strip() or None,
         "sen2like_workers": int(workers),

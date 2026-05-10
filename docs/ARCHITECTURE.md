@@ -121,7 +121,7 @@ Main role:
 - describe the future job flow as independent stages with dependencies
 - record one `StageResult` per stage, including status, outputs, metadata, errors and duration
 - provide a local CLI for inspecting a plan or running a target stage with its dependencies
-- prepare the Landsat normalization hook and call the Sen2Like service when a raw Landsat path is provided
+- execute isolated runtime probes for Sen2Like, Zarr, Mask and Cube through their service clients
 
 Current default stage graph:
 
@@ -139,6 +139,10 @@ Optional stages are omitted when disabled: no selected mask means no `mask` stag
 
 For USGS/Landsat API jobs, `NIMBUS_SEN2LIKE_SERVICE_URL` is required before Zarr conversion. If the service URL is missing or the service fails, the job fails at `sen2like_failed` and downstream Zarr is skipped. In the local CLI foundation, a manually run Sen2Like stage can still report `sen2like_service_url_missing` or `sen2like_input_missing` as a skipped stage because it is used for plan inspection and isolated stage probes.
 
+`python -m nimbuschain_fetch.stage_cli run-stage` has two modes:
+- dry mode, used when no runtime service URL or `--execute` flag is provided, keeps the stage graph inspectable without touching services;
+- runtime mode, enabled by `--execute` or service/input arguments, calls the real microservice clients for Zarr conversion, Mask application and Cube build. Each returned stage result includes `duration_seconds`, `outputs`, `metadata` and `error`.
+
 Local CLI examples:
 
 ```bash
@@ -153,6 +157,28 @@ python -m nimbuschain_fetch.stage_cli run-stage \
   --product-type L2SP \
   --raw-uri /data/downloads/raw/LC08_SCENE \
   --stage sen2like
+
+python -m nimbuschain_fetch.stage_cli run-stage \
+  --provider copernicus \
+  --collection SENTINEL-2 \
+  --product-type S2MSI2A \
+  --raw-uri /data/downloads/raw/S2A_SCENE.SAFE.zip \
+  --zarr-service-url http://nimbus-zarr:8010 \
+  --zarr-output-dir /data/downloads/zarr/manual \
+  --stage zarr \
+  --execute
+
+python -m nimbuschain_fetch.stage_cli run-stage \
+  --provider copernicus \
+  --collection SENTINEL-2 \
+  --product-type S2MSI2A \
+  --source-zarr-uri /data/downloads/zarr/S2A_SCENE.zarr \
+  --mask-types water,cloud \
+  --cube-mode after_mask \
+  --zarr-service-url http://nimbus-zarr:8010 \
+  --mask-service-url http://nimbus-mask:8020 \
+  --stage cube \
+  --execute
 ```
 
 ## 3. Data flow
@@ -185,7 +211,7 @@ fetcher -> sen2like normalization -> Zarr conversion -> optional masking -> opti
 Both paths persist artifacts, events and per-stage timing under the job lineage.
 ```
 
-This is the intended migration path, not a public API break. Each stage should eventually be executable from the worker or from the local CLI, and each stage should return a structured result with elapsed time.
+This is the intended migration path, not a public API break. API jobs already record the modular stage plan and results, while the local CLI can execute Zarr/Mask/Cube probes directly against their internal services. The remaining migration work is to replace the worker's legacy monolithic workflow branches with the same stage runner objects used by the CLI.
 
 ### Zarr conversion flow
 
@@ -218,7 +244,7 @@ existing Zarr output
 - `src/nimbuschain_fetch/`
   Core domain logic, providers, worker logic, storage contracts.
 - `src/nimbuschain_fetch/pipeline/`
-  Stage protocol, DAG orchestration, default stage graph and optional Sen2Like hook.
+  Stage protocol, DAG orchestration, default stage graph, Sen2Like hook and service-backed Zarr/Mask/Cube stage runners.
 - `src/nimbuschain_fetch_service/`
   Public API layer over the engine, stores, and converter-facing routes.
 - `src/nimbuschain_fetch_ui/`

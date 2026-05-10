@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import nimbuschain_fetch.pipeline.runners as pipeline_runners
 from nimbuschain_fetch.stage_cli import main
 
 
@@ -121,3 +122,133 @@ def test_stage_cli_plans_cube_without_mask_when_cube_mode_is_after_mask(capsys) 
     assert code == 0
     assert [stage["name"] for stage in payload["stages"]] == ["fetch", "zarr", "cube"]
     assert payload["stages"][-1]["depends_on"] == ["zarr"]
+
+
+def test_stage_cli_run_stage_executes_real_zarr_runner(monkeypatch, tmp_path, capsys) -> None:
+    captured: dict[str, object] = {"convert_calls": []}
+
+    class FakeZarrClient:
+        def __init__(self, *, service_url: str):
+            captured["service_url"] = service_url
+
+        def convert(self, **kwargs):
+            captured["convert_calls"].append(kwargs)
+            return (
+                kwargs["output_uri"],
+                "optical",
+                {"scene_id": kwargs["scene_id"]},
+                {"acquisition_datetime": "2026-05-01T10:00:00Z"},
+            )
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setattr(pipeline_runners, "ZarrServiceClient", FakeZarrClient)
+
+    code = main(
+        [
+            "run-stage",
+            "--provider",
+            "copernicus",
+            "--collection",
+            "SENTINEL-2",
+            "--product-type",
+            "S2MSI2A",
+            "--raw-uri",
+            "/data/raw/S2A_MSIL2A_TEST.SAFE.zip",
+            "--zarr-service-url",
+            "http://nimbus-zarr:8010",
+            "--zarr-output-dir",
+            str(tmp_path),
+            "--stage",
+            "zarr",
+            "--execute",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["execution_mode"] == "runtime"
+    assert [result["name"] for result in payload["results"]] == ["fetch", "zarr"]
+    assert payload["results"][-1]["status"] == "succeeded"
+    assert payload["results"][-1]["outputs"] == [str(tmp_path / "S2A_MSIL2A_TEST.zarr")]
+    assert captured["service_url"] == "http://nimbus-zarr:8010"
+    assert captured["closed"] is True
+    assert captured["convert_calls"][0]["provider"] == "copernicus"
+
+
+def test_stage_cli_run_stage_chains_existing_zarr_mask_and_cube(monkeypatch, capsys) -> None:
+    captured: dict[str, object] = {"masked": [], "cube_sources": []}
+
+    class FakeZarrClient:
+        def __init__(self, *, service_url: str):
+            captured["zarr_service_url"] = service_url
+
+        def build_grouped_cubes(self, **kwargs):
+            captured["cube_sources"] = list(kwargs["source_zarr_uris"])
+            return {
+                "status": "written",
+                "cube_outputs": ["/data/cubes/T31UDQ.zarr"],
+                "source_zarr_uris": list(kwargs["source_zarr_uris"]),
+            }
+
+        def close(self) -> None:
+            captured["zarr_closed"] = True
+
+    class FakeMaskClient:
+        def __init__(self, *, service_url: str | None = None):
+            captured["mask_service_url"] = service_url
+
+        def apply_masks_to_zarr(self, **kwargs):
+            captured["masked"].append(kwargs)
+            return {
+                "status": "written",
+                "masked_zarr_uri": "/data/zarr/SCENE_masked.zarr",
+                "masked_zarr_outputs": ["/data/zarr/SCENE_masked.zarr"],
+            }
+
+        def close(self) -> None:
+            captured["mask_closed"] = True
+
+    monkeypatch.setattr(pipeline_runners, "ZarrServiceClient", FakeZarrClient)
+    monkeypatch.setattr(pipeline_runners, "MaskServiceClient", FakeMaskClient)
+
+    code = main(
+        [
+            "run-stage",
+            "--provider",
+            "copernicus",
+            "--collection",
+            "SENTINEL-2",
+            "--product-type",
+            "S2MSI2A",
+            "--source-zarr-uri",
+            "/data/zarr/SCENE.zarr",
+            "--mask-types",
+            "water,cloud",
+            "--cube-mode",
+            "after_mask",
+            "--zarr-service-url",
+            "http://nimbus-zarr:8010",
+            "--mask-service-url",
+            "http://nimbus-mask:8020",
+            "--stage",
+            "cube",
+            "--execute",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    statuses = {result["name"]: result["status"] for result in payload["results"]}
+
+    assert code == 0
+    assert statuses == {
+        "fetch": "succeeded",
+        "zarr": "succeeded",
+        "mask": "succeeded",
+        "cube": "succeeded",
+    }
+    assert captured["masked"][0]["zarr_uri"] == "/data/zarr/SCENE.zarr"
+    assert captured["cube_sources"] == ["/data/zarr/SCENE_masked.zarr"]
+    assert payload["results"][-1]["outputs"] == ["/data/cubes/T31UDQ.zarr"]
