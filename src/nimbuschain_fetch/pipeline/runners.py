@@ -25,6 +25,10 @@ class PipelineRuntimeConfig:
     cube_output_dir: str = "./data/downloads/zarr/cubes/manual"
     cube_output_uri: str | None = None
     cube_group_by_tile: bool = True
+    cube_layout: str = "grouped_time"
+    cube_target_crs: str | None = None
+    cube_target_resolution_m: int = 10
+    cube_overlap_policy: str = "least_cloud"
     include_masks_in_cube: bool = False
     include_ancillary: bool = True
     cube_start_date: str | None = None
@@ -287,6 +291,10 @@ class CubeStage:
                     start_date=self.runtime.cube_start_date,
                     end_date=self.runtime.cube_end_date,
                     stage_label=self.cube_mode,
+                    cube_layout=str(self.runtime.cube_layout or "grouped_time"),
+                    target_crs=self.runtime.cube_target_crs,
+                    target_resolution_m=int(self.runtime.cube_target_resolution_m or 10),
+                    overlap_policy=str(self.runtime.cube_overlap_policy or "least_cloud"),
                 )
             else:
                 if not self.runtime.cube_output_uri:

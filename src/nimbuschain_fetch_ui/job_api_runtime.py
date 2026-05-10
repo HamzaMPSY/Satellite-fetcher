@@ -74,6 +74,10 @@ def build_job_payload(
     cube_mode: str | None = None,
     cube_start_date: dt.date | None = None,
     cube_end_date: dt.date | None = None,
+    cube_layout: str | None = None,
+    cube_target_crs: str | None = None,
+    cube_target_resolution_m: int | None = None,
+    cube_overlap_policy: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "job_type": "search_download",
@@ -104,6 +108,17 @@ def build_job_payload(
         if normalized_cube_mode != "none":
             payload["cube_start_date"] = str(cube_start_date or start_date)
             payload["cube_end_date"] = str(cube_end_date or end_date)
+            normalized_layout = str(cube_layout or "grouped_time").strip().lower()
+            if normalized_layout in {"grouped_time", "daily_mosaic"}:
+                payload["cube_layout"] = normalized_layout
+            normalized_overlap = str(cube_overlap_policy or "least_cloud").strip().lower()
+            if normalized_overlap in {"least_cloud", "latest", "earliest", "first_valid"}:
+                payload["cube_overlap_policy"] = normalized_overlap
+            if cube_target_resolution_m is not None:
+                payload["cube_target_resolution_m"] = int(cube_target_resolution_m)
+            normalized_crs = str(cube_target_crs or "").strip()
+            if normalized_crs:
+                payload["cube_target_crs"] = normalized_crs
     return payload
 
 

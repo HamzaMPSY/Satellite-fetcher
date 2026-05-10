@@ -187,6 +187,10 @@ def test_stage_cli_run_stage_chains_existing_zarr_mask_and_cube(monkeypatch, cap
 
         def build_grouped_cubes(self, **kwargs):
             captured["cube_sources"] = list(kwargs["source_zarr_uris"])
+            captured["cube_layout"] = kwargs["cube_layout"]
+            captured["target_crs"] = kwargs["target_crs"]
+            captured["target_resolution_m"] = kwargs["target_resolution_m"]
+            captured["overlap_policy"] = kwargs["overlap_policy"]
             return {
                 "status": "written",
                 "cube_outputs": ["/data/cubes/T31UDQ.zarr"],
@@ -229,6 +233,14 @@ def test_stage_cli_run_stage_chains_existing_zarr_mask_and_cube(monkeypatch, cap
             "water,cloud",
             "--cube-mode",
             "after_mask",
+            "--cube-layout",
+            "daily_mosaic",
+            "--cube-target-crs",
+            "EPSG:32631",
+            "--cube-target-resolution-m",
+            "20",
+            "--cube-overlap-policy",
+            "latest",
             "--zarr-service-url",
             "http://nimbus-zarr:8010",
             "--mask-service-url",
@@ -251,4 +263,8 @@ def test_stage_cli_run_stage_chains_existing_zarr_mask_and_cube(monkeypatch, cap
     }
     assert captured["masked"][0]["zarr_uri"] == "/data/zarr/SCENE.zarr"
     assert captured["cube_sources"] == ["/data/zarr/SCENE_masked.zarr"]
+    assert captured["cube_layout"] == "daily_mosaic"
+    assert captured["target_crs"] == "EPSG:32631"
+    assert captured["target_resolution_m"] == 20
+    assert captured["overlap_policy"] == "latest"
     assert payload["results"][-1]["outputs"] == ["/data/cubes/T31UDQ.zarr"]

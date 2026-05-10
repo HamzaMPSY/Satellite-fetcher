@@ -103,6 +103,10 @@ class SearchDownloadRequest(BaseModel):
     cube_mode: Literal["none", "before_mask", "after_mask"] = "none"
     cube_start_date: date | None = None
     cube_end_date: date | None = None
+    cube_layout: Literal["grouped_time", "daily_mosaic"] = "grouped_time"
+    cube_target_crs: str | None = None
+    cube_target_resolution_m: int = Field(default=10, ge=1, le=1000)
+    cube_overlap_policy: Literal["least_cloud", "latest", "earliest", "first_valid"] = "least_cloud"
 
     @field_validator("collection", "product_type")
     @classmethod
@@ -122,6 +126,12 @@ class SearchDownloadRequest(BaseModel):
             raise ValueError("output_dir traversal is not allowed.")
         return value
 
+    @field_validator("cube_target_crs")
+    @classmethod
+    def _normalize_cube_target_crs(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
+
     @field_validator("mask_types")
     @classmethod
     def _normalize_mask_types(cls, values: list[str]) -> list[str]:
@@ -139,6 +149,14 @@ class SearchDownloadRequest(BaseModel):
             raise ValueError("download_only requires cube_mode='none'.")
         if self.cube_mode == "after_mask" and not self.mask_types:
             raise ValueError("cube_mode='after_mask' requires at least one mask_type.")
+        has_cube_options = (
+            self.cube_layout != "grouped_time"
+            or self.cube_target_crs is not None
+            or self.cube_target_resolution_m != 10
+            or self.cube_overlap_policy != "least_cloud"
+        )
+        if self.cube_mode == "none" and has_cube_options:
+            raise ValueError("cube layout options require cube_mode != 'none'.")
         if self.cube_start_date is None:
             self.cube_start_date = self.start_date
         if self.cube_end_date is None:

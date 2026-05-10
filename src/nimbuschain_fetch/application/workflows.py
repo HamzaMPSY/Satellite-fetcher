@@ -518,6 +518,10 @@ class FetchJobWorkflowService:
                 final_pipeline_metadata.payload["mask_mode"] = "integrated"
             if cube_config is not None:
                 final_pipeline_metadata.payload["cube_mode"] = cube_config["mode"]
+                final_pipeline_metadata.payload["cube_layout"] = cube_config["layout"]
+                final_pipeline_metadata.payload["cube_target_crs"] = cube_config["target_crs"]
+                final_pipeline_metadata.payload["cube_target_resolution_m"] = cube_config["target_resolution_m"]
+                final_pipeline_metadata.payload["cube_overlap_policy"] = cube_config["overlap_policy"]
                 final_pipeline_metadata.payload["cube_date_range"] = {
                     "start_date": (
                         cube_config["start_date"].isoformat()
@@ -1242,6 +1246,10 @@ class FetchJobWorkflowService:
             final_pipeline_metadata.payload["mask_mode"] = "integrated"
         if cube_config is not None:
             final_pipeline_metadata.payload["cube_mode"] = cube_config["mode"]
+            final_pipeline_metadata.payload["cube_layout"] = cube_config["layout"]
+            final_pipeline_metadata.payload["cube_target_crs"] = cube_config["target_crs"]
+            final_pipeline_metadata.payload["cube_target_resolution_m"] = cube_config["target_resolution_m"]
+            final_pipeline_metadata.payload["cube_overlap_policy"] = cube_config["overlap_policy"]
             final_pipeline_metadata.payload["cube_date_range"] = {
                 "start_date": (
                     cube_config["start_date"].isoformat()

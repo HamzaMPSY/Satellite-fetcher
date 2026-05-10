@@ -28,6 +28,20 @@ class FetcherMaskPolicySupport:
             return candidate
         return "none"
 
+    @staticmethod
+    def normalized_cube_layout(value: Any) -> str:
+        candidate = str(value or "").strip().lower()
+        if candidate in {"grouped_time", "daily_mosaic"}:
+            return candidate
+        return "grouped_time"
+
+    @staticmethod
+    def normalized_cube_overlap_policy(value: Any) -> str:
+        candidate = str(value or "").strip().lower()
+        if candidate in {"least_cloud", "latest", "earliest", "first_valid"}:
+            return candidate
+        return "least_cloud"
+
     @classmethod
     def timeline_cube_mode_for_row(
         cls,
@@ -51,6 +65,12 @@ class FetcherMaskPolicySupport:
             "mode": cube_mode,
             "start_date": getattr(request, "cube_start_date", None),
             "end_date": getattr(request, "cube_end_date", None),
+            "layout": cls.normalized_cube_layout(getattr(request, "cube_layout", "grouped_time")),
+            "target_crs": str(getattr(request, "cube_target_crs", "") or "").strip() or None,
+            "target_resolution_m": int(getattr(request, "cube_target_resolution_m", 10) or 10),
+            "overlap_policy": cls.normalized_cube_overlap_policy(
+                getattr(request, "cube_overlap_policy", "least_cloud")
+            ),
         }
 
     @classmethod
@@ -62,6 +82,12 @@ class FetcherMaskPolicySupport:
             "mode": cube_mode,
             "start_date": request_payload.get("cube_start_date") or request_payload.get("start_date"),
             "end_date": request_payload.get("cube_end_date") or request_payload.get("end_date"),
+            "layout": cls.normalized_cube_layout(request_payload.get("cube_layout")),
+            "target_crs": str(request_payload.get("cube_target_crs") or "").strip() or None,
+            "target_resolution_m": int(request_payload.get("cube_target_resolution_m") or 10),
+            "overlap_policy": cls.normalized_cube_overlap_policy(
+                request_payload.get("cube_overlap_policy")
+            ),
         }
 
     @staticmethod

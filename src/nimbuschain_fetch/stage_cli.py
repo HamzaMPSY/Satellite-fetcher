@@ -60,6 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--cube-output-dir", default=None)
         command.add_argument("--cube-output-uri", default=None)
         command.add_argument("--single-cube", action="store_true")
+        command.add_argument("--cube-layout", choices=["grouped_time", "daily_mosaic"], default="grouped_time")
+        command.add_argument("--cube-target-crs", default=None)
+        command.add_argument("--cube-target-resolution-m", type=int, default=10)
+        command.add_argument(
+            "--cube-overlap-policy",
+            choices=["least_cloud", "latest", "earliest", "first_valid"],
+            default="least_cloud",
+        )
         command.add_argument("--include-masks-in-cube", action="store_true")
         command.add_argument("--skip-ancillary", action="store_true")
         command.add_argument("--cube-start-date", default=None)
@@ -145,6 +153,10 @@ def _runtime_config_from_args(args: argparse.Namespace) -> PipelineRuntimeConfig
         cube_output_dir=_optional_arg(args.cube_output_dir) or "./data/downloads/zarr/cubes/manual",
         cube_output_uri=_optional_arg(args.cube_output_uri),
         cube_group_by_tile=not bool(args.single_cube),
+        cube_layout=str(args.cube_layout or "grouped_time").strip(),
+        cube_target_crs=_optional_arg(args.cube_target_crs),
+        cube_target_resolution_m=int(args.cube_target_resolution_m),
+        cube_overlap_policy=str(args.cube_overlap_policy or "least_cloud").strip(),
         include_masks_in_cube=bool(args.include_masks_in_cube),
         include_ancillary=not bool(args.skip_ancillary),
         cube_start_date=_optional_arg(args.cube_start_date),

@@ -38,6 +38,10 @@ def build_stage_cli_command(
     zarr_output_uri: str | None = None,
     cube_output_dir: str | None = None,
     cube_output_uri: str | None = None,
+    cube_layout: str | None = None,
+    cube_target_crs: str | None = None,
+    cube_target_resolution_m: int | None = None,
+    cube_overlap_policy: str | None = None,
     execute: bool = False,
     sen2like_service_url: str | None = None,
     sen2like_working_dir: str | None = None,
@@ -86,6 +90,14 @@ def build_stage_cli_command(
         command.extend(["--cube-output-dir", cube_output_dir])
     if cube_output_uri:
         command.extend(["--cube-output-uri", cube_output_uri])
+    if cube_layout:
+        command.extend(["--cube-layout", cube_layout])
+    if cube_target_crs:
+        command.extend(["--cube-target-crs", cube_target_crs])
+    if cube_target_resolution_m is not None:
+        command.extend(["--cube-target-resolution-m", str(int(cube_target_resolution_m))])
+    if cube_overlap_policy:
+        command.extend(["--cube-overlap-policy", cube_overlap_policy])
     if sen2like_service_url:
         command.extend(["--sen2like-service-url", sen2like_service_url])
     if sen2like_working_dir:

@@ -319,6 +319,10 @@ def _build_job_payload(
     cube_mode: str | None = None,
     cube_start_date: dt.date | None = None,
     cube_end_date: dt.date | None = None,
+    cube_layout: str | None = None,
+    cube_target_crs: str | None = None,
+    cube_target_resolution_m: int | None = None,
+    cube_overlap_policy: str | None = None,
 ) -> dict[str, Any]:
     provider_api = PROVIDER_CLI_MAP[provider_label]
     return build_job_payload_runtime(
@@ -335,6 +339,10 @@ def _build_job_payload(
         cube_mode=cube_mode,
         cube_start_date=cube_start_date,
         cube_end_date=cube_end_date,
+        cube_layout=cube_layout,
+        cube_target_crs=cube_target_crs,
+        cube_target_resolution_m=cube_target_resolution_m,
+        cube_overlap_policy=cube_overlap_policy,
     )
 
 
@@ -4337,8 +4345,58 @@ def main():
 
         cube_start_date = st.session_state["start_date"]
         cube_end_date = st.session_state["end_date"]
+        selected_cube_layout = "grouped_time"
+        cube_target_crs: str | None = None
+        cube_target_resolution_m = 10
+        cube_overlap_policy = "least_cloud"
         cube_ready = len(preview_available_dates) >= 2
         if selected_cube_mode != "none":
+            layout_col, overlap_col = st.columns([1, 1])
+            with layout_col:
+                selected_cube_layout = st.selectbox(
+                    "Cube layout",
+                    options=["grouped_time", "daily_mosaic"],
+                    key="download_cube_layout",
+                    format_func=lambda value: {
+                        "grouped_time": "Grouped time cube",
+                        "daily_mosaic": "Daily multi-tile mosaic",
+                    }[value],
+                )
+            with overlap_col:
+                cube_overlap_policy = st.selectbox(
+                    "Overlap policy",
+                    options=["least_cloud", "latest", "earliest", "first_valid"],
+                    key="download_cube_overlap_policy",
+                    format_func=lambda value: {
+                        "least_cloud": "Least cloud",
+                        "latest": "Latest",
+                        "earliest": "Earliest",
+                        "first_valid": "First valid",
+                    }[value],
+                    disabled=selected_cube_layout != "daily_mosaic",
+                )
+            if selected_cube_layout == "daily_mosaic":
+                res_col, crs_col = st.columns([1, 1])
+                with res_col:
+                    cube_target_resolution_m = int(
+                        st.number_input(
+                            "Mosaic resolution",
+                            min_value=1,
+                            max_value=1000,
+                            value=int(st.session_state.get("download_cube_target_resolution_m", 10)),
+                            step=1,
+                            key="download_cube_target_resolution_m",
+                        )
+                    )
+                with crs_col:
+                    cube_target_crs = st.text_input(
+                        "Target CRS",
+                        value=st.session_state.get("download_cube_target_crs", ""),
+                        placeholder="auto or EPSG:32631",
+                        key="download_cube_target_crs",
+                    ).strip() or None
+                if provider == "Copernicus" and len(selected_tiles_for_cmd) > 1:
+                    st.caption("Daily mosaic keeps selected tiles in one pipeline run instead of creating one job per tile.")
             if cube_ready:
                 default_cube_start = min(
                     max(st.session_state["start_date"], preview_available_dates[0]),
@@ -4419,7 +4477,11 @@ def main():
                 st.error("Cube building needs at least two available acquisition dates in the current preview.")
             else:
                 try:
-                    if provider == "Copernicus" and len(selected_tiles_for_cmd) > 1:
+                    create_single_mosaic_job = (
+                        selected_cube_mode != "none"
+                        and selected_cube_layout == "daily_mosaic"
+                    )
+                    if provider == "Copernicus" and len(selected_tiles_for_cmd) > 1 and not create_single_mosaic_job:
                         jobs = [
                             _build_job_payload(
                                 provider_label=provider,
@@ -4434,6 +4496,10 @@ def main():
                                 cube_mode=selected_cube_mode,
                                 cube_start_date=cube_start_date,
                                 cube_end_date=cube_end_date,
+                                cube_layout=selected_cube_layout,
+                                cube_target_crs=cube_target_crs,
+                                cube_target_resolution_m=cube_target_resolution_m,
+                                cube_overlap_policy=cube_overlap_policy,
                             )
                             for tile_id in selected_tiles_for_cmd
                         ]
@@ -4465,6 +4531,10 @@ def main():
                             cube_mode=selected_cube_mode,
                             cube_start_date=cube_start_date,
                             cube_end_date=cube_end_date,
+                            cube_layout=selected_cube_layout,
+                            cube_target_crs=cube_target_crs,
+                            cube_target_resolution_m=cube_target_resolution_m,
+                            cube_overlap_policy=cube_overlap_policy,
                         )
                         response = _api_request(
                             "POST",

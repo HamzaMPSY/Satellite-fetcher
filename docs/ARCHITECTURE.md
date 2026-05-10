@@ -213,6 +213,12 @@ Both paths persist artifacts, events and per-stage timing under the job lineage.
 
 This is the intended migration path, not a public API break. API jobs already record the modular stage plan and results, while the local CLI can execute Zarr/Mask/Cube probes directly against their internal services. The remaining migration work is to replace the worker's legacy monolithic workflow branches with the same stage runner objects used by the CLI.
 
+Cube jobs support two layouts:
+- `grouped_time`, the existing per-tile/path-row time cube;
+- `daily_mosaic`, a Sentinel-2 daily multi-tile mosaic cube with configurable `overlap_policy`, `target_resolution_m`, and optional `target_crs`.
+
+The UI and `/v1/jobs` payload can pass these cube layout options. For `daily_mosaic`, the UI keeps a multi-tile Copernicus selection in a single pipeline run so the cube builder can compose one daily mosaic instead of splitting tiles into separate jobs.
+
 ### Zarr conversion flow
 
 ```text
