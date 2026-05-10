@@ -8,6 +8,7 @@ from typing import Any
 import anyio
 
 from nimbuschain_fetch.application.job_execution import JobExecutionContext
+from nimbuschain_fetch.application.sen2like_normalization import Sen2LikeNormalizationRouter
 from nimbuschain_fetch.domain.metadata import (
     ConversionMetadataRecord,
     MaskStateRecord,
@@ -31,6 +32,7 @@ from nimbuschain_fetch.security.paths import sanitize_output_dir
 class FetchJobWorkflowService:
     def __init__(self, runtime: Any):
         self._rt = runtime
+        self._sen2like_router = Sen2LikeNormalizationRouter(runtime)
 
     def _store_result_record(self, result: JobResultRecord) -> None:
         store = self._rt.store
@@ -456,16 +458,38 @@ class FetchJobWorkflowService:
                 )
                 return
 
+            sen2like_routing = self._sen2like_router.normalize_if_required(
+                job_id=job_id,
+                provider=provider_name,
+                collection=request.collection,
+                product_type=getattr(request, "product_type", None),
+                raw_outputs=raw_outputs,
+                pipeline_metadata=pipeline_metadata,
+                is_cancelled_now=is_cancelled_now,
+            )
+            zarr_input_outputs = list(sen2like_routing.conversion_inputs)
+            pipeline_metadata = sen2like_routing.pipeline_metadata
+            zarr_conversion_provider = "copernicus" if sen2like_routing.routed else None
+            zarr_conversion_collection = "SENTINEL-2" if sen2like_routing.routed else None
+            zarr_conversion_product_type = "S2MSI2A" if sen2like_routing.routed else None
+            pre_zarr_result_paths = [
+                *raw_result_paths,
+                *(zarr_input_outputs if sen2like_routing.routed else []),
+            ]
+
             zarr_outputs, conversion_metadata = rt._convert_raw_outputs(
                 job_id=job_id,
                 provider_name=provider_name,
                 collection=request.collection,
                 product_type=getattr(request, "product_type", None),
-                raw_outputs=raw_outputs,
+                raw_outputs=zarr_input_outputs,
                 is_cancelled=is_cancelled_now,
                 pipeline_metadata=pipeline_metadata.to_dict(),
+                conversion_provider_name=zarr_conversion_provider,
+                conversion_collection=zarr_conversion_collection,
+                conversion_product_type=zarr_conversion_product_type,
             )
-            final_paths = [*raw_result_paths, *zarr_outputs]
+            final_paths = [*pre_zarr_result_paths, *zarr_outputs]
             conversion_metadata_record = self._conversion_metadata_record(conversion_metadata)
             conversion_status = str(conversion_metadata_record.payload.get("status") or "")
             final_pipeline_state = (
@@ -556,7 +580,7 @@ class FetchJobWorkflowService:
                     final_pipeline_metadata = PipelineMetadataRecord.from_mapping(
                         cube_execution.get("pipeline_metadata") or final_pipeline_metadata.to_dict()
                     )
-                    final_paths = [*raw_result_paths, *zarr_outputs, *cube_outputs]
+                    final_paths = [*pre_zarr_result_paths, *zarr_outputs, *cube_outputs]
                     self._store_result_record(
                         JobResultRecord(
                             job_id=job_id,
@@ -609,7 +633,7 @@ class FetchJobWorkflowService:
                         job_id=job_id,
                         row=row,
                         request=request,
-                        raw_result_paths=raw_result_paths,
+                        raw_result_paths=pre_zarr_result_paths,
                         raw_outputs=raw_outputs,
                         zarr_outputs=zarr_outputs,
                         cube_outputs=cube_outputs,
@@ -657,10 +681,16 @@ class FetchJobWorkflowService:
             existing_result = rt._get_result_payload(job_id)
             raw_outputs = list(existing_result.get("raw_outputs") or current_row.get("raw_outputs") or [])
             current_pipeline_state = str(current_row.get("pipeline_state") or "")
+            is_sen2like_failure = current_pipeline_state in {
+                PipelineState.sen2like_queued.value,
+                PipelineState.sen2like_running.value,
+                PipelineState.sen2like_failed.value,
+            }
             is_zarr_failure = current_pipeline_state in {
                 PipelineState.zarr_queued.value,
                 PipelineState.zarr_converting.value,
                 PipelineState.downloaded.value,
+                PipelineState.sen2like_written.value,
             }
             is_cube_failure = current_pipeline_state in {
                 PipelineState.cube_queued.value,
@@ -668,21 +698,28 @@ class FetchJobWorkflowService:
                 PipelineState.cube_failed.value,
             }
             pipeline_state = (
-                PipelineState.zarr_failed
+                PipelineState.sen2like_failed
+                if is_sen2like_failure
+                else PipelineState.zarr_failed
                 if is_zarr_failure and raw_outputs
                 else PipelineState.cube_failed
                 if is_cube_failure
                 else PipelineState.failed
             )
             pipeline_step = (
-                "zarr_failed"
+                "sen2like_failed"
+                if pipeline_state == PipelineState.sen2like_failed
+                else "zarr_failed"
                 if pipeline_state == PipelineState.zarr_failed
                 else "cube_failed"
                 if pipeline_state == PipelineState.cube_failed
                 else "failed"
             )
+            failure_pipeline_metadata = PipelineMetadataRecord.from_mapping(
+                current_row.get("pipeline_metadata") or existing_result.get("pipeline_metadata")
+            )
             conversion_metadata = self._conversion_metadata_record(existing_result.get("conversion_metadata"))
-            if pipeline_state in {PipelineState.zarr_failed, PipelineState.cube_failed}:
+            if pipeline_state in {PipelineState.sen2like_failed, PipelineState.zarr_failed, PipelineState.cube_failed}:
                 conversion_metadata = conversion_metadata.merged_with(
                     {
                         "status": "failed",
@@ -703,9 +740,7 @@ class FetchJobWorkflowService:
                             checksums=dict(existing_result.get("checksums") or {}),
                             metadata=dict(existing_result.get("metadata") or {}),
                             manifest_entry=dict(existing_result.get("manifest_entry") or {}),
-                            pipeline_metadata=PipelineMetadataRecord.from_mapping(
-                                existing_result.get("pipeline_metadata")
-                            ).to_dict(),
+                            pipeline_metadata=failure_pipeline_metadata.to_dict(),
                             conversion_metadata=conversion_metadata.to_dict(),
                         )
                     )
@@ -716,9 +751,7 @@ class FetchJobWorkflowService:
                 errors=[str(exc)],
                 pipeline_state=pipeline_state.value,
                 pipeline_step=pipeline_step,
-                pipeline_metadata=PipelineMetadataRecord.from_mapping(
-                    existing_result.get("pipeline_metadata") or current_row.get("pipeline_metadata")
-                ).to_dict(),
+                pipeline_metadata=failure_pipeline_metadata.to_dict(),
                 conversion_metadata=conversion_metadata.to_dict(),
                 raw_outputs=raw_outputs,
                 zarr_outputs=list(existing_result.get("zarr_outputs") or current_row.get("zarr_outputs") or []),

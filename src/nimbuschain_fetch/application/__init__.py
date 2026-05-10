@@ -15,6 +15,7 @@ from nimbuschain_fetch.application.job_execution import (
 )
 from nimbuschain_fetch.application.pipeline_execution import ModularPipelineJobExecutionHandler
 from nimbuschain_fetch.application.pipeline_state import PipelineStateService
+from nimbuschain_fetch.application.sen2like_normalization import Sen2LikeNormalizationRouter
 
 __all__ = [
     "ArtifactRegistryService",
@@ -30,4 +31,5 @@ __all__ = [
     "JobQueryService",
     "JobSubmissionService",
     "PipelineStateService",
+    "Sen2LikeNormalizationRouter",
 ]

@@ -21,11 +21,21 @@ def convert_raw_outputs(
     scene_id_override: str | None = None,
     output_uri_override: str | None = None,
     pipeline_metadata: dict[str, Any] | None = None,
+    conversion_provider_name: str | None = None,
+    conversion_collection: str | None = None,
+    conversion_product_type: str | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     if not raw_outputs:
         return [], {"status": "skipped", "reason": "no_raw_outputs"}
 
     total = max(1, len(raw_outputs))
+    effective_conversion_provider = str(conversion_provider_name or provider_name).strip()
+    effective_conversion_collection = str(conversion_collection or collection).strip()
+    effective_conversion_product_type = (
+        str(conversion_product_type).strip()
+        if conversion_product_type is not None
+        else product_type
+    )
     zarr_outputs: list[str] = []
     conversions: list[dict[str, Any]] = []
     prepared_items: list[dict[str, Any]] = []
@@ -124,9 +134,9 @@ def convert_raw_outputs(
             )
             converted = rt._convert_single_raw_output(
                 job_id=job_id,
-                provider_name=provider_name,
-                collection=collection,
-                product_type=product_type,
+                provider_name=effective_conversion_provider,
+                collection=effective_conversion_collection,
+                product_type=effective_conversion_product_type,
                 raw_uri=raw_uri,
                 scene_id=scene_id,
                 output_uri=output_uri,
@@ -182,6 +192,9 @@ def convert_raw_outputs(
             "count": len(zarr_outputs),
             "items": conversions,
             "parallel_workers": 1,
+            "conversion_provider": effective_conversion_provider,
+            "conversion_collection": effective_conversion_collection,
+            "conversion_product_type": effective_conversion_product_type,
         }
 
     rt._update_pipeline(
@@ -306,9 +319,9 @@ def convert_raw_outputs(
             executor.submit(
                 rt._convert_single_raw_output,
                 job_id=job_id,
-                provider_name=provider_name,
-                collection=collection,
-                product_type=product_type,
+                provider_name=effective_conversion_provider,
+                collection=effective_conversion_collection,
+                product_type=effective_conversion_product_type,
                 raw_uri=str(item["raw_uri"]),
                 scene_id=str(item["scene_id"]),
                 output_uri=str(item["output_uri"]),
@@ -388,4 +401,7 @@ def convert_raw_outputs(
         "count": len(zarr_outputs),
         "items": conversions,
         "parallel_workers": max_workers,
+        "conversion_provider": effective_conversion_provider,
+        "conversion_collection": effective_conversion_collection,
+        "conversion_product_type": effective_conversion_product_type,
     }

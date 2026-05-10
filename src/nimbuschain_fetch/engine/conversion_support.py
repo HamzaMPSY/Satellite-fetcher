@@ -64,6 +64,9 @@ class FetcherConversionSupport:
         scene_id_override: str | None = None,
         output_uri_override: str | None = None,
         pipeline_metadata: dict[str, Any] | None = None,
+        conversion_provider_name: str | None = None,
+        conversion_collection: str | None = None,
+        conversion_product_type: str | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         return convert_raw_outputs(
             self._rt,
@@ -76,6 +79,9 @@ class FetcherConversionSupport:
             scene_id_override=scene_id_override,
             output_uri_override=output_uri_override,
             pipeline_metadata=pipeline_metadata,
+            conversion_provider_name=conversion_provider_name,
+            conversion_collection=conversion_collection,
+            conversion_product_type=conversion_product_type,
         )
 
     def convert_existing_job(

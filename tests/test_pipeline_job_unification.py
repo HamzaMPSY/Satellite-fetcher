@@ -8,6 +8,7 @@ from datetime import date
 from pathlib import Path
 
 import anyio
+import nimbuschain_fetch.application.sen2like_normalization as sen2like_normalization
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -66,7 +67,30 @@ class FakeCopernicusProvider:
         return [str(raw_path)]
 
 
+class FakeUsgsProvider(FakeCopernicusProvider):
+    def search_products(
+        self,
+        collection: str,
+        product_type: str,
+        start_date: str,
+        end_date: str,
+        aoi,
+        tile_id: str | None = None,
+    ) -> list[str]:
+        return ["LC08_FAKE_LANDSAT_SCENE"]
+
+    def download_products(self, product_ids: list[str], output_dir: str) -> list[str]:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        raw_path = output_path / "LC08_FAKE_LANDSAT_SCENE.tar"
+        raw_path.write_bytes(b"fake-landsat-scene")
+        return [str(raw_path)]
+
+
 class FakeZarrConverter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
     def convert(
         self,
         *,
@@ -78,6 +102,16 @@ class FakeZarrConverter:
         product_type: str | None = None,
         progress_callback=None,
     ) -> tuple[str, str, dict[str, object], dict[str, object]]:
+        self.calls.append(
+            {
+                "provider": provider,
+                "collection": collection,
+                "scene_id": scene_id,
+                "raw_uri": raw_uri,
+                "output_uri": output_uri,
+                "product_type": product_type,
+            }
+        )
         if progress_callback is not None:
             for index, fraction in enumerate((0.2, 0.5, 0.8, 1.0), start=1):
                 progress_callback(
@@ -135,6 +169,62 @@ class FakeZarrConverter:
                 "band_names": ["B02", "B03", "B04", "B08"],
             },
         )
+
+
+class FakeSen2LikeClient:
+    calls: list[dict[str, object]] = []
+
+    def __init__(self, *, service_url: str):
+        self.service_url = service_url
+
+    def close(self) -> None:
+        return None
+
+    def normalize(
+        self,
+        *,
+        products,
+        job_id=None,
+        pipeline_id=None,
+        working_dir=None,
+        workers=4,
+        timeout_seconds=None,
+        **_kwargs,
+    ) -> dict[str, object]:
+        outputs = []
+        base_dir = Path(str(working_dir or "/tmp/nimbus-sen2like-test"))
+        for product in list(products or []):
+            normalized_dir = base_dir / f"{Path(str(product)).stem}_L2F"
+            normalized_dir.mkdir(parents=True, exist_ok=True)
+            outputs.append(
+                {
+                    "product": str(product),
+                    "output_dir": str(normalized_dir),
+                    "normalized_uri": str(normalized_dir),
+                    "exists": True,
+                }
+            )
+        payload = {
+            "service_url": self.service_url,
+            "products": [str(item) for item in list(products or [])],
+            "job_id": job_id,
+            "pipeline_id": pipeline_id,
+            "working_dir": str(working_dir or ""),
+            "workers": int(workers),
+            "timeout_seconds": timeout_seconds,
+            "outputs": outputs,
+            "duration_seconds": 1.25,
+            "status": "succeeded",
+            "return_code": 0,
+        }
+        type(self).calls.append(payload)
+        return payload
+
+
+class FailingSen2LikeClient(FakeSen2LikeClient):
+    def normalize(self, **_kwargs) -> dict[str, object]:
+        type(self).calls.append(dict(_kwargs))
+        raise RuntimeError("sen2like exploded")
 
 
 class FakeMaskService:
@@ -521,6 +611,23 @@ def _request_payload(mask_types: list[str] | None = None) -> SearchDownloadReque
     return SearchDownloadRequest.model_validate(payload)
 
 
+def _landsat_request_payload() -> SearchDownloadRequest:
+    return SearchDownloadRequest.model_validate(
+        {
+            "job_type": "search_download",
+            "provider": ProviderName.usgs,
+            "collection": "landsat_ot_c2_l1",
+            "product_type": "L1TP",
+            "start_date": date(2026, 1, 1),
+            "end_date": date(2026, 1, 2),
+            "aoi": {
+                "wkt": "POLYGON((2.30 48.80, 2.30 48.90, 2.40 48.90, 2.40 48.80, 2.30 48.80))"
+            },
+            "output_dir": "integration/landsat-sen2like",
+        }
+    )
+
+
 def _write_local_zarr_store(
     root: Path,
     *,
@@ -621,6 +728,129 @@ def test_single_job_runs_download_and_zarr_in_one_pipeline(pipeline_runtime) -> 
     assert "job.zarr_converting" in event_types
     assert "job.zarr_written" in event_types
     assert "job.pipeline_orchestrated" in event_types
+
+
+def test_sentinel_job_does_not_call_sen2like(monkeypatch, pipeline_runtime) -> None:
+    client: NimbusFetcherClient = pipeline_runtime["client"]
+    fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
+    FakeSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        FakeSen2LikeClient,
+    )
+
+    job_id = client.submit_job(_request_payload())
+    final_status = _wait_for_completion(client, job_id)
+    converter = fetcher._zarr_converter
+
+    assert final_status.state == JobState.succeeded
+    assert FakeSen2LikeClient.calls == []
+    assert isinstance(converter, FakeZarrConverter)
+    assert converter.calls
+    assert converter.calls[-1]["provider"] == "copernicus"
+    assert converter.calls[-1]["raw_uri"] == final_status.raw_outputs[0]
+
+
+def test_landsat_job_routes_zarr_input_through_sen2like_service(monkeypatch, tmp_path: Path) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "nimbus_runtime_role": "all",
+            "nimbus_db_backend": "sqlite",
+            "nimbus_db_path": tmp_path / "nimbus.db",
+            "nimbus_data_dir": tmp_path / "downloads",
+            "nimbus_sen2like_service_url": "http://sen2like.test",
+            "nimbus_sen2like_work_dir": str(tmp_path / "sen2like"),
+        }
+    )
+    fetcher = NimbusFetcher(
+        settings=settings,
+        provider_registry={"usgs": FakeUsgsProvider},
+    )
+    converter = FakeZarrConverter()
+    fetcher._zarr_converter = converter
+    FakeSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        FakeSen2LikeClient,
+    )
+
+    with NimbusFetcherClient(mode="direct", fetcher=fetcher) as client:
+        job_id = client.submit_job(_landsat_request_payload())
+        final_status = _wait_for_completion(client, job_id)
+        result = client.get_result(job_id)
+
+    assert final_status.state == JobState.succeeded
+    assert final_status.pipeline_state == PipelineState.zarr_written
+    assert final_status.raw_outputs
+    assert FakeSen2LikeClient.calls
+    assert FakeSen2LikeClient.calls[-1]["products"] == final_status.raw_outputs
+
+    sen2like_outputs = result.pipeline_metadata["sen2like_outputs"]
+    assert sen2like_outputs
+    assert converter.calls
+    assert converter.calls[-1]["provider"] == "copernicus"
+    assert converter.calls[-1]["collection"] == "SENTINEL-2"
+    assert converter.calls[-1]["product_type"] == "S2MSI2A"
+    assert converter.calls[-1]["raw_uri"] == sen2like_outputs[0]
+    assert result.pipeline_metadata["zarr_input_source"] == "sen2like"
+    assert result.pipeline_metadata["zarr_input_outputs"] == sen2like_outputs
+    stage_results = {
+        str(stage["name"]): str(stage["status"])
+        for stage in result.pipeline_metadata["stage_results"]
+    }
+    assert stage_results["fetch"] == "succeeded"
+    assert stage_results["sen2like"] == "succeeded"
+    assert stage_results["zarr"] == "succeeded"
+
+    event_types = {row["type"] for row in fetcher.store.list_events(job_id, None, 200)}
+    assert "job.sen2like_running" in event_types
+    assert "job.sen2like_written" in event_types
+
+
+def test_landsat_job_fails_at_sen2like_before_zarr(monkeypatch, tmp_path: Path) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "nimbus_runtime_role": "all",
+            "nimbus_db_backend": "sqlite",
+            "nimbus_db_path": tmp_path / "nimbus.db",
+            "nimbus_data_dir": tmp_path / "downloads",
+            "nimbus_sen2like_service_url": "http://sen2like.test",
+            "nimbus_sen2like_work_dir": str(tmp_path / "sen2like"),
+        }
+    )
+    fetcher = NimbusFetcher(
+        settings=settings,
+        provider_registry={"usgs": FakeUsgsProvider},
+    )
+    converter = FakeZarrConverter()
+    fetcher._zarr_converter = converter
+    FailingSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        FailingSen2LikeClient,
+    )
+
+    with NimbusFetcherClient(mode="direct", fetcher=fetcher) as client:
+        job_id = client.submit_job(_landsat_request_payload())
+        final_status = _wait_for_completion(client, job_id)
+        result = client.get_result(job_id)
+
+    assert final_status.state == JobState.failed
+    assert final_status.pipeline_state == PipelineState.sen2like_failed
+    assert converter.calls == []
+    assert result.pipeline_metadata["sen2like_status"] == "failed"
+    assert "sen2like exploded" in result.pipeline_metadata["sen2like_error"]
+    stage_results = {
+        str(stage["name"]): stage
+        for stage in result.pipeline_metadata["stage_results"]
+    }
+    assert stage_results["fetch"]["status"] == "succeeded"
+    assert stage_results["sen2like"]["status"] == "failed"
+    assert stage_results["zarr"]["status"] == "skipped"
+    assert stage_results["zarr"]["metadata"]["blocked_by"] == ["sen2like"]
 
 
 def test_single_job_can_continue_with_integrated_masking(pipeline_runtime) -> None:

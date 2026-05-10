@@ -65,6 +65,30 @@ _STEP_DEFINITIONS: dict[str, dict[str, Any]] = {
         "badge": "DL",
         "kind": "done",
     },
+    "sen2like_queued": {
+        "label": "Sen2Like Queued",
+        "group": "sen2like",
+        "group_label": "Sen2Like",
+        "order": 22,
+        "badge": "S2L",
+        "kind": "queued",
+    },
+    "sen2like_running": {
+        "label": "Normalize Landsat",
+        "group": "sen2like",
+        "group_label": "Sen2Like",
+        "order": 23,
+        "badge": "S2L",
+        "kind": "running",
+    },
+    "sen2like_written": {
+        "label": "Sen2Like Ready",
+        "group": "sen2like",
+        "group_label": "Sen2Like",
+        "order": 24,
+        "badge": "S2L",
+        "kind": "done",
+    },
     "zarr_queued": {
         "label": "Conversion Queued",
         "group": "convert",
@@ -217,6 +241,14 @@ _STEP_DEFINITIONS: dict[str, dict[str, Any]] = {
         "badge": "RDY",
         "kind": "done",
     },
+    "sen2like_failed": {
+        "label": "Sen2Like Failed",
+        "group": "sen2like",
+        "group_label": "Sen2Like",
+        "order": 94,
+        "badge": "FAIL",
+        "kind": "failed",
+    },
     "zarr_failed": {
         "label": "Zarr Failed",
         "group": "convert",
@@ -258,6 +290,15 @@ _STATE_STEP_RULES: dict[str, dict[str, Any]] = {
     "searching": {"allowed": {"searching"}, "default": "searching"},
     "downloading": {"allowed": {"downloading"}, "default": "downloading"},
     "downloaded": {"allowed": {"downloaded"}, "default": "downloaded"},
+    "sen2like_queued": {"allowed": {"sen2like_queued"}, "default": "sen2like_queued"},
+    "sen2like_running": {
+        "allowed": {"sen2like_running"},
+        "default": "sen2like_running",
+    },
+    "sen2like_written": {
+        "allowed": {"sen2like_written"},
+        "default": "sen2like_written",
+    },
     "zarr_queued": {"allowed": {"zarr_queued"}, "default": "zarr_queued"},
     "zarr_converting": {
         "allowed": {"writing_chunks", "registering_artifact"},
@@ -303,9 +344,10 @@ _STATE_STEP_RULES: dict[str, dict[str, Any]] = {
         "allowed": {"masked_zarr_written"},
         "default": "masked_zarr_written",
     },
+    "sen2like_failed": {"allowed": {"sen2like_failed"}, "default": "sen2like_failed"},
     "zarr_failed": {"allowed": {"zarr_failed"}, "default": "zarr_failed"},
     "failed": {
-        "allowed": {"failed", "cloud_failed", "water_failed", "cube_failed"},
+        "allowed": {"failed", "sen2like_failed", "cloud_failed", "water_failed", "cube_failed"},
         "default": "failed",
     },
     "cancelled": {"allowed": {"cancelled"}, "default": "cancelled"},
@@ -774,6 +816,30 @@ def _build_stage_rows(
         mask_types=mask_types,
         cube_mode=cube_mode,
     )
+    if str(job_kind or "").strip().lower() != "mask":
+        step_stage_keys = {
+            str(
+                _stage_key_for_step(
+                    str(step.get("key") or ""),
+                    job_kind=job_kind,
+                    mask_types=mask_types,
+                    cube_mode=cube_mode,
+                )
+                or ""
+            ).strip().lower()
+            for step in steps
+            if isinstance(step, dict)
+        }
+        if "sen2like" in step_stage_keys and not any(spec["key"] == "sen2like" for spec in specs):
+            insert_at = next(
+                (
+                    index + 1
+                    for index, spec in enumerate(specs)
+                    if str(spec.get("key") or "") == "download"
+                ),
+                1,
+            )
+            specs.insert(insert_at, {"key": "sen2like", "label": "Sen2Like", "badge": "S2L"})
     stage_rows: list[dict[str, Any]] = []
     steps_by_stage: dict[str, list[dict[str, Any]]] = {spec["key"]: [] for spec in specs}
     for step in steps:

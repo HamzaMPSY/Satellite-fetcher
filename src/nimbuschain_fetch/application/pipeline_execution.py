@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -69,7 +68,11 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
             product_type=product_type,
             mask_types=mask_types,
             cube_mode=cube_mode,
-            sen2like_service_url=os.getenv("NIMBUS_SEN2LIKE_SERVICE_URL") or None,
+            sen2like_service_url=getattr(
+                getattr(self._rt, "settings", None),
+                "nimbus_sen2like_service_url",
+                None,
+            ),
         )
         orchestrator = PipelineOrchestrator(build_default_pipeline_stages(options))
         target_stage = "fetch" if bool(request_payload.get("download_only")) else None
@@ -171,8 +174,14 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
         result: dict[str, Any],
         plan: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        pipeline_metadata = PipelineMetadataRecord.from_mapping(
-            result.get("pipeline_metadata") or row.get("pipeline_metadata")
+        result_pipeline_metadata = PipelineMetadataRecord.from_mapping(
+            result.get("pipeline_metadata")
+        )
+        row_pipeline_metadata = PipelineMetadataRecord.from_mapping(
+            row.get("pipeline_metadata")
+        )
+        pipeline_metadata = result_pipeline_metadata.merged_with(
+            row_pipeline_metadata.to_dict()
         ).to_dict()
         timeline = dict(pipeline_metadata.get("timeline") or {})
         timeline_stages = [
@@ -215,14 +224,38 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                     pipeline_metadata.get("sen2like_outputs")
                     or result.get("sen2like_outputs")
                 )
+                sen2like_timeline_stages = _select_timeline_stages(timeline_stages, ["sen2like"])
+                sen2like_status = str(pipeline_metadata.get("sen2like_status") or "").strip().lower()
+                sen2like_error = str(pipeline_metadata.get("sen2like_error") or "").strip()
                 if sen2like_outputs:
                     results.append(
                         _stage_result_dict(
                             "sen2like",
                             status=StageStatus.succeeded.value,
                             outputs=sen2like_outputs,
-                            timeline_stages=[],
-                            metadata={"runner": "sen2like_service"},
+                            timeline_stages=sen2like_timeline_stages,
+                            metadata={
+                                "runner": "sen2like_service",
+                                "service_url": pipeline_metadata.get("sen2like_service_url"),
+                            },
+                        )
+                    )
+                elif sen2like_status == "failed" or pipeline_state == "sen2like_failed":
+                    results.append(
+                        _stage_result_dict(
+                            "sen2like",
+                            status=StageStatus.failed.value,
+                            outputs=[],
+                            timeline_stages=sen2like_timeline_stages,
+                            metadata={
+                                "runner": "sen2like_service",
+                                "service_url": pipeline_metadata.get("sen2like_service_url"),
+                            },
+                            error=sen2like_error or _stage_error(
+                                job_state,
+                                errors,
+                                has_outputs=False,
+                            ),
                         )
                     )
                 else:
@@ -239,6 +272,21 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                         )
                     )
             elif stage_name == "zarr":
+                if pipeline_state == "sen2like_failed":
+                    results.append(
+                        _stage_result_dict(
+                            "zarr",
+                            status=StageStatus.skipped.value,
+                            outputs=[],
+                            timeline_stages=[],
+                            metadata={
+                                "runner": "zarr_service",
+                                "reason": "dependency_not_succeeded",
+                                "blocked_by": ["sen2like"],
+                            },
+                        )
+                    )
+                    continue
                 results.append(
                     _stage_result_dict(
                         "zarr",

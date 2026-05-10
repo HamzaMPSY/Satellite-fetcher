@@ -2427,6 +2427,12 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
         return ("downloading", "#67e8f9", "rgba(34,211,238,0.14)", "↓")
     if pipeline_state == "downloaded":
         return ("download complete", "#86efac", "rgba(134,239,172,0.14)", "✓")
+    if pipeline_state == "sen2like_queued":
+        return ("sen2like queued", "#fbbf24", "rgba(251,191,36,0.16)", "⏳")
+    if pipeline_state == "sen2like_running":
+        return ("sen2like running", "#38bdf8", "rgba(56,189,248,0.16)", "⚙")
+    if pipeline_state == "sen2like_written":
+        return ("sen2like ready", "#4ade80", "rgba(74,222,128,0.14)", "S2")
     if pipeline_state == "zarr_queued":
         return ("zarr queued", "#fbbf24", "rgba(251,191,36,0.16)", "⏳")
     if pipeline_state == "zarr_converting":
@@ -2447,6 +2453,8 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
         return ("pipeline ready", "#4ade80", "rgba(74,222,128,0.14)", "✓")
     if pipeline_state == "cube_failed":
         return ("cube failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
+    if pipeline_state == "sen2like_failed":
+        return ("sen2like failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
     if pipeline_state == "zarr_failed":
         return ("zarr failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
     if pipeline_state == "cancelled":
@@ -2458,7 +2466,7 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
 
 def _job_progress_visual_state(item: dict[str, Any]) -> str:
     pipeline_state = _job_pipeline_state(item)
-    if pipeline_state in {"failed", "zarr_failed", "cube_failed"}:
+    if pipeline_state in {"failed", "sen2like_failed", "zarr_failed", "cube_failed"}:
         return "failed"
     if pipeline_state == "cancelled":
         return "cancelled"
@@ -2524,6 +2532,12 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
         return f"Raw product download is in progress{suffix}."
     if pipeline_state == "downloaded":
         return f"Download complete. Preparing Zarr conversion{suffix}."
+    if pipeline_state == "sen2like_queued":
+        return f"Landsat download complete. Sen2Like normalization is queued before Zarr{suffix}."
+    if pipeline_state == "sen2like_running":
+        return f"Landsat download complete. Sen2Like is normalizing products before Zarr{suffix}."
+    if pipeline_state == "sen2like_written":
+        return f"Sen2Like outputs are ready. Zarr conversion will use the normalized Sentinel-like products{suffix}."
     if pipeline_state == "zarr_queued":
         return f"Download complete. Zarr conversion is queued{suffix}."
     if pipeline_state == "zarr_converting":
@@ -2550,6 +2564,8 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
         return f"Download complete. Cube outputs are ready{suffix}."
     if pipeline_state == "cube_failed":
         return f"Download and conversion succeeded, but cube building failed{suffix}."
+    if pipeline_state == "sen2like_failed":
+        return f"Download succeeded, but Sen2Like normalization failed before Zarr conversion{suffix}."
     if pipeline_state == "zarr_failed":
         return f"Download completed, but Zarr conversion failed{suffix}."
     if pipeline_state == "failed":
@@ -2643,6 +2659,18 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
     worker_suffix = f" with {parallel_workers} parallel worker(s)" if parallel_workers > 1 else ""
     if pipeline_state == "zarr_queued":
         return f"Waiting for the worker to start Zarr conversion{item_suffix}."
+    if pipeline_state in {"sen2like_queued", "sen2like_running", "sen2like_written", "sen2like_failed"}:
+        inputs = int(pipeline_meta.get("sen2like_input_count", 0) or 0)
+        outputs = int(pipeline_meta.get("sen2like_output_count", 0) or 0)
+        service_url = str(pipeline_meta.get("sen2like_service_url") or "").strip()
+        parts = ["Landsat -> Sentinel-like normalization"]
+        if inputs:
+            parts.append(f"inputs: {inputs}")
+        if outputs:
+            parts.append(f"outputs: {outputs}")
+        if service_url:
+            parts.append("service configured")
+        return " · ".join(parts) + "."
     if pipeline_state == "zarr_converting":
         if pipeline_step == "writing_chunks":
             return f"Writing chunks into the Zarr store{item_suffix}{worker_suffix}."

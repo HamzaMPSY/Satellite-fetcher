@@ -92,9 +92,13 @@ class FetcherStatusTimelineSupport:
                 PipelineState.searching.value,
                 PipelineState.downloading.value,
                 PipelineState.downloaded.value,
+                PipelineState.sen2like_queued.value,
+                PipelineState.sen2like_running.value,
+                PipelineState.sen2like_written.value,
                 PipelineState.zarr_queued.value,
                 PipelineState.zarr_converting.value,
                 PipelineState.zarr_written.value,
+                PipelineState.sen2like_failed.value,
                 PipelineState.zarr_failed.value,
             }
             and cube_stage_status not in {"pending"}
@@ -107,6 +111,9 @@ class FetcherStatusTimelineSupport:
                 PipelineState.searching.value,
                 PipelineState.downloading.value,
                 PipelineState.downloaded.value,
+                PipelineState.sen2like_queued.value,
+                PipelineState.sen2like_running.value,
+                PipelineState.sen2like_written.value,
                 PipelineState.zarr_queued.value,
                 PipelineState.zarr_converting.value,
                 PipelineState.zarr_written.value,
@@ -115,6 +122,7 @@ class FetcherStatusTimelineSupport:
                 PipelineState.writing_mask_artifacts.value,
                 PipelineState.writing_masked_zarr.value,
                 PipelineState.registering_artifacts.value,
+                PipelineState.sen2like_failed.value,
                 PipelineState.zarr_failed.value,
             }
             and cube_stage_status not in {"pending"}
@@ -123,9 +131,18 @@ class FetcherStatusTimelineSupport:
         if pipeline_state == PipelineState.searching.value and stage_statuses.get("search", "pending") == "pending":
             return True
         if (
-            pipeline_state in {PipelineState.downloading.value, PipelineState.downloaded.value}
+            pipeline_state in {
+                PipelineState.downloading.value,
+                PipelineState.downloaded.value,
+                PipelineState.sen2like_queued.value,
+                PipelineState.sen2like_running.value,
+                PipelineState.sen2like_written.value,
+                PipelineState.sen2like_failed.value,
+            }
             and stage_statuses.get("download", "pending") == "pending"
         ):
+            return True
+        if pipeline_state == PipelineState.sen2like_running.value and current_stage not in {"sen2like"}:
             return True
         if (
             pipeline_state in {

@@ -34,6 +34,25 @@ class Settings(BaseSettings):
     nimbus_data_dir: Path = Field(default=Path("./data/downloads"), alias="NIMBUS_DATA_DIR")
     nimbus_mask_service_url: str | None = Field(default=None, alias="NIMBUS_MASK_SERVICE_URL")
     nimbus_zarr_service_url: str | None = Field(default=None, alias="NIMBUS_ZARR_SERVICE_URL")
+    nimbus_sen2like_service_url: str | None = Field(
+        default=None,
+        alias="NIMBUS_SEN2LIKE_SERVICE_URL",
+    )
+    nimbus_sen2like_work_dir: str | None = Field(
+        default=None,
+        alias="NIMBUS_SEN2LIKE_WORK_DIR",
+    )
+    nimbus_sen2like_workers: int = Field(
+        default=4,
+        alias="NIMBUS_SEN2LIKE_WORKERS",
+        ge=1,
+        le=128,
+    )
+    nimbus_sen2like_timeout_seconds: float | None = Field(
+        default=None,
+        alias="NIMBUS_SEN2LIKE_TIMEOUT_SECONDS",
+        gt=0,
+    )
     nimbus_runtime_role: str = Field(default="all", alias="NIMBUS_RUNTIME_ROLE")
     nimbus_executor_backend: str = Field(default="inprocess", alias="NIMBUS_EXECUTOR_BACKEND")
     nimbus_max_jobs: int = Field(default=4, alias="NIMBUS_MAX_JOBS", ge=1, le=128)
@@ -161,6 +180,7 @@ class Settings(BaseSettings):
         "nimbus_usgs_service_url",
         "nimbus_mask_service_url",
         "nimbus_zarr_service_url",
+        "nimbus_sen2like_service_url",
         mode="before",
     )
     @classmethod
@@ -176,6 +196,7 @@ class Settings(BaseSettings):
         "nimbus_copernicus_account_pool_json",
         "nimbus_usgs_username",
         "nimbus_usgs_token",
+        "nimbus_sen2like_work_dir",
         mode="before",
     )
     @classmethod
