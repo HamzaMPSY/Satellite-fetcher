@@ -92,6 +92,30 @@ def _build_s2_bundle(root: Path, *, scene_id: str, l1c: bool) -> Path:
     return safe_root
 
 
+def _build_sen2like_bundle(root: Path, scene_id: str) -> Path:
+    safe_root = (
+        root
+        / "S2L_MSIL2F_20260101T105501_N0500_R000_T31TDN_20260101T105501.SAFE"
+    )
+    safe_root.mkdir(parents=True, exist_ok=True)
+    (safe_root / "manifest.safe").write_text("SAFE", encoding="utf-8")
+    img_root = (
+        safe_root
+        / "GRANULE"
+        / "L2F_T31TDN_A20260101T105501"
+        / "IMG_DATA"
+        / "RESOLUTION_10M"
+    )
+    for index, code in enumerate(("B02", "B03", "B04", "B08", "B11", "B12"), start=1):
+        _write_raster(
+            img_root / f"T31TDN_20260101T105501_{code}_10m.TIF",
+            shape=(6, 6),
+            pixel_size=10.0,
+            value=index,
+        )
+    return safe_root
+
+
 def _build_landsat_bundle(root: Path, *, scene_id: str, l1: bool) -> Path:
     bundle_root = root / scene_id
     bundle_root.mkdir(parents=True, exist_ok=True)
@@ -240,6 +264,19 @@ def zarr_service() -> ZarrConversionService:
                 expected_pixel_size=(10.0, 10.0),
             ),
             lambda root, scene_id: _build_s2_bundle(root, scene_id=scene_id, l1c=False),
+        ),
+        (
+            LayerCase(
+                name="sen2like_l2f",
+                provider="copernicus",
+                collection="SENTINEL-2",
+                product_type="S2MSI2A",
+                scene_id="LC08_L1TP_190026_20260101_20260101_02_T1",
+                expected_band_names=("B02", "B03", "B04", "B08", "B11", "B12"),
+                expected_ancillary_names=(),
+                expected_pixel_size=(10.0, 10.0),
+            ),
+            _build_sen2like_bundle,
         ),
         (
             LayerCase(

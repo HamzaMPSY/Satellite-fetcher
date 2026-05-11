@@ -52,6 +52,7 @@ _S2_SPECTRAL_CODES = (
     "B12",
 )
 _S2_L2A_SPECTRAL_CODES = tuple(code for code in _S2_SPECTRAL_CODES if code != "B10")
+_SEN2LIKE_SPECTRAL_CODES = ("B02", "B03", "B04", "B08", "B11", "B12")
 _S2_CATEGORICAL_LAYER_TOKENS = {"SCL", "CLD", "SNW", "TCI"}
 _S2_PREFERRED_IMAGERY_REFERENCE = ("B04", "B03", "B02", "B08")
 _S2_DYNAMIC_TOKENS = (
@@ -668,7 +669,13 @@ def _prepare_sentinel2_layers(
         )
 
     imagery_paths, ancillary_paths = _discover_s2_layers(raster_files)
-    expected_layers = list(_S2_SPECTRAL_CODES if s2_product_type == "S2MSI1C" else _S2_L2A_SPECTRAL_CODES)
+    expected_layers = list(
+        _SEN2LIKE_SPECTRAL_CODES
+        if _is_sen2like_safe_source(extracted.root)
+        else _S2_SPECTRAL_CODES
+        if s2_product_type == "S2MSI1C"
+        else _S2_L2A_SPECTRAL_CODES
+    )
     missing = [band for band in expected_layers if band not in imagery_paths]
     if missing:
         raise ConversionError(
@@ -689,6 +696,11 @@ def _discover_s2_layers(raster_files: list[Path]) -> tuple[dict[str, Path], dict
         if existing is None or _s2_resolution_rank(path) < _s2_resolution_rank(existing):
             bucket[layer_name] = path
     return imagery_paths, ancillary_paths
+
+
+def _is_sen2like_safe_source(root: Path) -> bool:
+    parts = [part.upper() for part in root.parts]
+    return any(part.startswith("S2L_") for part in parts)
 
 
 def _s2_layer_name(path: Path) -> str | None:

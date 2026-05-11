@@ -115,7 +115,11 @@ def _skip_download_scan_dir(path: Path, root: Path) -> bool:
         relative_parts = tuple(part.lower() for part in path.parts)
     if len(relative_parts) >= 2 and relative_parts[-2:] == ("sen2like", "spark"):
         return True
+    if len(relative_parts) >= 2 and relative_parts[-2:] == ("sen2like", "_inputs"):
+        return True
     if len(relative_parts) >= 3 and relative_parts[-3:-1] == ("sen2like", "spark"):
+        return True
+    if len(relative_parts) >= 3 and relative_parts[-3:-1] == ("sen2like", "_inputs"):
         return True
     return False
 

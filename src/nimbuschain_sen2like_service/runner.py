@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 import os
+import shutil
 import subprocess
 import sys
+import tarfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from nimbuschain_sen2like_service.models import (
     Sen2LikeNormalizeRequest,
@@ -16,6 +20,14 @@ from nimbuschain_sen2like_service.models import (
 
 DEFAULT_VENDOR_SUBDIR = "sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation"
 DEFAULT_SPARK_LOCAL_DIRS = "/tmp/nimbus-sen2like-spark"
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProduct:
+    original: str
+    command_input: str
+    output_name: str
+    extracted: bool
 
 
 def resolve_vendor_root() -> Path:
@@ -39,10 +51,11 @@ def build_command(
     *,
     vendor_root: Path | None = None,
     working_dir: Path | None = None,
+    product_inputs: Sequence[str] | None = None,
 ) -> list[str]:
     root = vendor_root or resolve_vendor_root()
     work_dir = working_dir or resolve_working_dir(request.working_dir)
-    products = request.product_inputs()
+    products = list(product_inputs) if product_inputs is not None else request.product_inputs()
     if not products:
         raise ValueError("At least one Landsat product path is required.")
 
@@ -81,8 +94,18 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
     vendor_root = resolve_vendor_root()
     work_dir = resolve_working_dir(request.working_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+    original_products = request.product_inputs()
+    prepared_products = [
+        _prepare_product_input(product, work_dir)
+        for product in original_products
+    ]
 
-    command = build_command(request, vendor_root=vendor_root, working_dir=work_dir)
+    command = build_command(
+        request,
+        vendor_root=vendor_root,
+        working_dir=work_dir,
+        product_inputs=[product.command_input for product in prepared_products],
+    )
     env = os.environ.copy()
     env["LANDSAT_UPSAMPLING_BASE"] = str(vendor_root)
     env["PYTHONPATH"] = _prepend_path(str(vendor_root), env.get("PYTHONPATH"))
@@ -101,14 +124,18 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
         check=False,
     )
     duration = time.perf_counter() - started
-    outputs = [_product_output(product, work_dir) for product in request.product_inputs()]
-    status = "succeeded" if completed.returncode == 0 else "failed"
+    outputs = [
+        _product_output(product, work_dir)
+        for product in prepared_products
+    ]
+    output_issues = _collect_output_issues(outputs)
+    status = "succeeded" if completed.returncode == 0 and not output_issues else "failed"
     return Sen2LikeNormalizeResponse(
         status=status,
         job_id=request.job_id,
         pipeline_id=request.pipeline_id,
         trace_id=request.trace_id,
-        products=request.product_inputs(),
+        products=original_products,
         working_dir=str(work_dir),
         outputs=outputs,
         duration_seconds=duration,
@@ -122,6 +149,16 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
             "spark_master": request.spark_master,
             "spark_local_dirs": spark_local_dirs,
             "pyspark_service": True,
+            "prepared_products": [
+                {
+                    "original": product.original,
+                    "command_input": product.command_input,
+                    "output_name": product.output_name,
+                    "extracted": product.extracted,
+                }
+                for product in prepared_products
+            ],
+            "output_issues": output_issues,
         },
     )
 
@@ -138,18 +175,175 @@ def readiness_payload() -> dict[str, Any]:
     }
 
 
-def _product_output(product: str, working_dir: Path) -> Sen2LikeProductOutput:
-    output_dir = working_dir / Path(product).name
+def _prepare_product_input(product: str, working_dir: Path) -> PreparedProduct:
+    product_path = Path(product)
+    if _is_tar_product(product_path):
+        output_name = _tar_output_name(product_path)
+        extracted_dir = working_dir / "_inputs" / output_name
+        _extract_tar_product(product_path, extracted_dir)
+        return PreparedProduct(
+            original=product,
+            command_input=str(extracted_dir),
+            output_name=output_name,
+            extracted=True,
+        )
+    return PreparedProduct(
+        original=product,
+        command_input=product,
+        output_name=Path(product).name,
+        extracted=False,
+    )
+
+
+def _product_output(product: PreparedProduct, working_dir: Path) -> Sen2LikeProductOutput:
+    output_dir = working_dir / product.output_name
     manifest_path = output_dir / "manifest.json"
-    safe_dirs = sorted(output_dir.glob("*_L2F"))
-    normalized_uri = str(safe_dirs[0]) if safe_dirs else (str(output_dir) if output_dir.exists() else None)
+    normalized_uri = _normalized_output_uri(output_dir)
     return Sen2LikeProductOutput(
-        product=product,
+        product=product.original,
         output_dir=str(output_dir),
         manifest_path=str(manifest_path) if manifest_path.exists() else None,
         normalized_uri=normalized_uri,
         exists=output_dir.exists(),
     )
+
+
+def _is_tar_product(path: Path) -> bool:
+    try:
+        return path.is_file() and tarfile.is_tarfile(path)
+    except (OSError, tarfile.TarError):
+        return False
+
+
+def _tar_output_name(path: Path) -> str:
+    name = path.name
+    lowered = name.lower()
+    for suffix in (".tar.gz", ".tgz", ".tar"):
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
+def _extract_tar_product(archive_path: Path, target_dir: Path) -> None:
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path) as archive:
+        members = list(_safe_tar_members(archive, target_dir))
+        archive.extractall(path=target_dir, members=members)
+
+
+def _safe_tar_members(archive: tarfile.TarFile, target_dir: Path):
+    target_root = target_dir.resolve()
+    for member in archive.getmembers():
+        if member.issym() or member.islnk():
+            raise ValueError(f"Refusing to extract linked tar member: {member.name}")
+        member_path = (target_root / member.name).resolve()
+        try:
+            member_path.relative_to(target_root)
+        except ValueError as exc:
+            raise ValueError(f"Refusing to extract unsafe tar member: {member.name}") from exc
+        yield member
+
+
+def _normalized_output_uri(output_dir: Path) -> str | None:
+    candidates = [
+        *sorted((output_dir / "SAFE").glob("*.SAFE")),
+        *sorted(output_dir.glob("*.SAFE")),
+        *sorted(output_dir.glob("*_L2F")),
+    ]
+    for candidate in candidates:
+        if _valid_safe_output(candidate):
+            return str(candidate)
+    return None
+
+
+def _valid_safe_output(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if path.suffix.upper() == ".SAFE" and not (path / "manifest.safe").exists():
+        return False
+    raster_files = [
+        raster
+        for raster in path.rglob("*")
+        if raster.is_file() and raster.suffix.lower() in {".tif", ".tiff", ".jp2"}
+    ]
+    return bool(raster_files)
+
+
+def _collect_output_issues(outputs: Sequence[Sen2LikeProductOutput]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for output in outputs:
+        output_dir = Path(output.output_dir)
+        product = output.product
+        if not output.exists:
+            issues.append(
+                {
+                    "product": product,
+                    "code": "output_missing",
+                    "message": f"No Sen2Like output directory was written for {Path(product).name}.",
+                }
+            )
+            continue
+
+        manifest_path = Path(output.manifest_path) if output.manifest_path else output_dir / "manifest.json"
+        if not manifest_path.exists():
+            issues.append(
+                {
+                    "product": product,
+                    "code": "manifest_missing",
+                    "message": f"Sen2Like manifest is missing for {Path(product).name}.",
+                }
+            )
+        else:
+            issues.extend(_manifest_issues(product=product, manifest_path=manifest_path))
+
+        if not output.normalized_uri:
+            issues.append(
+                {
+                    "product": product,
+                    "code": "normalized_output_missing",
+                    "message": (
+                        f"Sen2Like did not produce a valid Sentinel-like SAFE output "
+                        f"for {Path(product).name}."
+                    ),
+                }
+            )
+    return issues
+
+
+def _manifest_issues(*, product: str, manifest_path: Path) -> list[dict[str, str]]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [
+            {
+                "product": product,
+                "code": "manifest_unreadable",
+                "message": f"Sen2Like manifest could not be read for {Path(product).name}: {exc}",
+            }
+        ]
+    issues: list[dict[str, str]] = []
+    steps = manifest.get("steps") if isinstance(manifest, dict) else None
+    if not isinstance(steps, dict):
+        return issues
+    for step_name, payload in steps.items():
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("status") or "").strip().lower() != "failed":
+            continue
+        error = str(payload.get("error") or "").strip()
+        message = f"Sen2Like step {step_name} failed for {Path(product).name}"
+        if error:
+            message = f"{message}: {error}"
+        issues.append(
+            {
+                "product": product,
+                "code": "step_failed",
+                "message": message,
+            }
+        )
+    return issues
 
 
 def _prepend_path(value: str, existing: str | None) -> str:
@@ -162,7 +356,6 @@ def _prepend_path(value: str, existing: str | None) -> str:
 def _prepare_spark_environment(env: dict[str, str]) -> str:
     configured = (
         str(env.get("NIMBUS_SEN2LIKE_SPARK_DIR") or "").strip()
-        or str(env.get("SPARK_LOCAL_DIRS") or "").strip()
         or DEFAULT_SPARK_LOCAL_DIRS
     )
     spark_dirs = _spark_dir_values(configured)

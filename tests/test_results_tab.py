@@ -67,6 +67,9 @@ def test_download_scans_skip_sen2like_spark_runtime_dirs(tmp_path: Path) -> None
     spark_output = tmp_path / "sen2like" / "spark" / "spark-runtime" / "tmp.bin"
     spark_output.parent.mkdir(parents=True)
     spark_output.write_text("runtime", encoding="utf-8")
+    extracted_input = tmp_path / "sen2like" / "_inputs" / "LC08_SCENE" / "B02.TIF"
+    extracted_input.parent.mkdir(parents=True)
+    extracted_input.write_text("runtime", encoding="utf-8")
 
     count_downloaded_products.clear()
 

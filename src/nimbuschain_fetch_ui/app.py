@@ -137,6 +137,7 @@ from nimbuschain_fetch_ui.styling import CUSTOM_CSS
 from nimbuschain_fetch_ui.timeline_display import (
     display_pipeline_stages as _display_pipeline_stages,
     display_stage_key as _display_stage_key,
+    _stage_error_summary,
 )
 from nimbuschain_fetch_ui.logging_setup import configure_logging, logger
 from nimbuschain_fetch_ui.data_loaders import (
@@ -1956,6 +1957,8 @@ def _render_job_cards(
                 error_summary = "Copernicus download endpoint timed out (HTTP 504) before the first byte. Retry later."
             elif "catalogue.dataspace.copernicus.eu" in first_error and "503" in first_error:
                 error_summary = "Copernicus catalogue is temporarily unavailable (HTTP 503). Retry later."
+            elif "sen2like" in error_text or "spark" in error_text:
+                error_summary = _stage_error_summary(first_error)
             elif len(first_error) > 240:
                 error_summary = f"{first_error[:240]}..."
             else:
