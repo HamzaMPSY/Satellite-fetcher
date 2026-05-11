@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import nimbuschain_fetch.application.sen2like_normalization as sen2like_normalization
@@ -212,6 +213,7 @@ class FakeSen2LikeClient:
             "working_dir": str(working_dir or ""),
             "workers": int(workers),
             "timeout_seconds": timeout_seconds,
+            "no_resume": bool(_kwargs.get("no_resume", False)),
             "outputs": outputs,
             "duration_seconds": 1.25,
             "status": "succeeded",
@@ -807,6 +809,44 @@ def test_landsat_job_routes_zarr_input_through_sen2like_service(monkeypatch, tmp
     event_types = {row["type"] for row in fetcher.store.list_events(job_id, None, 200)}
     assert "job.sen2like_running" in event_types
     assert "job.sen2like_written" in event_types
+
+
+def test_landsat_sen2like_router_calls_service_once_per_product(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            nimbus_sen2like_work_dir=str(tmp_path / "sen2like"),
+            nimbus_sen2like_workers=4,
+            nimbus_sen2like_timeout_seconds=600,
+        )
+    )
+    router = sen2like_normalization.Sen2LikeNormalizationRouter(runtime)
+    FakeSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        FakeSen2LikeClient,
+    )
+
+    response = router._normalize(
+        service_url="http://sen2like.test",
+        job_id="job-42",
+        products=["/data/raw/LC08_A.tar", "/data/raw/LC09_B.tar"],
+    )
+
+    assert len(FakeSen2LikeClient.calls) == 2
+    assert FakeSen2LikeClient.calls[0]["products"] == ["/data/raw/LC08_A.tar"]
+    assert FakeSen2LikeClient.calls[1]["products"] == ["/data/raw/LC09_B.tar"]
+    assert FakeSen2LikeClient.calls[0]["pipeline_id"] == "job-42"
+    assert FakeSen2LikeClient.calls[0]["job_id"] == "job-42-1"
+    assert FakeSen2LikeClient.calls[1]["job_id"] == "job-42-2"
+    assert FakeSen2LikeClient.calls[0]["working_dir"] == str(tmp_path / "sen2like" / "job-42")
+    assert FakeSen2LikeClient.calls[0]["no_resume"] is True
+    assert response["metadata"]["execution_mode"] == "sequential_single_product"
+    assert response["duration_seconds"] == 2.5
+    assert len(response["outputs"]) == 2
 
 
 def test_landsat_job_fails_at_sen2like_before_zarr(monkeypatch, tmp_path: Path) -> None:

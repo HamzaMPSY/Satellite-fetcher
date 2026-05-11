@@ -123,6 +123,17 @@ class Sen2LikeServiceClient:
             return "Sen2Like could not find one of the input files or runtime paths."
 
         metadata = dict(detail.get("metadata") or {})
+        return_code = detail.get("return_code")
+        try:
+            numeric_return_code = int(return_code)
+        except (TypeError, ValueError):
+            numeric_return_code = None
+        if numeric_return_code in {-9, 137}:
+            return (
+                "Sen2Like was killed during processing, most likely because the "
+                "Podman VM or Sen2Like container does not have enough memory."
+            )
+
         input_issues = list(metadata.get("input_issues") or [])
         if input_issues:
             first_issue = input_issues[0]
@@ -141,7 +152,6 @@ class Sen2LikeServiceClient:
                     return message
             return "Sen2Like did not produce a valid Sentinel-like SAFE output."
 
-        return_code = detail.get("return_code")
         duration = detail.get("duration_seconds")
         bits = ["Sen2Like subprocess failed"]
         if return_code is not None:

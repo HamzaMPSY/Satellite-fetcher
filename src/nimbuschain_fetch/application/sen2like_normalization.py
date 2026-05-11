@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from nimbuschain_fetch.domain.metadata import PipelineMetadataRecord
@@ -122,6 +123,11 @@ class Sen2LikeNormalizationRouter:
                 "sen2like_input_count": len(raw_outputs),
                 "sen2like_inputs": list(raw_outputs),
                 "sen2like_service_url": service_url,
+                "sen2like_execution_mode": "sequential_single_product",
+                "sen2like_working_dir": _job_working_dir(
+                    self._rt.settings.nimbus_sen2like_work_dir,
+                    job_id,
+                ),
             }
         )
         self._rt._update_pipeline(
@@ -221,15 +227,55 @@ class Sen2LikeNormalizationRouter:
         products: list[str],
     ) -> dict[str, Any]:
         client = Sen2LikeServiceClient(service_url=service_url)
+        working_dir = _job_working_dir(
+            self._rt.settings.nimbus_sen2like_work_dir,
+            job_id,
+        )
+        responses: list[dict[str, Any]] = []
+        outputs: list[dict[str, Any]] = []
+        duration_seconds = 0.0
         try:
-            return client.normalize(
-                products=products,
-                job_id=job_id,
-                pipeline_id=job_id,
-                working_dir=self._rt.settings.nimbus_sen2like_work_dir,
-                workers=int(self._rt.settings.nimbus_sen2like_workers),
-                timeout_seconds=self._rt.settings.nimbus_sen2like_timeout_seconds,
-            )
+            for index, product in enumerate(products, start=1):
+                product_job_id = f"{job_id}-{index}" if len(products) > 1 else job_id
+                try:
+                    response = client.normalize(
+                        products=[product],
+                        job_id=product_job_id,
+                        pipeline_id=job_id,
+                        working_dir=working_dir,
+                        workers=int(self._rt.settings.nimbus_sen2like_workers),
+                        no_resume=True,
+                        timeout_seconds=self._rt.settings.nimbus_sen2like_timeout_seconds,
+                    )
+                except Exception as exc:
+                    product_name = Path(str(product)).name or str(product)
+                    raise RuntimeError(f"Sen2Like failed for {product_name}: {exc}") from exc
+                responses.append(response)
+                outputs.extend(
+                    dict(item)
+                    for item in list(response.get("outputs") or [])
+                    if isinstance(item, dict)
+                )
+                try:
+                    duration_seconds += float(response.get("duration_seconds") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+            return {
+                "status": "succeeded",
+                "job_id": job_id,
+                "pipeline_id": job_id,
+                "products": list(products),
+                "working_dir": working_dir,
+                "outputs": outputs,
+                "duration_seconds": duration_seconds,
+                "return_code": 0,
+                "responses": responses,
+                "metadata": {
+                    "execution_mode": "sequential_single_product",
+                    "product_count": len(products),
+                    "service_url": service_url,
+                },
+            }
         finally:
             client.close()
 
@@ -243,3 +289,9 @@ def _sen2like_outputs(response: dict[str, Any]) -> list[str]:
         if output_uri and output_uri not in outputs:
             outputs.append(output_uri)
     return outputs
+
+
+def _job_working_dir(base_working_dir: str | None, job_id: str) -> str:
+    base = Path(str(base_working_dir or "/data/downloads/sen2like").strip())
+    safe_job_id = str(job_id or "job").strip().replace("/", "_")
+    return str(base / safe_job_id)

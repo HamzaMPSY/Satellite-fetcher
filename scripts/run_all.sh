@@ -53,6 +53,11 @@ fi
 
 if "$PODMAN_BIN" machine inspect >/dev/null 2>&1; then
   "$PODMAN_BIN" machine start >/dev/null 2>&1 || true
+  PODMAN_MEMORY_MB="$("$PODMAN_BIN" machine inspect 2>/dev/null | python3 -c 'import json,sys; data=json.load(sys.stdin); print(int((data[0].get("Resources") or {}).get("Memory") or 0))' 2>/dev/null || true)"
+  if [ -n "${PODMAN_MEMORY_MB:-}" ] && [ "$PODMAN_MEMORY_MB" -gt 0 ] && [ "$PODMAN_MEMORY_MB" -lt 12288 ]; then
+    echo "Warning: Podman machine memory is ${PODMAN_MEMORY_MB} MB. Sen2Like Landsat normalization can be killed under 12 GB."
+    echo "         Recommended before Landsat tests: podman machine stop && podman machine set --memory 16384 && podman machine start"
+  fi
 fi
 
 echo "Validating compose configuration..."

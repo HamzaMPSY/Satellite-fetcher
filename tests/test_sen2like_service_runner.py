@@ -5,6 +5,7 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+from nimbuschain_shared.clients.sen2like import Sen2LikeServiceClient
 from nimbuschain_sen2like_service.models import Sen2LikeNormalizeRequest
 from nimbuschain_sen2like_service.runner import build_command, run_sen2like
 
@@ -168,6 +169,25 @@ def test_sen2like_runner_fails_before_pyspark_when_tar_input_is_missing(
     assert response.metadata["prepared_products"][0]["extracted"] is False
     assert response.metadata["input_issues"][0]["code"] == "input_missing"
     assert "Landsat tar input is missing" in response.metadata["input_issues"][0]["message"]
+
+
+def test_sen2like_client_summarizes_sigkill_as_memory_pressure() -> None:
+    message = Sen2LikeServiceClient._summarize_structured_error(
+        {
+            "return_code": -9,
+            "stderr_tail": "Reprojection -> EPSG:32631 @ 10.0 m",
+            "metadata": {
+                "output_issues": [
+                    {
+                        "code": "normalized_output_missing",
+                        "message": "Sen2Like did not produce a valid Sentinel-like SAFE output.",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert "not have enough memory" in message
 
 
 def test_sen2like_runner_fails_when_manifest_contains_failed_steps(
