@@ -810,7 +810,7 @@ def _run_cloud_inference_tiled(
     def process_window(window: tuple[int, int, int, int]) -> tuple[tuple[int, int, int, int], Any]:
         row_start, row_stop, col_start, col_stop = window
         try:
-            channels_result = read_required_channels_window(
+            channels_result = service_module.read_required_channels_window(
                 root,
                 band_names=context.band_names,
                 required_bands=required_bands,
@@ -825,7 +825,7 @@ def _run_cloud_inference_tiled(
         except TypeError as exc:
             if "include_validity" not in str(exc):
                 raise
-            channels_result = read_required_channels_window(
+            channels_result = service_module.read_required_channels_window(
                 root,
                 band_names=context.band_names,
                 required_bands=required_bands,
@@ -878,16 +878,27 @@ def _run_cloud_inference_tiled(
                 valid_mask=valid_mask,
             )
         except TypeError as exc:
-            if "valid_mask" not in str(exc):
+            message = str(exc)
+            if "valid_mask" in message:
+                result = service_module.run_cloud_inference(
+                    sensor=sensor,
+                    channels=channels,
+                    threshold=threshold,
+                    backend_descriptor=backend_descriptor,
+                    inference_device=resolved_device,
+                    include_shadows=include_shadows,
+                )
+            elif "backend_descriptor" in message:
+                result = service_module.run_cloud_inference(
+                    sensor=sensor,
+                    channels=channels,
+                    threshold=threshold,
+                    backend=str(backend_descriptor.name),
+                    inference_device=resolved_device,
+                    include_shadows=include_shadows,
+                )
+            else:
                 raise
-            result = service_module.run_cloud_inference(
-                sensor=sensor,
-                channels=channels,
-                threshold=threshold,
-                backend_descriptor=backend_descriptor,
-                inference_device=resolved_device,
-                include_shadows=include_shadows,
-            )
         return window, result
 
     if tile_workers <= 1 or len(windows) <= 1:
@@ -900,21 +911,26 @@ def _run_cloud_inference_tiled(
         for window, result in results_iter:
             row_start, row_stop, col_start, col_stop = window
             tile_index += 1
+            summary = (
+                result.summary.to_dict()
+                if hasattr(result.summary, "to_dict")
+                else dict(result.summary or {})
+            )
             cloud_arr[0, row_start:row_stop, col_start:col_stop] = result.mask
             cloud_prob_arr[0, row_start:row_stop, col_start:col_stop] = result.probability
             cloud_pixels += int(np.asarray(result.mask, dtype=np.uint64).sum())
             tile_pixels = max(
                 1,
-                int(result.summary.get("valid_pixels") or 0)
+                int(summary.get("valid_pixels") or 0)
                 or (row_stop - row_start) * (col_stop - col_start),
             )
             valid_pixels_total += tile_pixels
-            shadow_pixels += int(round(float(result.summary.get("shadow_fraction") or 0.0) * tile_pixels))
-            cloud_only_pixels += int(round(float(result.summary.get("cloud_only_fraction") or 0.0) * tile_pixels))
-            confidence_available = confidence_available or bool(result.summary.get("confidence_available"))
-            mask_source = str(result.summary.get("mask_source") or mask_source)
-            probability_source = str(result.summary.get("probability_source") or probability_source)
-            for key, value in dict(result.summary.class_histogram).items():
+            shadow_pixels += int(round(float(summary.get("shadow_fraction") or 0.0) * tile_pixels))
+            cloud_only_pixels += int(round(float(summary.get("cloud_only_fraction") or 0.0) * tile_pixels))
+            confidence_available = confidence_available or bool(summary.get("confidence_available"))
+            mask_source = str(summary.get("mask_source") or mask_source)
+            probability_source = str(summary.get("probability_source") or probability_source)
+            for key, value in dict(summary.get("class_histogram") or {}).items():
                 class_histogram[str(key)] = int(class_histogram.get(str(key), 0)) + int(value)
 
             if stage_callback is not None and (tile_index == 1 or tile_index == total_tiles or tile_index % 8 == 0):

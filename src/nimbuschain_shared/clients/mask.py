@@ -258,9 +258,12 @@ class MaskServiceClient:
         last_sequence = -1
         last_stage_name = ""
         last_payload: dict[str, Any] = {}
-        while not stop_event.wait(poll_interval):
+        while not stop_event.is_set():
+            session_get = getattr(self._session, "get", None)
+            if not callable(session_get):
+                return
             try:
-                response = self._session.get(
+                response = session_get(
                     f"{self.service_url}/progress/{job_id}",
                     timeout=10,
                 )
@@ -326,3 +329,4 @@ class MaskServiceClient:
 
             if status in {"finished", "failed", "cancelled"}:
                 return
+            stop_event.wait(poll_interval)

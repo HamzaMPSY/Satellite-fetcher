@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
@@ -54,7 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collection", default=None)
     parser.add_argument("--product-type", default=None)
     parser.add_argument("--scene-id", default=None)
-    parser.add_argument("--service-url", required=True, help="Remote mask service base URL.")
+    parser.add_argument(
+        "--service-url",
+        default=None,
+        help="Remote mask service base URL. Defaults to NIMBUS_MASK_SERVICE_URL.",
+    )
     parser.add_argument("--cloud-backend", default="auto", choices=["auto", "omnicloudmask"])
     parser.add_argument("--cloud-threshold", type=float, default=0.45)
     parser.add_argument("--cloud-overwrite", action=argparse.BooleanOptionalAction, default=True)
@@ -78,7 +83,8 @@ def run(args: argparse.Namespace) -> int:
             "Either pass them explicitly or ensure the source Zarr attrs include them."
         )
 
-    client = MaskServiceClient(service_url=str(args.service_url or "").strip())
+    service_url = str(args.service_url or os.environ.get("NIMBUS_MASK_SERVICE_URL") or "").strip()
+    client = MaskServiceClient(service_url=service_url or None)
     try:
         result = client.apply_masks_to_zarr(
             zarr_uri=str(args.source_zarr_uri).strip(),

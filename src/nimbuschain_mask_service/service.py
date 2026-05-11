@@ -4,8 +4,10 @@ from typing import Any
 
 import numpy as np
 
+from nimbuschain_mask_service.channel_reader import read_required_channels_window
 from nimbuschain_mask_service.registry import CloudBackendRegistry, WaterBackendRegistry
 from nimbuschain_mask_service.runtime import resolve_inference_device
+from nimbuschain_mask_service.sensor_mapping import resolve_sensor_mask_spec
 from nimbuschain_mask_service.workflows import (
     CloudMaskWorkflowService,
     CombinedMaskWorkflowService,
