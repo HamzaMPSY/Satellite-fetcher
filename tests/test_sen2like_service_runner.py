@@ -129,6 +129,47 @@ def test_sen2like_runner_extracts_tar_products_before_invoking_pipeline(
     assert response.metadata["prepared_products"][0]["extracted"] is True
 
 
+def test_sen2like_runner_fails_before_pyspark_when_tar_input_is_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    vendor_root = tmp_path / "vendor"
+    vendor_root.mkdir()
+    (vendor_root / "Pipeline.py").write_text("print('upstream')")
+    work_dir = tmp_path / "work"
+    missing_archive = tmp_path / "LC08_MISSING.tar"
+    subprocess_called = False
+
+    def fake_vendor_root() -> Path:
+        return vendor_root
+
+    def fake_run(*_args, **_kwargs):
+        nonlocal subprocess_called
+        subprocess_called = True
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("nimbuschain_sen2like_service.runner.resolve_vendor_root", fake_vendor_root)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    response = run_sen2like(
+        Sen2LikeNormalizeRequest(
+            job_id="job-1",
+            products=[str(missing_archive)],
+            working_dir=str(work_dir),
+        )
+    )
+
+    assert subprocess_called is False
+    assert response.status == "failed"
+    assert response.return_code == -1
+    assert response.command == []
+    assert response.outputs[0].output_dir == str(work_dir / "LC08_MISSING")
+    assert response.metadata["tar_inputs_supported"] is True
+    assert response.metadata["prepared_products"][0]["extracted"] is False
+    assert response.metadata["input_issues"][0]["code"] == "input_missing"
+    assert "Landsat tar input is missing" in response.metadata["input_issues"][0]["message"]
+
+
 def test_sen2like_runner_fails_when_manifest_contains_failed_steps(
     tmp_path: Path,
     monkeypatch,

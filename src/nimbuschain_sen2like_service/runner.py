@@ -28,6 +28,7 @@ class PreparedProduct:
     command_input: str
     output_name: str
     extracted: bool
+    input_issue: dict[str, str] | None = None
 
 
 def resolve_vendor_root() -> Path:
@@ -95,10 +96,40 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
     work_dir = resolve_working_dir(request.working_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     original_products = request.product_inputs()
+    started = time.perf_counter()
     prepared_products = [
         _prepare_product_input(product, work_dir)
         for product in original_products
     ]
+    input_issues = [
+        issue
+        for product in prepared_products
+        if (issue := product.input_issue) is not None
+    ]
+    if input_issues:
+        duration = time.perf_counter() - started
+        return Sen2LikeNormalizeResponse(
+            status="failed",
+            job_id=request.job_id,
+            pipeline_id=request.pipeline_id,
+            trace_id=request.trace_id,
+            products=original_products,
+            working_dir=str(work_dir),
+            outputs=[_product_output(product, work_dir) for product in prepared_products],
+            duration_seconds=duration,
+            return_code=-1,
+            command=[],
+            stdout_tail="",
+            stderr_tail="",
+            metadata=_response_metadata(
+                vendor_root=vendor_root,
+                request=request,
+                spark_local_dirs=None,
+                prepared_products=prepared_products,
+                input_issues=input_issues,
+                output_issues=input_issues,
+            ),
+        )
 
     command = build_command(
         request,
@@ -113,7 +144,6 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
     if request.spark_master:
         env["SPARK_MASTER"] = request.spark_master
 
-    started = time.perf_counter()
     completed = subprocess.run(
         command,
         cwd=str(vendor_root),
@@ -143,23 +173,14 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
         command=command,
         stdout_tail=_tail(completed.stdout),
         stderr_tail=_tail(completed.stderr),
-        metadata={
-            "vendor_root": str(vendor_root),
-            "pipeline_py": str(pipeline_path(vendor_root)),
-            "spark_master": request.spark_master,
-            "spark_local_dirs": spark_local_dirs,
-            "pyspark_service": True,
-            "prepared_products": [
-                {
-                    "original": product.original,
-                    "command_input": product.command_input,
-                    "output_name": product.output_name,
-                    "extracted": product.extracted,
-                }
-                for product in prepared_products
-            ],
-            "output_issues": output_issues,
-        },
+        metadata=_response_metadata(
+            vendor_root=vendor_root,
+            request=request,
+            spark_local_dirs=spark_local_dirs,
+            prepared_products=prepared_products,
+            input_issues=[],
+            output_issues=output_issues,
+        ),
     )
 
 
@@ -177,8 +198,17 @@ def readiness_payload() -> dict[str, Any]:
 
 def _prepare_product_input(product: str, working_dir: Path) -> PreparedProduct:
     product_path = Path(product)
-    if _is_tar_product(product_path):
+    if _looks_like_tar_product(product_path):
         output_name = _tar_output_name(product_path)
+        input_issue = _tar_input_issue(product_path)
+        if input_issue:
+            return PreparedProduct(
+                original=product,
+                command_input=product,
+                output_name=output_name,
+                extracted=False,
+                input_issue=input_issue,
+            )
         extracted_dir = working_dir / "_inputs" / output_name
         _extract_tar_product(product_path, extracted_dir)
         return PreparedProduct(
@@ -206,6 +236,32 @@ def _product_output(product: PreparedProduct, working_dir: Path) -> Sen2LikeProd
         normalized_uri=normalized_uri,
         exists=output_dir.exists(),
     )
+
+
+def _looks_like_tar_product(path: Path) -> bool:
+    return str(path.name).lower().endswith((".tar", ".tar.gz", ".tgz"))
+
+
+def _tar_input_issue(path: Path) -> dict[str, str] | None:
+    if not path.exists():
+        return {
+            "product": str(path),
+            "code": "input_missing",
+            "message": f"Landsat tar input is missing before Sen2Like: {path}.",
+        }
+    if not path.is_file():
+        return {
+            "product": str(path),
+            "code": "input_not_file",
+            "message": f"Landsat tar input is not a file: {path}.",
+        }
+    if not _is_tar_product(path):
+        return {
+            "product": str(path),
+            "code": "input_not_tar",
+            "message": f"Landsat input is not a readable tar archive: {path}.",
+        }
+    return None
 
 
 def _is_tar_product(path: Path) -> bool:
@@ -382,6 +438,39 @@ def _spark_dir_values(configured: str) -> list[str]:
         if part.strip()
     ]
     return raw_parts or [DEFAULT_SPARK_LOCAL_DIRS]
+
+
+def _response_metadata(
+    *,
+    vendor_root: Path,
+    request: Sen2LikeNormalizeRequest,
+    spark_local_dirs: str | None,
+    prepared_products: Sequence[PreparedProduct],
+    input_issues: Sequence[dict[str, str]],
+    output_issues: Sequence[dict[str, str]],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "vendor_root": str(vendor_root),
+        "pipeline_py": str(pipeline_path(vendor_root)),
+        "spark_master": request.spark_master,
+        "spark_local_dirs": spark_local_dirs,
+        "pyspark_service": True,
+        "tar_inputs_supported": True,
+        "tar_inputs_are_extracted_before_pyspark": True,
+        "prepared_products": [
+            {
+                "original": product.original,
+                "command_input": product.command_input,
+                "output_name": product.output_name,
+                "extracted": product.extracted,
+                **({"input_issue": product.input_issue} if product.input_issue else {}),
+            }
+            for product in prepared_products
+        ],
+        "input_issues": list(input_issues),
+        "output_issues": list(output_issues),
+    }
+    return metadata
 
 
 def _tail(value: str, *, limit: int = 6000) -> str:

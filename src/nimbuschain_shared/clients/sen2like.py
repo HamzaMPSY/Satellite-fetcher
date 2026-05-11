@@ -122,7 +122,17 @@ class Sen2LikeServiceClient:
         if "no such file or directory" in lowered:
             return "Sen2Like could not find one of the input files or runtime paths."
 
-        output_issues = list(dict(detail.get("metadata") or {}).get("output_issues") or [])
+        metadata = dict(detail.get("metadata") or {})
+        input_issues = list(metadata.get("input_issues") or [])
+        if input_issues:
+            first_issue = input_issues[0]
+            if isinstance(first_issue, Mapping):
+                message = str(first_issue.get("message") or "").strip()
+                if message:
+                    return message
+            return "Sen2Like input is missing or invalid."
+
+        output_issues = list(metadata.get("output_issues") or [])
         if output_issues:
             first_issue = output_issues[0]
             if isinstance(first_issue, Mapping):
