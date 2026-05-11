@@ -76,16 +76,52 @@ def count_downloaded_products(dl_dir: Optional[str] = None):
         return 0, 0.0
     total_files = 0
     total_size_bytes = 0
-    for file_path in dl_path.rglob("*"):
+    for file_path in iter_download_files(dl_path):
         try:
-            if not file_path.is_file():
-                continue
             stat = file_path.stat()
         except OSError:
             continue
         total_files += 1
         total_size_bytes += stat.st_size
     return total_files, total_size_bytes / (1024 * 1024)
+
+
+def iter_download_files(dl_dir: str | Path | None = None):
+    dl_path = Path(dl_dir) if dl_dir else DOWNLOADS_DIR
+    if not dl_path.exists():
+        return
+
+    root = dl_path.resolve()
+    for parent, dirnames, filenames in os.walk(root, topdown=True, onerror=_ignore_scan_error):
+        parent_path = Path(parent)
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if not _skip_download_scan_dir(parent_path / dirname, root)
+        ]
+        for filename in filenames:
+            file_path = parent_path / filename
+            try:
+                if file_path.is_file():
+                    yield file_path
+            except OSError:
+                continue
+
+
+def _skip_download_scan_dir(path: Path, root: Path) -> bool:
+    try:
+        relative_parts = tuple(part.lower() for part in path.resolve().relative_to(root).parts)
+    except (OSError, ValueError):
+        relative_parts = tuple(part.lower() for part in path.parts)
+    if len(relative_parts) >= 2 and relative_parts[-2:] == ("sen2like", "spark"):
+        return True
+    if len(relative_parts) >= 3 and relative_parts[-3:-1] == ("sen2like", "spark"):
+        return True
+    return False
+
+
+def _ignore_scan_error(_error: OSError) -> None:
+    return None
 
 
 def parse_download_logs(path: Optional[str] = None):

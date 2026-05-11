@@ -18,7 +18,7 @@ from nimbuschain_fetch_ui.constants import (
     RECENT_JOBS_FETCH_LIMIT,
     RECENT_JOBS_WINDOW_HOURS,
 )
-from nimbuschain_fetch_ui.downloads import count_downloaded_products
+from nimbuschain_fetch_ui.downloads import count_downloaded_products, iter_download_files
 from nimbuschain_fetch_ui.jobs_helpers import (
     _api_request,
     _filter_recent_job_rows,
@@ -555,10 +555,8 @@ def _render_files_section(downloads_dir: Path) -> None:
 
 def _download_file_rows(downloads_dir: Path) -> list[dict[str, Any]]:
     indexed_files: list[tuple[Path, Any]] = []
-    for entry in downloads_dir.rglob("*"):
+    for entry in iter_download_files(downloads_dir):
         try:
-            if not entry.is_file():
-                continue
             stat = entry.stat()
         except OSError:
             continue
