@@ -1941,10 +1941,10 @@ def _render_job_cards(
         download_progress = float(item.get("progress", 0.0) or 0.0)
         pipeline_state = _job_pipeline_state(item)
         pipeline_progress = _job_pipeline_progress(item)
-        duration = item.get("duration_seconds")
+        duration = _job_elapsed_seconds(item)
         current_stage = _current_timeline_stage(item)
         current_stage_label = str((current_stage or {}).get("label") or "-")
-        current_stage_duration = _format_runtime_duration((current_stage or {}).get("duration_seconds"))
+        current_stage_duration = _format_runtime_duration(_stage_elapsed_seconds(current_stage or {}))
         errors = item.get("errors", []) or []
         error_summary = None
         if errors:
@@ -2192,8 +2192,12 @@ def _job_pipeline_progress(item: dict[str, Any]) -> float:
 
 
 def _format_runtime_duration(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, str) and not value.strip():
+        return "-"
     try:
-        seconds = max(0.0, float(value or 0.0))
+        seconds = max(0.0, float(value))
     except Exception:
         return "-"
     if seconds < 60.0:
@@ -2203,6 +2207,66 @@ def _format_runtime_duration(value: Any) -> str:
         return f"{minutes}m {sec:02d}s"
     hours, minute = divmod(minutes, 60)
     return f"{hours}h {minute:02d}m"
+
+
+def _job_elapsed_seconds(item: dict[str, Any]) -> float | None:
+    stage_duration = _display_stage_duration_seconds(item)
+    if stage_duration is not None:
+        return stage_duration
+
+    pipeline_metadata = dict(item.get("pipeline_metadata") or {})
+    orchestrator = dict(pipeline_metadata.get("orchestrator") or {})
+    orchestrator_duration = _elapsed_between(
+        orchestrator.get("started_at"),
+        orchestrator.get("finished_at") or item.get("updated_at"),
+    )
+    if orchestrator_duration is not None:
+        return orchestrator_duration
+
+    return item.get("duration_seconds")
+
+
+def _display_stage_duration_seconds(item: dict[str, Any]) -> float | None:
+    timeline = _pipeline_timeline_snapshot(item)
+    raw_stages = [
+        dict(stage)
+        for stage in list(timeline.get("stages") or [])
+        if isinstance(stage, dict)
+    ]
+    stages = _display_pipeline_stages(item, timeline, raw_stages)
+    durations = [
+        duration
+        for duration in (_stage_elapsed_seconds(stage) for stage in stages)
+        if duration is not None
+    ]
+    if not durations:
+        return None
+    return sum(durations)
+
+
+def _stage_elapsed_seconds(stage: dict[str, Any]) -> float | None:
+    if not stage:
+        return None
+    value = stage.get("duration_seconds")
+    if value is not None:
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+
+    status = str(stage.get("status") or "").strip().lower()
+    finished_at = stage.get("finished_at")
+    if finished_at is None and status in {"running", "queued"}:
+        finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    return _elapsed_between(stage.get("started_at"), finished_at)
+
+
+def _elapsed_between(started_at: Any, finished_at: Any) -> float | None:
+    started = _parse_iso_datetime(started_at)
+    finished = _parse_iso_datetime(finished_at)
+    if started is None or finished is None:
+        return None
+    return max(0.0, (finished - started).total_seconds())
 
 
 def _promote_timeline_stage_for_display(
@@ -3034,10 +3098,11 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
             "failed": "failed",
             "cancelled": "stopped",
         }.get(status_kind, status_kind.replace("_", " "))
-        label = html.escape(str(stage.get("label") or stage_key or "Stage"))
+        raw_label = str(stage.get("label") or stage_key or "Stage")
+        label = html.escape(raw_label)
         badge = html.escape(str(stage.get("badge") or "STEP"))
-        detail = html.escape(str(stage.get("detail_label") or label))
-        duration_label = _format_runtime_duration(stage.get("duration_seconds"))
+        detail = str(stage.get("detail_label") or raw_label)
+        duration_label = _format_runtime_duration(_stage_elapsed_seconds(stage))
         started_label = _format_status_timestamp(stage.get("started_at"))
         finished_label = _format_status_timestamp(stage.get("finished_at"))
         progress_bits: list[str] = []

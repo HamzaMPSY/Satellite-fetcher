@@ -15,6 +15,7 @@ from nimbuschain_sen2like_service.models import (
 
 
 DEFAULT_VENDOR_SUBDIR = "sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation"
+DEFAULT_SPARK_LOCAL_DIRS = "/tmp/nimbus-sen2like-spark"
 
 
 def resolve_vendor_root() -> Path:
@@ -85,6 +86,7 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
     env = os.environ.copy()
     env["LANDSAT_UPSAMPLING_BASE"] = str(vendor_root)
     env["PYTHONPATH"] = _prepend_path(str(vendor_root), env.get("PYTHONPATH"))
+    spark_local_dirs = _prepare_spark_environment(env)
     if request.spark_master:
         env["SPARK_MASTER"] = request.spark_master
 
@@ -118,6 +120,7 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
             "vendor_root": str(vendor_root),
             "pipeline_py": str(pipeline_path(vendor_root)),
             "spark_master": request.spark_master,
+            "spark_local_dirs": spark_local_dirs,
             "pyspark_service": True,
         },
     )
@@ -154,6 +157,38 @@ def _prepend_path(value: str, existing: str | None) -> str:
         return value
     parts = [value, *[part for part in existing.split(os.pathsep) if part and part != value]]
     return os.pathsep.join(parts)
+
+
+def _prepare_spark_environment(env: dict[str, str]) -> str:
+    configured = (
+        str(env.get("NIMBUS_SEN2LIKE_SPARK_DIR") or "").strip()
+        or str(env.get("SPARK_LOCAL_DIRS") or "").strip()
+        or DEFAULT_SPARK_LOCAL_DIRS
+    )
+    spark_dirs = _spark_dir_values(configured)
+    for spark_dir in spark_dirs:
+        path = Path(spark_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            path.chmod(0o777)
+        except OSError:
+            pass
+    normalized = ",".join(spark_dirs)
+    env["SPARK_LOCAL_DIRS"] = normalized
+    env.setdefault("TMPDIR", "/tmp")
+    env.setdefault("PYSPARK_PYTHON", sys.executable)
+    env.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+    return normalized
+
+
+def _spark_dir_values(configured: str) -> list[str]:
+    raw_parts = [
+        part.strip()
+        for item in str(configured or DEFAULT_SPARK_LOCAL_DIRS).split(os.pathsep)
+        for part in item.split(",")
+        if part.strip()
+    ]
+    return raw_parts or [DEFAULT_SPARK_LOCAL_DIRS]
 
 
 def _tail(value: str, *, limit: int = 6000) -> str:

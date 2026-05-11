@@ -151,8 +151,9 @@ services:
       NIMBUS_DATA_DIR: /data/downloads
       NIMBUS_SEN2LIKE_WORK_DIR: ${NIMBUS_SEN2LIKE_WORK_DIR:-/data/downloads/sen2like}
       NIMBUS_SEN2LIKE_VENDOR_DIR: /app/sen2like
+      NIMBUS_SEN2LIKE_SPARK_DIR: ${NIMBUS_SEN2LIKE_SPARK_DIR:-/tmp/nimbus-sen2like-spark}
       LANDSAT_UPSAMPLING_BASE: /app/sen2like
-      SPARK_LOCAL_DIRS: /data/downloads/sen2like/spark
+      SPARK_LOCAL_DIRS: ${NIMBUS_SEN2LIKE_SPARK_DIR:-/tmp/nimbus-sen2like-spark}
     volumes:
       - ./data:/data
     healthcheck:

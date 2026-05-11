@@ -98,8 +98,40 @@ class Sen2LikeServiceClient:
     def _error_detail(payload: Mapping[str, Any], response: requests.Response, *, prefix: str) -> str:
         detail = payload.get("detail")
         if detail:
+            if isinstance(detail, Mapping):
+                return f"{prefix}: {Sen2LikeServiceClient._summarize_structured_error(detail)}"
             return f"{prefix}: {detail}"
         text = str(getattr(response, "text", "") or "").strip()
         if text:
             return f"{prefix}: HTTP {response.status_code}: {text[:500]}"
         return f"{prefix}: HTTP {response.status_code}"
+
+    @staticmethod
+    def _summarize_structured_error(detail: Mapping[str, Any]) -> str:
+        stderr_tail = str(detail.get("stderr_tail") or "").strip()
+        lowered = stderr_tail.lower()
+        if "failed to create a temp directory" in lowered:
+            spark_dir = str(
+                dict(detail.get("metadata") or {}).get("spark_local_dirs")
+                or ""
+            ).strip()
+            suffix = f" ({spark_dir})" if spark_dir else ""
+            return f"Spark could not create its temporary directory{suffix}."
+        if "permission denied" in lowered:
+            return "Sen2Like could not write to one of its working directories."
+        if "no such file or directory" in lowered:
+            return "Sen2Like could not find one of the input files or runtime paths."
+
+        return_code = detail.get("return_code")
+        duration = detail.get("duration_seconds")
+        bits = ["Sen2Like subprocess failed"]
+        if return_code is not None:
+            bits.append(f"exit code {return_code}")
+        if duration is not None:
+            try:
+                bits.append(f"{float(duration):.1f}s")
+            except (TypeError, ValueError):
+                pass
+        if len(bits) == 1:
+            return f"{bits[0]}."
+        return f"{bits[0]} after {', '.join(bits[1:])}."

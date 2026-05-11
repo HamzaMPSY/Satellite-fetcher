@@ -467,6 +467,11 @@ iframe[title="leaflet_map"] {
     font-size: 0.80rem;
     line-height: 1.5;
     color: #cbd5e1;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
 }
 .nimbus-stage-pills {
     display: flex;

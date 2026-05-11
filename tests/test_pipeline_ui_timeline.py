@@ -5,6 +5,8 @@ from nimbuschain_fetch_ui.app import (
     _conversion_progress_snapshot,
     _cube_mode_from_payload,
     _display_pipeline_stages,
+    _format_runtime_duration,
+    _job_elapsed_seconds,
     _mask_types_from_payload,
     _pipeline_timeline_snapshot,
     _timeline_breakdown_rows,
@@ -202,6 +204,68 @@ def test_pipeline_display_prefers_modular_stage_results() -> None:
     assert display_stages[0]["detail_label"] == "Provider fetch · 1 output"
     assert display_stages[1]["detail_label"] == "Skipped: sen2like runtime not routed yet"
     assert display_stages[2]["duration_seconds"] == 5.0
+
+
+def test_pipeline_display_compacts_structured_sen2like_errors() -> None:
+    item = {
+        "pipeline_metadata": {
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "sen2like", "depends_on": ["fetch"]},
+            ],
+            "stage_results": [
+                {
+                    "name": "fetch",
+                    "status": "succeeded",
+                    "outputs": ["/data/raw/LC08"],
+                    "duration_seconds": 2.5,
+                },
+                {
+                    "name": "sen2like",
+                    "status": "failed",
+                    "error": (
+                        "Sen2Like service failed: {&#x27;status&#x27;: &#x27;failed&#x27;, "
+                        "&#x27;duration_seconds&#x27;: 2.49, &#x27;return_code&#x27;: 1, "
+                        "&#x27;stderr_tail&#x27;: &#x27;java.io.IOException: Failed to create "
+                        "a temp directory under /data/downloads/sen2like/spark&#x27;}"
+                    ),
+                    "duration_seconds": 2.49,
+                },
+            ],
+        },
+    }
+
+    display_stages = _display_pipeline_stages(item, {}, [])
+
+    assert display_stages[1]["detail_label"] == "Spark could not create its temporary directory."
+
+
+def test_job_elapsed_prefers_stage_runtime_over_stale_row_duration() -> None:
+    item = {
+        "state": "failed",
+        "pipeline_state": "sen2like_failed",
+        "duration_seconds": 8 * 60 * 60,
+        "pipeline_metadata": {
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "sen2like", "depends_on": ["fetch"]},
+                {"name": "zarr", "depends_on": ["sen2like"]},
+            ],
+            "stage_results": [
+                {"name": "fetch", "status": "succeeded", "duration_seconds": 926.0},
+                {"name": "sen2like", "status": "failed", "duration_seconds": 2.5, "error": "boom"},
+                {
+                    "name": "zarr",
+                    "status": "skipped",
+                    "duration_seconds": 0.0,
+                    "metadata": {"reason": "dependency_not_succeeded"},
+                },
+            ],
+        },
+    }
+
+    assert _job_elapsed_seconds(item) == 928.5
+    assert _format_runtime_duration(_job_elapsed_seconds(item)) == "15m 28s"
 
 
 def test_pipeline_timeline_snapshot_heals_terminal_display_gaps(monkeypatch) -> None:

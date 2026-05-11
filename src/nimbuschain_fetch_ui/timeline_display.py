@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import html
 from typing import Any
 
 
@@ -132,7 +134,7 @@ def _stage_result_to_display_stage(
     reason = str(metadata.get("reason") or "").strip()
     error = str(result.get("error") or "").strip()
     if error:
-        detail_label = error
+        detail_label = _stage_error_summary(error)
     elif status == "skipped" and reason:
         detail_label = f"Skipped: {reason.replace('_', ' ')}"
     elif outputs:
@@ -153,6 +155,72 @@ def _stage_result_to_display_stage(
         "metadata": metadata,
         "index": index,
     }
+
+
+def _stage_error_summary(error: str) -> str:
+    text = html.unescape(str(error or "").strip())
+    if not text:
+        return "Stage failed."
+
+    structured = _extract_structured_error(text)
+    if structured:
+        return _structured_error_summary(structured)
+
+    lowered = text.lower()
+    if "failed to create a temp directory" in lowered:
+        return "Spark could not create its temporary directory."
+    if "inappropriate content detected" in lowered:
+        return "Provider rejected the search query."
+    if "permission denied" in lowered:
+        return "Stage could not write to a required directory."
+    if "no such file or directory" in lowered:
+        return "Stage could not find an input file or runtime path."
+    return _compact_error_text(text)
+
+
+def _extract_structured_error(text: str) -> dict[str, Any]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        value = ast.literal_eval(text[start : end + 1])
+    except (SyntaxError, ValueError):
+        return {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _structured_error_summary(payload: dict[str, Any]) -> str:
+    stderr_tail = str(payload.get("stderr_tail") or "").strip()
+    lowered = stderr_tail.lower()
+    if "failed to create a temp directory" in lowered:
+        return "Spark could not create its temporary directory."
+    if "permission denied" in lowered:
+        return "Sen2Like could not write to a required directory."
+    if "no such file or directory" in lowered:
+        return "Sen2Like could not find an input file or runtime path."
+
+    status = str(payload.get("status") or "").strip().lower()
+    return_code = payload.get("return_code")
+    duration = payload.get("duration_seconds")
+    if status == "failed" or return_code not in (None, 0, "0"):
+        bits = ["Sen2Like subprocess failed"]
+        if return_code is not None:
+            bits.append(f"exit code {return_code}")
+        if duration is not None:
+            try:
+                bits.append(f"{float(duration):.1f}s")
+            except (TypeError, ValueError):
+                pass
+        return f"{bits[0]} ({', '.join(bits[1:])})." if len(bits) > 1 else f"{bits[0]}."
+    return _compact_error_text(str(payload.get("error") or payload.get("detail") or "Stage failed."))
+
+
+def _compact_error_text(text: str, *, limit: int = 170) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "..."
 
 
 def _requires_sen2like(item: dict[str, Any]) -> bool:

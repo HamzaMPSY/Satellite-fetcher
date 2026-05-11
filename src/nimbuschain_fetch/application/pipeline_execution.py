@@ -174,8 +174,9 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
         result: dict[str, Any],
         plan: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        result_payload = result
         result_pipeline_metadata = PipelineMetadataRecord.from_mapping(
-            result.get("pipeline_metadata")
+            result_payload.get("pipeline_metadata")
         )
         row_pipeline_metadata = PipelineMetadataRecord.from_mapping(
             row.get("pipeline_metadata")
@@ -189,118 +190,139 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
             for item in list(timeline.get("stages") or [])
             if isinstance(item, dict)
         ]
-        raw_outputs = _string_list(result.get("raw_outputs") or row.get("raw_outputs"))
-        zarr_outputs = _string_list(result.get("zarr_outputs") or row.get("zarr_outputs"))
-        cube_outputs = _string_list(result.get("cube_outputs") or row.get("cube_outputs"))
+        raw_outputs = _string_list(result_payload.get("raw_outputs") or row.get("raw_outputs"))
+        zarr_outputs = _string_list(result_payload.get("zarr_outputs") or row.get("zarr_outputs"))
+        cube_outputs = _string_list(result_payload.get("cube_outputs") or row.get("cube_outputs"))
         masked_outputs = _string_list(
-            result.get("masked_zarr_outputs") or row.get("masked_zarr_outputs")
+            result_payload.get("masked_zarr_outputs") or row.get("masked_zarr_outputs")
         )
-        water_outputs = _string_list(result.get("watermask_outputs") or row.get("watermask_outputs"))
-        cloud_outputs = _string_list(result.get("cloudmask_outputs") or row.get("cloudmask_outputs"))
+        water_outputs = _string_list(result_payload.get("watermask_outputs") or row.get("watermask_outputs"))
+        cloud_outputs = _string_list(result_payload.get("cloudmask_outputs") or row.get("cloudmask_outputs"))
         job_state = str(row.get("state") or "").strip().lower()
         pipeline_state = str(row.get("pipeline_state") or "").strip().lower()
         errors = _string_list(row.get("errors"))
         results: list[dict[str, Any]] = []
-        for stage_name in [str(item.get("name") or "").strip() for item in plan]:
+        results_by_name: dict[str, dict[str, Any]] = {}
+        for plan_item in plan:
+            stage_name = str(plan_item.get("name") or "").strip()
             if not stage_name:
                 continue
-            if stage_name == "fetch":
-                results.append(
-                    _stage_result_dict(
-                        "fetch",
-                        status=_status_from_outputs(
-                            raw_outputs,
-                            job_state=job_state,
-                            fallback=_combined_timeline_status(timeline_stages, ["search", "download"]),
-                        ),
-                        outputs=raw_outputs,
-                        timeline_stages=_select_timeline_stages(timeline_stages, ["search", "download"]),
-                        metadata={"runner": "provider_download"},
-                        error=_stage_error(job_state, errors, has_outputs=bool(raw_outputs)),
-                    )
+            blocked_by = [
+                str(dependency)
+                for dependency in list(plan_item.get("depends_on") or [])
+                if _stage_blocks_downstream(results_by_name.get(str(dependency)))
+            ]
+            if blocked_by:
+                stage_result = _stage_result_dict(
+                    stage_name,
+                    status=StageStatus.skipped.value,
+                    outputs=[],
+                    timeline_stages=[],
+                    metadata={
+                        "reason": "dependency_not_succeeded",
+                        "blocked_by": blocked_by,
+                    },
                 )
+                results.append(stage_result)
+                results_by_name[stage_name] = stage_result
+                continue
+            if stage_name == "fetch":
+                stage_result = _stage_result_dict(
+                    "fetch",
+                    status=_status_from_outputs(
+                        raw_outputs,
+                        job_state=job_state,
+                        fallback=_combined_timeline_status(timeline_stages, ["search", "download"]),
+                    ),
+                    outputs=raw_outputs,
+                    timeline_stages=_select_timeline_stages(timeline_stages, ["search", "download"]),
+                    metadata={"runner": "provider_download"},
+                    error=_stage_error(job_state, errors, has_outputs=bool(raw_outputs)),
+                )
+                results.append(stage_result)
+                results_by_name[stage_name] = stage_result
             elif stage_name == "sen2like":
                 sen2like_outputs = _string_list(
                     pipeline_metadata.get("sen2like_outputs")
-                    or result.get("sen2like_outputs")
+                    or result_payload.get("sen2like_outputs")
                 )
                 sen2like_timeline_stages = _select_timeline_stages(timeline_stages, ["sen2like"])
                 sen2like_status = str(pipeline_metadata.get("sen2like_status") or "").strip().lower()
                 sen2like_error = str(pipeline_metadata.get("sen2like_error") or "").strip()
                 if sen2like_outputs:
-                    results.append(
-                        _stage_result_dict(
-                            "sen2like",
-                            status=StageStatus.succeeded.value,
-                            outputs=sen2like_outputs,
-                            timeline_stages=sen2like_timeline_stages,
-                            metadata={
-                                "runner": "sen2like_service",
-                                "service_url": pipeline_metadata.get("sen2like_service_url"),
-                            },
-                        )
+                    stage_result = _stage_result_dict(
+                        "sen2like",
+                        status=StageStatus.succeeded.value,
+                        outputs=sen2like_outputs,
+                        timeline_stages=sen2like_timeline_stages,
+                        metadata={
+                            "runner": "sen2like_service",
+                            "service_url": pipeline_metadata.get("sen2like_service_url"),
+                        },
                     )
+                    results.append(stage_result)
+                    results_by_name[stage_name] = stage_result
                 elif sen2like_status == "failed" or pipeline_state == "sen2like_failed":
-                    results.append(
-                        _stage_result_dict(
-                            "sen2like",
-                            status=StageStatus.failed.value,
-                            outputs=[],
-                            timeline_stages=sen2like_timeline_stages,
-                            metadata={
-                                "runner": "sen2like_service",
-                                "service_url": pipeline_metadata.get("sen2like_service_url"),
-                            },
-                            error=sen2like_error or _stage_error(
-                                job_state,
-                                errors,
-                                has_outputs=False,
-                            ),
-                        )
+                    stage_result = _stage_result_dict(
+                        "sen2like",
+                        status=StageStatus.failed.value,
+                        outputs=[],
+                        timeline_stages=sen2like_timeline_stages,
+                        metadata={
+                            "runner": "sen2like_service",
+                            "service_url": pipeline_metadata.get("sen2like_service_url"),
+                        },
+                        error=sen2like_error or _stage_error(
+                            job_state,
+                            errors,
+                            has_outputs=False,
+                        ),
                     )
+                    results.append(stage_result)
+                    results_by_name[stage_name] = stage_result
                 else:
-                    results.append(
-                        _stage_result_dict(
-                            "sen2like",
-                            status=StageStatus.skipped.value,
-                            outputs=[],
-                            timeline_stages=[],
-                            metadata={
-                                "reason": "sen2like_runtime_not_routed_yet",
-                                "runner": "pending_service_routing",
-                            },
-                        )
+                    stage_result = _stage_result_dict(
+                        "sen2like",
+                        status=StageStatus.skipped.value,
+                        outputs=[],
+                        timeline_stages=[],
+                        metadata={
+                            "reason": "sen2like_runtime_not_routed_yet",
+                            "runner": "pending_service_routing",
+                        },
                     )
+                    results.append(stage_result)
+                    results_by_name[stage_name] = stage_result
             elif stage_name == "zarr":
                 if pipeline_state == "sen2like_failed":
-                    results.append(
-                        _stage_result_dict(
-                            "zarr",
-                            status=StageStatus.skipped.value,
-                            outputs=[],
-                            timeline_stages=[],
-                            metadata={
-                                "runner": "zarr_service",
-                                "reason": "dependency_not_succeeded",
-                                "blocked_by": ["sen2like"],
-                            },
-                        )
-                    )
-                    continue
-                results.append(
-                    _stage_result_dict(
+                    stage_result = _stage_result_dict(
                         "zarr",
-                        status=_status_from_outputs(
-                            zarr_outputs,
-                            job_state=job_state,
-                            fallback=_combined_timeline_status(timeline_stages, ["convert", "ready"]),
-                        ),
-                        outputs=zarr_outputs,
-                        timeline_stages=_select_timeline_stages(timeline_stages, ["convert", "ready"]),
-                        metadata={"runner": "zarr_service"},
-                        error=_stage_error(job_state, errors, has_outputs=bool(zarr_outputs)),
+                        status=StageStatus.skipped.value,
+                        outputs=[],
+                        timeline_stages=[],
+                        metadata={
+                            "runner": "zarr_service",
+                            "reason": "dependency_not_succeeded",
+                            "blocked_by": ["sen2like"],
+                        },
                     )
+                    results.append(stage_result)
+                    results_by_name[stage_name] = stage_result
+                    continue
+                stage_result = _stage_result_dict(
+                    "zarr",
+                    status=_status_from_outputs(
+                        zarr_outputs,
+                        job_state=job_state,
+                        fallback=_combined_timeline_status(timeline_stages, ["convert", "ready"]),
+                    ),
+                    outputs=zarr_outputs,
+                    timeline_stages=_select_timeline_stages(timeline_stages, ["convert", "ready"]),
+                    metadata={"runner": "zarr_service"},
+                    error=_stage_error(job_state, errors, has_outputs=bool(zarr_outputs)),
                 )
+                results.append(stage_result)
+                results_by_name[stage_name] = stage_result
             elif stage_name == "mask":
                 mask_outputs = [*masked_outputs, *water_outputs, *cloud_outputs]
                 mask_status = str(pipeline_metadata.get("mask_status") or "").strip().lower()
@@ -327,6 +349,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                         error=_stage_error(job_state, errors, has_outputs=status == StageStatus.succeeded.value),
                     )
                 )
+                results_by_name[stage_name] = results[-1]
             elif stage_name == "cube":
                 status = (
                     StageStatus.succeeded.value
@@ -350,6 +373,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                         error=_stage_error(job_state, errors, has_outputs=status == StageStatus.succeeded.value),
                     )
                 )
+                results_by_name[stage_name] = results[-1]
         return results
 
 
@@ -419,6 +443,18 @@ def _stage_status_from_timeline(status: str) -> str:
     if normalized in {"failed", "cancelled"}:
         return StageStatus.failed.value
     return StageStatus.skipped.value
+
+
+def _stage_blocks_downstream(stage_result: dict[str, Any] | None) -> bool:
+    if not stage_result:
+        return False
+    status = str(stage_result.get("status") or "").strip().lower()
+    if status in {StageStatus.failed.value, "cancelled"}:
+        return True
+    if status != StageStatus.skipped.value:
+        return False
+    metadata = dict(stage_result.get("metadata") or {})
+    return str(metadata.get("reason") or "").strip().lower() == "dependency_not_succeeded"
 
 
 def _status_from_outputs(
