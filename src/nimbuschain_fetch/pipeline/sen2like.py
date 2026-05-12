@@ -59,8 +59,8 @@ class Sen2LikeStage:
                 },
             )
 
-        landsat_input = self._landsat_input(context)
-        if not landsat_input:
+        landsat_inputs = self._landsat_inputs(context)
+        if not landsat_inputs:
             return StageResult.skipped_result(
                 self.name,
                 reason="sen2like_input_missing",
@@ -76,7 +76,16 @@ class Sen2LikeStage:
                 },
             )
 
-        payload = self._normalize(configured_url, context, landsat_input)
+        try:
+            payload = self._normalize(configured_url, context, landsat_inputs)
+        except Exception as exc:
+            return self._fallback_to_raw(
+                context,
+                configured_url=configured_url,
+                landsat_inputs=landsat_inputs,
+                reason="sen2like_service_failed",
+                error=exc,
+            )
         outputs = [
             str(item.get("normalized_uri") or item.get("output_dir"))
             for item in list(payload.get("outputs") or [])
@@ -88,10 +97,20 @@ class Sen2LikeStage:
             "product_type": context.product_type,
             "service_url": configured_url,
             "service_url_configured": True,
-            "landsat_input": landsat_input,
+            "landsat_input": landsat_inputs[0],
+            "landsat_inputs": landsat_inputs,
             "sen2like_response": payload,
         }
-        resolved_outputs = outputs or [f"stage://{self.name}/{context.job_id or 'manual'}"]
+        if not outputs:
+            return self._fallback_to_raw(
+                context,
+                configured_url=configured_url,
+                landsat_inputs=landsat_inputs,
+                reason="sen2like_output_missing",
+                response=payload,
+            )
+
+        resolved_outputs = outputs
         context.set("sen2like_outputs", resolved_outputs)
         context.set("zarr_inputs", resolved_outputs)
         return StageResult.succeeded_result(
@@ -107,22 +126,69 @@ class Sen2LikeStage:
         value = str(raw_value or "").strip()
         return value or None
 
+    def _fallback_to_raw(
+        self,
+        context: PipelineContext,
+        *,
+        configured_url: str,
+        landsat_inputs: list[str],
+        reason: str,
+        error: Exception | None = None,
+        response: dict[str, Any] | None = None,
+    ) -> StageResult:
+        metadata: dict[str, Any] = {
+            "provider": context.provider,
+            "collection": context.collection,
+            "product_type": context.product_type,
+            "service_url": configured_url,
+            "service_url_configured": True,
+            "landsat_input": landsat_inputs[0],
+            "landsat_inputs": landsat_inputs,
+            "fallback_to_raw": True,
+            "fallback_reason": reason,
+        }
+        if error is not None:
+            metadata["fallback_error"] = str(error)
+            metadata["fallback_error_type"] = type(error).__name__
+        if response is not None:
+            metadata["sen2like_response"] = response
+        context.set("sen2like_outputs", landsat_inputs)
+        context.set("zarr_inputs", landsat_inputs)
+        context.set("sen2like_fallback_to_raw", True)
+        return StageResult.succeeded_result(
+            self.name,
+            outputs=landsat_inputs,
+            metadata=metadata,
+        )
+
     @staticmethod
-    def _landsat_input(context: PipelineContext) -> str | None:
+    def _landsat_inputs(context: PipelineContext) -> list[str]:
+        values: list[str] = []
         for key in ("landsat_path", "raw_uri", "source_uri", "product_path"):
             value = context.payload.get(key)
             if value:
-                return str(value).strip()
+                values.append(str(value).strip())
             value = context.get(key)
             if value:
-                return str(value).strip()
-        return None
+                values.append(str(value).strip())
+        for key in ("landsat_paths", "raw_uris", "source_uris", "product_paths", "raw_outputs"):
+            raw_values = context.payload.get(key) or context.get(key)
+            if isinstance(raw_values, (list, tuple, set)):
+                values.extend(str(item).strip() for item in raw_values)
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for value in values:
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
 
     @staticmethod
     def _normalize(
         service_url: str,
         context: PipelineContext,
-        landsat_input: str,
+        landsat_inputs: list[str],
     ) -> dict[str, Any]:
         global Sen2LikeServiceClient
         if Sen2LikeServiceClient is None:
@@ -133,7 +199,7 @@ class Sen2LikeStage:
         client = Sen2LikeServiceClient(service_url=service_url)
         try:
             return client.normalize(
-                products=[landsat_input],
+                products=landsat_inputs,
                 job_id=context.job_id or None,
                 pipeline_id=str(context.payload.get("pipeline_id") or "") or None,
                 trace_id=str(context.payload.get("trace_id") or "") or None,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import threading
 import time
 from datetime import date
@@ -19,7 +18,6 @@ from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.models import (
     ArtifactUpsertRequest,
     ArtifactType,
-    JobConvertRequest,
     JobState,
     PipelineState,
     ProviderName,
@@ -172,6 +170,28 @@ class FakeZarrConverter:
         )
 
 
+class DailyMosaicRejectingZarrConverter(FakeZarrConverter):
+    def build_grouped_cubes(
+        self,
+        *,
+        cube_layout: str = "grouped_time",
+        **_kwargs,
+    ) -> dict[str, object]:
+        if cube_layout == "daily_mosaic":
+            raise ValueError(
+                "Zarr cube build request was rejected: Daily mosaic cube is currently "
+                "supported only for Sentinel-2 scene Zarr inputs."
+            )
+        return {
+            "status": "skipped",
+            "reason": "no_groups_with_multiple_times",
+            "cube_outputs": [],
+            "items": [],
+            "tiles_built": [],
+            "tiles_skipped": [],
+        }
+
+
 class FakeSen2LikeClient:
     calls: list[dict[str, object]] = []
 
@@ -227,6 +247,15 @@ class FailingSen2LikeClient(FakeSen2LikeClient):
     def normalize(self, **_kwargs) -> dict[str, object]:
         type(self).calls.append(dict(_kwargs))
         raise RuntimeError("sen2like exploded")
+
+
+class MemoryKilledSen2LikeClient(FakeSen2LikeClient):
+    def normalize(self, **_kwargs) -> dict[str, object]:
+        type(self).calls.append(dict(_kwargs))
+        raise RuntimeError(
+            "Sen2Like was killed during processing, most likely because the "
+            "Podman VM or Sen2Like container does not have enough memory."
+        )
 
 
 class FakeMaskService:
@@ -763,6 +792,7 @@ def test_landsat_job_routes_zarr_input_through_sen2like_service(monkeypatch, tmp
             "nimbus_data_dir": tmp_path / "downloads",
             "nimbus_sen2like_service_url": "http://sen2like.test",
             "nimbus_sen2like_work_dir": str(tmp_path / "sen2like"),
+            "nimbus_sen2like_raw_fallback": False,
         }
     )
     fetcher = NimbusFetcher(
@@ -891,6 +921,110 @@ def test_landsat_job_fails_at_sen2like_before_zarr(monkeypatch, tmp_path: Path) 
     assert stage_results["sen2like"]["status"] == "failed"
     assert stage_results["zarr"]["status"] == "skipped"
     assert stage_results["zarr"]["metadata"]["blocked_by"] == ["sen2like"]
+
+
+def test_landsat_job_falls_back_to_raw_when_sen2like_runs_out_of_memory(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "nimbus_runtime_role": "all",
+            "nimbus_db_backend": "sqlite",
+            "nimbus_db_path": tmp_path / "nimbus.db",
+            "nimbus_data_dir": tmp_path / "downloads",
+            "nimbus_sen2like_service_url": "http://sen2like.test",
+            "nimbus_sen2like_work_dir": str(tmp_path / "sen2like"),
+            "nimbus_sen2like_raw_fallback": True,
+        }
+    )
+    fetcher = NimbusFetcher(
+        settings=settings,
+        provider_registry={"usgs": FakeUsgsProvider},
+    )
+    converter = FakeZarrConverter()
+    fetcher._zarr_converter = converter
+    MemoryKilledSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        MemoryKilledSen2LikeClient,
+    )
+
+    with NimbusFetcherClient(mode="direct", fetcher=fetcher) as client:
+        job_id = client.submit_job(_landsat_request_payload())
+        final_status = _wait_for_completion(client, job_id)
+        result = client.get_result(job_id)
+
+    assert final_status.state == JobState.succeeded
+    assert final_status.pipeline_state == PipelineState.zarr_written
+    assert final_status.raw_outputs
+    assert final_status.zarr_outputs
+    assert result.pipeline_metadata["sen2like_status"] == "raw_fallback"
+    assert result.pipeline_metadata["sen2like_fallback_reason"] == "sen2like_resource_exhausted"
+    assert result.pipeline_metadata["zarr_input_source"] == "raw"
+    assert result.pipeline_metadata["zarr_input_outputs"] == final_status.raw_outputs
+    assert converter.calls
+    assert converter.calls[-1]["provider"] == "usgs"
+    assert converter.calls[-1]["collection"] == "landsat_ot_c2_l1"
+    assert converter.calls[-1]["raw_uri"] == final_status.raw_outputs[0]
+
+
+def test_unsupported_daily_mosaic_cube_does_not_block_integrated_masks(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "nimbus_runtime_role": "all",
+            "nimbus_db_backend": "sqlite",
+            "nimbus_db_path": tmp_path / "nimbus.db",
+            "nimbus_data_dir": tmp_path / "downloads",
+            "nimbus_sen2like_service_url": "http://sen2like.test",
+            "nimbus_sen2like_work_dir": str(tmp_path / "sen2like"),
+            "nimbus_sen2like_raw_fallback": True,
+        }
+    )
+    fetcher = NimbusFetcher(
+        settings=settings,
+        provider_registry={"usgs": FakeUsgsProvider},
+    )
+    fetcher._zarr_converter = DailyMosaicRejectingZarrConverter()
+    fetcher._mask_service = RemoteLikeMaskService(fetcher)
+    MemoryKilledSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        MemoryKilledSen2LikeClient,
+    )
+    payload = _landsat_request_payload().model_dump()
+    payload.update(
+        {
+            "cube_mode": "before_mask",
+            "cube_layout": "daily_mosaic",
+            "mask_types": ["water", "cloud"],
+        }
+    )
+    request = SearchDownloadRequest.model_validate(payload)
+
+    with NimbusFetcherClient(mode="direct", fetcher=fetcher) as client:
+        job_id = client.submit_job(request)
+        final_status = _wait_for_completion(client, job_id)
+        result = client.get_result(job_id)
+
+    assert final_status.state == JobState.succeeded
+    assert final_status.pipeline_state == PipelineState.masked_zarr_written
+    assert result.pipeline_metadata["cube_status"] == "skipped"
+    assert "Daily mosaic cube is currently supported only for Sentinel-2" in str(
+        result.pipeline_metadata["cube_reason"]
+    )
+    assert result.pipeline_metadata["mask_status"] == "written"
+    assert result.pipeline_metadata["mask_completed_scenes"] == 1
+
+    event_types = [row["type"] for row in fetcher.store.list_events(job_id, None, 200)]
+    assert "job.cube_skipped" in event_types
+    assert "job.cube_failed" not in event_types
+    assert "job.mask_completed" in event_types
 
 
 def test_single_job_can_continue_with_integrated_masking(pipeline_runtime) -> None:

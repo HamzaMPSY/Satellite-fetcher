@@ -106,13 +106,14 @@ def _display_stages_from_stage_results(item: dict[str, Any]) -> list[dict[str, A
             ordered_names.append(name)
 
     display_stages = [
-        _stage_result_to_display_stage(name, results_by_name.get(name) or {}, index)
+        _stage_result_to_display_stage(item, name, results_by_name.get(name) or {}, index)
         for index, name in enumerate(ordered_names)
     ]
     return [stage for stage in display_stages if stage.get("key")]
 
 
 def _stage_result_to_display_stage(
+    item: dict[str, Any],
     name: str,
     result: dict[str, Any],
     index: int,
@@ -125,6 +126,11 @@ def _stage_result_to_display_stage(
         str(result.get("status") or "pending").strip().lower(),
         str(result.get("status") or "pending").strip().lower() or "pending",
     )
+    pipeline_metadata = dict(item.get("pipeline_metadata") or {})
+    pipeline_state = str(item.get("pipeline_state") or "").strip().lower()
+    job_state = str(item.get("state") or "").strip().lower()
+    cube_status = str(pipeline_metadata.get("cube_status") or "").strip().lower()
+    mask_status = str(pipeline_metadata.get("mask_status") or "").strip().lower()
     outputs = [
         str(output)
         for output in list(result.get("outputs") or [])
@@ -133,6 +139,24 @@ def _stage_result_to_display_stage(
     metadata = dict(result.get("metadata") or {})
     reason = str(metadata.get("reason") or "").strip()
     error = str(result.get("error") or "").strip()
+    if name == "cube" and cube_status == "skipped":
+        status = "skipped"
+        error = ""
+        if not reason:
+            reason = _cube_skip_reason_label(result)
+    elif name == "mask" and (
+        mask_status == "written"
+        or (job_state == "succeeded" and pipeline_state == "masked_zarr_written")
+    ):
+        status = "done"
+        error = ""
+        reason = ""
+        if not outputs:
+            outputs = [
+                str(output)
+                for output in list(item.get("zarr_outputs") or pipeline_metadata.get("zarr_outputs") or [])
+                if str(output).strip()
+            ]
     if error:
         detail_label = _stage_error_summary(error)
     elif status == "skipped" and reason:
@@ -155,6 +179,13 @@ def _stage_result_to_display_stage(
         "metadata": metadata,
         "index": index,
     }
+
+
+def _cube_skip_reason_label(result: dict[str, Any]) -> str:
+    error = str(result.get("error") or "").strip().lower()
+    if "daily mosaic cube" in error and "sentinel-2" in error:
+        return "daily mosaic cubes currently require Sentinel-2 scene inputs"
+    return "optional cube stage not required for these outputs"
 
 
 def _stage_error_summary(error: str) -> str:

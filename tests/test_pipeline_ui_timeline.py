@@ -206,6 +206,53 @@ def test_pipeline_display_prefers_modular_stage_results() -> None:
     assert display_stages[2]["duration_seconds"] == 5.0
 
 
+def test_pipeline_display_heals_optional_cube_skip_after_resumed_masks() -> None:
+    item = {
+        "state": "succeeded",
+        "pipeline_state": "masked_zarr_written",
+        "zarr_outputs": [
+            "/data/zarr/a.zarr",
+            "/data/zarr/b.zarr",
+        ],
+        "pipeline_metadata": {
+            "cube_status": "skipped",
+            "mask_status": "written",
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "zarr", "depends_on": ["fetch"]},
+                {"name": "cube", "depends_on": ["zarr"]},
+                {"name": "mask", "depends_on": ["cube"]},
+            ],
+            "stage_results": [
+                {"name": "fetch", "status": "succeeded", "outputs": ["/data/raw/a.tar"]},
+                {"name": "zarr", "status": "succeeded", "outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"]},
+                {
+                    "name": "cube",
+                    "status": "failed",
+                    "error": (
+                        "Zarr cube build request was rejected: Daily mosaic cube is currently "
+                        "supported only for Sentinel-2 scene Zarr inputs."
+                    ),
+                },
+                {
+                    "name": "mask",
+                    "status": "skipped",
+                    "metadata": {"reason": "dependency_not_succeeded"},
+                },
+            ],
+        },
+    }
+
+    display_stages = _display_pipeline_stages(item, {}, [])
+
+    assert [stage["key"] for stage in display_stages] == ["fetch", "zarr", "cube", "mask"]
+    assert [stage["status"] for stage in display_stages] == ["done", "done", "skipped", "done"]
+    assert display_stages[2]["detail_label"] == (
+        "Skipped: daily mosaic cubes currently require Sentinel-2 scene inputs"
+    )
+    assert display_stages[3]["detail_label"] == "Integrated masking · 2 outputs"
+
+
 def test_pipeline_display_compacts_structured_sen2like_errors() -> None:
     item = {
         "pipeline_metadata": {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import nimbuschain_fetch.pipeline.runners as pipeline_runners
+import nimbuschain_fetch.pipeline.sen2like as sen2like_module
 from nimbuschain_fetch.stage_cli import main
 
 
@@ -268,3 +269,79 @@ def test_stage_cli_run_stage_chains_existing_zarr_mask_and_cube(monkeypatch, cap
     assert captured["target_resolution_m"] == 20
     assert captured["overlap_policy"] == "latest"
     assert payload["results"][-1]["outputs"] == ["/data/cubes/T31UDQ.zarr"]
+
+
+def test_stage_cli_landsat_runtime_falls_back_to_raw_when_sen2like_fails(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {"convert_calls": []}
+
+    class FakeSen2LikeClient:
+        def __init__(self, *, service_url: str):
+            captured["sen2like_service_url"] = service_url
+
+        def normalize(self, **kwargs):
+            captured["sen2like_products"] = list(kwargs["products"])
+            raise RuntimeError("Sen2Like was killed")
+
+        def close(self) -> None:
+            captured["sen2like_closed"] = True
+
+    class FakeZarrClient:
+        def __init__(self, *, service_url: str):
+            captured["zarr_service_url"] = service_url
+
+        def convert(self, **kwargs):
+            captured["convert_calls"].append(kwargs)
+            return (
+                kwargs["output_uri"],
+                "optical",
+                {"scene_id": kwargs["scene_id"]},
+                {"acquisition_datetime": "2026-05-01T10:00:00Z"},
+            )
+
+        def close(self) -> None:
+            captured["zarr_closed"] = True
+
+    monkeypatch.setattr(sen2like_module, "Sen2LikeServiceClient", FakeSen2LikeClient)
+    monkeypatch.setattr(pipeline_runners, "ZarrServiceClient", FakeZarrClient)
+
+    code = main(
+        [
+            "run-stage",
+            "--provider",
+            "usgs",
+            "--collection",
+            "landsat_ot_c2_l1",
+            "--product-type",
+            "L1TP",
+            "--raw-uri",
+            "/data/raw/LC09_L1TP_TEST",
+            "--sen2like-service-url",
+            "http://nimbus-sen2like:8030",
+            "--zarr-service-url",
+            "http://nimbus-zarr:8010",
+            "--zarr-output-dir",
+            str(tmp_path),
+            "--stage",
+            "zarr",
+            "--execute",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    statuses = {result["name"]: result["status"] for result in payload["results"]}
+    sen2like_result = payload["results"][1]
+    zarr_call = captured["convert_calls"][0]
+
+    assert code == 0
+    assert statuses == {"fetch": "succeeded", "sen2like": "succeeded", "zarr": "succeeded"}
+    assert captured["sen2like_products"] == ["/data/raw/LC09_L1TP_TEST"]
+    assert captured["sen2like_closed"] is True
+    assert sen2like_result["metadata"]["fallback_to_raw"] is True
+    assert zarr_call["provider"] == "usgs"
+    assert zarr_call["collection"] == "landsat_ot_c2_l1"
+    assert zarr_call["product_type"] == "L1TP"
+    assert zarr_call["raw_uri"] == "/data/raw/LC09_L1TP_TEST"

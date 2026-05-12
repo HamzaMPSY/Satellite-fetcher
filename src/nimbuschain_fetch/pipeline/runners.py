@@ -438,10 +438,15 @@ def _dataset_summary_for_zarr(context: PipelineContext, zarr_uri: str) -> dict[s
 
 def _conversion_identity(context: PipelineContext) -> tuple[str, str, str | None]:
     sen2like_result = context.results.get("sen2like")
+    sen2like_fallback_to_raw = bool(
+        sen2like_result is not None
+        and sen2like_result.metadata.get("fallback_to_raw")
+    )
     sen2like_succeeded = bool(
         sen2like_result is not None
         and sen2like_result.outputs
         and is_landsat_context(context)
+        and not sen2like_fallback_to_raw
     )
     if sen2like_succeeded:
         return "copernicus", "SENTINEL-2", "S2MSI2A"

@@ -217,6 +217,50 @@ class FetcherCubeSupport:
                     progress_callback=cube_request.progress_callback,
                 )
         except Exception as exc:
+            if self._is_optional_cube_rejection(exc):
+                reason = str(exc)
+                skipped_metadata = {
+                    **pipeline_metadata,
+                    "cube_mode": cube_mode,
+                    "cube_stage": cube_mode,
+                    "cube_status": "skipped",
+                    "cube_reason": reason,
+                    "cube_output_dir": output_dir,
+                    "cube_output_count": 0,
+                    "cube_outputs": [],
+                    "cube_items": [],
+                    "cube_tiles_built": [],
+                    "cube_tiles_skipped": [
+                        {
+                            "reason": "unsupported_cube_layout_for_inputs",
+                            "message": reason,
+                        }
+                    ],
+                    "cube_date_range": requested_date_range,
+                }
+                self._rt._update_pipeline(
+                    job_id,
+                    pipeline_state=PipelineState.cube_building,
+                    pipeline_step="cube_skipped",
+                    pipeline_progress=stage_end_progress,
+                    pipeline_metadata=skipped_metadata,
+                    event_type="job.cube_skipped",
+                    event_payload={
+                        "cube_mode": cube_mode,
+                        "reason": reason,
+                    },
+                )
+                return {
+                    "status": "skipped",
+                    "reason": reason,
+                    "cube_outputs": [],
+                    "items": [],
+                    "tiles_built": [],
+                    "tiles_skipped": list(skipped_metadata["cube_tiles_skipped"]),
+                    "stage_label": cube_mode,
+                    "date_range": requested_date_range,
+                    "pipeline_metadata": skipped_metadata,
+                }
             failed_metadata = {
                 **queued_metadata,
                 "cube_status": "failed",
@@ -296,6 +340,14 @@ class FetcherCubeSupport:
             "items": cube_items,
             "pipeline_metadata": final_metadata,
         }
+
+    @staticmethod
+    def _is_optional_cube_rejection(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "daily mosaic cube is currently supported only for sentinel-2 scene zarr inputs"
+            in message
+        )
 
     def resume_base_result_paths(
         self,

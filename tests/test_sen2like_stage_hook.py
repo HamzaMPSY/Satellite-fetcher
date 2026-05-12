@@ -136,3 +136,112 @@ def test_sen2like_stage_calls_configured_service(monkeypatch) -> None:
     assert calls[0]["products"] == ["/data/downloads/raw/LC08_SCENE"]
     assert calls[0]["workers"] == 8
     assert calls[-1] == {"closed": True}
+
+
+def test_sen2like_stage_normalizes_all_raw_uris(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *, service_url: str):
+            self.service_url = service_url
+
+        def normalize(self, **kwargs):
+            calls.append({"service_url": self.service_url, **kwargs})
+            return {
+                "status": "succeeded",
+                "outputs": [
+                    {"normalized_uri": "/tmp/sen2like/LC08_A/T31UDQ_L2F"},
+                    {"normalized_uri": "/tmp/sen2like/LC08_B/T31UDQ_L2F"},
+                ],
+            }
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(sen2like_module, "Sen2LikeServiceClient", FakeClient)
+    options = PipelineOptions(
+        provider="usgs",
+        collection="landsat_ot_c2_l1",
+        product_type="L1TP",
+        sen2like_service_url="http://nimbus-sen2like:8030",
+    )
+    context = PipelineContext(
+        job_id="job-landsat",
+        provider="usgs",
+        collection="landsat_ot_c2_l1",
+        product_type="L1TP",
+        payload={
+            "raw_uri": "/data/downloads/raw/LC08_A",
+            "raw_uris": [
+                "/data/downloads/raw/LC08_A",
+                "/data/downloads/raw/LC08_B",
+            ],
+        },
+    )
+
+    results = PipelineOrchestrator(build_default_pipeline_stages(options)).run(
+        context,
+        target_stage="sen2like",
+    )
+
+    assert results[-1].status == StageStatus.succeeded
+    assert calls[0]["products"] == [
+        "/data/downloads/raw/LC08_A",
+        "/data/downloads/raw/LC08_B",
+    ]
+    assert results[-1].outputs == [
+        "/tmp/sen2like/LC08_A/T31UDQ_L2F",
+        "/tmp/sen2like/LC08_B/T31UDQ_L2F",
+    ]
+    assert results[-1].metadata["landsat_inputs"] == calls[0]["products"]
+
+
+def test_sen2like_stage_falls_back_to_raw_when_service_fails(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *, service_url: str):
+            self.service_url = service_url
+
+        def normalize(self, **kwargs):
+            calls.append({"service_url": self.service_url, **kwargs})
+            raise RuntimeError("sen2like container was killed")
+
+        def close(self) -> None:
+            calls.append({"closed": True})
+
+    monkeypatch.setattr(sen2like_module, "Sen2LikeServiceClient", FakeClient)
+    options = PipelineOptions(
+        provider="usgs",
+        collection="landsat_ot_c2_l1",
+        product_type="L1TP",
+        sen2like_service_url="http://nimbus-sen2like:8030",
+    )
+    context = PipelineContext(
+        job_id="job-landsat",
+        provider="usgs",
+        collection="landsat_ot_c2_l1",
+        product_type="L1TP",
+        payload={
+            "raw_uris": [
+                "/data/downloads/raw/LC08_A",
+                "/data/downloads/raw/LC08_B",
+            ],
+        },
+    )
+
+    results = PipelineOrchestrator(build_default_pipeline_stages(options)).run(
+        context,
+        target_stage="sen2like",
+    )
+
+    assert results[-1].status == StageStatus.succeeded
+    assert results[-1].outputs == [
+        "/data/downloads/raw/LC08_A",
+        "/data/downloads/raw/LC08_B",
+    ]
+    assert results[-1].metadata["fallback_to_raw"] is True
+    assert results[-1].metadata["fallback_reason"] == "sen2like_service_failed"
+    assert results[-1].metadata["fallback_error_type"] == "RuntimeError"
+    assert context.get("zarr_inputs") == results[-1].outputs
+    assert calls[-1] == {"closed": True}
