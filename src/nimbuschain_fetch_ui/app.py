@@ -2214,9 +2214,6 @@ def _format_runtime_duration(value: Any) -> str:
 
 def _job_elapsed_seconds(item: dict[str, Any]) -> float | None:
     stage_duration = _display_stage_duration_seconds(item)
-    if stage_duration is not None:
-        return stage_duration
-
     pipeline_metadata = dict(item.get("pipeline_metadata") or {})
     orchestrator = dict(pipeline_metadata.get("orchestrator") or {})
     orchestrator_duration = _elapsed_between(
@@ -2224,9 +2221,109 @@ def _job_elapsed_seconds(item: dict[str, Any]) -> float | None:
         orchestrator.get("finished_at") or item.get("updated_at"),
     )
     if orchestrator_duration is not None:
-        return orchestrator_duration
+        if stage_duration is None:
+            return orchestrator_duration
+        if _stage_duration_looks_partial(
+            item,
+            stage_duration=stage_duration,
+            orchestrator_duration=orchestrator_duration,
+        ):
+            return orchestrator_duration
+        return stage_duration
 
-    return item.get("duration_seconds")
+    if stage_duration is not None:
+        return stage_duration
+
+    row_duration = item.get("duration_seconds")
+    if row_duration is not None:
+        return row_duration
+
+    started_at = item.get("started_at") or item.get("created_at")
+    finished_at = item.get("finished_at") or item.get("updated_at")
+    row_window_duration = _elapsed_between(started_at, finished_at)
+    if row_window_duration is not None:
+        return row_window_duration
+
+    return None
+
+
+def _stage_duration_looks_partial(
+    item: dict[str, Any],
+    *,
+    stage_duration: float,
+    orchestrator_duration: float,
+) -> bool:
+    if orchestrator_duration <= max(stage_duration, 0.0) * 1.25:
+        return False
+    pipeline_metadata = dict(item.get("pipeline_metadata") or {})
+    stage_results = [
+        dict(stage)
+        for stage in list(pipeline_metadata.get("stage_results") or [])
+        if isinstance(stage, dict)
+    ]
+    if not stage_results:
+        return False
+    terminal_state = str(item.get("state") or "").strip().lower() in FINAL_JOB_STATES
+    if not terminal_state:
+        return False
+    completed_stages = [
+        stage
+        for stage in stage_results
+        if str(stage.get("status") or "").strip().lower() in {"succeeded", "skipped"}
+    ]
+    zero_duration_count = sum(
+        1
+        for stage in completed_stages
+        if float(stage.get("duration_seconds") or 0.0) <= 0.0
+    )
+    return zero_duration_count >= max(1, len(completed_stages) // 2)
+
+
+def _display_stages_are_terminal_success(
+    item: dict[str, Any],
+    stages: list[dict[str, Any]],
+) -> bool:
+    if str(item.get("state") or "").strip().lower() != "succeeded":
+        return False
+    statuses = {str(stage.get("status") or "").strip().lower() for stage in stages}
+    return not statuses.intersection({"pending", "queued", "running", "failed", "cancelled"})
+
+
+def _terminal_ready_stage() -> dict[str, Any]:
+    return {
+        "key": "ready",
+        "label": "Ready",
+        "badge": "RDY",
+        "status": "done",
+        "duration_seconds": None,
+    }
+
+
+def _stage_display_has_warning(stage: dict[str, Any]) -> bool:
+    metadata = dict(stage.get("metadata") or {})
+    stage_key = str(stage.get("key") or "").strip().lower()
+    status = str(stage.get("status") or "").strip().lower()
+    if bool(metadata.get("fallback_to_raw")):
+        return True
+    if str(metadata.get("sen2like_status") or "").strip().lower() == "raw_fallback":
+        return True
+    if stage_key == "cube" and status == "skipped":
+        return bool(
+            str(metadata.get("reason") or metadata.get("cube_reason") or "").strip()
+            or list(metadata.get("cube_tiles_skipped") or [])
+        )
+    return False
+
+
+def _terminal_pipeline_label(item: dict[str, Any]) -> str:
+    state = str(item.get("state") or "").strip().lower()
+    if state == "succeeded":
+        return "Ready"
+    if state == "failed":
+        return "Failed"
+    if state == "cancelled":
+        return "Stopped"
+    return "Waiting"
 
 
 def _display_stage_duration_seconds(item: dict[str, Any]) -> float | None:
@@ -2466,6 +2563,8 @@ def _current_timeline_stage(item: dict[str, Any]) -> dict[str, Any] | None:
     current_stage_key = _display_stage_key(str(timeline.get("current_stage") or "").strip().lower())
     raw_stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
     stages = _display_pipeline_stages(item, timeline, raw_stages)
+    if _display_stages_are_terminal_success(item, stages):
+        return _terminal_ready_stage()
     for stage in stages:
         if str(stage.get("key") or "").strip().lower() == current_stage_key:
             return stage
@@ -3025,7 +3124,12 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
     done_count = sum(
         1
         for stage in stages
-        if str(stage.get("status") or "").strip().lower() in {"done", "skipped"}
+        if str(stage.get("status") or "").strip().lower() == "done"
+    )
+    skipped_count = sum(
+        1
+        for stage in stages
+        if str(stage.get("status") or "").strip().lower() == "skipped"
     )
     active_count = sum(
         1
@@ -3037,7 +3141,8 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         for stage in stages
         if str(stage.get("status") or "").strip().lower() == "pending"
     )
-    stage_progress = (100.0 * done_count / len(stages)) if stages else 0.0
+    progress_count = done_count + skipped_count
+    stage_progress = (100.0 * progress_count / len(stages)) if stages else 0.0
     current_stage = next(
         (
             stage
@@ -3064,7 +3169,13 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
             ),
             None,
         )
-    current_stage_label = str((current_stage or {}).get("label") or timeline.get("current_stage_label") or "").strip() or "Waiting"
+    terminal_success = _display_stages_are_terminal_success(item, stages)
+    current_stage_label = (
+        _terminal_pipeline_label(item)
+        if terminal_success
+        else str((current_stage or {}).get("label") or timeline.get("current_stage_label") or "").strip()
+        or "Waiting"
+    )
     mask_types = _normalize_mask_types(_mask_types_from_payload(item))
     cube_mode = str(timeline.get("cube_mode") or _cube_mode_from_payload(item) or "none").strip().lower()
     flow_bits = [str(stage.get("label") or stage.get("key") or "Stage") for stage in stages]
@@ -3081,10 +3192,16 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         detail_bits.append("no integrated masks")
 
     overview_cards = [
-        ("Complete", f"{done_count}/{len(stages)}"),
-        ("Current", current_stage_label),
-        ("Waiting", str(waiting_count)),
+        ("Done", f"{done_count}/{len(stages)}"),
     ]
+    if skipped_count > 0:
+        overview_cards.append(("Skipped", str(skipped_count)))
+    overview_cards.extend(
+        [
+            ("Current", current_stage_label),
+            ("Waiting", str(waiting_count)),
+        ]
+    )
     if active_count > 0:
         overview_cards.append(("Live", str(active_count)))
 
@@ -3139,8 +3256,8 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         card_classes = ["nimbus-stage-card", f"nimbus-stage-{status_kind}"]
         if stage_key == current_stage_key and status_kind in {"running", "queued"}:
             card_classes.append("is-current")
-        if stage_key == current_stage_key and status_kind == "done":
-            card_classes.append("is-current")
+        if _stage_display_has_warning(stage):
+            card_classes.append("has-warning")
 
         pill_markup = "".join(
             "<span class='nimbus-stage-pill'>{text}</span>".format(text=html.escape(str(text)))
@@ -3185,7 +3302,8 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
         "</div>".format(
             headline=html.escape(" -> ".join(flow_bits)),
             subtitle=html.escape(
-                f"{' · '.join(detail_bits)} · {done_count} complete · {active_count} live · {waiting_count} waiting"
+                f"{' · '.join(detail_bits)} · {done_count} done · {skipped_count} skipped · "
+                f"{active_count} live · {waiting_count} waiting"
             ),
             metrics="".join(
                 (

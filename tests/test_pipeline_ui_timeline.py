@@ -202,7 +202,7 @@ def test_pipeline_display_prefers_modular_stage_results() -> None:
     assert [stage["key"] for stage in display_stages] == ["fetch", "sen2like", "zarr"]
     assert [stage["status"] for stage in display_stages] == ["done", "skipped", "done"]
     assert display_stages[0]["detail_label"] == "Provider fetch · 1 output"
-    assert display_stages[1]["detail_label"] == "Skipped: sen2like runtime not routed yet"
+    assert display_stages[1]["detail_label"] == "Skipped: Sen2Like runtime is not routed yet"
     assert display_stages[2]["duration_seconds"] == 5.0
 
 
@@ -250,7 +250,93 @@ def test_pipeline_display_heals_optional_cube_skip_after_resumed_masks() -> None
     assert display_stages[2]["detail_label"] == (
         "Skipped: daily mosaic cubes currently require Sentinel-2 scene inputs"
     )
-    assert display_stages[3]["detail_label"] == "Integrated masking · 2 outputs"
+    assert display_stages[3]["detail_label"] == "Masks written in-place on 2 scenes"
+
+
+def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() -> None:
+    item = {
+        "state": "succeeded",
+        "pipeline_state": "masked_zarr_written",
+        "zarr_outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"],
+        "request": {
+            "mask_types": ["water", "cloud"],
+            "cube_mode": "before_mask",
+        },
+        "pipeline_metadata": {
+            "sen2like_status": "raw_fallback",
+            "sen2like_fallback_reason": "sen2like_resource_exhausted",
+            "zarr_input_source": "raw",
+            "cube_status": "skipped",
+            "cube_reason": "no_groups_with_multiple_times",
+            "cube_tiles_skipped": [
+                {"group_key": "LC8198023", "reason": "fewer_than_two_unique_times"},
+            ],
+            "mask_status": "written",
+            "mask_types": ["water", "cloud"],
+            "mask_total_scenes": 2,
+            "mask_completed_scenes": 2,
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "sen2like", "depends_on": ["fetch"]},
+                {"name": "zarr", "depends_on": ["sen2like"]},
+                {"name": "cube", "depends_on": ["zarr"]},
+                {"name": "mask", "depends_on": ["cube"]},
+            ],
+            "stage_results": [
+                {"name": "fetch", "status": "succeeded", "outputs": ["/data/raw/a.tar", "/data/raw/b.tar"]},
+                {
+                    "name": "sen2like",
+                    "status": "succeeded",
+                    "outputs": ["/data/raw/a.tar", "/data/raw/b.tar"],
+                    "metadata": {
+                        "fallback_to_raw": True,
+                        "sen2like_status": "raw_fallback",
+                        "fallback_reason": "sen2like_resource_exhausted",
+                        "zarr_input_source": "raw",
+                    },
+                },
+                {"name": "zarr", "status": "succeeded", "outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"]},
+                {
+                    "name": "cube",
+                    "status": "skipped",
+                    "metadata": {
+                        "reason": "no_groups_with_multiple_times",
+                        "cube_tiles_skipped": [
+                            {"group_key": "LC8198023", "reason": "fewer_than_two_unique_times"},
+                        ],
+                    },
+                },
+                {
+                    "name": "mask",
+                    "status": "succeeded",
+                    "outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"],
+                    "metadata": {
+                        "mask_status": "written",
+                        "mask_types": ["water", "cloud"],
+                        "mask_total_scenes": 2,
+                        "mask_completed_scenes": 2,
+                    },
+                },
+            ],
+        },
+    }
+
+    display_stages = _display_pipeline_stages(item, {}, [])
+
+    assert [stage["status"] for stage in display_stages] == [
+        "done",
+        "done",
+        "done",
+        "skipped",
+        "done",
+    ]
+    assert display_stages[1]["detail_label"] == (
+        "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
+    )
+    assert display_stages[3]["detail_label"] == (
+        "Skipped: no cube built because each group has fewer than two acquisition times"
+    )
+    assert display_stages[4]["detail_label"] == "Water + Cloud masks written in-place on 2 scenes"
 
 
 def test_pipeline_display_compacts_structured_sen2like_errors() -> None:
@@ -313,6 +399,36 @@ def test_job_elapsed_prefers_stage_runtime_over_stale_row_duration() -> None:
 
     assert _job_elapsed_seconds(item) == 928.5
     assert _format_runtime_duration(_job_elapsed_seconds(item)) == "15m 28s"
+
+
+def test_job_elapsed_uses_orchestrator_window_when_stage_results_are_partial() -> None:
+    item = {
+        "state": "succeeded",
+        "pipeline_state": "masked_zarr_written",
+        "pipeline_metadata": {
+            "orchestrator": {
+                "started_at": "2026-05-14T10:00:00+00:00",
+                "finished_at": "2026-05-14T10:02:47+00:00",
+            },
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "sen2like", "depends_on": ["fetch"]},
+                {"name": "zarr", "depends_on": ["sen2like"]},
+                {"name": "cube", "depends_on": ["zarr"]},
+                {"name": "mask", "depends_on": ["cube"]},
+            ],
+            "stage_results": [
+                {"name": "fetch", "status": "succeeded", "duration_seconds": 3.2},
+                {"name": "sen2like", "status": "succeeded", "duration_seconds": 0.0},
+                {"name": "zarr", "status": "succeeded", "duration_seconds": 0.0},
+                {"name": "cube", "status": "skipped", "duration_seconds": 0.0},
+                {"name": "mask", "status": "succeeded", "duration_seconds": 0.0},
+            ],
+        },
+    }
+
+    assert _job_elapsed_seconds(item) == 167.0
+    assert _format_runtime_duration(_job_elapsed_seconds(item)) == "2m 47s"
 
 
 def test_pipeline_timeline_snapshot_heals_terminal_display_gaps(monkeypatch) -> None:

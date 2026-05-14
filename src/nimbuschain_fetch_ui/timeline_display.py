@@ -137,13 +137,31 @@ def _stage_result_to_display_stage(
         if str(output).strip()
     ]
     metadata = dict(result.get("metadata") or {})
+    if name == "sen2like":
+        metadata.setdefault("sen2like_status", pipeline_metadata.get("sen2like_status"))
+        metadata.setdefault("fallback_reason", pipeline_metadata.get("sen2like_fallback_reason"))
+        metadata.setdefault("fallback_message", pipeline_metadata.get("sen2like_fallback_message"))
+        metadata.setdefault("zarr_input_source", pipeline_metadata.get("zarr_input_source"))
+    elif name == "cube":
+        metadata.setdefault("cube_status", pipeline_metadata.get("cube_status"))
+        metadata.setdefault("cube_reason", pipeline_metadata.get("cube_reason"))
+        metadata.setdefault("cube_tiles_skipped", pipeline_metadata.get("cube_tiles_skipped"))
+    elif name == "mask":
+        metadata.setdefault("mask_status", pipeline_metadata.get("mask_status"))
+        metadata.setdefault("mask_types", pipeline_metadata.get("mask_types"))
+        metadata.setdefault("mask_total_scenes", pipeline_metadata.get("mask_total_scenes"))
+        metadata.setdefault("mask_completed_scenes", pipeline_metadata.get("mask_completed_scenes"))
+        metadata.setdefault("mask_mode", pipeline_metadata.get("mask_mode"))
     reason = str(metadata.get("reason") or "").strip()
     error = str(result.get("error") or "").strip()
     if name == "cube" and cube_status == "skipped":
         status = "skipped"
         error = ""
         if not reason:
-            reason = _cube_skip_reason_label(result)
+            reason = str(metadata.get("cube_reason") or "").strip() or _cube_skip_reason_label(
+                result,
+                pipeline_metadata,
+            )
     elif name == "mask" and (
         mask_status == "written"
         or (job_state == "succeeded" and pipeline_state == "masked_zarr_written")
@@ -159,8 +177,17 @@ def _stage_result_to_display_stage(
             ]
     if error:
         detail_label = _stage_error_summary(error)
+    elif name == "sen2like" and status == "done" and _sen2like_used_raw_fallback(metadata):
+        detail_label = _sen2like_fallback_label(metadata)
+    elif name == "cube" and status == "skipped":
+        detail_label = f"Skipped: {_cube_skip_reason_label(result, pipeline_metadata)}"
+    elif name == "mask" and status == "done" and (
+        str(metadata.get("mask_status") or "").strip().lower() == "written"
+        or mask_status == "written"
+    ):
+        detail_label = _mask_written_label(metadata, outputs)
     elif status == "skipped" and reason:
-        detail_label = f"Skipped: {reason.replace('_', ' ')}"
+        detail_label = f"Skipped: {_generic_skip_reason_label(reason)}"
     elif outputs:
         detail_label = f"{default_detail} · {len(outputs)} output{'s' if len(outputs) != 1 else ''}"
     else:
@@ -181,11 +208,81 @@ def _stage_result_to_display_stage(
     }
 
 
-def _cube_skip_reason_label(result: dict[str, Any]) -> str:
-    error = str(result.get("error") or "").strip().lower()
-    if "daily mosaic cube" in error and "sentinel-2" in error:
+def _sen2like_used_raw_fallback(metadata: dict[str, Any]) -> bool:
+    return bool(metadata.get("fallback_to_raw")) or (
+        str(metadata.get("sen2like_status") or "").strip().lower() == "raw_fallback"
+    )
+
+
+def _sen2like_fallback_label(metadata: dict[str, Any]) -> str:
+    reason = str(metadata.get("fallback_reason") or "").strip().lower()
+    if reason == "sen2like_resource_exhausted":
+        return "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
+    if reason:
+        return f"Sen2Like fallback: raw Landsat inputs used ({reason.replace('_', ' ')})"
+    return "Sen2Like fallback: raw Landsat inputs used for Zarr"
+
+
+def _mask_written_label(metadata: dict[str, Any], outputs: list[str]) -> str:
+    mask_types = [
+        str(mask).strip().title()
+        for mask in list(metadata.get("mask_types") or [])
+        if str(mask).strip()
+    ]
+    prefix = f"{' + '.join(mask_types)} masks" if mask_types else "Masks"
+    total = _positive_int(metadata.get("mask_total_scenes"))
+    completed = _positive_int(metadata.get("mask_completed_scenes"))
+    scene_count = completed or total or len(outputs)
+    if scene_count > 0:
+        scene_word = "scene" if scene_count == 1 else "scenes"
+        return f"{prefix} written in-place on {scene_count} {scene_word}"
+    return f"{prefix} written in-place"
+
+
+def _cube_skip_reason_label(
+    result: dict[str, Any],
+    pipeline_metadata: dict[str, Any] | None = None,
+) -> str:
+    metadata = dict(result.get("metadata") or {})
+    pipeline_metadata = dict(pipeline_metadata or {})
+    reason = str(
+        metadata.get("reason")
+        or metadata.get("cube_reason")
+        or pipeline_metadata.get("cube_reason")
+        or result.get("error")
+        or ""
+    ).strip()
+    lowered = reason.lower()
+    if lowered in {"no_groups_with_multiple_times", "fewer_than_two_unique_times"}:
+        return "no cube built because each group has fewer than two acquisition times"
+    if "fewer_than_two_unique_times" in lowered:
+        return "no cube built because a group has fewer than two acquisition times"
+    if "no_groups_with_multiple_times" in lowered:
+        return "no cube built because each group has fewer than two acquisition times"
+    if "daily mosaic cube" in lowered and "sentinel-2" in lowered:
         return "daily mosaic cubes currently require Sentinel-2 scene inputs"
+    if lowered == "cube_input_missing":
+        return "no cube inputs were available"
+    if lowered:
+        return _compact_error_text(reason, limit=140)
     return "optional cube stage not required for these outputs"
+
+
+def _generic_skip_reason_label(reason: str) -> str:
+    normalized = str(reason or "").strip()
+    if normalized == "sen2like_runtime_not_routed_yet":
+        return "Sen2Like runtime is not routed yet"
+    if normalized == "dependency_not_succeeded":
+        return "dependency did not succeed"
+    return normalized.replace("_", " ")
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(parsed, 0)
 
 
 def _stage_error_summary(error: str) -> str:
