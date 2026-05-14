@@ -968,6 +968,16 @@ def test_landsat_job_falls_back_to_raw_when_sen2like_runs_out_of_memory(
     assert converter.calls[-1]["provider"] == "usgs"
     assert converter.calls[-1]["collection"] == "landsat_ot_c2_l1"
     assert converter.calls[-1]["raw_uri"] == final_status.raw_outputs[0]
+    stage_results = {
+        str(stage["name"]): stage
+        for stage in result.pipeline_metadata["stage_results"]
+    }
+    assert stage_results["fetch"]["status"] == "succeeded"
+    assert stage_results["sen2like"]["status"] == "succeeded"
+    assert stage_results["sen2like"]["outputs"] == final_status.raw_outputs
+    assert stage_results["sen2like"]["metadata"]["fallback_to_raw"] is True
+    assert stage_results["sen2like"]["metadata"]["fallback_reason"] == "sen2like_resource_exhausted"
+    assert stage_results["zarr"]["status"] == "succeeded"
 
 
 def test_unsupported_daily_mosaic_cube_does_not_block_integrated_masks(
@@ -1020,6 +1030,19 @@ def test_unsupported_daily_mosaic_cube_does_not_block_integrated_masks(
     )
     assert result.pipeline_metadata["mask_status"] == "written"
     assert result.pipeline_metadata["mask_completed_scenes"] == 1
+    stage_results = {
+        str(stage["name"]): stage
+        for stage in result.pipeline_metadata["stage_results"]
+    }
+    assert stage_results["sen2like"]["status"] == "succeeded"
+    assert stage_results["sen2like"]["metadata"]["fallback_to_raw"] is True
+    assert stage_results["cube"]["status"] == "skipped"
+    assert "Daily mosaic cube is currently supported only for Sentinel-2" in str(
+        stage_results["cube"]["metadata"]["reason"]
+    )
+    assert stage_results["mask"]["status"] == "succeeded"
+    assert stage_results["mask"]["outputs"] == final_status.zarr_outputs
+    assert stage_results["mask"]["metadata"]["mask_completed_scenes"] == 1
 
     event_types = [row["type"] for row in fetcher.store.list_events(job_id, None, 200)]
     assert "job.cube_skipped" in event_types

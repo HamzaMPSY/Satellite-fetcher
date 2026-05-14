@@ -249,6 +249,14 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                 sen2like_timeline_stages = _select_timeline_stages(timeline_stages, ["sen2like"])
                 sen2like_status = str(pipeline_metadata.get("sen2like_status") or "").strip().lower()
                 sen2like_error = str(pipeline_metadata.get("sen2like_error") or "").strip()
+                sen2like_metadata = {
+                    "runner": "sen2like_service",
+                    "service_url": pipeline_metadata.get("sen2like_service_url"),
+                    "sen2like_status": sen2like_status or None,
+                    "sen2like_input_count": pipeline_metadata.get("sen2like_input_count"),
+                    "sen2like_output_count": pipeline_metadata.get("sen2like_output_count"),
+                    "zarr_input_source": pipeline_metadata.get("zarr_input_source"),
+                }
                 if sen2like_outputs:
                     stage_result = _stage_result_dict(
                         "sen2like",
@@ -256,8 +264,28 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                         outputs=sen2like_outputs,
                         timeline_stages=sen2like_timeline_stages,
                         metadata={
-                            "runner": "sen2like_service",
-                            "service_url": pipeline_metadata.get("sen2like_service_url"),
+                            **sen2like_metadata,
+                            "normalized_output_count": len(sen2like_outputs),
+                        },
+                    )
+                    results.append(stage_result)
+                    results_by_name[stage_name] = stage_result
+                elif sen2like_status == "raw_fallback":
+                    fallback_outputs = _string_list(
+                        pipeline_metadata.get("zarr_input_outputs") or raw_outputs
+                    )
+                    stage_result = _stage_result_dict(
+                        "sen2like",
+                        status=StageStatus.succeeded.value,
+                        outputs=fallback_outputs,
+                        timeline_stages=sen2like_timeline_stages,
+                        metadata={
+                            **sen2like_metadata,
+                            "fallback_to_raw": True,
+                            "fallback_reason": pipeline_metadata.get("sen2like_fallback_reason"),
+                            "fallback_message": pipeline_metadata.get("sen2like_fallback_message"),
+                            "fallback_error": sen2like_error or None,
+                            "raw_output_count": len(fallback_outputs),
                         },
                     )
                     results.append(stage_result)
@@ -268,10 +296,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                         status=StageStatus.failed.value,
                         outputs=[],
                         timeline_stages=sen2like_timeline_stages,
-                        metadata={
-                            "runner": "sen2like_service",
-                            "service_url": pipeline_metadata.get("sen2like_service_url"),
-                        },
+                        metadata=sen2like_metadata,
                         error=sen2like_error or _stage_error(
                             job_state,
                             errors,
@@ -335,6 +360,10 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                         _combined_timeline_status(timeline_stages, ["cloud", "water"])
                     )
                 )
+                if status == StageStatus.succeeded.value and not mask_outputs:
+                    mask_outputs = _string_list(
+                        pipeline_metadata.get("masked_zarr_outputs") or zarr_outputs
+                    )
                 results.append(
                     _stage_result_dict(
                         "mask",
@@ -345,32 +374,58 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                             "runner": "mask_service",
                             "mask_types": _string_list(pipeline_metadata.get("mask_types")),
                             "mask_status": mask_status or None,
+                            "mask_mode": pipeline_metadata.get("mask_mode"),
+                            "mask_total_scenes": pipeline_metadata.get("mask_total_scenes"),
+                            "mask_completed_scenes": pipeline_metadata.get("mask_completed_scenes"),
+                            "mask_parallel_workers": pipeline_metadata.get("mask_parallel_workers"),
+                            "storage_mode": "in_place_zarr_masking"
+                            if status == StageStatus.succeeded.value
+                            else None,
+                            "in_place": True if status == StageStatus.succeeded.value else None,
                         },
                         error=_stage_error(job_state, errors, has_outputs=status == StageStatus.succeeded.value),
                     )
                 )
                 results_by_name[stage_name] = results[-1]
             elif stage_name == "cube":
+                cube_status = str(pipeline_metadata.get("cube_status") or "").strip().lower()
+                cube_reason = str(pipeline_metadata.get("cube_reason") or "").strip()
                 status = (
                     StageStatus.succeeded.value
-                    if cube_outputs or pipeline_state == "cube_written"
+                    if cube_outputs or cube_status in {"written", "succeeded"} or pipeline_state == "cube_written"
+                    else StageStatus.skipped.value
+                    if cube_status == "skipped"
                     else StageStatus.failed.value
-                    if pipeline_state == "cube_failed"
+                    if cube_status == "failed" or pipeline_state == "cube_failed"
                     else _stage_status_from_timeline(
                         _combined_timeline_status(timeline_stages, ["cube"])
                     )
                 )
+                cube_metadata = {
+                    "runner": "cube_builder",
+                    "cube_mode": str(pipeline_metadata.get("cube_mode") or "none"),
+                    "cube_status": cube_status or None,
+                    "cube_layout": pipeline_metadata.get("cube_layout"),
+                    "cube_output_count": pipeline_metadata.get("cube_output_count"),
+                    "cube_tiles_built": pipeline_metadata.get("cube_tiles_built"),
+                    "cube_tiles_skipped": pipeline_metadata.get("cube_tiles_skipped"),
+                    "cube_date_range": pipeline_metadata.get("cube_date_range"),
+                    "reason": cube_reason if status == StageStatus.skipped.value else None,
+                }
                 results.append(
                     _stage_result_dict(
                         "cube",
                         status=status,
                         outputs=cube_outputs,
                         timeline_stages=_select_timeline_stages(timeline_stages, ["cube"]),
-                        metadata={
-                            "runner": "cube_builder",
-                            "cube_mode": str(pipeline_metadata.get("cube_mode") or "none"),
-                        },
-                        error=_stage_error(job_state, errors, has_outputs=status == StageStatus.succeeded.value),
+                        metadata=cube_metadata,
+                        error=cube_reason
+                        if status == StageStatus.failed.value and cube_reason
+                        else _stage_error(
+                            job_state,
+                            errors,
+                            has_outputs=status == StageStatus.succeeded.value,
+                        ),
                     )
                 )
                 results_by_name[stage_name] = results[-1]
@@ -504,6 +559,8 @@ def _last_value(items: Sequence[dict[str, Any]], key: str) -> Any:
 
 
 def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
     return [str(item) for item in list(value or []) if str(item).strip()]
 
 
