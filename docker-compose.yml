@@ -145,8 +145,8 @@ services:
       context: .
       dockerfile: sen2like-service/Containerfile
     restart: unless-stopped
-    mem_limit: ${NIMBUS_SEN2LIKE_MEM_LIMIT:-12g}
-    shm_size: ${NIMBUS_SEN2LIKE_SHM_SIZE:-4g}
+    mem_limit: ${NIMBUS_SEN2LIKE_MEM_LIMIT:-16g}
+    shm_size: ${NIMBUS_SEN2LIKE_SHM_SIZE:-8g}
     ports:
       - "${NIMBUS_SEN2LIKE_PORT:-8030}:8030"
     environment:
