@@ -217,8 +217,8 @@ def test_timeline_breakdown_rows_fill_missing_modular_stages() -> None:
         "Cube",
         "Mask",
     ]
-    assert rows[3]["status"] == "fallback"
-    assert rows[5]["status"] == "skipped"
+    assert rows[3]["status"] == "raw input"
+    assert rows[5]["status"] == "not built"
     assert rows[6]["detail"] == "OK: Water + Cloud masks written in-place on 2/2 scenes"
 
 
@@ -330,7 +330,7 @@ def test_pipeline_display_heals_optional_cube_skip_after_resumed_masks() -> None
     assert [stage["key"] for stage in display_stages] == ["fetch", "zarr", "cube", "mask"]
     assert [stage["status"] for stage in display_stages] == ["done", "done", "skipped", "done"]
     assert display_stages[2]["detail_label"] == (
-        "Skipped: daily mosaic cubes currently require Sentinel-2 scene inputs"
+        "Cube not built because daily mosaic cubes currently require Sentinel-2 scene inputs"
     )
     assert display_stages[3]["detail_label"] == "OK: Masks written in-place on 2 scenes"
 
@@ -413,22 +413,22 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
         "done",
     ]
     assert display_stages[1]["detail_label"] == (
-        "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
+        "Raw Landsat inputs used directly for Zarr"
     )
-    assert display_stages[1]["metadata"]["status_label"] == "fallback"
-    assert _stage_status_label_for_display(display_stages[1], display_stages[1]["status"]) == "fallback"
+    assert display_stages[1]["metadata"]["status_label"] == "raw input"
+    assert _stage_status_label_for_display(display_stages[1], display_stages[1]["status"]) == "raw input"
     assert display_stages[2]["metadata"]["raw_fallback"] is True
     assert display_stages[2]["detail_label"] == (
-        "Zarr conversion from raw Landsat fallback after Sen2Like memory kill · 2 outputs"
+        "Zarr conversion from raw Landsat inputs · 2 outputs"
     )
     assert display_stages[3]["detail_label"] == (
-        "Skipped: no cube built because each group has fewer than two acquisition times; "
+        "Cube not built because each group has fewer than two acquisition times; "
         "select at least two dates for the same tile/path-row"
     )
     assert display_stages[4]["detail_label"] == "OK: Water + Cloud masks written in-place on 2/2 scenes"
 
 
-def test_pipeline_ready_badge_warns_for_fallbacks_and_skips() -> None:
+def test_pipeline_ready_badge_stays_success_for_non_blocking_notes() -> None:
     item = {
         "state": "succeeded",
         "pipeline_state": "masked_zarr_written",
@@ -447,11 +447,11 @@ def test_pipeline_ready_badge_warns_for_fallbacks_and_skips() -> None:
         },
     }
 
-    assert _job_has_pipeline_warnings(item) is True
-    assert _job_pipeline_style(item)[0] == "ready with caveats"
-    assert app_module._terminal_pipeline_label(item) == "Ready with caveats"
-    assert "ready with caveats" in str(_job_pipeline_summary(item))
-    assert _job_pipeline_substate(item) == "Pipeline caveats: Sen2Like raw fallback, cube skipped."
+    assert _job_has_pipeline_warnings(item) is False
+    assert _job_pipeline_style(item)[0] == "pipeline ready"
+    assert app_module._terminal_pipeline_label(item) == "Ready"
+    assert "ready with caveats" not in str(_job_pipeline_summary(item))
+    assert _job_pipeline_substate(item) == "Pipeline notes: raw Landsat source, cube not built."
 
 
 def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:
@@ -516,10 +516,10 @@ def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:
     ]
     assert display_stages[1]["outputs"] == ["/data/raw/a.tar", "/data/raw/b.tar"]
     assert display_stages[1]["detail_label"] == (
-        "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
+        "Raw Landsat inputs used directly for Zarr"
     )
     assert display_stages[3]["detail_label"] == (
-        "Skipped: no cube built because each group has fewer than two acquisition times; "
+        "Cube not built because each group has fewer than two acquisition times; "
         "select at least two dates for the same tile/path-row"
     )
     assert display_stages[4]["outputs"] == ["/data/zarr/a.zarr", "/data/zarr/b.zarr"]

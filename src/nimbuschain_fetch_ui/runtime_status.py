@@ -298,7 +298,7 @@ def render_download_coordinator_dashboard(snapshot: Any) -> None:
         status_rows = _coordinator_status_rows(summary)
         if status_rows:
             st.markdown("**Files by Status**")
-            st.dataframe(status_rows, use_container_width=True, hide_index=True)
+            st.dataframe(status_rows, width="stretch", hide_index=True)
         else:
             st.caption("No coordinator task status rows yet.")
 
@@ -318,7 +318,7 @@ def render_download_coordinator_dashboard(snapshot: Any) -> None:
                     }
                     for item in pending_by_job
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -344,7 +344,7 @@ def render_download_coordinator_dashboard(snapshot: Any) -> None:
             for item in list(copernicus.get("accounts") or [])
         ]
         if account_rows:
-            st.dataframe(account_rows, use_container_width=True, hide_index=True)
+            st.dataframe(account_rows, width="stretch", hide_index=True)
         else:
             st.caption("No Copernicus account worker state yet.")
 
@@ -369,7 +369,7 @@ def render_download_coordinator_dashboard(snapshot: Any) -> None:
                     "success_streak": int(usgs.get("success_streak", 0) or 0),
                 }
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -395,7 +395,7 @@ def render_download_coordinator_dashboard(snapshot: Any) -> None:
                     }
                     for item in active_tasks
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -416,7 +416,7 @@ def render_download_coordinator_dashboard(snapshot: Any) -> None:
                     }
                     for item in recent_terminal
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -439,7 +439,7 @@ def render_download_coordinator_dashboard(snapshot: Any) -> None:
                     }
                     for item in workers
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:

@@ -165,7 +165,7 @@ def _stage_result_to_display_stage(
         status = "done"
         error = ""
         reason = ""
-        metadata["status_label"] = "fallback"
+        metadata["status_label"] = "raw input"
         if not outputs:
             outputs = [
                 str(output)
@@ -175,6 +175,7 @@ def _stage_result_to_display_stage(
     elif name == "cube" and cube_status == "skipped":
         status = "skipped"
         error = ""
+        metadata["status_label"] = "not built"
         if not reason:
             reason = str(metadata.get("cube_reason") or "").strip() or _cube_skip_reason_label(
                 result,
@@ -198,7 +199,7 @@ def _stage_result_to_display_stage(
     elif name == "sen2like" and status == "done" and _sen2like_used_raw_fallback(metadata):
         detail_label = _sen2like_fallback_label(metadata)
     elif name == "cube" and status == "skipped":
-        detail_label = f"Skipped: {_cube_skip_reason_label(result, pipeline_metadata)}"
+        detail_label = _cube_skip_reason_label(result, pipeline_metadata)
     elif name == "mask" and status == "done" and (
         str(metadata.get("mask_status") or "").strip().lower() == "written"
         or mask_status == "written"
@@ -237,10 +238,10 @@ def _sen2like_used_raw_fallback(metadata: dict[str, Any]) -> bool:
 def _sen2like_fallback_label(metadata: dict[str, Any]) -> str:
     reason = str(metadata.get("fallback_reason") or "").strip().lower()
     if reason == "sen2like_resource_exhausted":
-        return "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
+        return "Raw Landsat inputs used directly for Zarr"
     if reason:
-        return f"Sen2Like fallback: raw Landsat inputs used ({reason.replace('_', ' ')})"
-    return "Sen2Like fallback: raw Landsat inputs used for Zarr"
+        return f"Raw Landsat inputs used directly for Zarr ({reason.replace('_', ' ')})"
+    return "Raw Landsat inputs used directly for Zarr"
 
 
 def _zarr_uses_raw_fallback(metadata: dict[str, Any]) -> bool:
@@ -257,8 +258,8 @@ def _zarr_raw_fallback_label(
     suffix = f" · {output_count} output{'s' if output_count != 1 else ''}" if output_count else ""
     reason = str(metadata.get("fallback_reason") or "").strip().lower()
     if reason == "sen2like_resource_exhausted":
-        return f"{default_detail} from raw Landsat fallback after Sen2Like memory kill{suffix}"
-    return f"{default_detail} from raw Landsat fallback{suffix}"
+        return f"{default_detail} from raw Landsat inputs{suffix}"
+    return f"{default_detail} from raw Landsat inputs{suffix}"
 
 
 def _mask_written_label(metadata: dict[str, Any], outputs: list[str]) -> str:
@@ -296,15 +297,15 @@ def _cube_skip_reason_label(
     ).strip()
     lowered = reason.lower()
     if lowered in {"no_groups_with_multiple_times", "fewer_than_two_unique_times"}:
-        return "no cube built because each group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
+        return "Cube not built because each group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
     if "fewer_than_two_unique_times" in lowered:
-        return "no cube built because a group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
+        return "Cube not built because a group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
     if "no_groups_with_multiple_times" in lowered:
-        return "no cube built because each group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
+        return "Cube not built because each group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
     if "daily mosaic cube" in lowered and "sentinel-2" in lowered:
-        return "daily mosaic cubes currently require Sentinel-2 scene inputs"
+        return "Cube not built because daily mosaic cubes currently require Sentinel-2 scene inputs"
     if lowered == "cube_input_missing":
-        return "no cube inputs were available"
+        return "Cube not built because no cube inputs were available"
     if lowered:
         return _compact_error_text(reason, limit=140)
     return "optional cube stage not required for these outputs"
