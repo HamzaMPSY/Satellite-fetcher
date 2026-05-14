@@ -580,6 +580,16 @@ def _ss(key, default=None):
     return st.session_state.get(key, default)
 
 
+def _default_tile_system_for_provider(
+    provider_label: str,
+    sat_tiles: dict[str, Any],
+) -> str | None:
+    desired = "landsat" if str(provider_label or "").strip() == "USGS" else "sentinel-2"
+    if sat_tiles.get(desired, {}).get("tiles") is None:
+        return None
+    return desired
+
+
 def _resolve_usgs_product_type(selected_product_type: str, selected_satellite: str) -> str:
     product = str(selected_product_type or "").strip().upper()
     if not product:
@@ -1925,6 +1935,16 @@ def _render_job_download_telemetry(item: dict[str, Any]) -> bool:
     return True
 
 
+def _render_compact_job_metric(label: str, value: Any) -> None:
+    st.markdown(
+        "<div class='nimbus-job-metric'>"
+        f"<span>{html.escape(str(label))}</span>"
+        f"<strong>{html.escape(str(value or '-'))}</strong>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _render_job_cards(
     statuses: list[dict[str, Any]],
     *,
@@ -1994,13 +2014,13 @@ def _render_job_cards(
                     f"{item.get('product_type', '-')}"
                 )
             with h2:
-                st.metric("State", state)
+                _render_compact_job_metric("State", state_label)
             with h3:
-                st.metric("Pipeline", pipeline_label)
+                _render_compact_job_metric("Pipeline", pipeline_label)
             with h4:
-                st.metric("Job elapsed", _format_runtime_duration(duration))
+                _render_compact_job_metric("Job elapsed", _format_runtime_duration(duration))
             with h5:
-                st.metric("Stage elapsed", current_stage_duration)
+                _render_compact_job_metric("Stage elapsed", current_stage_duration)
             _render_pipeline_timeline(item)
             _render_job_progress_bar(pipeline_progress, _job_progress_visual_state(item))
             st.caption(
@@ -2939,10 +2959,13 @@ def _job_pipeline_paths(item: dict[str, Any]) -> tuple[str | None, str | None]:
     return (raw_uri or None, zarr_uri or None)
 
 
-def _render_job_pipeline_paths(item: dict[str, Any]) -> None:
+def _basename_label(value: Any) -> str:
+    text = str(value or "").strip()
+    return Path(text).name if text else "-"
+
+
+def _job_pipeline_path_lines(item: dict[str, Any]) -> list[str]:
     raw_uri, zarr_uri = _job_pipeline_paths(item)
-    if not raw_uri and not zarr_uri:
-        return
     lines: list[str] = []
     if _job_is_mask_job(item):
         if raw_uri:
@@ -2952,12 +2975,50 @@ def _render_job_pipeline_paths(item: dict[str, Any]) -> None:
             if raw_uri and Path(raw_uri).name == Path(zarr_uri).name:
                 label = "Target Zarr (same store)"
             lines.append(f"{label}: {Path(zarr_uri).name}")
+        return lines
+
+    raw_outputs = [str(path) for path in list(item.get("raw_outputs") or []) if str(path).strip()]
+    zarr_outputs = [str(path) for path in list(item.get("zarr_outputs") or []) if str(path).strip()]
+    pipeline_meta = dict(item.get("pipeline_metadata") or {})
+    cube_outputs = [
+        str(path)
+        for path in list(item.get("cube_outputs") or pipeline_meta.get("cube_outputs") or [])
+        if str(path).strip()
+    ]
+    pipeline_state = _job_pipeline_state(item)
+    if len(raw_outputs) > 1 or len(zarr_outputs) > 1:
+        if raw_outputs:
+            lines.append(f"Sources: {len(raw_outputs)} raw file{'s' if len(raw_outputs) != 1 else ''}")
+        if zarr_outputs:
+            lines.append(f"Zarr stores: {len(zarr_outputs)}")
+        preview_count = min(3, max(len(raw_outputs), len(zarr_outputs)))
+        for index in range(preview_count):
+            source = _basename_label(raw_outputs[index] if index < len(raw_outputs) else "")
+            target = _basename_label(zarr_outputs[index] if index < len(zarr_outputs) else "")
+            lines.append(f"{index + 1}. {source} -> {target}")
+        remaining = max(len(raw_outputs), len(zarr_outputs)) - preview_count
+        if remaining > 0:
+            lines.append(f"+ {remaining} more scene{'s' if remaining != 1 else ''}")
     else:
         if raw_uri:
             lines.append(f"Source raw: {Path(raw_uri).name}")
         if zarr_uri:
-            label = "Cube target" if _job_pipeline_state(item) in {"cube_queued", "cube_building", "cube_written", "cube_failed"} else "Zarr target"
+            label = "Cube target" if pipeline_state in {"cube_queued", "cube_building", "cube_written", "cube_failed"} else "Zarr target"
             lines.append(f"{label}: {Path(zarr_uri).name}")
+
+    if cube_outputs:
+        lines.append(f"Cube stores: {len(cube_outputs)}")
+        for index, cube_uri in enumerate(cube_outputs[:3], start=1):
+            lines.append(f"cube {index}. {_basename_label(cube_uri)}")
+        if len(cube_outputs) > 3:
+            lines.append(f"+ {len(cube_outputs) - 3} more cube stores")
+    return lines
+
+
+def _render_job_pipeline_paths(item: dict[str, Any]) -> None:
+    lines = _job_pipeline_path_lines(item)
+    if not lines:
+        return
     st.code("\n".join(lines), language="text")
 
 
@@ -3793,6 +3854,17 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_
     st.sidebar.markdown('<div style="display:flex;align-items:center;gap:6px;padding-top:.3rem"><span>📡</span><span style="font-weight:600;font-size:.88rem;">Data Source</span></div>', unsafe_allow_html=True)
     provider = st.sidebar.selectbox("Provider", list(PROVIDERS.keys()), index=list(PROVIDERS.keys()).index(_ss("provider", "Copernicus")), key="sb_prov")
     st.session_state["provider"] = provider
+    synced_provider = str(st.session_state.get("_tile_system_synced_provider") or "")
+    desired_tile_system = _default_tile_system_for_provider(provider, sat_tiles)
+    if desired_tile_system and synced_provider != provider:
+        st.session_state["_tile_system_synced_provider"] = provider
+        if st.session_state.get("tile_system") != desired_tile_system:
+            st.session_state["tile_system"] = desired_tile_system
+            st.session_state["selected_tiles"] = []
+            st.session_state["intersecting_tiles"] = []
+            st.rerun()
+    else:
+        st.session_state["_tile_system_synced_provider"] = provider
     missions = PROVIDERS.get(provider, [])
     if missions:
         ds = _ss("satellite", missions[0])

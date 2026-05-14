@@ -121,6 +121,32 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"] {
 [data-testid="stMetricValue"] {
     color: var(--text) !important;
 }
+.nimbus-job-metric {
+    min-height: 66px;
+    padding: 9px 11px;
+    border-radius: 8px;
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    background: rgba(9, 15, 29, 0.72);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 5px;
+    overflow: hidden;
+}
+.nimbus-job-metric span {
+    color: #7b8da8;
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.nimbus-job-metric strong {
+    color: #e2e8f0;
+    font-size: 0.94rem;
+    line-height: 1.2;
+    font-weight: 700;
+    overflow-wrap: anywhere;
+}
 pre, code {
     background: #0b1120 !important;
     color: var(--text) !important;
@@ -298,21 +324,18 @@ iframe[title="leaflet_map"] {
 .nimbus-pipeline-shell {
     position: relative;
     margin: 12px 0 10px 0;
-    padding: 16px;
-    border-radius: 24px;
+    padding: 13px;
+    border-radius: 10px;
     border: 1px solid rgba(56, 189, 248, 0.14);
-    background:
-        radial-gradient(circle at top right, rgba(45, 212, 191, 0.10), transparent 24%),
-        radial-gradient(circle at left center, rgba(56, 189, 248, 0.08), transparent 22%),
-        linear-gradient(180deg, rgba(8, 14, 28, 0.98), rgba(5, 9, 18, 0.98));
-    box-shadow: 0 24px 60px rgba(2, 8, 23, 0.40);
+    background: linear-gradient(180deg, rgba(8, 14, 28, 0.98), rgba(5, 9, 18, 0.98));
+    box-shadow: 0 16px 34px rgba(2, 8, 23, 0.34);
     overflow: hidden;
 }
 .nimbus-pipeline-overview {
     display: flex;
     justify-content: space-between;
     align-items: flex-start;
-    gap: 16px;
+    gap: 12px;
     flex-wrap: wrap;
 }
 .nimbus-pipeline-title-block {
@@ -341,15 +364,16 @@ iframe[title="leaflet_map"] {
 }
 .nimbus-pipeline-metrics {
     display: flex;
-    gap: 10px;
+    gap: 8px;
     flex-wrap: wrap;
     justify-content: flex-end;
     flex: 0 1 auto;
 }
 .nimbus-pipeline-metric {
-    min-width: 110px;
-    padding: 10px 12px;
-    border-radius: 16px;
+    min-width: 92px;
+    max-width: 150px;
+    padding: 8px 10px;
+    border-radius: 8px;
     border: 1px solid rgba(148, 163, 184, 0.12);
     background: rgba(9, 15, 29, 0.72);
     display: flex;
@@ -364,13 +388,14 @@ iframe[title="leaflet_map"] {
     color: #7b8da8;
 }
 .nimbus-pipeline-metric strong {
-    font-size: 0.92rem;
+    font-size: 0.86rem;
     line-height: 1.25;
     color: #e2e8f0;
+    overflow-wrap: anywhere;
 }
 .nimbus-pipeline-progress {
-    margin: 14px 0 18px 0;
-    height: 10px;
+    margin: 12px 0 14px 0;
+    height: 8px;
     border-radius: 999px;
     background: rgba(15, 23, 42, 0.92);
     border: 1px solid rgba(148, 163, 184, 0.10);
@@ -385,17 +410,17 @@ iframe[title="leaflet_map"] {
 }
 .nimbus-stage-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
-    gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+    gap: 10px;
 }
 .nimbus-stage-card {
     position: relative;
-    min-height: 148px;
-    padding: 14px 14px 13px 14px;
-    border-radius: 20px;
+    min-height: 124px;
+    padding: 11px 11px 10px 11px;
+    border-radius: 8px;
     border: 1px solid rgba(148, 163, 184, 0.14);
     background: linear-gradient(180deg, rgba(12, 18, 34, 0.96), rgba(8, 13, 26, 0.96));
-    box-shadow: 0 18px 42px rgba(2, 8, 23, 0.28);
+    box-shadow: 0 12px 26px rgba(2, 8, 23, 0.24);
     transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
     overflow: hidden;
 }
@@ -424,9 +449,9 @@ iframe[title="leaflet_map"] {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 999px;
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.67rem;
     font-weight: 700;
@@ -438,9 +463,9 @@ iframe[title="leaflet_map"] {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-width: 52px;
-    padding: 4px 8px;
-    border-radius: 999px;
+    min-width: 46px;
+    padding: 4px 7px;
+    border-radius: 8px;
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.68rem;
     font-weight: 700;
@@ -456,16 +481,16 @@ iframe[title="leaflet_map"] {
     color: var(--muted);
 }
 .nimbus-stage-title {
-    margin-top: 16px;
-    font-size: 1.02rem;
+    margin-top: 12px;
+    font-size: 0.94rem;
     font-weight: 700;
     color: #f8fafc;
 }
 .nimbus-stage-detail {
-    margin-top: 8px;
-    min-height: 40px;
-    font-size: 0.80rem;
-    line-height: 1.5;
+    margin-top: 6px;
+    min-height: 34px;
+    font-size: 0.76rem;
+    line-height: 1.42;
     color: #cbd5e1;
     overflow-wrap: anywhere;
     display: -webkit-box;
@@ -476,24 +501,22 @@ iframe[title="leaflet_map"] {
 .nimbus-stage-pills {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 12px;
+    gap: 6px;
+    margin-top: 9px;
 }
 .nimbus-stage-pill {
     display: inline-flex;
     align-items: center;
-    padding: 4px 8px;
-    border-radius: 999px;
-    font-size: 0.68rem;
+    padding: 3px 7px;
+    border-radius: 8px;
+    font-size: 0.66rem;
     font-weight: 700;
     color: #cbd5e1;
     background: rgba(148, 163, 184, 0.12);
 }
 .nimbus-stage-done {
     border-color: rgba(74, 222, 128, 0.26);
-    background:
-        radial-gradient(circle at top right, rgba(74, 222, 128, 0.12), transparent 36%),
-        linear-gradient(180deg, rgba(11, 29, 24, 0.98), rgba(8, 19, 18, 0.98));
+    background: linear-gradient(180deg, rgba(11, 29, 24, 0.98), rgba(8, 19, 18, 0.98));
 }
 .nimbus-stage-done::before {
     background: linear-gradient(90deg, rgba(74, 222, 128, 0.96), rgba(45, 212, 191, 0.82));
@@ -509,9 +532,7 @@ iframe[title="leaflet_map"] {
 }
 .nimbus-stage-running {
     border-color: rgba(56, 189, 248, 0.34);
-    background:
-        radial-gradient(circle at top right, rgba(56, 189, 248, 0.14), transparent 38%),
-        linear-gradient(180deg, rgba(10, 20, 36, 0.98), rgba(8, 13, 26, 0.98));
+    background: linear-gradient(180deg, rgba(10, 20, 36, 0.98), rgba(8, 13, 26, 0.98));
     box-shadow: 0 22px 54px rgba(8, 47, 73, 0.24);
 }
 .nimbus-stage-running::before {
@@ -528,9 +549,7 @@ iframe[title="leaflet_map"] {
 }
 .nimbus-stage-queued {
     border-color: rgba(251, 191, 36, 0.28);
-    background:
-        radial-gradient(circle at top right, rgba(251, 191, 36, 0.12), transparent 36%),
-        linear-gradient(180deg, rgba(34, 24, 9, 0.98), rgba(20, 15, 8, 0.98));
+    background: linear-gradient(180deg, rgba(34, 24, 9, 0.98), rgba(20, 15, 8, 0.98));
 }
 .nimbus-stage-queued::before {
     background: linear-gradient(90deg, rgba(251, 191, 36, 0.94), rgba(249, 168, 37, 0.82));
@@ -546,9 +565,7 @@ iframe[title="leaflet_map"] {
 }
 .nimbus-stage-skipped {
     border-color: rgba(148, 163, 184, 0.24);
-    background:
-        radial-gradient(circle at top right, rgba(148, 163, 184, 0.10), transparent 36%),
-        linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(10, 15, 28, 0.98));
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(10, 15, 28, 0.98));
 }
 .nimbus-stage-skipped::before {
     background: linear-gradient(90deg, rgba(148, 163, 184, 0.70), rgba(100, 116, 139, 0.58));
@@ -564,9 +581,7 @@ iframe[title="leaflet_map"] {
 }
 .nimbus-stage-failed {
     border-color: rgba(248, 113, 113, 0.30);
-    background:
-        radial-gradient(circle at top right, rgba(248, 113, 113, 0.12), transparent 36%),
-        linear-gradient(180deg, rgba(40, 12, 17, 0.98), rgba(27, 10, 16, 0.98));
+    background: linear-gradient(180deg, rgba(40, 12, 17, 0.98), rgba(27, 10, 16, 0.98));
 }
 .nimbus-stage-failed::before {
     background: linear-gradient(90deg, rgba(248, 113, 113, 0.96), rgba(244, 63, 94, 0.82));
@@ -582,9 +597,7 @@ iframe[title="leaflet_map"] {
 }
 .nimbus-stage-cancelled {
     border-color: rgba(192, 132, 252, 0.30);
-    background:
-        radial-gradient(circle at top right, rgba(192, 132, 252, 0.12), transparent 36%),
-        linear-gradient(180deg, rgba(28, 13, 40, 0.98), rgba(20, 10, 30, 0.98));
+    background: linear-gradient(180deg, rgba(28, 13, 40, 0.98), rgba(20, 10, 30, 0.98));
 }
 .nimbus-stage-cancelled::before {
     background: linear-gradient(90deg, rgba(192, 132, 252, 0.96), rgba(168, 85, 247, 0.82));
@@ -601,9 +614,7 @@ iframe[title="leaflet_map"] {
 .nimbus-stage-pending {
     opacity: 0.96;
     border-color: rgba(100, 116, 139, 0.22);
-    background:
-        radial-gradient(circle at top right, rgba(148, 163, 184, 0.08), transparent 38%),
-        linear-gradient(180deg, rgba(13, 18, 32, 0.96), rgba(9, 13, 24, 0.96));
+    background: linear-gradient(180deg, rgba(13, 18, 32, 0.96), rgba(9, 13, 24, 0.96));
 }
 .nimbus-stage-pending::before {
     background: rgba(100, 116, 139, 0.32);
@@ -617,10 +628,26 @@ iframe[title="leaflet_map"] {
 .nimbus-stage-pending .nimbus-stage-status {
     color: #94a3b8;
 }
+.nimbus-stage-card.has-warning {
+    border-color: rgba(245, 158, 11, 0.46);
+    background: linear-gradient(180deg, rgba(34, 24, 9, 0.96), rgba(17, 18, 27, 0.98));
+}
+.nimbus-stage-card.has-warning::before {
+    background: linear-gradient(90deg, rgba(245, 158, 11, 0.96), rgba(251, 191, 36, 0.74));
+}
+.nimbus-stage-card.has-warning .nimbus-stage-index,
+.nimbus-stage-card.has-warning .nimbus-stage-badge,
+.nimbus-stage-card.has-warning .nimbus-stage-pill {
+    background: rgba(245, 158, 11, 0.16);
+    color: #fde68a;
+}
+.nimbus-stage-card.has-warning .nimbus-stage-status {
+    color: #fde68a;
+}
 @media (max-width: 900px) {
     .nimbus-pipeline-shell {
-        padding: 14px;
-        border-radius: 20px;
+        padding: 12px;
+        border-radius: 10px;
     }
     .nimbus-pipeline-metrics {
         width: 100%;

@@ -6,7 +6,9 @@ from nimbuschain_fetch_ui.app import (
     _cube_mode_from_payload,
     _display_pipeline_stages,
     _format_runtime_duration,
+    _job_pipeline_path_lines,
     _job_elapsed_seconds,
+    _default_tile_system_for_provider,
     _mask_types_from_payload,
     _pipeline_timeline_snapshot,
     _timeline_breakdown_rows,
@@ -429,6 +431,38 @@ def test_job_elapsed_uses_orchestrator_window_when_stage_results_are_partial() -
 
     assert _job_elapsed_seconds(item) == 167.0
     assert _format_runtime_duration(_job_elapsed_seconds(item)) == "2m 47s"
+
+
+def test_pipeline_path_lines_pair_multi_scene_outputs_by_index() -> None:
+    item = {
+        "state": "succeeded",
+        "pipeline_state": "masked_zarr_written",
+        "raw_outputs": [
+            "/data/raw/LC81980232026133LGN00.tar",
+            "/data/raw/LC82000232026131LGN01.tar",
+        ],
+        "zarr_outputs": [
+            "/data/zarr/LC81980232026133LGN00.zarr",
+            "/data/zarr/LC82000232026131LGN01.zarr",
+        ],
+    }
+
+    assert _job_pipeline_path_lines(item) == [
+        "Sources: 2 raw files",
+        "Zarr stores: 2",
+        "1. LC81980232026133LGN00.tar -> LC81980232026133LGN00.zarr",
+        "2. LC82000232026131LGN01.tar -> LC82000232026131LGN01.zarr",
+    ]
+
+
+def test_default_tile_system_follows_provider_when_available() -> None:
+    sat_tiles = {
+        "sentinel-2": {"tiles": object()},
+        "landsat": {"tiles": object()},
+    }
+
+    assert _default_tile_system_for_provider("USGS", sat_tiles) == "landsat"
+    assert _default_tile_system_for_provider("Copernicus", sat_tiles) == "sentinel-2"
 
 
 def test_pipeline_timeline_snapshot_heals_terminal_display_gaps(monkeypatch) -> None:
