@@ -9,7 +9,11 @@ from nimbuschain_fetch_ui.app import (
     _display_pipeline_stages,
     _format_runtime_duration,
     _job_pipeline_path_lines,
+    _job_pipeline_style,
+    _job_pipeline_summary,
+    _job_pipeline_substate,
     _job_elapsed_seconds,
+    _job_has_pipeline_warnings,
     _default_tile_system_for_provider,
     _mask_types_from_payload,
     _pipeline_timeline_snapshot,
@@ -422,6 +426,32 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
         "select at least two dates for the same tile/path-row"
     )
     assert display_stages[4]["detail_label"] == "OK: Water + Cloud masks written in-place on 2/2 scenes"
+
+
+def test_pipeline_ready_badge_warns_for_fallbacks_and_skips() -> None:
+    item = {
+        "state": "succeeded",
+        "pipeline_state": "masked_zarr_written",
+        "zarr_outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"],
+        "request": {
+            "mask_types": ["water", "cloud"],
+            "cube_mode": "before_mask",
+        },
+        "pipeline_metadata": {
+            "sen2like_status": "raw_fallback",
+            "zarr_input_source": "raw",
+            "cube_status": "skipped",
+            "mask_status": "written",
+            "mask_mode": "integrated",
+            "mask_types": ["water", "cloud"],
+        },
+    }
+
+    assert _job_has_pipeline_warnings(item) is True
+    assert _job_pipeline_style(item)[0] == "ready with caveats"
+    assert app_module._terminal_pipeline_label(item) == "Ready with caveats"
+    assert "ready with caveats" in str(_job_pipeline_summary(item))
+    assert _job_pipeline_substate(item) == "Pipeline caveats: Sen2Like raw fallback, cube skipped."
 
 
 def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:

@@ -2362,6 +2362,8 @@ def _stage_status_label_for_display(stage: dict[str, Any], status_kind: str) -> 
 def _terminal_pipeline_label(item: dict[str, Any]) -> str:
     state = str(item.get("state") or "").strip().lower()
     if state == "succeeded":
+        if _job_has_pipeline_warnings(item):
+            return "Ready with caveats"
         return "Ready"
     if state == "failed":
         return "Failed"
@@ -2682,18 +2684,24 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
     if pipeline_state == "zarr_converting":
         return ("zarr converting", "#38bdf8", "rgba(56,189,248,0.16)", "⚙")
     if pipeline_state == "zarr_written":
+        if _job_has_pipeline_warnings(item):
+            return ("zarr ready with caveats", "#f59e0b", "rgba(245,158,11,0.16)", "!")
         return ("zarr ready", "#4ade80", "rgba(74,222,128,0.14)", "⬢")
     if pipeline_state == "cube_queued":
         return ("cube queued", "#fbbf24", "rgba(251,191,36,0.16)", "⏳")
     if pipeline_state == "cube_building":
         return ("cube building", "#14b8a6", "rgba(20,184,166,0.16)", "▣")
     if pipeline_state == "cube_written":
+        if _job_has_pipeline_warnings(item):
+            return ("cube ready with caveats", "#f59e0b", "rgba(245,158,11,0.16)", "!")
         return ("cube ready", "#4ade80", "rgba(74,222,128,0.14)", "▣")
     if pipeline_state == "running_cloud_inference":
         return ("cloud inference", "#38bdf8", "rgba(56,189,248,0.16)", "☁")
     if pipeline_state == "running_water_inference":
         return ("water inference", "#22d3ee", "rgba(34,211,238,0.16)", "≈")
     if pipeline_state == "masked_zarr_written":
+        if _job_has_pipeline_warnings(item):
+            return ("ready with caveats", "#f59e0b", "rgba(245,158,11,0.16)", "!")
         return ("pipeline ready", "#4ade80", "rgba(74,222,128,0.14)", "✓")
     if pipeline_state == "cube_failed":
         return ("cube failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
@@ -2706,6 +2714,23 @@ def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
     if pipeline_state == "failed":
         return ("failed", "#f87171", "rgba(248,113,113,0.14)", "✕")
     return ("queued", "#fbbf24", "rgba(251,191,36,0.16)", "⏳")
+
+
+def _job_pipeline_warning_reasons(item: dict[str, Any]) -> list[str]:
+    pipeline_meta = dict(item.get("pipeline_metadata") or {})
+    reasons: list[str] = []
+    sen2like_status = str(pipeline_meta.get("sen2like_status") or "").strip().lower()
+    zarr_input_source = str(pipeline_meta.get("zarr_input_source") or "").strip().lower()
+    if sen2like_status == "raw_fallback" or zarr_input_source == "raw":
+        reasons.append("Sen2Like raw fallback")
+    cube_status = str(pipeline_meta.get("cube_status") or "").strip().lower()
+    if cube_status == "skipped":
+        reasons.append("cube skipped")
+    return reasons
+
+
+def _job_has_pipeline_warnings(item: dict[str, Any]) -> bool:
+    return bool(_job_pipeline_warning_reasons(item))
 
 
 def _job_progress_visual_state(item: dict[str, Any]) -> str:
@@ -2803,6 +2828,12 @@ def _job_pipeline_summary(item: dict[str, Any]) -> str | None:
     if pipeline_state == "running_water_inference":
         return f"Download and conversion completed. Running water masking in-place on the resulting Zarr{suffix}."
     if pipeline_state == "masked_zarr_written":
+        warning_reasons = _job_pipeline_warning_reasons(item)
+        if warning_reasons:
+            return (
+                "Download complete. Zarr output and requested masks are ready with caveats: "
+                f"{', '.join(warning_reasons)}{suffix}."
+            )
         return f"Download complete. Zarr output and requested masks are ready{suffix}."
     if pipeline_state == "cube_written":
         return f"Download complete. Cube outputs are ready{suffix}."
@@ -2968,6 +2999,9 @@ def _job_pipeline_substate(item: dict[str, Any]) -> str | None:
             "Water layers will be written into `masks/water` and `masks/water_probability`"
             f" in the same Zarr store{suffix}{worker_suffix}."
         )
+    warning_reasons = _job_pipeline_warning_reasons(item)
+    if warning_reasons and pipeline_state in {"zarr_written", "cube_written", "masked_zarr_written"}:
+        return f"Pipeline caveats: {', '.join(warning_reasons)}."
     return None
 
 
