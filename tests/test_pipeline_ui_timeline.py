@@ -341,6 +341,77 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
     assert display_stages[4]["detail_label"] == "Water + Cloud masks written in-place on 2 scenes"
 
 
+def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:
+    item = {
+        "state": "succeeded",
+        "pipeline_state": "masked_zarr_written",
+        "raw_outputs": ["/data/raw/a.tar", "/data/raw/b.tar"],
+        "zarr_outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"],
+        "pipeline_metadata": {
+            "sen2like_status": "raw_fallback",
+            "sen2like_fallback_reason": "sen2like_resource_exhausted",
+            "zarr_input_source": "raw",
+            "zarr_input_outputs": ["/data/raw/a.tar", "/data/raw/b.tar"],
+            "cube_status": "skipped",
+            "cube_reason": "no_groups_with_multiple_times",
+            "mask_status": "written",
+            "mask_types": ["water", "cloud"],
+            "mask_total_scenes": 2,
+            "mask_completed_scenes": 2,
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "sen2like", "depends_on": ["fetch"]},
+                {"name": "zarr", "depends_on": ["sen2like"]},
+                {"name": "cube", "depends_on": ["zarr"]},
+                {"name": "mask", "depends_on": ["cube"]},
+            ],
+            "stage_results": [
+                {"name": "fetch", "status": "succeeded", "outputs": ["/data/raw/a.tar", "/data/raw/b.tar"]},
+                {
+                    "name": "sen2like",
+                    "status": "skipped",
+                    "outputs": [],
+                    "metadata": {
+                        "reason": "sen2like_runtime_not_routed_yet",
+                        "runner": "pending_service_routing",
+                    },
+                },
+                {"name": "zarr", "status": "succeeded", "outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"]},
+                {
+                    "name": "cube",
+                    "status": "skipped",
+                    "metadata": {"runner": "cube_builder", "cube_mode": "before_mask"},
+                },
+                {
+                    "name": "mask",
+                    "status": "succeeded",
+                    "outputs": [],
+                    "metadata": {"mask_status": "written"},
+                },
+            ],
+        },
+    }
+
+    display_stages = _display_pipeline_stages(item, {}, [])
+
+    assert [stage["status"] for stage in display_stages] == [
+        "done",
+        "done",
+        "done",
+        "skipped",
+        "done",
+    ]
+    assert display_stages[1]["outputs"] == ["/data/raw/a.tar", "/data/raw/b.tar"]
+    assert display_stages[1]["detail_label"] == (
+        "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
+    )
+    assert display_stages[3]["detail_label"] == (
+        "Skipped: no cube built because each group has fewer than two acquisition times"
+    )
+    assert display_stages[4]["outputs"] == ["/data/zarr/a.zarr", "/data/zarr/b.zarr"]
+    assert display_stages[4]["detail_label"] == "Water + Cloud masks written in-place on 2 scenes"
+
+
 def test_pipeline_display_compacts_structured_sen2like_errors() -> None:
     item = {
         "pipeline_metadata": {

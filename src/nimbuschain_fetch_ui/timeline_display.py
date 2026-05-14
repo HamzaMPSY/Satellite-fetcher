@@ -154,7 +154,17 @@ def _stage_result_to_display_stage(
         metadata.setdefault("mask_mode", pipeline_metadata.get("mask_mode"))
     reason = str(metadata.get("reason") or "").strip()
     error = str(result.get("error") or "").strip()
-    if name == "cube" and cube_status == "skipped":
+    if name == "sen2like" and _sen2like_used_raw_fallback(metadata):
+        status = "done"
+        error = ""
+        reason = ""
+        if not outputs:
+            outputs = [
+                str(output)
+                for output in list(pipeline_metadata.get("zarr_input_outputs") or item.get("raw_outputs") or [])
+                if str(output).strip()
+            ]
+    elif name == "cube" and cube_status == "skipped":
         status = "skipped"
         error = ""
         if not reason:
