@@ -260,6 +260,19 @@ def _matches_case_candidate(case: PipelineCase, raw_uri: str) -> bool:
     return "_L2" in name or "L2SP" in name or "L2SR" in name
 
 
+def _usable_local_raw_candidate(case: PipelineCase, path: Path) -> Path:
+    if case.provider != "usgs" or not path.is_file():
+        return path
+    if path.suffix.lower() not in {".tif", ".txt", ".xml"}:
+        return path
+    parent = path.parent
+    if list(parent.glob("*_MTL.txt")) and (
+        list(parent.glob("*.TIF")) or list(parent.glob("*.tif"))
+    ):
+        return parent
+    return path
+
+
 def _discover_local_raw(case: PipelineCase) -> RawProduct | None:
     explicit = _env(f"{case.env_prefix}_RAW_URI")
     if explicit:
@@ -274,7 +287,7 @@ def _discover_local_raw(case: PipelineCase) -> RawProduct | None:
     seen: set[str] = set()
     for candidate in recent_source_candidates(limit=500):
         if _matches_case_candidate(case, candidate):
-            path = resolve_local_path(candidate)
+            path = _usable_local_raw_candidate(case, resolve_local_path(candidate))
             if path.exists():
                 return RawProduct(
                     source_mode="local_fixture",
@@ -292,6 +305,7 @@ def _discover_local_raw(case: PipelineCase) -> RawProduct | None:
             if ".zarr" in path.parts or path.name.endswith(".zarr"):
                 continue
             if _matches_case_candidate(case, str(path)):
+                path = _usable_local_raw_candidate(case, path)
                 return RawProduct(
                     source_mode="local_fixture",
                     raw_uri=str(path.resolve()),
