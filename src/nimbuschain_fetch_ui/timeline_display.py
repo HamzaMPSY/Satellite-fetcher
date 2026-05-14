@@ -142,6 +142,13 @@ def _stage_result_to_display_stage(
         metadata.setdefault("fallback_reason", pipeline_metadata.get("sen2like_fallback_reason"))
         metadata.setdefault("fallback_message", pipeline_metadata.get("sen2like_fallback_message"))
         metadata.setdefault("zarr_input_source", pipeline_metadata.get("zarr_input_source"))
+    elif name == "zarr":
+        metadata.setdefault("zarr_input_source", pipeline_metadata.get("zarr_input_source"))
+        metadata.setdefault("zarr_input_outputs", pipeline_metadata.get("zarr_input_outputs"))
+        metadata.setdefault("sen2like_status", pipeline_metadata.get("sen2like_status"))
+        metadata.setdefault("fallback_reason", pipeline_metadata.get("sen2like_fallback_reason"))
+        if _zarr_uses_raw_fallback(metadata):
+            metadata["raw_fallback"] = True
     elif name == "cube":
         metadata.setdefault("cube_status", pipeline_metadata.get("cube_status"))
         metadata.setdefault("cube_reason", pipeline_metadata.get("cube_reason"))
@@ -196,6 +203,8 @@ def _stage_result_to_display_stage(
         or mask_status == "written"
     ):
         detail_label = _mask_written_label(metadata, outputs)
+    elif name == "zarr" and status == "done" and _zarr_uses_raw_fallback(metadata):
+        detail_label = _zarr_raw_fallback_label(metadata, outputs, default_detail)
     elif status == "skipped" and reason:
         detail_label = f"Skipped: {_generic_skip_reason_label(reason)}"
     elif outputs:
@@ -231,6 +240,24 @@ def _sen2like_fallback_label(metadata: dict[str, Any]) -> str:
     if reason:
         return f"Sen2Like fallback: raw Landsat inputs used ({reason.replace('_', ' ')})"
     return "Sen2Like fallback: raw Landsat inputs used for Zarr"
+
+
+def _zarr_uses_raw_fallback(metadata: dict[str, Any]) -> bool:
+    source = str(metadata.get("zarr_input_source") or "").strip().lower()
+    return source == "raw" and _sen2like_used_raw_fallback(metadata)
+
+
+def _zarr_raw_fallback_label(
+    metadata: dict[str, Any],
+    outputs: list[str],
+    default_detail: str,
+) -> str:
+    output_count = len(outputs)
+    suffix = f" · {output_count} output{'s' if output_count != 1 else ''}" if output_count else ""
+    reason = str(metadata.get("fallback_reason") or "").strip().lower()
+    if reason == "sen2like_resource_exhausted":
+        return f"{default_detail} from raw Landsat fallback after Sen2Like memory kill{suffix}"
+    return f"{default_detail} from raw Landsat fallback{suffix}"
 
 
 def _mask_written_label(metadata: dict[str, Any], outputs: list[str]) -> str:

@@ -335,6 +335,10 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
     assert display_stages[1]["detail_label"] == (
         "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
     )
+    assert display_stages[2]["metadata"]["raw_fallback"] is True
+    assert display_stages[2]["detail_label"] == (
+        "Zarr conversion from raw Landsat fallback after Sen2Like memory kill · 2 outputs"
+    )
     assert display_stages[3]["detail_label"] == (
         "Skipped: no cube built because each group has fewer than two acquisition times"
     )
