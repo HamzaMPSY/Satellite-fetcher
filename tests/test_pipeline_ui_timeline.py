@@ -252,7 +252,7 @@ def test_pipeline_display_heals_optional_cube_skip_after_resumed_masks() -> None
     assert display_stages[2]["detail_label"] == (
         "Skipped: daily mosaic cubes currently require Sentinel-2 scene inputs"
     )
-    assert display_stages[3]["detail_label"] == "Masks written in-place on 2 scenes"
+    assert display_stages[3]["detail_label"] == "OK: Masks written in-place on 2 scenes"
 
 
 def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() -> None:
@@ -343,7 +343,7 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
         "Skipped: no cube built because each group has fewer than two acquisition times; "
         "select at least two dates for the same tile/path-row"
     )
-    assert display_stages[4]["detail_label"] == "Water + Cloud masks written in-place on 2 scenes"
+    assert display_stages[4]["detail_label"] == "OK: Water + Cloud masks written in-place on 2/2 scenes"
 
 
 def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:
@@ -415,7 +415,7 @@ def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:
         "select at least two dates for the same tile/path-row"
     )
     assert display_stages[4]["outputs"] == ["/data/zarr/a.zarr", "/data/zarr/b.zarr"]
-    assert display_stages[4]["detail_label"] == "Water + Cloud masks written in-place on 2 scenes"
+    assert display_stages[4]["detail_label"] == "OK: Water + Cloud masks written in-place on 2/2 scenes"
 
 
 def test_pipeline_display_compacts_structured_sen2like_errors() -> None:

@@ -270,9 +270,13 @@ def _mask_written_label(metadata: dict[str, Any], outputs: list[str]) -> str:
     total = _positive_int(metadata.get("mask_total_scenes"))
     completed = _positive_int(metadata.get("mask_completed_scenes"))
     scene_count = completed or total or len(outputs)
+    if total > 0 and completed > 0:
+        scene_word = "scene" if total == 1 else "scenes"
+        prefix_text = "OK: " if completed >= total else ""
+        return f"{prefix_text}{prefix} written in-place on {completed}/{total} {scene_word}"
     if scene_count > 0:
         scene_word = "scene" if scene_count == 1 else "scenes"
-        return f"{prefix} written in-place on {scene_count} {scene_word}"
+        return f"OK: {prefix} written in-place on {scene_count} {scene_word}"
     return f"{prefix} written in-place"
 
 
