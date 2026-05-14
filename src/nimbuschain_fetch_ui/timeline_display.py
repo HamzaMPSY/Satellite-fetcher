@@ -291,11 +291,11 @@ def _cube_skip_reason_label(
     ).strip()
     lowered = reason.lower()
     if lowered in {"no_groups_with_multiple_times", "fewer_than_two_unique_times"}:
-        return "no cube built because each group has fewer than two acquisition times"
+        return "no cube built because each group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
     if "fewer_than_two_unique_times" in lowered:
-        return "no cube built because a group has fewer than two acquisition times"
+        return "no cube built because a group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
     if "no_groups_with_multiple_times" in lowered:
-        return "no cube built because each group has fewer than two acquisition times"
+        return "no cube built because each group has fewer than two acquisition times; select at least two dates for the same tile/path-row"
     if "daily mosaic cube" in lowered and "sentinel-2" in lowered:
         return "daily mosaic cubes currently require Sentinel-2 scene inputs"
     if lowered == "cube_input_missing":

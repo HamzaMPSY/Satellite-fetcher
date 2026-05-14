@@ -340,7 +340,8 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
         "Zarr conversion from raw Landsat fallback after Sen2Like memory kill · 2 outputs"
     )
     assert display_stages[3]["detail_label"] == (
-        "Skipped: no cube built because each group has fewer than two acquisition times"
+        "Skipped: no cube built because each group has fewer than two acquisition times; "
+        "select at least two dates for the same tile/path-row"
     )
     assert display_stages[4]["detail_label"] == "Water + Cloud masks written in-place on 2 scenes"
 
@@ -410,7 +411,8 @@ def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:
         "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
     )
     assert display_stages[3]["detail_label"] == (
-        "Skipped: no cube built because each group has fewer than two acquisition times"
+        "Skipped: no cube built because each group has fewer than two acquisition times; "
+        "select at least two dates for the same tile/path-row"
     )
     assert display_stages[4]["outputs"] == ["/data/zarr/a.zarr", "/data/zarr/b.zarr"]
     assert display_stages[4]["detail_label"] == "Water + Cloud masks written in-place on 2 scenes"
