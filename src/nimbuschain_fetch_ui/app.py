@@ -3154,7 +3154,7 @@ def _timeline_breakdown_rows(
 ) -> tuple[list[dict[str, str]], bool]:
     raw_steps = [dict(step) for step in list(timeline.get("steps") or []) if isinstance(step, dict)]
     if not raw_steps:
-        return ([], False)
+        return (_append_modular_breakdown_rows(item, timeline, []), False)
 
     rows: list[dict[str, str]] = []
     collapsed_convert_rows = False
@@ -3221,7 +3221,59 @@ def _timeline_breakdown_rows(
             }
         )
 
-    return (rows, collapsed_convert_rows)
+    return (_append_modular_breakdown_rows(item, timeline, rows), collapsed_convert_rows)
+
+
+def _append_modular_breakdown_rows(
+    item: dict[str, Any],
+    timeline: dict[str, Any],
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    raw_stages = [dict(stage) for stage in list(timeline.get("stages") or []) if isinstance(stage, dict)]
+    display_stages = _display_pipeline_stages(item, timeline, raw_stages)
+    if not display_stages:
+        return rows
+
+    seen = {
+        _breakdown_stage_key(str(row.get("stage") or ""))
+        for row in rows
+    }
+    augmented_rows = list(rows)
+    for stage in display_stages:
+        stage_key = str(stage.get("key") or "").strip().lower()
+        if stage_key not in {"fetch", "sen2like", "zarr", "cube", "mask"}:
+            continue
+        if stage_key in seen:
+            continue
+        status_kind = str(stage.get("status") or "-").strip().lower() or "-"
+        augmented_rows.append(
+            {
+                "step": str(stage.get("label") or stage_key.title()),
+                "detail": str(stage.get("detail_label") or "-"),
+                "status": _stage_status_label_for_display(stage, status_kind),
+                "started": _format_status_timestamp(stage.get("started_at")),
+                "finished": _format_status_timestamp(stage.get("finished_at")),
+                "duration": _format_runtime_duration(_stage_elapsed_seconds(stage)),
+                "stage": str(stage.get("label") or stage_key.title()),
+            }
+        )
+        seen.add(stage_key)
+    return augmented_rows
+
+
+def _breakdown_stage_key(value: str) -> str:
+    normalized = str(value or "").strip().lower().replace("_", " ")
+    if normalized in {"search", "download", "fetch", "provider fetch"}:
+        return "fetch"
+    if normalized in {"convert", "conversion", "zarr", "zarr conversion"}:
+        return "zarr"
+    if normalized in {"cloud", "water", "finalize", "mask", "integrated masking"}:
+        return "mask"
+    if "sen2like" in normalized:
+        return "sen2like"
+    if "cube" in normalized:
+        return "cube"
+    return normalized
 
 
 def _render_pipeline_timeline(item: dict[str, Any]) -> None:

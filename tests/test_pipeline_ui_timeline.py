@@ -146,6 +146,78 @@ def test_timeline_breakdown_rows_group_repeating_convert_steps() -> None:
     )
 
 
+def test_timeline_breakdown_rows_fill_missing_modular_stages() -> None:
+    item = {
+        "state": "succeeded",
+        "pipeline_state": "masked_zarr_written",
+        "raw_outputs": ["/data/raw/a.tar", "/data/raw/b.tar"],
+        "zarr_outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"],
+        "pipeline_metadata": {
+            "sen2like_status": "raw_fallback",
+            "sen2like_fallback_reason": "sen2like_resource_exhausted",
+            "zarr_input_source": "raw",
+            "cube_status": "skipped",
+            "cube_reason": "no_groups_with_multiple_times",
+            "mask_status": "written",
+            "mask_types": ["water", "cloud"],
+            "mask_total_scenes": 2,
+            "mask_completed_scenes": 2,
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "sen2like", "depends_on": ["fetch"]},
+                {"name": "zarr", "depends_on": ["sen2like"]},
+                {"name": "cube", "depends_on": ["zarr"]},
+                {"name": "mask", "depends_on": ["cube"]},
+            ],
+            "stage_results": [
+                {"name": "fetch", "status": "succeeded", "outputs": ["/data/raw/a.tar", "/data/raw/b.tar"]},
+                {
+                    "name": "sen2like",
+                    "status": "succeeded",
+                    "outputs": ["/data/raw/a.tar", "/data/raw/b.tar"],
+                    "metadata": {"fallback_to_raw": True, "sen2like_status": "raw_fallback"},
+                },
+                {"name": "zarr", "status": "succeeded", "outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"]},
+                {"name": "cube", "status": "skipped", "metadata": {"reason": "no_groups_with_multiple_times"}},
+                {
+                    "name": "mask",
+                    "status": "succeeded",
+                    "outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"],
+                    "metadata": {
+                        "mask_status": "written",
+                        "mask_types": ["water", "cloud"],
+                        "mask_total_scenes": 2,
+                        "mask_completed_scenes": 2,
+                    },
+                },
+            ],
+        },
+    }
+    timeline = {
+        "steps": [
+            {"key": "searching", "label": "Search Catalog", "status": "done", "group_label": "Search"},
+            {"key": "downloading", "label": "Download Files", "status": "done", "group_label": "Download"},
+            {"key": "masked_zarr_written", "label": "Pipeline Ready", "status": "done", "group_label": "Ready"},
+        ],
+    }
+
+    rows, grouped = _timeline_breakdown_rows(item, timeline)
+
+    assert grouped is False
+    assert [row["stage"] for row in rows] == [
+        "Search",
+        "Download",
+        "Ready",
+        "Sen2Like",
+        "Zarr",
+        "Cube",
+        "Mask",
+    ]
+    assert rows[3]["status"] == "fallback"
+    assert rows[5]["status"] == "skipped"
+    assert rows[6]["detail"] == "OK: Water + Cloud masks written in-place on 2/2 scenes"
+
+
 def test_pipeline_display_stages_match_landsat_dag_vocabulary() -> None:
     item = {
         "provider": "usgs",
