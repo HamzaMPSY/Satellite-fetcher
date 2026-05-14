@@ -165,6 +165,7 @@ def _stage_result_to_display_stage(
         status = "done"
         error = ""
         reason = ""
+        metadata["status_label"] = "fallback"
         if not outputs:
             outputs = [
                 str(output)

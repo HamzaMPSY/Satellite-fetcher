@@ -2335,6 +2335,26 @@ def _stage_display_has_warning(stage: dict[str, Any]) -> bool:
     return False
 
 
+def _stage_status_label_for_display(stage: dict[str, Any], status_kind: str) -> str:
+    metadata = dict(stage.get("metadata") or {})
+    explicit_label = str(
+        metadata.get("status_label")
+        or metadata.get("display_status")
+        or ""
+    ).strip().lower()
+    if explicit_label:
+        return explicit_label.replace("_", " ")
+    return {
+        "pending": "waiting",
+        "queued": "queued",
+        "running": "live",
+        "done": "done",
+        "skipped": "skipped",
+        "failed": "failed",
+        "cancelled": "stopped",
+    }.get(status_kind, status_kind.replace("_", " "))
+
+
 def _terminal_pipeline_label(item: dict[str, Any]) -> str:
     state = str(item.get("state") or "").strip().lower()
     if state == "succeeded":
@@ -3270,15 +3290,7 @@ def _render_pipeline_timeline(item: dict[str, Any]) -> None:
     for index, stage in enumerate(stages, start=1):
         status_kind = str(stage.get("status") or "pending").strip().lower() or "pending"
         stage_key = str(stage.get("key") or "").strip().lower()
-        status_label = {
-            "pending": "waiting",
-            "queued": "queued",
-            "running": "live",
-            "done": "done",
-            "skipped": "skipped",
-            "failed": "failed",
-            "cancelled": "stopped",
-        }.get(status_kind, status_kind.replace("_", " "))
+        status_label = _stage_status_label_for_display(stage, status_kind)
         raw_label = str(stage.get("label") or stage_key or "Stage")
         label = html.escape(raw_label)
         badge = html.escape(str(stage.get("badge") or "STEP"))

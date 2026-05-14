@@ -11,6 +11,7 @@ from nimbuschain_fetch_ui.app import (
     _default_tile_system_for_provider,
     _mask_types_from_payload,
     _pipeline_timeline_snapshot,
+    _stage_status_label_for_display,
     _timeline_breakdown_rows,
 )
 
@@ -335,6 +336,8 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
     assert display_stages[1]["detail_label"] == (
         "Sen2Like hit a memory limit; raw Landsat inputs were used for Zarr"
     )
+    assert display_stages[1]["metadata"]["status_label"] == "fallback"
+    assert _stage_status_label_for_display(display_stages[1], display_stages[1]["status"]) == "fallback"
     assert display_stages[2]["metadata"]["raw_fallback"] is True
     assert display_stages[2]["detail_label"] == (
         "Zarr conversion from raw Landsat fallback after Sen2Like memory kill · 2 outputs"
