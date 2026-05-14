@@ -4,6 +4,8 @@ import nimbuschain_fetch_ui.app as app_module
 from nimbuschain_fetch_ui.app import (
     _conversion_progress_snapshot,
     _cube_mode_from_payload,
+    _current_stage_elapsed_label,
+    _current_timeline_stage,
     _display_pipeline_stages,
     _format_runtime_duration,
     _job_pipeline_path_lines,
@@ -511,6 +513,13 @@ def test_job_elapsed_uses_orchestrator_window_when_stage_results_are_partial() -
 
     assert _job_elapsed_seconds(item) == 167.0
     assert _format_runtime_duration(_job_elapsed_seconds(item)) == "2m 47s"
+    current_stage = _current_timeline_stage(item)
+    assert (current_stage or {})["key"] == "ready"
+    assert _current_stage_elapsed_label(
+        item,
+        current_stage=current_stage,
+        job_duration=_job_elapsed_seconds(item),
+    ) == "2m 47s"
 
 
 def test_pipeline_path_lines_pair_multi_scene_outputs_by_index() -> None:

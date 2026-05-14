@@ -1965,7 +1965,11 @@ def _render_job_cards(
         duration = _job_elapsed_seconds(item)
         current_stage = _current_timeline_stage(item)
         current_stage_label = str((current_stage or {}).get("label") or "-")
-        current_stage_duration = _format_runtime_duration(_stage_elapsed_seconds(current_stage or {}))
+        current_stage_duration = _current_stage_elapsed_label(
+            item,
+            current_stage=current_stage,
+            job_duration=duration,
+        )
         errors = item.get("errors", []) or []
         error_summary = None
         if errors:
@@ -2615,6 +2619,22 @@ def _current_timeline_stage(item: dict[str, Any]) -> dict[str, Any] | None:
         if str(stage.get("status") or "").strip().lower() in {"done", "skipped", "failed", "cancelled"}:
             return stage
     return None
+
+
+def _current_stage_elapsed_label(
+    item: dict[str, Any],
+    *,
+    current_stage: dict[str, Any] | None,
+    job_duration: float | None,
+) -> str:
+    label = _format_runtime_duration(_stage_elapsed_seconds(current_stage or {}))
+    if label != "-":
+        return label
+    if str((current_stage or {}).get("key") or "").strip().lower() != "ready":
+        return label
+    if str(item.get("state") or "").strip().lower() != "succeeded":
+        return label
+    return _format_runtime_duration(job_duration)
 
 
 def _job_pipeline_style(item: dict[str, Any]) -> tuple[str, str, str, str]:
