@@ -197,6 +197,7 @@ Ignored locally:
 ## Documentation
 
 - `docs/ARCHITECTURE.md`
+- `docs/MANUAL_CLI_TESTS.md`
 - `docs/MASTER_DIAGRAM.md`
 - `docs/RUNBOOK.md`
 - `docs/API_REFERENCE.md`

@@ -207,6 +207,47 @@ def test_failed_zarr_job_exposes_resume_metadata(tmp_path) -> None:
     assert "Downloaded raw outputs are already available" in str(status.resume_reason)
 
 
+def test_failed_sen2like_job_exposes_resume_metadata(tmp_path) -> None:
+    fetcher = NimbusFetcher(
+        settings=_sqlite_settings(
+            tmp_path,
+            NIMBUS_SEN2LIKE_SERVICE_URL="http://nimbus-sen2like:8030",
+            NIMBUS_ZARR_SERVICE_URL="http://nimbus-zarr:8010",
+        )
+    )
+    request = SearchDownloadRequest(
+        job_type="search_download",
+        provider=ProviderName.usgs,
+        collection="landsat_ot_c2_l1",
+        product_type="L1TP",
+        start_date=date(2026, 4, 1),
+        end_date=date(2026, 4, 2),
+        aoi={"wkt": "POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))"},
+    )
+    job_id = "resume-sen2like-job"
+    fetcher.store.create_job(
+        job_id=job_id,
+        job_type=request.job_type,
+        provider=request.provider.value,
+        collection=request.collection,
+        request_payload=request.model_dump(mode="json"),
+    )
+    fetcher.store.update_job(
+        job_id,
+        state="failed",
+        pipeline_state="sen2like_failed",
+        pipeline_step="sen2like_failed",
+        raw_outputs=["/tmp/LC08_FAKE.tar"],
+        errors=["Sen2Like was killed."],
+    )
+
+    status = fetcher.get_job(job_id)
+
+    assert status.can_resume is True
+    assert status.resume_action == "resume_pipeline_from_sen2like"
+    assert "Sen2Like can be retried" in str(status.resume_reason)
+
+
 def test_resume_job_retries_failed_zarr_step(monkeypatch, tmp_path) -> None:
     fetcher = NimbusFetcher(settings=_sqlite_settings(tmp_path, NIMBUS_ZARR_SERVICE_URL="http://nimbus-zarr:8010"))
     request = SearchDownloadRequest(
@@ -261,6 +302,72 @@ def test_resume_job_retries_failed_zarr_step(monkeypatch, tmp_path) -> None:
     assert captured["job_id"] == job_id
     assert captured["continue_pipeline"] is True
     assert response.resume_action == "resume_pipeline_from_zarr"
+    assert response.resumed_job_id == job_id
+    assert response.spawned_new_job is False
+    assert response.job.pipeline_state == "zarr_written"
+
+
+def test_resume_job_routes_failed_sen2like_step(monkeypatch, tmp_path) -> None:
+    fetcher = NimbusFetcher(
+        settings=_sqlite_settings(
+            tmp_path,
+            NIMBUS_SEN2LIKE_SERVICE_URL="http://nimbus-sen2like:8030",
+            NIMBUS_ZARR_SERVICE_URL="http://nimbus-zarr:8010",
+        )
+    )
+    request = SearchDownloadRequest(
+        job_type="search_download",
+        provider=ProviderName.usgs,
+        collection="landsat_ot_c2_l1",
+        product_type="L1TP",
+        start_date=date(2026, 4, 1),
+        end_date=date(2026, 4, 2),
+        aoi={"wkt": "POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))"},
+    )
+    job_id = "resume-sen2like-route"
+    fetcher.store.create_job(
+        job_id=job_id,
+        job_type=request.job_type,
+        provider=request.provider.value,
+        collection=request.collection,
+        request_payload=request.model_dump(mode="json"),
+    )
+    fetcher.store.update_job(
+        job_id,
+        state="failed",
+        pipeline_state="sen2like_failed",
+        pipeline_step="sen2like_failed",
+        raw_outputs=["/tmp/LC08_FAKE.tar"],
+        errors=["Sen2Like was killed."],
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_resume_pipeline_from_sen2like_failure(*, job_id: str, row) -> JobStatusResponse:
+        captured["job_id"] = job_id
+        captured["row"] = row
+        return JobStatusResponse(
+            job_id=job_id,
+            job_type="search_download",
+            job_kind="fetch",
+            service_name="fetch_service",
+            source_job_id=None,
+            state="succeeded",
+            pipeline_state="zarr_written",
+            pipeline_step="zarr_written",
+            provider=ProviderName.usgs,
+            collection="landsat_ot_c2_l1",
+        )
+
+    monkeypatch.setattr(
+        fetcher,
+        "_resume_pipeline_from_sen2like_failure",
+        _fake_resume_pipeline_from_sen2like_failure,
+    )
+
+    response = fetcher.resume_job(job_id)
+
+    assert captured["job_id"] == job_id
+    assert response.resume_action == "resume_pipeline_from_sen2like"
     assert response.resumed_job_id == job_id
     assert response.spawned_new_job is False
     assert response.job.pipeline_state == "zarr_written"

@@ -133,6 +133,17 @@ class Sen2LikeServiceClient:
                 "Sen2Like was killed during processing, most likely because the "
                 "Podman VM or Sen2Like container does not have enough memory."
             )
+        if numeric_return_code == -124:
+            timeout_seconds = metadata.get("timeout_seconds")
+            suffix = ""
+            try:
+                suffix = f" after {float(timeout_seconds):.0f}s"
+            except (TypeError, ValueError):
+                pass
+            return (
+                "Sen2Like timed out"
+                f"{suffix}; the Landsat normalization step did not finish in time."
+            )
 
         input_issues = list(metadata.get("input_issues") or [])
         if input_issues:
@@ -147,6 +158,9 @@ class Sen2LikeServiceClient:
         if output_issues:
             first_issue = output_issues[0]
             if isinstance(first_issue, Mapping):
+                if str(first_issue.get("code") or "").strip().lower() == "timeout":
+                    message = str(first_issue.get("message") or "").strip()
+                    return message or "Sen2Like timed out during processing."
                 message = str(first_issue.get("message") or "").strip()
                 if message:
                     return message

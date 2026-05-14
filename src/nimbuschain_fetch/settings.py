@@ -49,9 +49,13 @@ class Settings(BaseSettings):
         le=128,
     )
     nimbus_sen2like_timeout_seconds: float | None = Field(
-        default=None,
+        default=900.0,
         alias="NIMBUS_SEN2LIKE_TIMEOUT_SECONDS",
         gt=0,
+    )
+    nimbus_sen2like_raw_fallback: bool = Field(
+        default=True,
+        alias="NIMBUS_SEN2LIKE_RAW_FALLBACK",
     )
     nimbus_runtime_role: str = Field(default="all", alias="NIMBUS_RUNTIME_ROLE")
     nimbus_executor_backend: str = Field(default="inprocess", alias="NIMBUS_EXECUTOR_BACKEND")

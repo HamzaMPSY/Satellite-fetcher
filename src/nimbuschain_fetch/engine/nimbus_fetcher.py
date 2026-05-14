@@ -754,6 +754,7 @@ NimbusFetcher.submit_batch = _delegate_async_method("_job_support", "submit_batc
 NimbusFetcher._create_mask_job = _delegate_method("_job_support", "create_mask_job")
 NimbusFetcher.get_job = _delegate_method("_job_support", "get_job")
 NimbusFetcher._resume_metadata_for_row = _delegate_method("_job_support", "resume_metadata_for_row")
+NimbusFetcher._resume_pipeline_from_sen2like_failure = _delegate_method("_fetch_job_workflow", "resume_pipeline_from_sen2like_failure")
 NimbusFetcher._resume_pipeline_from_mask_failure = _delegate_method("_job_support", "resume_pipeline_from_mask_failure")
 NimbusFetcher._resume_pipeline_from_cube_failure = _delegate_method("_job_support", "resume_pipeline_from_cube_failure")
 NimbusFetcher.resume_job = _delegate_method("_job_support", "resume_job")

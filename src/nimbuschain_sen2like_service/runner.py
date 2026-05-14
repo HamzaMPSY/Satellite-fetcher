@@ -20,6 +20,10 @@ from nimbuschain_sen2like_service.models import (
 
 DEFAULT_VENDOR_SUBDIR = "sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation"
 DEFAULT_SPARK_LOCAL_DIRS = "/tmp/nimbus-sen2like-spark"
+DEFAULT_TIMEOUT_SECONDS = 900.0
+DEFAULT_SPARK_DRIVER_MEMORY = "2g"
+DEFAULT_SPARK_EXECUTOR_MEMORY = "2g"
+DEFAULT_SPARK_PYTHON_WORKER_MEMORY = "512m"
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,15 +148,53 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
     if request.spark_master:
         env["SPARK_MASTER"] = request.spark_master
 
-    completed = subprocess.run(
-        command,
-        cwd=str(vendor_root),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=request.timeout_seconds,
-        check=False,
-    )
+    timeout_seconds = _resolve_timeout_seconds(request)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(vendor_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        duration = time.perf_counter() - started
+        outputs = [
+            _product_output(product, work_dir)
+            for product in prepared_products
+        ]
+        timeout_issue = {
+            "code": "timeout",
+            "message": (
+                "Sen2Like exceeded its runtime timeout "
+                f"({timeout_seconds:.0f}s) and was stopped."
+            ),
+        }
+        return Sen2LikeNormalizeResponse(
+            status="failed",
+            job_id=request.job_id,
+            pipeline_id=request.pipeline_id,
+            trace_id=request.trace_id,
+            products=original_products,
+            working_dir=str(work_dir),
+            outputs=outputs,
+            duration_seconds=duration,
+            return_code=-124,
+            command=command,
+            stdout_tail=_tail(exc.stdout or ""),
+            stderr_tail=_tail(exc.stderr or ""),
+            metadata=_response_metadata(
+                vendor_root=vendor_root,
+                request=request,
+                spark_local_dirs=spark_local_dirs,
+                prepared_products=prepared_products,
+                input_issues=[],
+                output_issues=[timeout_issue],
+            )
+            | {"timeout_seconds": timeout_seconds},
+        )
     duration = time.perf_counter() - started
     outputs = [
         _product_output(product, work_dir)
@@ -180,7 +222,8 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
             prepared_products=prepared_products,
             input_issues=[],
             output_issues=output_issues,
-        ),
+        )
+        | {"timeout_seconds": timeout_seconds},
     )
 
 
@@ -427,7 +470,60 @@ def _prepare_spark_environment(env: dict[str, str]) -> str:
     env.setdefault("TMPDIR", "/tmp")
     env.setdefault("PYSPARK_PYTHON", sys.executable)
     env.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+    env.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
+    env.setdefault("SPARK_DRIVER_HOST", "127.0.0.1")
+    driver_memory = (
+        str(env.get("NIMBUS_SEN2LIKE_SPARK_DRIVER_MEMORY") or "").strip()
+        or DEFAULT_SPARK_DRIVER_MEMORY
+    )
+    executor_memory = (
+        str(env.get("NIMBUS_SEN2LIKE_SPARK_EXECUTOR_MEMORY") or "").strip()
+        or DEFAULT_SPARK_EXECUTOR_MEMORY
+    )
+    python_worker_memory = (
+        str(env.get("NIMBUS_SEN2LIKE_SPARK_PYTHON_WORKER_MEMORY") or "").strip()
+        or DEFAULT_SPARK_PYTHON_WORKER_MEMORY
+    )
+    env.setdefault("SPARK_DRIVER_MEMORY", driver_memory)
+    env.setdefault("PYSPARK_SUBMIT_ARGS", _default_pyspark_submit_args(
+        driver_memory=driver_memory,
+        executor_memory=executor_memory,
+        python_worker_memory=python_worker_memory,
+        spark_local_dirs=normalized,
+    ))
     return normalized
+
+
+def _default_pyspark_submit_args(
+    *,
+    driver_memory: str,
+    executor_memory: str,
+    python_worker_memory: str,
+    spark_local_dirs: str,
+) -> str:
+    return (
+        f"--driver-memory {driver_memory} "
+        f"--conf spark.driver.memory={driver_memory} "
+        f"--conf spark.executor.memory={executor_memory} "
+        f"--conf spark.python.worker.memory={python_worker_memory} "
+        "--conf spark.sql.shuffle.partitions=1 "
+        f"--conf spark.local.dir={spark_local_dirs} "
+        "pyspark-shell"
+    )
+
+
+def _resolve_timeout_seconds(request: Sen2LikeNormalizeRequest) -> float:
+    if request.timeout_seconds:
+        return float(request.timeout_seconds)
+    configured = str(os.getenv("NIMBUS_SEN2LIKE_TIMEOUT_SECONDS") or "").strip()
+    if configured:
+        try:
+            value = float(configured)
+        except ValueError:
+            return DEFAULT_TIMEOUT_SECONDS
+        if value > 0:
+            return value
+    return DEFAULT_TIMEOUT_SECONDS
 
 
 def _spark_dir_values(configured: str) -> list[str]:
@@ -473,7 +569,9 @@ def _response_metadata(
     return metadata
 
 
-def _tail(value: str, *, limit: int = 6000) -> str:
+def _tail(value: str | bytes, *, limit: int = 6000) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
     if len(value) <= limit:
         return value
     return value[-limit:]

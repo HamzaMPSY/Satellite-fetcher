@@ -418,6 +418,11 @@ class FetcherJobSupport:
             PipelineState.zarr_converting.value,
             PipelineState.zarr_failed.value,
         }
+        sen2like_resume_states = {
+            PipelineState.sen2like_queued.value,
+            PipelineState.sen2like_running.value,
+            PipelineState.sen2like_failed.value,
+        }
         cube_resume_states = {
             PipelineState.cube_queued.value,
             PipelineState.cube_building.value,
@@ -433,6 +438,28 @@ class FetcherJobSupport:
             PipelineState.registering_artifacts.value,
             PipelineState.failed.value,
         }
+
+        if pipeline_state in sen2like_resume_states and raw_outputs:
+            return {
+                "can_resume": True,
+                "resume_action": "resume_pipeline_from_sen2like",
+                "resume_label": "Resume Pipeline",
+                "resume_reason": (
+                    "Downloaded raw outputs are already available, so Sen2Like can be retried "
+                    "and the remaining pipeline stages can continue."
+                ),
+            }
+
+        if pipeline_state in sen2like_resume_states:
+            return {
+                "can_resume": False,
+                "resume_action": None,
+                "resume_label": "Can't Resume",
+                "resume_reason": (
+                    "This Sen2Like step cannot be resumed because the required downloaded raw outputs "
+                    "are not available."
+                ),
+            }
 
         if pipeline_state in zarr_resume_states and raw_outputs:
             return {
@@ -631,7 +658,12 @@ class FetcherJobSupport:
             },
         )
 
-        if resume_action == "resume_pipeline_from_zarr":
+        if resume_action == "resume_pipeline_from_sen2like":
+            resumed_job = self._rt._resume_pipeline_from_sen2like_failure(
+                job_id=job_id,
+                row=normalized_row,
+            )
+        elif resume_action == "resume_pipeline_from_zarr":
             resumed_job = self._rt.convert_existing_job(
                 job_id,
                 JobConvertRequest(),

@@ -1196,6 +1196,214 @@ class FetchJobWorkflowService:
             },
         )
 
+    def resume_pipeline_from_sen2like_failure(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+    ) -> JobStatusResponse:
+        rt = self._rt
+        result = rt._get_result_payload(job_id)
+        raw_outputs = rt._merge_paths(
+            list(row.get("raw_outputs") or []),
+            list(result.get("raw_outputs") or []),
+        )
+        if not raw_outputs:
+            raise ValueError(
+                "This job cannot be resumed because the downloaded raw outputs are not available."
+            )
+
+        request_payload = dict(row.get("request") or {})
+        request = rt._request_adapter.validate_python(request_payload)
+        provider_name = rt._provider_name(row.get("provider") or getattr(request, "provider", ""))
+        collection = str(row.get("collection") or getattr(request, "collection", "") or "")
+        product_type = (
+            str(
+                request_payload.get("product_type")
+                or row.get("product_type")
+                or getattr(request, "product_type", "")
+                or ""
+            ).strip()
+            or None
+        )
+        pipeline_metadata = PipelineMetadataRecord.from_mapping(
+            result.get("pipeline_metadata") or row.get("pipeline_metadata")
+        ).merged_with(
+            {
+                "provider": provider_name,
+                "collection": collection,
+                "product_type": product_type,
+                "raw_output_count": len(raw_outputs),
+                "sen2like_resumed": True,
+            }
+        )
+        bytes_downloaded = int(row.get("bytes_downloaded") or 0)
+        bytes_total = max(int(row.get("bytes_total") or 0), bytes_downloaded)
+        started_at = str(row.get("started_at") or "").strip() or rt._now_iso()
+        rt.store.update_job(
+            job_id,
+            state=JobState.running.value,
+            started_at=started_at,
+            finished_at=None,
+            progress=99.0,
+            bytes_downloaded=bytes_downloaded,
+            bytes_total=bytes_total,
+            pipeline_metadata=pipeline_metadata.to_dict(),
+            raw_outputs=raw_outputs,
+            zarr_outputs=[],
+            errors=[],
+        )
+
+        try:
+            sen2like_routing = self._sen2like_router.normalize_if_required(
+                job_id=job_id,
+                provider=provider_name,
+                collection=collection,
+                product_type=product_type,
+                raw_outputs=raw_outputs,
+                pipeline_metadata=pipeline_metadata,
+                is_cancelled_now=lambda: rt._is_job_cancel_requested(job_id),
+            )
+            zarr_input_outputs = list(sen2like_routing.conversion_inputs)
+            zarr_conversion_provider = "copernicus" if sen2like_routing.routed else None
+            zarr_conversion_collection = "SENTINEL-2" if sen2like_routing.routed else None
+            zarr_conversion_product_type = "S2MSI2A" if sen2like_routing.routed else None
+            zarr_outputs, conversion_metadata = rt._convert_raw_outputs(
+                job_id=job_id,
+                provider_name=provider_name,
+                collection=collection,
+                product_type=product_type,
+                raw_outputs=zarr_input_outputs,
+                is_cancelled=lambda: rt._is_job_cancel_requested(job_id),
+                pipeline_metadata=sen2like_routing.pipeline_metadata.to_dict(),
+                conversion_provider_name=zarr_conversion_provider,
+                conversion_collection=zarr_conversion_collection,
+                conversion_product_type=zarr_conversion_product_type,
+            )
+            base_paths = rt._resume_base_result_paths(
+                result=result,
+                raw_outputs=raw_outputs,
+            )
+            resumed_result = {
+                **result,
+                "paths": rt._merge_paths(
+                    base_paths,
+                    zarr_input_outputs if sen2like_routing.routed else [],
+                ),
+                "raw_outputs": raw_outputs,
+                "pipeline_metadata": sen2like_routing.pipeline_metadata.to_dict(),
+            }
+            return self.continue_remaining_pipeline_after_zarr(
+                job_id=job_id,
+                row=row,
+                result=resumed_result,
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+                conversion_metadata=conversion_metadata,
+            )
+        except (DownloadCancelled, rt.job_cancelled_error_cls):
+            rt._mark_cancelled(job_id, "cancelled_during_sen2like_resume")
+            return rt.get_job(job_id)
+        except Exception as exc:
+            self._mark_sen2like_resume_failed(
+                job_id=job_id,
+                row=row,
+                result=result,
+                raw_outputs=raw_outputs,
+                error=str(exc),
+            )
+            raise
+
+    def _mark_sen2like_resume_failed(
+        self,
+        *,
+        job_id: str,
+        row: dict[str, Any],
+        result: dict[str, Any],
+        raw_outputs: list[str],
+        error: str,
+    ) -> None:
+        rt = self._rt
+        current_row_record = rt._get_job_row_record(job_id)
+        current_row = current_row_record.to_row() if current_row_record is not None else row
+        existing_result = rt._get_result_payload(job_id) or result
+        current_pipeline_state = str(current_row.get("pipeline_state") or "").strip()
+        is_sen2like_failure = current_pipeline_state in {
+            PipelineState.sen2like_queued.value,
+            PipelineState.sen2like_running.value,
+            PipelineState.sen2like_failed.value,
+        }
+        is_zarr_failure = current_pipeline_state in {
+            PipelineState.zarr_queued.value,
+            PipelineState.zarr_converting.value,
+            PipelineState.zarr_failed.value,
+        }
+        pipeline_state = (
+            PipelineState.sen2like_failed
+            if is_sen2like_failure
+            else PipelineState.zarr_failed
+            if is_zarr_failure
+            else PipelineState.failed
+        )
+        pipeline_step = (
+            "sen2like_failed"
+            if pipeline_state == PipelineState.sen2like_failed
+            else "zarr_failed"
+            if pipeline_state == PipelineState.zarr_failed
+            else "failed"
+        )
+        conversion_metadata = ConversionMetadataRecord.from_mapping(
+            existing_result.get("conversion_metadata") or current_row.get("conversion_metadata")
+        ).merged_with(
+            {
+                "status": "failed",
+                "error": error,
+            }
+        )
+        pipeline_metadata = PipelineMetadataRecord.from_mapping(
+            existing_result.get("pipeline_metadata") or current_row.get("pipeline_metadata")
+        ).merged_with({"sen2like_resume_failed": True})
+        zarr_outputs = list(existing_result.get("zarr_outputs") or current_row.get("zarr_outputs") or [])
+        self._store_result_record(
+            JobResultRecord(
+                job_id=job_id,
+                paths=list(existing_result.get("paths") or []),
+                raw_outputs=raw_outputs,
+                zarr_outputs=zarr_outputs,
+                cube_outputs=list(existing_result.get("cube_outputs") or []),
+                masked_zarr_outputs=list(existing_result.get("masked_zarr_outputs") or []),
+                watermask_outputs=list(existing_result.get("watermask_outputs") or []),
+                cloudmask_outputs=list(existing_result.get("cloudmask_outputs") or []),
+                checksums=dict(existing_result.get("checksums") or {}),
+                metadata=dict(existing_result.get("metadata") or {}),
+                manifest_entry=dict(existing_result.get("manifest_entry") or {}),
+                pipeline_metadata=pipeline_metadata.to_dict(),
+                conversion_metadata=conversion_metadata.to_dict(),
+            )
+        )
+        rt.store.update_job(
+            job_id,
+            state=JobState.failed.value,
+            finished_at=rt._now_iso(),
+            errors=[error],
+            pipeline_state=pipeline_state.value,
+            pipeline_step=pipeline_step,
+            pipeline_metadata=pipeline_metadata.to_dict(),
+            conversion_metadata=conversion_metadata.to_dict(),
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+        )
+        rt.store.append_event(
+            job_id,
+            "job.failed",
+            {
+                "status": JobState.failed.value,
+                "error": error,
+                "pipeline_state": pipeline_state.value,
+                "resumed_pipeline": True,
+            },
+        )
+
     def continue_remaining_pipeline_after_zarr(
         self,
         *,
@@ -1217,7 +1425,6 @@ class FetchJobWorkflowService:
         request_payload = dict(row.get("request") or {})
         provider_name = rt._provider_name(row.get("provider"))
         collection = str(row.get("collection") or "")
-        product_type = str(request_payload.get("product_type") or row.get("product_type") or "").strip() or None
         requested_mask_types = rt._normalized_mask_types(request_payload.get("mask_types") or [])
         cube_config = rt._cube_config_from_request_payload(request_payload)
 

@@ -116,6 +116,46 @@ class Sen2LikeNormalizationRouter:
                 error
             )
 
+        previous_error = str(metadata_record.payload.get("sen2like_error") or "").strip()
+        previous_status = str(metadata_record.payload.get("sen2like_status") or "").strip().lower()
+        previous_fallback = _raw_fallback_payload(
+            settings=self._rt.settings,
+            error=previous_error,
+            raw_outputs=raw_outputs,
+            service_url=service_url,
+        )
+        if previous_status == "failed" and previous_fallback is not None:
+            fallback_metadata = metadata_record.merged_with(
+                {
+                    "sen2like_status": "raw_fallback",
+                    "sen2like_fallback_reason": previous_fallback["reason"],
+                    "sen2like_fallback_message": previous_fallback["message"],
+                    "zarr_input_source": "raw",
+                    "zarr_input_outputs": list(raw_outputs),
+                }
+            )
+            self._rt._update_pipeline(
+                job_id,
+                pipeline_state=PipelineState.sen2like_written,
+                pipeline_step="sen2like_fallback",
+                pipeline_progress=74.0,
+                pipeline_metadata=fallback_metadata.to_dict(),
+                raw_outputs=raw_outputs,
+                event_type="job.sen2like_fallback",
+                event_payload={
+                    "error": previous_error,
+                    "input_count": len(raw_outputs),
+                    "reason": previous_fallback["reason"],
+                    "from_previous_failure": True,
+                },
+            )
+            return Sen2LikeRoutingResult(
+                conversion_inputs=list(raw_outputs),
+                pipeline_metadata=fallback_metadata,
+                routed=False,
+                response=previous_fallback,
+            )
+
         queued_metadata = metadata_record.merged_with(
             {
                 "sen2like_required": True,
@@ -165,6 +205,44 @@ class Sen2LikeNormalizationRouter:
             if not outputs:
                 raise RuntimeError("Sen2Like service returned no normalized outputs.")
         except Exception as exc:
+            fallback = _raw_fallback_payload(
+                settings=self._rt.settings,
+                error=str(exc),
+                raw_outputs=raw_outputs,
+                service_url=service_url,
+            )
+            if fallback is not None:
+                fallback_metadata = running_metadata.merged_with(
+                    {
+                        "sen2like_status": "raw_fallback",
+                        "sen2like_error": str(exc),
+                        "sen2like_fallback_reason": fallback["reason"],
+                        "sen2like_fallback_message": fallback["message"],
+                        "zarr_input_source": "raw",
+                        "zarr_input_outputs": list(raw_outputs),
+                    }
+                )
+                self._rt._update_pipeline(
+                    job_id,
+                    pipeline_state=PipelineState.sen2like_written,
+                    pipeline_step="sen2like_fallback",
+                    pipeline_progress=74.0,
+                    pipeline_metadata=fallback_metadata.to_dict(),
+                    raw_outputs=raw_outputs,
+                    event_type="job.sen2like_fallback",
+                    event_payload={
+                        "error": str(exc),
+                        "input_count": len(raw_outputs),
+                        "reason": fallback["reason"],
+                    },
+                )
+                return Sen2LikeRoutingResult(
+                    conversion_inputs=list(raw_outputs),
+                    pipeline_metadata=fallback_metadata,
+                    routed=False,
+                    response=fallback,
+                )
+
             failed_metadata = running_metadata.merged_with(
                 {
                     "sen2like_status": "failed",
@@ -295,3 +373,56 @@ def _job_working_dir(base_working_dir: str | None, job_id: str) -> str:
     base = Path(str(base_working_dir or "/data/downloads/sen2like").strip())
     safe_job_id = str(job_id or "job").strip().replace("/", "_")
     return str(base / safe_job_id)
+
+
+def _raw_fallback_payload(
+    *,
+    settings: Any,
+    error: str,
+    raw_outputs: list[str],
+    service_url: str,
+) -> dict[str, Any] | None:
+    if not bool(getattr(settings, "nimbus_sen2like_raw_fallback", True)):
+        return None
+    if not _is_sen2like_resource_exhaustion(error):
+        return None
+    return {
+        "status": "raw_fallback",
+        "reason": "sen2like_resource_exhausted",
+        "message": (
+            "Sen2Like was killed by the runtime, so Nimbus will continue with the "
+            "downloaded Landsat raw products."
+        ),
+        "service_url": service_url,
+        "products": list(raw_outputs),
+        "outputs": [
+            {
+                "product": str(product),
+                "output_dir": None,
+                "normalized_uri": None,
+                "exists": False,
+            }
+            for product in raw_outputs
+        ],
+        "metadata": {
+            "fallback_to_raw": True,
+            "error": error,
+        },
+    }
+
+
+def _is_sen2like_resource_exhaustion(error: str) -> bool:
+    lowered = str(error or "").strip().lower()
+    if not lowered:
+        return False
+    markers = (
+        "killed during processing",
+        "not have enough memory",
+        "out of memory",
+        "oom",
+        "exit code -9",
+        "exit code 137",
+        "return_code=-9",
+        "return_code 137",
+    )
+    return any(marker in lowered for marker in markers)
