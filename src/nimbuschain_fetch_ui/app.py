@@ -2394,9 +2394,19 @@ def _stage_elapsed_seconds(stage: dict[str, Any]) -> float | None:
     value = stage.get("duration_seconds")
     if value is not None:
         try:
-            return max(0.0, float(value))
+            seconds = max(0.0, float(value))
         except (TypeError, ValueError):
-            pass
+            seconds = None
+        if seconds is not None:
+            status = str(stage.get("status") or "").strip().lower()
+            if (
+                seconds <= 0.0
+                and status in {"done", "skipped", "failed", "cancelled"}
+                and not stage.get("started_at")
+                and not stage.get("finished_at")
+            ):
+                return None
+            return seconds
 
     status = str(stage.get("status") or "").strip().lower()
     finished_at = stage.get("finished_at")

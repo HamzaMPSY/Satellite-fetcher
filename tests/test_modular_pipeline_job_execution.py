@@ -179,3 +179,43 @@ def test_modular_pipeline_handler_targets_fetch_only_for_download_only_jobs() ->
     )
 
     assert [stage["name"] for stage in handler._stage_plan(row.to_row())] == ["fetch"]
+
+
+def test_modular_pipeline_stage_results_use_row_timeline_when_metadata_is_sparse() -> None:
+    row = {
+        "job_id": "job-3",
+        "job_type": "search_download",
+        "provider": "copernicus",
+        "collection": "SENTINEL-2",
+        "product_type": "S2MSI2A",
+        "state": "succeeded",
+        "pipeline_state": "zarr_written",
+        "raw_outputs": ["/data/raw/S2A.zip"],
+        "zarr_outputs": ["/data/zarr/S2A.zarr"],
+        "pipeline_metadata": {"timeline": {"stages": [{"key": "search", "status": "done"}]}},
+        "pipeline_timeline": {
+            "stages": [
+                {"key": "search", "status": "done", "duration_seconds": 1.0},
+                {"key": "download", "status": "done", "duration_seconds": 2.0},
+                {"key": "convert", "status": "done", "duration_seconds": 3.0},
+            ]
+        },
+    }
+    store = FakeStore(JobRowRecord.from_row(row))
+    handler = ModularPipelineJobExecutionHandler(
+        runtime=FakeRuntime(store),
+        workflow=FakeWorkflow(store),
+    )
+
+    stage_results = handler._stage_results_from_job(
+        row=row,
+        result={},
+        plan=[
+            {"name": "fetch", "depends_on": []},
+            {"name": "zarr", "depends_on": ["fetch"]},
+        ],
+    )
+
+    by_name = {str(stage["name"]): stage for stage in stage_results}
+    assert by_name["fetch"]["duration_seconds"] == 3.0
+    assert by_name["zarr"]["duration_seconds"] == 3.0

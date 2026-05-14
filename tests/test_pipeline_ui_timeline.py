@@ -13,6 +13,7 @@ from nimbuschain_fetch_ui.app import (
     _default_tile_system_for_provider,
     _mask_types_from_payload,
     _pipeline_timeline_snapshot,
+    _stage_elapsed_seconds,
     _stage_status_label_for_display,
     _timeline_breakdown_rows,
 )
@@ -520,6 +521,10 @@ def test_job_elapsed_uses_orchestrator_window_when_stage_results_are_partial() -
         current_stage=current_stage,
         job_duration=_job_elapsed_seconds(item),
     ) == "2m 47s"
+
+
+def test_completed_stage_zero_duration_without_timing_is_hidden() -> None:
+    assert _stage_elapsed_seconds({"status": "done", "duration_seconds": 0.0}) is None
 
 
 def test_pipeline_path_lines_pair_multi_scene_outputs_by_index() -> None:

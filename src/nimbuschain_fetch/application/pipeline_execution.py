@@ -184,7 +184,11 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
         pipeline_metadata = result_pipeline_metadata.merged_with(
             row_pipeline_metadata.to_dict()
         ).to_dict()
-        timeline = dict(pipeline_metadata.get("timeline") or {})
+        timeline = _best_timeline(
+            pipeline_metadata.get("timeline"),
+            result_payload.get("pipeline_timeline"),
+            row.get("pipeline_timeline"),
+        )
         timeline_stages = [
             dict(item)
             for item in list(timeline.get("stages") or [])
@@ -460,6 +464,21 @@ def _stage_result_dict(
         duration_seconds=duration_seconds,
     )
     return result.to_dict()
+
+
+def _best_timeline(*values: Any) -> dict[str, Any]:
+    timelines = [dict(value) for value in values if isinstance(value, dict)]
+    if not timelines:
+        return {}
+    return max(timelines, key=_timeline_detail_score)
+
+
+def _timeline_detail_score(timeline: dict[str, Any]) -> int:
+    stages = [item for item in list(timeline.get("stages") or []) if isinstance(item, dict)]
+    steps = [item for item in list(timeline.get("steps") or []) if isinstance(item, dict)]
+    timed_stages = sum(1 for item in stages if item.get("duration_seconds") is not None)
+    timed_steps = sum(1 for item in steps if item.get("duration_seconds") is not None)
+    return len(stages) + len(steps) + timed_stages + timed_steps
 
 
 def _select_timeline_stages(
