@@ -4888,7 +4888,7 @@ def main():
                         else:
                             st.error(f"{response.status_code}: {response.text}")
                     else:
-                        tile_id = selected_tiles_for_cmd[0] if (provider == "Copernicus" and len(selected_tiles_for_cmd) == 1) else None
+                        tile_id = selected_tiles_for_cmd[0] if len(selected_tiles_for_cmd) == 1 else None
                         payload = _build_job_payload(
                             provider_label=provider,
                             collection=collection,

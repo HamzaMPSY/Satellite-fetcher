@@ -321,6 +321,65 @@ def test_build_grouped_time_cubes_filters_dates_and_deduplicates_same_timestamp(
     ]
 
 
+def test_build_grouped_time_cubes_groups_compact_landsat_scene_ids(tmp_path: Path) -> None:
+    scene_a = tmp_path / "landsat_a.zarr"
+    scene_b = tmp_path / "landsat_b.zarr"
+    scene_c = tmp_path / "landsat_c.zarr"
+    other_path_row = tmp_path / "landsat_other.zarr"
+    output_dir = tmp_path / "landsat_cubes"
+
+    _write_scene_store(
+        scene_a,
+        scene_id="LC92010262026098LGN00",
+        acquisition_time="2026-04-08T10:00:00Z",
+        imagery_value=1,
+        band_names=["B4", "B3"],
+    )
+    _write_scene_store(
+        scene_b,
+        scene_id="LC82010262026106LGN00",
+        acquisition_time="2026-04-16T10:00:00Z",
+        imagery_value=2,
+        band_names=["B4", "B3"],
+    )
+    _write_scene_store(
+        scene_c,
+        scene_id="LC92010262026114LGN00",
+        acquisition_time="2026-04-24T10:00:00Z",
+        imagery_value=3,
+        band_names=["B4", "B3"],
+    )
+    _write_scene_store(
+        other_path_row,
+        scene_id="LC82020262026097LGN00",
+        acquisition_time="2026-04-07T10:00:00Z",
+        imagery_value=4,
+        band_names=["B4", "B3"],
+    )
+
+    summary = build_grouped_time_cubes(
+        [str(scene_a), str(scene_b), str(scene_c), str(other_path_row)],
+        str(output_dir),
+        start_date="2026-04-07",
+        end_date="2026-04-24",
+        stage_label="before_mask",
+    )
+
+    assert summary["status"] == "written"
+    assert summary["cube_outputs"] == [
+        str((output_dir / "cube_201026_20260408_20260424_before_mask.zarr").resolve())
+    ]
+    assert summary["tiles_built"] == ["201026"]
+    assert summary["tiles_skipped"] == [
+        {
+            "group_key": "202026",
+            "reason": "fewer_than_two_unique_times",
+            "candidate_scene_ids": ["LC82020262026097LGN00"],
+        }
+    ]
+    assert summary["items"][0]["source_scene_count"] == 3
+
+
 def test_copy_time_slice_in_chunks_reads_imagery_by_chunk() -> None:
     source_data = np.arange(1 * 3 * 4 * 5, dtype=np.uint16).reshape(1, 3, 4, 5)
     source = _ChunkGuardArray(source_data, chunks=(1, 1, 2, 2))

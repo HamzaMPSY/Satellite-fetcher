@@ -813,10 +813,23 @@ def _scene_group_key(scene_id: str) -> str:
     sentinel_match = re.search(r"_T(\d{2}[A-Z]{3})_", str(scene_id or ""))
     if sentinel_match:
         return sentinel_match.group(1)
+    compact_landsat = _compact_landsat_path_row(scene_id)
+    if compact_landsat:
+        return compact_landsat
     landsat_parts = str(scene_id or "").split("_")
     if len(landsat_parts) >= 3 and landsat_parts[2].isdigit():
         return landsat_parts[2]
     return str(scene_id or "scene")
+
+
+def _compact_landsat_path_row(scene_id: str) -> str:
+    value = str(scene_id or "").strip().upper()
+    value = value.rsplit("/", 1)[-1]
+    value = re.sub(r"\.(TAR|ZIP|TGZ|GZ)$", "", value)
+    match = re.match(r"^L[A-Z]\d(?P<path>\d{3})(?P<row>\d{3})\d{7}[A-Z0-9]*$", value)
+    if not match:
+        return ""
+    return f"{match.group('path')}{match.group('row')}"
 
 
 def _deduplicate_scenes_by_time(scenes: list[SourceScene]) -> tuple[list[SourceScene], list[str]]:

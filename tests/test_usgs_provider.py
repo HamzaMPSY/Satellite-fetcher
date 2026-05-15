@@ -7,7 +7,11 @@ import pytest
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
 from nimbuschain_fetch.providers.usgs import UsgsProvider
 from nimbuschain_fetch.settings import Settings
-from nimbuschain_fetch.usgs_product_type import canonicalize_usgs_product_type
+from nimbuschain_fetch.usgs_product_type import (
+    canonicalize_usgs_product_type,
+    landsat_path_row_from_display_id,
+    usgs_display_id_matches_tile,
+)
 
 
 class _DummyDownloadManager:
@@ -105,6 +109,19 @@ def test_canonicalize_usgs_product_type_strips_satellite_digit() -> None:
     assert canonicalize_usgs_product_type("8L2SP") == "L2SP"
     assert canonicalize_usgs_product_type("L1TP") == "L1TP"
     assert NimbusFetcher._normalize_product_type_for_zarr("9L1TP") == "L1TP"
+
+
+def test_landsat_path_row_from_display_id_handles_usgs_display_ids() -> None:
+    assert landsat_path_row_from_display_id("LC09_L1TP_199026_20260101_20260102_02_T1") == "199026"
+
+
+def test_landsat_path_row_from_display_id_handles_compact_bundle_ids() -> None:
+    assert landsat_path_row_from_display_id("LC92010262026114LGN00.tar") == "201026"
+
+
+def test_usgs_display_id_matches_selected_wrs_tile() -> None:
+    assert usgs_display_id_matches_tile("LC09_L1TP_199026_20260101_20260102_02_T1", "199026")
+    assert not usgs_display_id_matches_tile("LC09_L1TP_201026_20260101_20260102_02_T1", "199026")
 
 
 def test_prepare_download_product_uses_entity_id_when_scene_name_missing(monkeypatch):

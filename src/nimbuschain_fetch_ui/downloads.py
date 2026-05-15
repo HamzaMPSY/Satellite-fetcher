@@ -484,7 +484,7 @@ def _build_download_command(
     if product and str(product).strip():
         cmd_parts.extend(["--product-type", str(product)])
 
-    if selected_tiles and cli_provider == "copernicus":
+    if selected_tiles:
         if len(selected_tiles) == 1:
             cmd_parts.extend(["--tile-id", selected_tiles[0]])
 

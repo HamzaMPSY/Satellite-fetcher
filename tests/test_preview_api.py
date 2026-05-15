@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from nimbuschain_fetch.preview import preview_products_from_env
+from nimbuschain_fetch.preview import parse_usgs_scenes, preview_products_from_env
 from nimbuschain_fetch.settings import Settings
 from nimbuschain_fetch_service.api.preview import router as preview_router
 
@@ -57,6 +57,31 @@ def test_preview_endpoint_returns_backend_payload(monkeypatch):
     assert body["error"] == ""
     assert body["error_kind"] == ""
     assert body["items"][0]["id"] == "entity-1"
+
+
+def test_parse_usgs_scenes_filters_preview_by_selected_wrs_tile() -> None:
+    payload = {
+        "data": {
+            "results": [
+                {
+                    "entityId": "LC92010262026098LGN00",
+                    "displayId": "LC09_L1TP_201026_20260408_20260409_02_T1",
+                    "acquisitionDate": "2026-04-08",
+                },
+                {
+                    "entityId": "LC82020262026097LGN00",
+                    "displayId": "LC08_L1TP_202026_20260407_20260414_02_T1",
+                    "acquisitionDate": "2026-04-07",
+                },
+            ]
+        }
+    }
+
+    parsed = parse_usgs_scenes(payload, max_items=10, product_type="L1TP", tile_ids=["201026"])
+
+    assert parsed["total"] == 1
+    assert parsed["items"][0]["name"] == "LC09_L1TP_201026_20260408_20260409_02_T1"
+    assert parsed["items"][0]["tile_id"] == "201026"
 
 
 def test_settings_strip_usgs_credentials():

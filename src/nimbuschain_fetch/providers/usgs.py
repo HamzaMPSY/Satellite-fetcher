@@ -15,7 +15,7 @@ from nimbuschain_fetch.ports import ProviderCapabilities, ProviderDownloadManage
 from nimbuschain_fetch.providers.base import ProviderBase
 from nimbuschain_fetch.settings import Settings
 try:
-    from nimbuschain_fetch.usgs_product_type import usgs_product_type_matches
+    from nimbuschain_fetch.usgs_product_type import usgs_display_id_matches_tile, usgs_product_type_matches
 except ModuleNotFoundError:
     import re
 
@@ -29,6 +29,10 @@ except ModuleNotFoundError:
         if not digits or not product_code.startswith("L"):
             return ""
         return f"{digits[-1]}{product_code}"
+
+    def usgs_display_id_matches_tile(display_id: str, tile_id: str | None) -> bool:
+        _ = (display_id, tile_id)
+        return True
 
     def usgs_product_type_matches(display_id: str, product_type: str) -> bool:
         requested = str(product_type or "").strip().upper()
@@ -241,6 +245,8 @@ class UsgsProvider(ProviderBase):
                 continue
             display_id = str(scene.get("displayId", "")).strip()
             if not usgs_product_type_matches(display_id, product_type):
+                continue
+            if not usgs_display_id_matches_tile(display_id, tile_id):
                 continue
             entity_id_str = str(entity_id)
             self.scene_names[entity_id_str] = display_id or entity_id_str

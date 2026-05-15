@@ -14,7 +14,11 @@ from shapely.ops import unary_union
 
 from nimbuschain_fetch.copernicus_query import build_copernicus_filter as _shared_build_copernicus_filter
 from nimbuschain_fetch.provider_status import classify_provider_error
-from nimbuschain_fetch.usgs_product_type import usgs_product_type_matches
+from nimbuschain_fetch.usgs_product_type import (
+    landsat_path_row_from_display_id,
+    usgs_display_id_matches_tile,
+    usgs_product_type_matches,
+)
 
 
 def _env(key: str, default: str = "") -> str:
@@ -266,9 +270,16 @@ def _copernicus_preview(
     return parse_copernicus_products(products_response.json(), max_items=max_items)
 
 
-def parse_usgs_scenes(payload: dict[str, Any], *, max_items: int, product_type: str) -> dict[str, Any]:
+def parse_usgs_scenes(
+    payload: dict[str, Any],
+    *,
+    max_items: int,
+    product_type: str,
+    tile_ids: list[str] | None = None,
+) -> dict[str, Any]:
     data = payload.get("data", {}) if isinstance(payload, dict) else {}
     scenes = data.get("results", []) if isinstance(data, dict) else []
+    requested_tiles = [str(tile).strip() for tile in list(tile_ids or []) if str(tile).strip()]
     filtered: list[dict[str, Any]] = []
     for scene in scenes:
         if not isinstance(scene, dict):
@@ -276,12 +287,15 @@ def parse_usgs_scenes(payload: dict[str, Any], *, max_items: int, product_type: 
         display_id = str(scene.get("displayId") or "")
         if not usgs_product_type_matches(display_id, product_type):
             continue
+        if requested_tiles and not any(usgs_display_id_matches_tile(display_id, tile) for tile in requested_tiles):
+            continue
+        path_row = landsat_path_row_from_display_id(display_id)
         temporal = scene.get("temporalCoverage", {}) if isinstance(scene.get("temporalCoverage"), dict) else {}
         filtered.append(
             {
                 "id": str(scene.get("entityId") or ""),
                 "name": display_id or str(scene.get("entityId") or "scene"),
-                "tile_id": str(scene.get("entityId") or "-"),
+                "tile_id": path_row or str(scene.get("entityId") or "-"),
                 "sensing_time": str(temporal.get("startDate") or scene.get("acquisitionDate") or "-"),
                 "size_mb": None,
             }
@@ -338,6 +352,7 @@ def _usgs_preview(
     end_date: str,
     aoi_wkt: str,
     max_items: int,
+    tile_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     service_url = _env("NIMBUS_USGS_SERVICE_URL", "https://m2m.cr.usgs.gov/api/api/json/stable/")
     username = _env("NIMBUS_USGS_USERNAME")
@@ -382,7 +397,12 @@ def _usgs_preview(
             payload=search_payload,
             auth_token=str(api_key),
         )
-        return parse_usgs_scenes(search_body, max_items=max_items, product_type=product_type)
+        return parse_usgs_scenes(
+            search_body,
+            max_items=max_items,
+            product_type=product_type,
+            tile_ids=tile_ids,
+        )
     except Exception as exc:
         detail = f"USGS preview failed: {exc}"
         error_kind = classify_provider_error(detail)
@@ -443,6 +463,7 @@ def preview_products_from_env(
             end_date=end_date,
             aoi_wkt=aoi_wkt,
             max_items=safe_max_items,
+            tile_ids=tile_ids,
         )
     return _preview_error(
         f"Preview unsupported for provider '{provider}'.",
