@@ -149,6 +149,7 @@ def _stage_result_to_display_stage(
         metadata.setdefault("fallback_reason", pipeline_metadata.get("sen2like_fallback_reason"))
         if _zarr_uses_raw_fallback(metadata):
             metadata["raw_fallback"] = True
+            metadata.setdefault("status_label", "degraded")
     elif name == "cube":
         metadata.setdefault("cube_status", pipeline_metadata.get("cube_status"))
         metadata.setdefault("cube_reason", pipeline_metadata.get("cube_reason"))
@@ -165,7 +166,8 @@ def _stage_result_to_display_stage(
         status = "done"
         error = ""
         reason = ""
-        metadata["status_label"] = "raw input"
+        metadata["status_label"] = "degraded"
+        metadata["raw_fallback"] = True
         if not outputs:
             outputs = [
                 str(output)
@@ -238,10 +240,10 @@ def _sen2like_used_raw_fallback(metadata: dict[str, Any]) -> bool:
 def _sen2like_fallback_label(metadata: dict[str, Any]) -> str:
     reason = str(metadata.get("fallback_reason") or "").strip().lower()
     if reason == "sen2like_resource_exhausted":
-        return "Raw Landsat inputs used directly for Zarr"
+        return "Degraded: raw Landsat inputs used because Sen2Like did not write outputs"
     if reason:
-        return f"Raw Landsat inputs used directly for Zarr ({reason.replace('_', ' ')})"
-    return "Raw Landsat inputs used directly for Zarr"
+        return f"Degraded: raw Landsat inputs used after Sen2Like failure ({reason.replace('_', ' ')})"
+    return "Degraded: raw Landsat inputs used after Sen2Like failure"
 
 
 def _zarr_uses_raw_fallback(metadata: dict[str, Any]) -> bool:
@@ -258,8 +260,8 @@ def _zarr_raw_fallback_label(
     suffix = f" · {output_count} output{'s' if output_count != 1 else ''}" if output_count else ""
     reason = str(metadata.get("fallback_reason") or "").strip().lower()
     if reason == "sen2like_resource_exhausted":
-        return f"{default_detail} from raw Landsat inputs{suffix}"
-    return f"{default_detail} from raw Landsat inputs{suffix}"
+        return f"{default_detail} used raw Landsat fallback{suffix}"
+    return f"{default_detail} used raw Landsat fallback{suffix}"
 
 
 def _mask_written_label(metadata: dict[str, Any], outputs: list[str]) -> str:

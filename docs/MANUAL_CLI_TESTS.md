@@ -75,7 +75,7 @@ testing, run all green-path cases and at least one edge case.
 | S1 | `stage_cli` | Sentinel | Plan | no `sen2like` stage |
 | S2 | `stage_cli` | Landsat | Plan | includes `sen2like` before `zarr` |
 | S3 | `stage_cli` | Sentinel | Runtime after-mask cube | all stages `succeeded` |
-| S4 | `stage_cli` | Landsat | Runtime before-mask cube | Sen2Like succeeds or falls back, then Zarr/Cube/Mask succeed |
+| S4 | `stage_cli` | Landsat | Runtime before-mask cube | Sen2Like writes normalized outputs; Sen2Like failure fails the run |
 | S5 | `stage_cli` | Any | Existing Zarr inputs | skips raw conversion and runs Mask/Cube |
 
 ## 3. `pipeline_cli` Cases
@@ -354,9 +354,10 @@ Expected:
 
 ### S4. Landsat Runtime Before-Mask Cube, Then Mask
 
-This is the main modular Landsat E2E check. Sen2Like may either write
-normalized outputs or fall back to raw Landsat inputs. Both are acceptable as
-long as Zarr, Cube, and Mask continue.
+This is the main modular Landsat E2E check. Sen2Like must write normalized
+Sentinel-like outputs. A Sen2Like failure is expected to fail the run before
+Zarr conversion unless `--allow-sen2like-raw-fallback` is explicitly passed for
+degraded fallback testing.
 
 ```bash
 api python -m nimbuschain_fetch.stage_cli run-stage \
@@ -385,9 +386,8 @@ Expected:
 - top-level `status` is `completed`
 - stages are `fetch`, `sen2like`, `zarr`, `cube`, `mask`
 - every stage status is `succeeded`
-- if Sen2Like cannot normalize the product, `sen2like.metadata.fallback_to_raw`
-  is `true`
-- `zarr.metadata.conversion_provider` remains `usgs` when fallback is used
+- `sen2like.outputs` point to Sentinel-like outputs, not the raw Landsat inputs
+- `zarr.metadata.conversion_provider` is `copernicus`
 - cube output is named like `cube_199026_*_before_mask.zarr`
 
 ### S5. Existing Zarr Inputs
@@ -444,7 +444,8 @@ For CLI JSON responses, the most important fields are:
 - `cube_result.status`
 - `results[*].name`
 - `results[*].status`
-- `results[*].metadata.fallback_to_raw`
+- `results[*].metadata.fallback_to_raw` (only when
+  `--allow-sen2like-raw-fallback` is explicitly used for degraded tests)
 - `results[*].metadata.conversion_provider`
 
 ## 6. Troubleshooting
@@ -482,15 +483,21 @@ api find /data/downloads -maxdepth 4 -type d | head
 
 ### Sen2Like fails on Landsat
 
-For `stage_cli` runtime tests, this is not automatically fatal. The expected
-fallback behavior is:
+For normal API and `stage_cli` runtime tests, this is fatal. Expected behavior:
+
+- `sen2like` stage status is `failed`
+- downstream `zarr` is skipped because `sen2like` did not succeed
+- the job/run exits failed, with the Sen2Like error in the stage metadata
+
+For degraded fallback experiments only, pass
+`--allow-sen2like-raw-fallback`. In that mode the expected fallback behavior is:
 
 - `sen2like` stage status is `succeeded`
 - `sen2like.metadata.fallback_to_raw` is `true`
 - `zarr` stage still runs
 - `zarr.metadata.conversion_provider` is `usgs`
 
-If Zarr is skipped after Sen2Like fallback, the modular DAG fallback regressed.
+Do not use degraded fallback for production Landsat validation.
 
 ### Landsat daily mosaic
 

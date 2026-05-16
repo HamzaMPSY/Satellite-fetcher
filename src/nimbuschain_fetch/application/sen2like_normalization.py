@@ -382,7 +382,7 @@ def _raw_fallback_payload(
     raw_outputs: list[str],
     service_url: str,
 ) -> dict[str, Any] | None:
-    if not bool(getattr(settings, "nimbus_sen2like_raw_fallback", True)):
+    if not bool(getattr(settings, "nimbus_sen2like_raw_fallback", False)):
         return None
     if not _is_sen2like_resource_exhaustion(error):
         return None

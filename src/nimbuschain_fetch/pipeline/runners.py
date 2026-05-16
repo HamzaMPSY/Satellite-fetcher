@@ -341,6 +341,7 @@ def build_runtime_pipeline_stages(
     mask_types: tuple[str, ...],
     cube_mode: str,
     sen2like_service_url: str | None,
+    allow_sen2like_raw_fallback: bool = False,
     runtime: PipelineRuntimeConfig,
 ) -> list[Any]:
     has_mask = bool(mask_types)
@@ -355,7 +356,12 @@ def build_runtime_pipeline_stages(
 
     stages: list[Any] = [ManualFetchStage()]
     if requires_sen2like:
-        stages.append(Sen2LikeStage(service_url=sen2like_service_url))
+        stages.append(
+            Sen2LikeStage(
+                service_url=sen2like_service_url,
+                allow_raw_fallback=allow_sen2like_raw_fallback,
+            )
+        )
     stages.append(ZarrStage(depends_on=zarr_depends_on, runtime=runtime))
     if has_mask:
         stages.append(MaskStage(depends_on=mask_depends_on, runtime=runtime, mask_types=mask_types))

@@ -380,6 +380,55 @@ def test_build_grouped_time_cubes_groups_compact_landsat_scene_ids(tmp_path: Pat
     assert summary["items"][0]["source_scene_count"] == 3
 
 
+def test_build_grouped_time_cubes_aligns_landsat_scenes_with_shifted_grids(tmp_path: Path) -> None:
+    scene_a = tmp_path / "landsat_a.zarr"
+    scene_b = tmp_path / "landsat_b.zarr"
+    output_dir = tmp_path / "landsat_cubes"
+
+    _write_scene_store(
+        scene_a,
+        scene_id="LC92010262026098LGN00",
+        acquisition_time="2026-04-08T10:00:00Z",
+        imagery_value=1,
+        band_names=["B4", "B3"],
+        transform=[10.0, 0.0, 500000.0, 0.0, -10.0, 4100000.0],
+    )
+    _write_scene_store(
+        scene_b,
+        scene_id="LC82010262026106LGN00",
+        acquisition_time="2026-04-16T10:00:00Z",
+        imagery_value=2,
+        band_names=["B4", "B3"],
+        transform=[10.0, 0.0, 500010.0, 0.0, -10.0, 4100000.0],
+    )
+
+    summary = build_grouped_time_cubes(
+        [str(scene_a), str(scene_b)],
+        str(output_dir),
+        start_date="2026-04-07",
+        end_date="2026-04-24",
+        stage_label="before_mask",
+    )
+
+    assert summary["status"] == "written"
+    assert summary["cube_outputs"] == [
+        str((output_dir / "cube_201026_20260408_20260416_before_mask.zarr").resolve())
+    ]
+    assert summary["tiles_built"] == ["201026"]
+
+    cube = zarr.open_group(summary["cube_outputs"][0], mode="r", zarr_format=2)
+    assert cube.attrs["grid_alignment"] == "reprojected_union"
+    assert cube.attrs["shape"] == [2, 2, 2, 4]
+    assert cube.attrs["transform"] == [10.0, 0.0, 500000.0, 0.0, -10.0, 4100000.0]
+    assert cube.attrs["dtype"] == "float32"
+
+    imagery = cube["imagery"][:]
+    np.testing.assert_allclose(imagery[0, :, :, :3], 1.0)
+    assert np.isnan(imagery[0, :, :, 3]).all()
+    assert np.isnan(imagery[1, :, :, 0]).all()
+    np.testing.assert_allclose(imagery[1, :, :, 1:], 2.0)
+
+
 def test_copy_time_slice_in_chunks_reads_imagery_by_chunk() -> None:
     source_data = np.arange(1 * 3 * 4 * 5, dtype=np.uint16).reshape(1, 3, 4, 5)
     source = _ChunkGuardArray(source_data, chunks=(1, 1, 2, 2))

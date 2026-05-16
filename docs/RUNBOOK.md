@@ -21,6 +21,39 @@ Do not commit `.env`.
 
 At minimum, configure provider credentials before testing downloads.
 
+### Sen2Like memory profile for Landsat
+
+Landsat jobs require Sen2Like to produce real Sentinel-like outputs before Zarr
+conversion. The default local profile is fail-closed:
+
+```bash
+NIMBUS_SEN2LIKE_WORKERS=1
+NIMBUS_SEN2LIKE_TIMEOUT_SECONDS=3600
+NIMBUS_SEN2LIKE_RAW_FALLBACK=false
+NIMBUS_SEN2LIKE_MEM_LIMIT=24g
+NIMBUS_SEN2LIKE_SHM_SIZE=8g
+NIMBUS_SEN2LIKE_GDAL_CACHEMAX=256
+NIMBUS_SEN2LIKE_JAVA_TOOL_OPTIONS=-Xmx1536m -XX:MaxRAMPercentage=55
+NIMBUS_SEN2LIKE_MALLOC_ARENA_MAX=2
+NIMBUS_SEN2LIKE_OMP_NUM_THREADS=1
+NIMBUS_SEN2LIKE_OPENBLAS_NUM_THREADS=1
+NIMBUS_SEN2LIKE_MKL_NUM_THREADS=1
+```
+
+On macOS with Podman, give the VM enough memory before starting the stack:
+
+```bash
+podman machine stop
+podman machine set --memory 32768
+podman machine start
+```
+
+After restart, verify `podman machine inspect` reports `Memory: 32768` and
+`podman inspect nimbus-sen2like` shows about 24 GB memory limit plus 8 GB
+shared memory. If Sen2Like is killed or returns no normalized output, the
+Landsat job should fail at `sen2like_failed` instead of continuing with raw
+`.tar` inputs.
+
 ### Optional: Copernicus account-pool test mode
 
 The default Copernicus path stays on the primary account.

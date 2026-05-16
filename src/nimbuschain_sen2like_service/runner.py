@@ -20,10 +20,10 @@ from nimbuschain_sen2like_service.models import (
 
 DEFAULT_VENDOR_SUBDIR = "sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation"
 DEFAULT_SPARK_LOCAL_DIRS = "/tmp/nimbus-sen2like-spark"
-DEFAULT_TIMEOUT_SECONDS = 900.0
-DEFAULT_SPARK_DRIVER_MEMORY = "2g"
-DEFAULT_SPARK_EXECUTOR_MEMORY = "2g"
-DEFAULT_SPARK_PYTHON_WORKER_MEMORY = "512m"
+DEFAULT_TIMEOUT_SECONDS = 3600.0
+DEFAULT_SPARK_DRIVER_MEMORY = "1g"
+DEFAULT_SPARK_EXECUTOR_MEMORY = "1g"
+DEFAULT_SPARK_PYTHON_WORKER_MEMORY = "256m"
 
 
 @dataclass(frozen=True, slots=True)

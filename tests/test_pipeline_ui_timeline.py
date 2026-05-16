@@ -217,7 +217,7 @@ def test_timeline_breakdown_rows_fill_missing_modular_stages() -> None:
         "Cube",
         "Mask",
     ]
-    assert rows[3]["status"] == "raw input"
+    assert rows[3]["status"] == "degraded"
     assert rows[5]["status"] == "not built"
     assert rows[6]["detail"] == "OK: Water + Cloud masks written in-place on 2/2 scenes"
 
@@ -413,13 +413,13 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
         "done",
     ]
     assert display_stages[1]["detail_label"] == (
-        "Raw Landsat inputs used directly for Zarr"
+        "Degraded: raw Landsat inputs used because Sen2Like did not write outputs"
     )
-    assert display_stages[1]["metadata"]["status_label"] == "raw input"
-    assert _stage_status_label_for_display(display_stages[1], display_stages[1]["status"]) == "raw input"
+    assert display_stages[1]["metadata"]["status_label"] == "degraded"
+    assert _stage_status_label_for_display(display_stages[1], display_stages[1]["status"]) == "degraded"
     assert display_stages[2]["metadata"]["raw_fallback"] is True
     assert display_stages[2]["detail_label"] == (
-        "Zarr conversion from raw Landsat inputs · 2 outputs"
+        "Zarr conversion used raw Landsat fallback · 2 outputs"
     )
     assert display_stages[3]["detail_label"] == (
         "Cube not built because each group has fewer than two acquisition times; "
@@ -447,10 +447,9 @@ def test_pipeline_ready_badge_stays_success_for_non_blocking_notes() -> None:
         },
     }
 
-    assert _job_has_pipeline_warnings(item) is False
-    assert _job_pipeline_style(item)[0] == "pipeline ready"
-    assert app_module._terminal_pipeline_label(item) == "Ready"
-    assert "ready with caveats" not in str(_job_pipeline_summary(item))
+    assert _job_has_pipeline_warnings(item) is True
+    assert _job_pipeline_style(item)[0] == "ready with caveats"
+    assert app_module._terminal_pipeline_label(item) == "Ready with caveats"
     assert _job_pipeline_substate(item) == "Pipeline notes: raw Landsat source, cube not built."
 
 
@@ -516,7 +515,7 @@ def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:
     ]
     assert display_stages[1]["outputs"] == ["/data/raw/a.tar", "/data/raw/b.tar"]
     assert display_stages[1]["detail_label"] == (
-        "Raw Landsat inputs used directly for Zarr"
+        "Degraded: raw Landsat inputs used because Sen2Like did not write outputs"
     )
     assert display_stages[3]["detail_label"] == (
         "Cube not built because each group has fewer than two acquisition times; "

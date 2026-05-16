@@ -46,6 +46,7 @@ def build_stage_cli_command(
     sen2like_service_url: str | None = None,
     sen2like_working_dir: str | None = None,
     sen2like_workers: int | None = None,
+    allow_sen2like_raw_fallback: bool = False,
     python_executable: str | None = None,
 ) -> list[str]:
     if action not in {"plan", "run-stage"}:
@@ -102,6 +103,8 @@ def build_stage_cli_command(
         command.extend(["--sen2like-service-url", sen2like_service_url])
     if sen2like_working_dir:
         command.extend(["--sen2like-working-dir", sen2like_working_dir])
+    if allow_sen2like_raw_fallback:
+        command.append("--allow-sen2like-raw-fallback")
     if execute:
         command.append("--execute")
     if action == "plan" and target_stage:

@@ -27,7 +27,7 @@ class Sen2LikeNormalizeRequest(BaseModel):
     products: list[str] = Field(default_factory=list)
     landsat_path: str | None = None
     working_dir: str | None = None
-    workers: int = Field(default=4, ge=1, le=128)
+    workers: int = Field(default=1, ge=1, le=128)
     steps: list[str] | None = None
     s2_path: str | None = None
     no_resume: bool = False

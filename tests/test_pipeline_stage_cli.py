@@ -271,7 +271,7 @@ def test_stage_cli_run_stage_chains_existing_zarr_mask_and_cube(monkeypatch, cap
     assert payload["results"][-1]["outputs"] == ["/data/cubes/T31UDQ.zarr"]
 
 
-def test_stage_cli_landsat_runtime_falls_back_to_raw_when_sen2like_fails(
+def test_stage_cli_landsat_runtime_fails_when_sen2like_fails_by_default(
     monkeypatch,
     tmp_path,
     capsys,
@@ -321,6 +321,81 @@ def test_stage_cli_landsat_runtime_falls_back_to_raw_when_sen2like_fails(
             "/data/raw/LC09_L1TP_TEST",
             "--sen2like-service-url",
             "http://nimbus-sen2like:8030",
+            "--zarr-service-url",
+            "http://nimbus-zarr:8010",
+            "--zarr-output-dir",
+            str(tmp_path),
+            "--stage",
+            "zarr",
+            "--execute",
+        ]
+    )
+
+    captured_output = capsys.readouterr()
+    payload = json.loads(captured_output.err)
+    statuses = {result["name"]: result["status"] for result in payload["results"]}
+    sen2like_result = payload["results"][1]
+
+    assert code == 1
+    assert statuses == {"fetch": "succeeded", "sen2like": "failed", "zarr": "skipped"}
+    assert captured["sen2like_products"] == ["/data/raw/LC09_L1TP_TEST"]
+    assert captured["sen2like_closed"] is True
+    assert sen2like_result["metadata"]["fallback_to_raw"] is False
+    assert sen2like_result["metadata"]["failure_reason"] == "sen2like_service_failed"
+    assert captured["convert_calls"] == []
+
+
+def test_stage_cli_landsat_runtime_allows_raw_fallback_when_flag_is_set(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {"convert_calls": []}
+
+    class FakeSen2LikeClient:
+        def __init__(self, *, service_url: str):
+            captured["sen2like_service_url"] = service_url
+
+        def normalize(self, **kwargs):
+            captured["sen2like_products"] = list(kwargs["products"])
+            raise RuntimeError("Sen2Like was killed")
+
+        def close(self) -> None:
+            captured["sen2like_closed"] = True
+
+    class FakeZarrClient:
+        def __init__(self, *, service_url: str):
+            captured["zarr_service_url"] = service_url
+
+        def convert(self, **kwargs):
+            captured["convert_calls"].append(kwargs)
+            return (
+                kwargs["output_uri"],
+                "optical",
+                {"scene_id": kwargs["scene_id"]},
+                {"acquisition_datetime": "2026-05-01T10:00:00Z"},
+            )
+
+        def close(self) -> None:
+            captured["zarr_closed"] = True
+
+    monkeypatch.setattr(sen2like_module, "Sen2LikeServiceClient", FakeSen2LikeClient)
+    monkeypatch.setattr(pipeline_runners, "ZarrServiceClient", FakeZarrClient)
+
+    code = main(
+        [
+            "run-stage",
+            "--provider",
+            "usgs",
+            "--collection",
+            "landsat_ot_c2_l1",
+            "--product-type",
+            "L1TP",
+            "--raw-uri",
+            "/data/raw/LC09_L1TP_TEST",
+            "--sen2like-service-url",
+            "http://nimbus-sen2like:8030",
+            "--allow-sen2like-raw-fallback",
             "--zarr-service-url",
             "http://nimbus-zarr:8010",
             "--zarr-output-dir",

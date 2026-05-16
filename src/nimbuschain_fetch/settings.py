@@ -43,18 +43,18 @@ class Settings(BaseSettings):
         alias="NIMBUS_SEN2LIKE_WORK_DIR",
     )
     nimbus_sen2like_workers: int = Field(
-        default=4,
+        default=1,
         alias="NIMBUS_SEN2LIKE_WORKERS",
         ge=1,
         le=128,
     )
     nimbus_sen2like_timeout_seconds: float | None = Field(
-        default=900.0,
+        default=3600.0,
         alias="NIMBUS_SEN2LIKE_TIMEOUT_SECONDS",
         gt=0,
     )
     nimbus_sen2like_raw_fallback: bool = Field(
-        default=True,
+        default=False,
         alias="NIMBUS_SEN2LIKE_RAW_FALLBACK",
     )
     nimbus_runtime_role: str = Field(default="all", alias="NIMBUS_RUNTIME_ROLE")

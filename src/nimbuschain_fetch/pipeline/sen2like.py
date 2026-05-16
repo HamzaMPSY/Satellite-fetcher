@@ -37,6 +37,7 @@ class Sen2LikeStage:
     name: str = "sen2like"
     depends_on: tuple[str, ...] = ("fetch",)
     service_url: str | None = None
+    allow_raw_fallback: bool = False
     skip_reason: str = "not_landsat_or_usgs"
 
     def should_run(self, context: PipelineContext) -> bool:
@@ -79,7 +80,15 @@ class Sen2LikeStage:
         try:
             payload = self._normalize(configured_url, context, landsat_inputs)
         except Exception as exc:
-            return self._fallback_to_raw(
+            if self.allow_raw_fallback:
+                return self._fallback_to_raw(
+                    context,
+                    configured_url=configured_url,
+                    landsat_inputs=landsat_inputs,
+                    reason="sen2like_service_failed",
+                    error=exc,
+                )
+            return self._failed_result(
                 context,
                 configured_url=configured_url,
                 landsat_inputs=landsat_inputs,
@@ -102,7 +111,15 @@ class Sen2LikeStage:
             "sen2like_response": payload,
         }
         if not outputs:
-            return self._fallback_to_raw(
+            if self.allow_raw_fallback:
+                return self._fallback_to_raw(
+                    context,
+                    configured_url=configured_url,
+                    landsat_inputs=landsat_inputs,
+                    reason="sen2like_output_missing",
+                    response=payload,
+                )
+            return self._failed_result(
                 context,
                 configured_url=configured_url,
                 landsat_inputs=landsat_inputs,
@@ -161,6 +178,39 @@ class Sen2LikeStage:
             metadata=metadata,
         )
 
+    def _failed_result(
+        self,
+        context: PipelineContext,
+        *,
+        configured_url: str,
+        landsat_inputs: list[str],
+        reason: str,
+        error: Exception | None = None,
+        response: dict[str, Any] | None = None,
+    ) -> StageResult:
+        metadata: dict[str, Any] = {
+            "provider": context.provider,
+            "collection": context.collection,
+            "product_type": context.product_type,
+            "service_url": configured_url,
+            "service_url_configured": True,
+            "landsat_input": landsat_inputs[0],
+            "landsat_inputs": landsat_inputs,
+            "fallback_to_raw": False,
+            "fallback_allowed": False,
+            "failure_reason": reason,
+        }
+        if error is not None:
+            metadata["error_type"] = type(error).__name__
+        if response is not None:
+            metadata["sen2like_response"] = response
+        message = str(error) if error is not None else "Sen2Like service returned no normalized outputs."
+        return StageResult.failed_result(
+            self.name,
+            error=message,
+            metadata=metadata,
+        )
+
     @staticmethod
     def _landsat_inputs(context: PipelineContext) -> list[str]:
         values: list[str] = []
@@ -195,7 +245,7 @@ class Sen2LikeStage:
             from nimbuschain_shared.clients.sen2like import Sen2LikeServiceClient as _Client
 
             Sen2LikeServiceClient = _Client
-        workers = int(context.payload.get("sen2like_workers") or context.get("sen2like_workers", 4))
+        workers = int(context.payload.get("sen2like_workers") or context.get("sen2like_workers", 1))
         client = Sen2LikeServiceClient(service_url=service_url)
         try:
             return client.normalize(

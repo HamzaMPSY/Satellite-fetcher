@@ -74,7 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--cube-end-date", default=None)
         command.add_argument("--sen2like-service-url", default=None)
         command.add_argument("--sen2like-working-dir", default=None)
-        command.add_argument("--sen2like-workers", type=int, default=4)
+        command.add_argument("--sen2like-workers", type=int, default=1)
+        command.add_argument(
+            "--allow-sen2like-raw-fallback",
+            action="store_true",
+            help=(
+                "Allow degraded Landsat tests to continue with raw inputs when "
+                "Sen2Like fails. By default Sen2Like failures fail the stage."
+            ),
+        )
         command.add_argument(
             "--execute",
             action="store_true",
@@ -109,6 +117,7 @@ def _options_from_args(args: argparse.Namespace) -> PipelineOptions:
             if args.sen2like_service_url
             else None
         ),
+        allow_sen2like_raw_fallback=bool(args.allow_sen2like_raw_fallback),
     )
 
 
@@ -189,6 +198,7 @@ def _orchestrator(
                 mask_types=options.mask_types,
                 cube_mode=options.normalized_cube_mode,
                 sen2like_service_url=options.sen2like_service_url,
+                allow_sen2like_raw_fallback=options.allow_sen2like_raw_fallback,
                 runtime=_runtime_config_from_args(args),
             )
         )

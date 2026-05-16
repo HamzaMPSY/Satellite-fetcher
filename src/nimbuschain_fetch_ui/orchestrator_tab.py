@@ -190,7 +190,10 @@ def render_orchestrator_tab(
             options=target_stage_options,
             key="orch_target_stage",
         )
-        sen2like_workers = int(st.session_state.get("orch_sen2like_workers", 4))
+        default_sen2like_workers = int(os.getenv("NIMBUS_SEN2LIKE_WORKERS", "1") or 1)
+        sen2like_workers = int(
+            st.session_state.get("orch_sen2like_workers", default_sen2like_workers)
+        )
         if is_landsat_flow:
             sen2like_workers = int(
                 st.number_input(

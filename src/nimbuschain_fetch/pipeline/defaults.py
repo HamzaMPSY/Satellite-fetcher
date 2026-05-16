@@ -20,6 +20,7 @@ class PipelineOptions:
     mask_types: tuple[str, ...] = field(default_factory=tuple)
     cube_mode: str = "none"
     sen2like_service_url: str | None = None
+    allow_sen2like_raw_fallback: bool = False
 
     @property
     def normalized_provider(self) -> str:
@@ -59,7 +60,12 @@ def build_default_pipeline_stages(options: PipelineOptions) -> list[PipelineStag
         ),
     ]
     if options.requires_sen2like:
-        stages.append(Sen2LikeStage(service_url=options.sen2like_service_url))
+        stages.append(
+            Sen2LikeStage(
+                service_url=options.sen2like_service_url,
+                allow_raw_fallback=options.allow_sen2like_raw_fallback,
+            )
+        )
     stages.append(
         FunctionStage(
             "zarr",

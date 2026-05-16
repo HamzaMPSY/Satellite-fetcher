@@ -5,8 +5,7 @@ from collections.abc import Callable
 import math
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from pathlib import Path
+from datetime import date
 from typing import Any
 
 from affine import Affine
@@ -23,16 +22,13 @@ from nimbuschain_zarr_service.core import (
     _coerce_timestamp,
     _open_existing_output_store,
     _prepare_output_store,
-    is_oci_uri,
 )
 from nimbuschain_zarr_service.cube_support import (
     clean_optional_text as _clean_optional_text,
     coerce_date_only as _coerce_date_only,
     copy_time_slice_in_chunks as _copy_time_slice_in_chunks,
     default_scene_id as _default_scene_id,
-    normalize_label as _normalize_label,
     normalize_public_uri as _normalize_public_uri,
-    normalized_chunk_shape as _normalized_chunk_shape,
     read_label_array as _read_label_array,
     resolve_acquisition_time as _resolve_acquisition_time,
     sanitize_layer_metadata as _sanitize_layer_metadata,
@@ -478,7 +474,8 @@ def build_grouped_time_cubes(
                 }
             )
 
-        summary = build_time_cube(
+        builder = build_time_cube if _scenes_share_exact_cube_grid(unique_scenes) else build_aligned_time_cube
+        summary = builder(
             [scene.zarr_uri for scene in unique_scenes],
             output_uri,
             include_ancillary=include_ancillary,
@@ -534,6 +531,271 @@ def build_grouped_time_cubes(
             "start_date": start_bound.isoformat() if start_bound else None,
             "end_date": end_bound.isoformat() if end_bound else None,
         },
+    ).to_dict()
+
+
+def build_aligned_time_cube(
+    source_zarr_uris: list[str],
+    output_uri: str,
+    *,
+    include_ancillary: bool = True,
+    include_masks: bool = False,
+    progress_callback: CubeProgressCallback | None = None,
+) -> dict[str, Any]:
+    try:
+        import zarr
+        from numcodecs import Blosc
+    except ImportError as exc:
+        raise ConversionDependencyError(
+            "Cube-building dependencies are unavailable "
+            f"({exc}). Ensure zarr and numcodecs are installed."
+        ) from exc
+
+    if not source_zarr_uris:
+        raise ConversionError("At least one source Zarr store is required to build a cube.")
+
+    scenes = [_load_source_scene(uri, include_ancillary=include_ancillary) for uri in source_zarr_uris]
+    mask_layer_names = _validate_aligned_scene_compatibility(
+        scenes,
+        include_masks=include_masks,
+    )
+    ordered_scenes = sorted(scenes, key=lambda item: item.sort_key)
+    baseline = ordered_scenes[0]
+
+    target_resolution_m = _target_resolution_m(ordered_scenes)
+    target_crs, crs_policy = _choose_target_crs(ordered_scenes, None)
+    target_grid = _build_mosaic_grid(
+        ordered_scenes,
+        target_crs=target_crs,
+        resolution_m=target_resolution_m,
+    )
+
+    source_count = len(ordered_scenes)
+    band_names = list(baseline.band_names)
+    band_count = len(band_names)
+    chunk_spec = ChunkShape()
+    imagery_chunks = (
+        1,
+        min(chunk_spec.band, band_count),
+        min(chunk_spec.y, target_grid.height),
+        min(chunk_spec.x, target_grid.width),
+    )
+
+    output_store, public_uri = _prepare_output_store(output_uri)
+    root = zarr.open_group(output_store, mode="w", zarr_format=2)
+    compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
+
+    imagery = root.create_array(
+        "imagery",
+        shape=(source_count, band_count, target_grid.height, target_grid.width),
+        chunks=imagery_chunks,
+        dtype=np.float32,
+        compressor=compressor,
+        fill_value=np.float32(np.nan),
+    )
+
+    time_values = [scene.acquisition_time for scene in ordered_scenes]
+    scene_ids = [scene.scene_id for scene in ordered_scenes]
+    source_uris = [scene.zarr_uri for scene in ordered_scenes]
+
+    root.create_array("time", data=_string_array(time_values), overwrite=True)
+    root.create_array("band", data=_string_array(band_names), overwrite=True)
+    root.create_array("scene_id", data=_string_array(scene_ids), overwrite=True)
+    root.create_array("source_zarr_uri", data=_string_array(source_uris), overwrite=True)
+    root.create_array("x", data=target_grid.x_coords, chunks=(min(chunk_spec.x, target_grid.width),), overwrite=True)
+    root.create_array("y", data=target_grid.y_coords, chunks=(min(chunk_spec.y, target_grid.height),), overwrite=True)
+
+    masks_group = None
+    mask_arrays: dict[str, Any] = {}
+    if mask_layer_names:
+        masks_group = root.require_group("masks")
+        masks_group.attrs.update(
+            {
+                "dimensions": ["time", "y", "x"],
+                "mask_layer_names": list(mask_layer_names),
+                "grid_alignment": "reprojected_union",
+            }
+        )
+        mask_chunks = (
+            1,
+            min(chunk_spec.y, target_grid.height),
+            min(chunk_spec.x, target_grid.width),
+        )
+        for mask_name in mask_layer_names:
+            mask_spec = baseline.mask_layers[mask_name]
+            target = masks_group.create_array(
+                mask_name,
+                shape=(source_count, target_grid.height, target_grid.width),
+                chunks=mask_chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                fill_value=np.float32(np.nan),
+            )
+            target.attrs.update(_sanitize_mask_array_attrs(mask_spec.attrs))
+            target.attrs["grid_alignment"] = "reprojected_union"
+            target.attrs["source_dtype"] = mask_spec.dtype
+            mask_arrays[mask_name] = target
+
+    windows = _iter_grid_windows(
+        width=target_grid.width,
+        height=target_grid.height,
+        chunk_x=max(1, int(imagery.chunks[3])),
+        chunk_y=max(1, int(imagery.chunks[2])),
+    )
+    total_windows = len(windows) * max(1, source_count)
+    processed_windows = 0
+
+    root.attrs.update(
+        {
+            "cube_kind": "time_series",
+            "build_status": "writing",
+            "grid_alignment": "reprojected_union",
+            "shape": [source_count, band_count, target_grid.height, target_grid.width],
+        }
+    )
+
+    try:
+        for time_index, scene in enumerate(ordered_scenes):
+            source_store = _open_existing_output_store(scene.zarr_uri)
+            source_root = zarr.open_group(source_store, mode="r", zarr_format=2)
+            for row_off, col_off, win_h, win_w in windows:
+                warped_imagery, warped_masks = _warp_scene_time_window(
+                    source_root,
+                    scene,
+                    target_grid=target_grid,
+                    row_off=row_off,
+                    col_off=col_off,
+                    win_h=win_h,
+                    win_w=win_w,
+                    mask_layer_names=mask_layer_names,
+                )
+                imagery[time_index, :, row_off : row_off + win_h, col_off : col_off + win_w] = warped_imagery
+                for mask_name, target in mask_arrays.items():
+                    target[time_index, row_off : row_off + win_h, col_off : col_off + win_w] = warped_masks[
+                        mask_name
+                    ]
+
+                processed_windows += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "aligned_time_cube",
+                            "scene_id": scene.scene_id,
+                            "scene_index": time_index + 1,
+                            "scene_total": source_count,
+                            "window_row_offset": row_off,
+                            "window_col_offset": col_off,
+                            "window_height": win_h,
+                            "window_width": win_w,
+                            "window_index": processed_windows,
+                            "window_total": total_windows,
+                            "cube_output_uri": public_uri,
+                            "fraction": processed_windows / total_windows if total_windows else 1.0,
+                        }
+                    )
+    except Exception as exc:
+        root.attrs.update(
+            {
+                "build_status": "failed",
+                "build_error": str(exc),
+            }
+        )
+        raise
+
+    imagery_metadata = _sanitize_layer_metadata(baseline.imagery_attrs)
+    root.attrs.update(
+        {
+            "zarr_format_version": ZARR_FORMAT_VERSION,
+            "cube_kind": "time_series",
+            "build_status": "written",
+            "grid_alignment": "reprojected_union",
+            "source_scene_count": source_count,
+            "provider": baseline.provider,
+            "collection": baseline.collection,
+            "product_type": baseline.product_type,
+            "data_family": baseline.data_family,
+            "dimensions": ["time", "band", "y", "x"],
+            "shape": [source_count, band_count, target_grid.height, target_grid.width],
+            "dtype": "float32",
+            "nodata": "nan",
+            "band_names": list(band_names),
+            "band_metadata": imagery_metadata,
+            "crs": target_grid.crs,
+            "transform": target_grid.transform,
+            "reference_band": baseline.reference_band,
+            "reference_pixel_size": [float(target_resolution_m), float(target_resolution_m)],
+            "time_start": time_values[0],
+            "time_end": time_values[-1],
+            "time_granularity": "scene",
+            "mosaic_grid_policy": "union_extent",
+            "mosaic_crs_policy": crs_policy,
+            "mosaic_resolution_m": int(target_resolution_m),
+            "source_scene_ids": list(scene_ids),
+        }
+    )
+
+    if include_ancillary:
+        root.attrs["ancillary_omitted_reason"] = (
+            "Ancillary layers were not written because the source scene grids required "
+            "reprojection into a shared cube grid."
+        )
+
+    if mask_arrays:
+        root.attrs.update(
+            {
+                "mask_dimensions": ["time", "y", "x"],
+                "mask_layer_names": list(mask_layer_names),
+            }
+        )
+    elif include_masks:
+        root.attrs["masks_omitted_reason"] = (
+            "Mask layers were not written because the source stores do not all share "
+            "the same masks schema."
+        )
+
+    quadkey_attrs = _build_quadkey_metadata(
+        crs=target_grid.crs,
+        transform=target_grid.transform,
+        width=target_grid.width,
+        height=target_grid.height,
+        time_values=time_values,
+        pixel_size=[float(target_resolution_m), float(target_resolution_m)],
+    )
+    if quadkey_attrs:
+        quadkey_attrs.pop("quadkeys_by_time", None)
+        root.attrs.update(quadkey_attrs)
+
+    zarr.consolidate_metadata(output_store)
+
+    return CubeBuildSummaryRecord(
+        zarr_uri=public_uri,
+        cube_kind="time_series",
+        source_scene_count=source_count,
+        source_zarr_uris=list(source_uris),
+        band_names=list(band_names),
+        shape=[source_count, band_count, target_grid.height, target_grid.width],
+        time_values=list(time_values),
+        scene_ids=list(scene_ids),
+        provider=baseline.provider,
+        collection=baseline.collection,
+        product_type=baseline.product_type,
+        data_family=baseline.data_family,
+        crs=target_grid.crs,
+        transform=target_grid.transform,
+        pixel_size=[float(target_resolution_m), float(target_resolution_m)],
+        dimensions=["time", "band", "y", "x"],
+        ancillary_written=False,
+        ancillary_layer_names=[],
+        masks_written=bool(mask_arrays),
+        mask_layer_names=list(mask_layer_names),
+        quadkey_schema_version=quadkey_attrs.get("quadkey_schema_version") if quadkey_attrs else None,
+        quadkey_coverage_mode=quadkey_attrs.get("quadkey_coverage_mode") if quadkey_attrs else None,
+        quadkey_zoom_index=quadkey_attrs.get("quadkey_zoom_index") if quadkey_attrs else None,
+        quadkeys_index=list(quadkey_attrs.get("quadkeys_index") or []) if quadkey_attrs else [],
+        time_granularity="scene",
+        mosaic_crs_policy=crs_policy,
+        mosaic_resolution_m=int(target_resolution_m),
+        nodata="nan",
     ).to_dict()
 
 
@@ -736,6 +998,98 @@ def _validate_scene_compatibility(
     return ancillary_mode, mask_layer_names
 
 
+def _scenes_share_exact_cube_grid(scenes: list[SourceScene]) -> bool:
+    if not scenes:
+        return True
+
+    baseline = scenes[0]
+    for scene in scenes[1:]:
+        if scene.crs != baseline.crs:
+            return False
+        if _comparable_value(scene.transform) != _comparable_value(baseline.transform):
+            return False
+        if _comparable_value(scene.reference_pixel_size) != _comparable_value(baseline.reference_pixel_size):
+            return False
+        if scene.imagery_shape[1:] != baseline.imagery_shape[1:]:
+            return False
+        if not _coords_equal(scene.x_coords, baseline.x_coords):
+            return False
+        if not _coords_equal(scene.y_coords, baseline.y_coords):
+            return False
+    return True
+
+
+def _validate_aligned_scene_compatibility(
+    scenes: list[SourceScene],
+    *,
+    include_masks: bool,
+) -> list[str]:
+    if not scenes:
+        raise ConversionError("At least one source Zarr store is required to build a cube.")
+
+    baseline = scenes[0]
+    for scene in scenes:
+        if not scene.crs:
+            raise ConversionError(f"Source Zarr has no CRS and cannot be aligned into a cube: {scene.zarr_uri}")
+        if not isinstance(scene.transform, (list, tuple)) or len(scene.transform) < 6:
+            raise ConversionError(
+                f"Source Zarr has no usable transform and cannot be aligned into a cube: {scene.zarr_uri}"
+            )
+
+    for scene in scenes[1:]:
+        _ensure_same(scene.provider, baseline.provider, field_name="provider", scene=scene)
+        _ensure_same(scene.collection, baseline.collection, field_name="collection", scene=scene)
+        _ensure_same(scene.product_type, baseline.product_type, field_name="product_type", scene=scene)
+        _ensure_same(scene.data_family, baseline.data_family, field_name="data_family", scene=scene)
+        _ensure_same(scene.imagery_dtype, baseline.imagery_dtype, field_name="imagery_dtype", scene=scene)
+        _ensure_same(scene.band_names, baseline.band_names, field_name="band_names", scene=scene)
+        _ensure_same(
+            _comparable_value(scene.reference_pixel_size),
+            _comparable_value(baseline.reference_pixel_size),
+            field_name="reference_pixel_size",
+            scene=scene,
+        )
+
+    return _validate_aligned_mask_compatibility(
+        scenes,
+        include_masks=include_masks,
+    )
+
+
+def _validate_aligned_mask_compatibility(
+    scenes: list[SourceScene],
+    *,
+    include_masks: bool,
+) -> list[str]:
+    if not include_masks:
+        return []
+
+    baseline = scenes[0]
+    if not baseline.mask_layers:
+        raise ConversionError(
+            f"Cube requested masks, but source Zarr has no masks group: {baseline.zarr_uri}"
+        )
+
+    mask_layer_names = sorted(baseline.mask_layers)
+    for scene in scenes[1:]:
+        scene_mask_names = sorted(scene.mask_layers)
+        if scene_mask_names != mask_layer_names:
+            raise ConversionError(
+                "Source Zarr masks do not match the cube baseline: "
+                f"{scene.zarr_uri}"
+            )
+        for mask_name in mask_layer_names:
+            baseline_mask = baseline.mask_layers[mask_name]
+            scene_mask = scene.mask_layers[mask_name]
+            _ensure_same(
+                scene_mask.dtype,
+                baseline_mask.dtype,
+                field_name=f"masks/{mask_name}.dtype",
+                scene=scene,
+            )
+    return mask_layer_names
+
+
 def _validate_mask_compatibility(
     scenes: list[SourceScene],
     *,
@@ -783,6 +1137,14 @@ def _ensure_same(expected: Any, actual: Any, *, field_name: str, scene: SourceSc
         )
 
 
+def _comparable_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return value
+
+
 def _coords_equal(left: np.ndarray | None, right: np.ndarray | None) -> bool:
     if left is None and right is None:
         return True
@@ -820,6 +1182,29 @@ def _scene_group_key(scene_id: str) -> str:
     if len(landsat_parts) >= 3 and landsat_parts[2].isdigit():
         return landsat_parts[2]
     return str(scene_id or "scene")
+
+
+def _target_resolution_m(scenes: list[SourceScene]) -> float:
+    candidates: list[float] = []
+    for scene in scenes:
+        pixel_size = scene.reference_pixel_size
+        if isinstance(pixel_size, (list, tuple, np.ndarray)):
+            candidates.extend(abs(float(value)) for value in pixel_size if float(value) > 0)
+        elif pixel_size is not None:
+            value = float(pixel_size)
+            if value > 0:
+                candidates.append(value)
+
+    if not candidates:
+        for scene in scenes:
+            if isinstance(scene.transform, (list, tuple)) and len(scene.transform) >= 6:
+                candidates.append(abs(float(scene.transform[0])))
+                candidates.append(abs(float(scene.transform[4])))
+
+    positive_candidates = [value for value in candidates if value > 0]
+    if not positive_candidates:
+        raise ConversionError("Could not determine cube target resolution from source scenes.")
+    return min(positive_candidates)
 
 
 def _compact_landsat_path_row(scene_id: str) -> str:
@@ -1271,6 +1656,78 @@ def _warp_scene_window(
             )
 
     return imagery_dst, cloud_mask_dst, cloud_probability_dst
+
+
+def _warp_scene_time_window(
+    source_root: Any,
+    scene: SourceScene,
+    *,
+    target_grid: MosaicGrid,
+    row_off: int,
+    col_off: int,
+    win_h: int,
+    win_w: int,
+    mask_layer_names: list[str],
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    band_count = int(scene.imagery_shape[1])
+    imagery_dst = np.full((band_count, win_h, win_w), np.nan, dtype=np.float32)
+    mask_dst = {
+        mask_name: np.full((win_h, win_w), np.nan, dtype=np.float32)
+        for mask_name in mask_layer_names
+    }
+
+    src_window = _scene_source_window_for_target_window(
+        scene,
+        target_grid=target_grid,
+        row_off=row_off,
+        col_off=col_off,
+        win_h=win_h,
+        win_w=win_w,
+    )
+    if src_window is None:
+        return imagery_dst, mask_dst
+
+    min_row, max_row, min_col, max_col = src_window
+    src_transform = Affine(*[float(v) for v in scene.transform[:6]]) * Affine.translation(min_col, min_row)
+    dst_transform = Affine(*[float(v) for v in target_grid.transform[:6]]) * Affine.translation(col_off, row_off)
+
+    for band_index in range(band_count):
+        source_band = np.asarray(
+            source_root["imagery"][0, band_index, min_row:max_row, min_col:max_col],
+            dtype=np.float32,
+        )
+        reproject(
+            source=source_band,
+            destination=imagery_dst[band_index],
+            src_transform=src_transform,
+            src_crs=scene.crs,
+            dst_transform=dst_transform,
+            dst_crs=target_grid.crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+
+    if mask_layer_names:
+        masks_group = source_root["masks"]
+        for mask_name in mask_layer_names:
+            source_mask = np.asarray(
+                masks_group[mask_name][0, min_row:max_row, min_col:max_col],
+                dtype=np.float32,
+            )
+            reproject(
+                source=source_mask,
+                destination=mask_dst[mask_name],
+                src_transform=src_transform,
+                src_crs=scene.crs,
+                dst_transform=dst_transform,
+                dst_crs=target_grid.crs,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=Resampling.nearest,
+            )
+
+    return imagery_dst, mask_dst
 
 
 def build_daily_mosaic_cube(

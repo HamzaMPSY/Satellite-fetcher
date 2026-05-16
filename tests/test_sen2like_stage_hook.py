@@ -196,7 +196,7 @@ def test_sen2like_stage_normalizes_all_raw_uris(monkeypatch) -> None:
     assert results[-1].metadata["landsat_inputs"] == calls[0]["products"]
 
 
-def test_sen2like_stage_falls_back_to_raw_when_service_fails(monkeypatch) -> None:
+def test_sen2like_stage_fails_when_service_fails_by_default(monkeypatch) -> None:
     calls: list[dict] = []
 
     class FakeClient:
@@ -216,6 +216,56 @@ def test_sen2like_stage_falls_back_to_raw_when_service_fails(monkeypatch) -> Non
         collection="landsat_ot_c2_l1",
         product_type="L1TP",
         sen2like_service_url="http://nimbus-sen2like:8030",
+    )
+    context = PipelineContext(
+        job_id="job-landsat",
+        provider="usgs",
+        collection="landsat_ot_c2_l1",
+        product_type="L1TP",
+        payload={
+            "raw_uris": [
+                "/data/downloads/raw/LC08_A",
+                "/data/downloads/raw/LC08_B",
+            ],
+        },
+    )
+
+    results = PipelineOrchestrator(build_default_pipeline_stages(options)).run(
+        context,
+        target_stage="sen2like",
+    )
+
+    assert results[-1].status == StageStatus.failed
+    assert results[-1].outputs == []
+    assert results[-1].metadata["fallback_to_raw"] is False
+    assert results[-1].metadata["fallback_allowed"] is False
+    assert results[-1].metadata["failure_reason"] == "sen2like_service_failed"
+    assert results[-1].metadata["error_type"] == "RuntimeError"
+    assert context.get("zarr_inputs") is None
+    assert calls[-1] == {"closed": True}
+
+
+def test_sen2like_stage_can_opt_into_raw_fallback_for_degraded_tests(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *, service_url: str):
+            self.service_url = service_url
+
+        def normalize(self, **kwargs):
+            calls.append({"service_url": self.service_url, **kwargs})
+            raise RuntimeError("sen2like container was killed")
+
+        def close(self) -> None:
+            calls.append({"closed": True})
+
+    monkeypatch.setattr(sen2like_module, "Sen2LikeServiceClient", FakeClient)
+    options = PipelineOptions(
+        provider="usgs",
+        collection="landsat_ot_c2_l1",
+        product_type="L1TP",
+        sen2like_service_url="http://nimbus-sen2like:8030",
+        allow_sen2like_raw_fallback=True,
     )
     context = PipelineContext(
         job_id="job-landsat",
