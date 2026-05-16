@@ -499,6 +499,17 @@ For degraded fallback experiments only, pass
 
 Do not use degraded fallback for production Landsat validation.
 
+If the error mentions `6S executable not found`, rebuild and recreate
+`nimbus-sen2like`, then verify:
+
+```bash
+podman exec backendnimbus_nimbus-sen2like_1 which sixs
+podman exec backendnimbus_nimbus-sen2like_1 python -m sixs_bin --test-wrapper
+curl -fsS http://127.0.0.1:8030/readiness
+```
+
+The readiness payload must include `"sixs_executable_exists": true`.
+
 ### Landsat daily mosaic
 
 Daily mosaic is not the primary Landsat layout. Use `grouped_time` for the

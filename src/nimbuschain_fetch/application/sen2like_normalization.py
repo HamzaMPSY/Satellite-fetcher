@@ -304,17 +304,46 @@ class Sen2LikeNormalizationRouter:
         job_id: str,
         products: list[str],
     ) -> dict[str, Any]:
-        client = Sen2LikeServiceClient(service_url=service_url)
         working_dir = _job_working_dir(
             self._rt.settings.nimbus_sen2like_work_dir,
             job_id,
         )
+        working_path = Path(working_dir)
+        client: Sen2LikeServiceClient | None = None
         responses: list[dict[str, Any]] = []
         outputs: list[dict[str, Any]] = []
         duration_seconds = 0.0
+        reused_existing_count = 0
         try:
             for index, product in enumerate(products, start=1):
                 product_job_id = f"{job_id}-{index}" if len(products) > 1 else job_id
+                existing_output = _existing_sen2like_output(
+                    product=product,
+                    working_dir=working_path,
+                )
+                if existing_output is not None:
+                    reused_existing_count += 1
+                    outputs.append(existing_output)
+                    responses.append(
+                        {
+                            "status": "succeeded",
+                            "job_id": product_job_id,
+                            "pipeline_id": job_id,
+                            "products": [str(product)],
+                            "working_dir": working_dir,
+                            "outputs": [existing_output],
+                            "duration_seconds": 0.0,
+                            "return_code": 0,
+                            "metadata": {
+                                "reused_existing_output": True,
+                                "execution_mode": "resume_existing_safe",
+                            },
+                        }
+                    )
+                    continue
+
+                if client is None:
+                    client = Sen2LikeServiceClient(service_url=service_url)
                 try:
                     response = client.normalize(
                         products=[product],
@@ -351,11 +380,13 @@ class Sen2LikeNormalizationRouter:
                 "metadata": {
                     "execution_mode": "sequential_single_product",
                     "product_count": len(products),
+                    "reused_existing_output_count": reused_existing_count,
                     "service_url": service_url,
                 },
             }
         finally:
-            client.close()
+            if client is not None:
+                client.close()
 
 
 def _sen2like_outputs(response: dict[str, Any]) -> list[str]:
@@ -373,6 +404,60 @@ def _job_working_dir(base_working_dir: str | None, job_id: str) -> str:
     base = Path(str(base_working_dir or "/data/downloads/sen2like").strip())
     safe_job_id = str(job_id or "job").strip().replace("/", "_")
     return str(base / safe_job_id)
+
+
+def _existing_sen2like_output(
+    *,
+    product: str,
+    working_dir: Path,
+) -> dict[str, Any] | None:
+    output_dir = working_dir / _sen2like_product_output_name(product)
+    normalized_uri = _existing_normalized_output_uri(output_dir)
+    if not normalized_uri:
+        return None
+    manifest_path = output_dir / "manifest.json"
+    return {
+        "product": str(product),
+        "output_dir": str(output_dir),
+        "manifest_path": str(manifest_path) if manifest_path.exists() else None,
+        "normalized_uri": normalized_uri,
+        "exists": True,
+        "reused_existing": True,
+    }
+
+
+def _sen2like_product_output_name(product: str) -> str:
+    name = Path(str(product)).name
+    lowered = name.lower()
+    for suffix in (".tar.gz", ".tgz", ".tar"):
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(name).stem or name
+
+
+def _existing_normalized_output_uri(output_dir: Path) -> str | None:
+    if not output_dir.exists():
+        return None
+    candidates = [
+        *sorted((output_dir / "SAFE").glob("*.SAFE")),
+        *sorted(output_dir.glob("*.SAFE")),
+        *sorted(output_dir.glob("*_L2F")),
+    ]
+    for candidate in candidates:
+        if _valid_existing_sen2like_output(candidate):
+            return str(candidate)
+    return None
+
+
+def _valid_existing_sen2like_output(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if path.suffix.upper() == ".SAFE" and not (path / "manifest.safe").exists():
+        return False
+    for raster in path.rglob("*"):
+        if raster.is_file() and raster.suffix.lower() in {".tif", ".tiff", ".jp2"}:
+            return True
+    return False
 
 
 def _raw_fallback_payload(

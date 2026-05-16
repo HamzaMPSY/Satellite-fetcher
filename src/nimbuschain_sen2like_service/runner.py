@@ -230,13 +230,24 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
 def readiness_payload() -> dict[str, Any]:
     vendor_root = resolve_vendor_root()
     script = pipeline_path(vendor_root)
+    sixs_path = _sixs_executable_path()
+    ready = script.exists() and sixs_path is not None
     return {
-        "status": "ok" if script.exists() else "unavailable",
+        "status": "ok" if ready else "unavailable",
         "service": "nimbus-sen2like",
         "vendor_root": str(vendor_root),
         "pipeline_py": str(script),
         "pipeline_py_exists": script.exists(),
+        "sixs_executable": sixs_path,
+        "sixs_executable_exists": sixs_path is not None,
     }
+
+
+def _sixs_executable_path() -> str | None:
+    for executable in ("sixs", "sixsV1.1", "sixs.exe", "sixsV1.1.exe"):
+        if path := shutil.which(executable):
+            return path
+    return None
 
 
 def _prepare_product_input(product: str, working_dir: Path) -> PreparedProduct:

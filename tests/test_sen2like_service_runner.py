@@ -5,9 +5,12 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
 from nimbuschain_shared.clients.sen2like import Sen2LikeServiceClient
+from nimbuschain_sen2like_service.main import create_app
 from nimbuschain_sen2like_service.models import Sen2LikeNormalizeRequest
-from nimbuschain_sen2like_service.runner import build_command, run_sen2like
+from nimbuschain_sen2like_service.runner import build_command, readiness_payload, run_sen2like
 
 
 def _write_valid_sen2like_output(work_dir: Path, scene_name: str) -> Path:
@@ -188,6 +191,59 @@ def test_sen2like_client_summarizes_sigkill_as_memory_pressure() -> None:
     )
 
     assert "not have enough memory" in message
+
+
+def test_sen2like_readiness_requires_sixs_executable(tmp_path: Path, monkeypatch) -> None:
+    vendor_root = tmp_path / "vendor"
+    vendor_root.mkdir()
+    pipeline = vendor_root / "Pipeline.py"
+    pipeline.write_text("print('upstream')", encoding="utf-8")
+
+    monkeypatch.setenv("NIMBUS_SEN2LIKE_VENDOR_DIR", str(vendor_root))
+    monkeypatch.setattr("nimbuschain_sen2like_service.runner.shutil.which", lambda _name: None)
+
+    payload = readiness_payload()
+
+    assert payload["status"] == "unavailable"
+    assert payload["pipeline_py_exists"] is True
+    assert payload["sixs_executable"] is None
+    assert payload["sixs_executable_exists"] is False
+
+
+def test_sen2like_readiness_reports_sixs_path(tmp_path: Path, monkeypatch) -> None:
+    vendor_root = tmp_path / "vendor"
+    vendor_root.mkdir()
+    pipeline = vendor_root / "Pipeline.py"
+    pipeline.write_text("print('upstream')", encoding="utf-8")
+
+    monkeypatch.setenv("NIMBUS_SEN2LIKE_VENDOR_DIR", str(vendor_root))
+    monkeypatch.setattr(
+        "nimbuschain_sen2like_service.runner.shutil.which",
+        lambda name: "/usr/local/bin/sixsV1.1" if name == "sixs" else None,
+    )
+
+    payload = readiness_payload()
+
+    assert payload["status"] == "ok"
+    assert payload["pipeline_py_exists"] is True
+    assert payload["sixs_executable"] == "/usr/local/bin/sixsV1.1"
+    assert payload["sixs_executable_exists"] is True
+
+
+def test_sen2like_readiness_endpoint_fails_when_sixs_is_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "nimbuschain_sen2like_service.main.readiness_payload",
+        lambda: {
+            "status": "unavailable",
+            "pipeline_py_exists": True,
+            "sixs_executable_exists": False,
+        },
+    )
+
+    response = TestClient(create_app()).get("/readiness")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["sixs_executable_exists"] is False
 
 
 def test_sen2like_runner_fails_when_manifest_contains_failed_steps(

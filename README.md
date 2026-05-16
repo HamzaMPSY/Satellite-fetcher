@@ -179,6 +179,11 @@ Then start the API, worker, UI, Zarr service, and mask service with the containe
 - Converter health: [http://127.0.0.1:8000/v1/converter/health](http://127.0.0.1:8000/v1/converter/health)
 - Converter readiness: [http://127.0.0.1:8000/v1/converter/readiness](http://127.0.0.1:8000/v1/converter/readiness)
 - Mask health: [http://127.0.0.1:8000/v1/mask/health](http://127.0.0.1:8000/v1/mask/health)
+- Sen2Like readiness: [http://127.0.0.1:8030/readiness](http://127.0.0.1:8030/readiness)
+
+Sen2Like readiness requires both the vendored `Pipeline.py` and a `6S`/`sixsV1.1`
+executable on the container `PATH`, because Py6S atmospheric correction shells
+out to that binary.
 
 ## Data and git policy
 

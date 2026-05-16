@@ -41,7 +41,7 @@ def create_app() -> FastAPI:
     @app.get("/readiness")
     def readiness() -> dict[str, object]:
         payload = readiness_payload()
-        if not payload["pipeline_py_exists"]:
+        if not payload["pipeline_py_exists"] or not payload["sixs_executable_exists"]:
             raise HTTPException(status_code=503, detail=payload)
         return payload
 

@@ -33,6 +33,7 @@ RUN apt-get update && \
       build-essential \
       ca-certificates \
       default-jre-headless \
+      gfortran \
       gdal-bin \
       libexpat1 \
       libgdal-dev \
@@ -49,9 +50,14 @@ COPY sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation
 RUN python -m pip install --upgrade pip "setuptools<81" wheel && \
     grep -viE '^(GDAL|podman-compose|opencv-python-headless|pyrasterframes|zarr)==' \
       /app/requirements/sen2like-upstream.txt > /app/requirements/sen2like-container.txt && \
+    printf '%s\n' '6s-bin==0.11.3' >> /app/requirements/sen2like-container.txt && \
     printf '%s\n' 'opencv-python-headless==4.10.0.84' >> /app/requirements/sen2like-container.txt && \
     printf '%s\n' 'zarr==3.0.10' >> /app/requirements/sen2like-container.txt && \
-    python -m pip install -r /app/requirements/sen2like-container.txt
+    python -m pip install -r /app/requirements/sen2like-container.txt && \
+    sixs_path="$(python -m sixs_bin --path 1.1)" && \
+    ln -sf "$sixs_path" /usr/local/bin/sixsV1.1 && \
+    ln -sf "$sixs_path" /usr/local/bin/sixs && \
+    python -m sixs_bin --test-wrapper
 
 COPY --chown=appuser:appuser src/nimbuschain_sen2like_service /app/src/nimbuschain_sen2like_service
 COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared

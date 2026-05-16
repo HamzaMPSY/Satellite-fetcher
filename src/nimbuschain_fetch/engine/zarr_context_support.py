@@ -57,8 +57,8 @@ class FetcherZarrContextSupport:
             ]
         if not dataset_summary:
             dataset_summary = self.inspect_zarr_dataset(zarr_uri)
-        provider_name = self._provider_name(row.get("provider"))
-        collection = str(row.get("collection") or summary.get("collection") or "").strip()
+        provider_name = self._provider_name(summary.get("provider") or row.get("provider"))
+        collection = str(summary.get("collection") or row.get("collection") or "").strip()
         scene_id = (
             str(scene_id_override or "").strip()
             or str(matching_item.scene_id if matching_item is not None else "").strip()
@@ -66,9 +66,9 @@ class FetcherZarrContextSupport:
             or self._scene_id_from_raw_uri(zarr_uri)
         )
         product_type = (
-            str(product_type_override or "").strip()
+            str(summary.get("product_type") or "").strip()
+            or str(product_type_override or "").strip()
             or str(row.get("product_type") or "").strip()
-            or str(summary.get("product_type") or "").strip()
             or None
         )
         acquisition_datetime = (

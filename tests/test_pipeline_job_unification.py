@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from nimbuschain_fetch.client import NimbusFetcherClient
 from nimbuschain_fetch.engine.nimbus_fetcher import NimbusFetcher
+from nimbuschain_fetch.engine.zarr_context_support import FetcherZarrContextSupport
 from nimbuschain_fetch.models import (
     ArtifactUpsertRequest,
     ArtifactType,
@@ -877,6 +878,103 @@ def test_landsat_sen2like_router_calls_service_once_per_product(
     assert response["metadata"]["execution_mode"] == "sequential_single_product"
     assert response["duration_seconds"] == 2.5
     assert len(response["outputs"]) == 2
+
+
+def test_landsat_sen2like_router_reuses_existing_safe_outputs(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "sen2like"
+    safe_dir = (
+        work_dir
+        / "job-42"
+        / "LC08_A"
+        / "SAFE"
+        / "S2L_MSIL2F_20260516T000000_N0500_R000_T31UDQ_20260516T000000.SAFE"
+    )
+    safe_dir.mkdir(parents=True)
+    (safe_dir / "manifest.safe").write_text("<xml />", encoding="utf-8")
+    (safe_dir / "B02.TIF").write_bytes(b"fake-raster")
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            nimbus_sen2like_work_dir=str(work_dir),
+            nimbus_sen2like_workers=4,
+            nimbus_sen2like_timeout_seconds=600,
+        )
+    )
+    router = sen2like_normalization.Sen2LikeNormalizationRouter(runtime)
+    FakeSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        FakeSen2LikeClient,
+    )
+
+    response = router._normalize(
+        service_url="http://sen2like.test",
+        job_id="job-42",
+        products=["/data/raw/LC08_A.tar"],
+    )
+
+    assert FakeSen2LikeClient.calls == []
+    assert response["outputs"] == [
+        {
+            "product": "/data/raw/LC08_A.tar",
+            "output_dir": str(work_dir / "job-42" / "LC08_A"),
+            "manifest_path": None,
+            "normalized_uri": str(safe_dir),
+            "exists": True,
+            "reused_existing": True,
+        }
+    ]
+    assert response["metadata"]["reused_existing_output_count"] == 1
+
+
+def test_zarr_context_prefers_sen2like_conversion_sensor_metadata() -> None:
+    support = FetcherZarrContextSupport(
+        converter=lambda: None,
+        provider_name=lambda value: str(value or "").strip().lower(),
+        scene_id_from_raw_uri=lambda uri: Path(str(uri)).stem,
+    )
+
+    context = support.resolve_zarr_context(
+        job_id="job-1",
+        row={
+            "provider": "usgs",
+            "collection": "landsat_ot_c2_l1",
+            "product_type": "L1TP",
+            "conversion_metadata": {},
+        },
+        result={
+            "conversion_metadata": {
+                "items": [
+                    {
+                        "zarr_uri": "/data/downloads/zarr/S2L_TEST.zarr",
+                        "scene_id": "S2L_TEST",
+                        "summary": {
+                            "provider": "copernicus",
+                            "collection": "SENTINEL-2",
+                            "product_type": "S2MSI2A",
+                            "acquisition_datetime": "2026-05-16T00:00:00+00:00",
+                        },
+                        "dataset_summary": {
+                            "band_names": ["B02", "B03", "B04", "B08", "B11", "B12"],
+                            "crs": "EPSG:32631",
+                            "shape": [1, 6, 10980, 10980],
+                        },
+                    }
+                ]
+            }
+        },
+        zarr_uri="/data/downloads/zarr/S2L_TEST.zarr",
+        scene_id_override=None,
+        product_type_override="L1TP",
+    )
+
+    assert context["provider"] == "copernicus"
+    assert context["collection"] == "SENTINEL-2"
+    assert context["product_type"] == "S2MSI2A"
+    assert context["dataset_summary"]["band_names"] == ["B02", "B03", "B04", "B08", "B11", "B12"]
 
 
 def test_landsat_job_fails_at_sen2like_before_zarr(monkeypatch, tmp_path: Path) -> None:
