@@ -1,0 +1,158 @@
+x-runtime-env: &runtime-env
+  PYTHONPATH: /app/src
+  NIMBUS_DB_BACKEND: ${NIMBUS_DB_BACKEND:-mongodb}
+  NIMBUS_DB_PATH: /data/nimbus.db
+  NIMBUS_MONGODB_URI: ${NIMBUS_MONGODB_URI_INTERNAL:-mongodb://mongodb:27017}
+  NIMBUS_MONGODB_DB: ${NIMBUS_MONGODB_DB:-nimbuschain_fetch}
+  NIMBUS_DATA_DIR: /data/downloads
+  NIMBUS_ZARRMASK_DIR: /data/downloads/zarrmask
+  NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-}
+  NIMBUS_ZARR_SERVICE_URL: ${NIMBUS_ZARR_SERVICE_URL:-}
+  NIMBUS_MAX_JOBS: ${NIMBUS_MAX_JOBS:-4}
+  NIMBUS_LOG_LEVEL: ${NIMBUS_LOG_LEVEL:-INFO}
+  NIMBUS_LOG_JSON: ${NIMBUS_LOG_JSON:-false}
+  NIMBUS_PROVIDER_LIMITS: ${NIMBUS_PROVIDER_LIMITS:-copernicus=2,usgs=4}
+  NIMBUS_QUEUE_POLL_SECONDS: ${NIMBUS_QUEUE_POLL_SECONDS:-1.0}
+  NIMBUS_STALE_JOB_SECONDS: ${NIMBUS_STALE_JOB_SECONDS:-900}
+  NIMBUS_COPERNICUS_BASE_URL: ${NIMBUS_COPERNICUS_BASE_URL:-https://catalogue.dataspace.copernicus.eu}
+  NIMBUS_COPERNICUS_TOKEN_URL: ${NIMBUS_COPERNICUS_TOKEN_URL:-https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token}
+  NIMBUS_COPERNICUS_DOWNLOAD_URL: ${NIMBUS_COPERNICUS_DOWNLOAD_URL:-https://zipper.dataspace.copernicus.eu}
+  NIMBUS_COPERNICUS_USERNAME: ${NIMBUS_COPERNICUS_USERNAME:-}
+  NIMBUS_COPERNICUS_PASSWORD: ${NIMBUS_COPERNICUS_PASSWORD:-}
+  NIMBUS_USGS_SERVICE_URL: ${NIMBUS_USGS_SERVICE_URL:-https://m2m.cr.usgs.gov/api/api/json/stable/}
+  NIMBUS_USGS_USERNAME: ${NIMBUS_USGS_USERNAME:-}
+  NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
+
+x-runtime-volumes: &runtime-volumes
+  - ./data:/data
+  - ./docs:/app/docs:ro
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: nimbus-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  nimbus-api:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Containerfile
+    depends_on:
+      - mongodb
+      - nimbus-mask
+    command: ["uvicorn", "nimbuschain_fetch_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *runtime-env
+      NIMBUS_RUNTIME_ROLE: api
+      NIMBUS_ENABLE_METRICS: ${NIMBUS_ENABLE_METRICS:-true}
+      NIMBUS_API_KEY: ${NIMBUS_API_KEY:-}
+      NIMBUS_CORS_ORIGINS: ${NIMBUS_CORS_ORIGINS:-http://localhost:8501}
+      NIMBUS_MAX_REQUEST_MB: ${NIMBUS_MAX_REQUEST_MB:-10}
+    volumes: *runtime-volumes
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8000/v1/health'))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  nimbus-worker:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Containerfile
+    depends_on:
+      - mongodb
+      - nimbus-mask
+    command: ["python", "-m", "nimbuschain_fetch.worker"]
+    restart: unless-stopped
+    environment:
+      <<: *runtime-env
+      NIMBUS_RUNTIME_ROLE: worker
+    volumes: *runtime-volumes
+
+  nimbus-ui:
+    build:
+      context: .
+      dockerfile: ui/Containerfile
+    depends_on:
+      - nimbus-api
+    restart: unless-stopped
+    ports:
+      - "${NIMBUS_UI_PORT:-8501}:8501"
+    environment:
+      PYTHONPATH: /app/src
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+      NIMBUS_SERVICE_URL: ${NIMBUS_SERVICE_URL:-http://nimbus-api:8000}
+      NIMBUS_API_KEY: ${NIMBUS_API_KEY:-}
+      NIMBUS_UI_DATA_DIR: /data/downloads
+      NIMBUS_UI_JOB_REFRESH_EVERY: ${NIMBUS_UI_JOB_REFRESH_EVERY:-3s}
+      NIMBUS_COPERNICUS_BASE_URL: ${NIMBUS_COPERNICUS_BASE_URL:-https://catalogue.dataspace.copernicus.eu}
+      NIMBUS_COPERNICUS_TOKEN_URL: ${NIMBUS_COPERNICUS_TOKEN_URL:-https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token}
+      NIMBUS_COPERNICUS_DOWNLOAD_URL: ${NIMBUS_COPERNICUS_DOWNLOAD_URL:-https://zipper.dataspace.copernicus.eu}
+      NIMBUS_COPERNICUS_USERNAME: ${NIMBUS_COPERNICUS_USERNAME:-}
+      NIMBUS_COPERNICUS_PASSWORD: ${NIMBUS_COPERNICUS_PASSWORD:-}
+      NIMBUS_USGS_SERVICE_URL: ${NIMBUS_USGS_SERVICE_URL:-https://m2m.cr.usgs.gov/api/api/json/stable/}
+      NIMBUS_USGS_USERNAME: ${NIMBUS_USGS_USERNAME:-}
+      NIMBUS_USGS_TOKEN: ${NIMBUS_USGS_TOKEN:-}
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501')"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  nimbus-zarr:
+    build:
+      context: .
+      dockerfile: zarr-service/Containerfile
+    restart: unless-stopped
+    mem_limit: 8g
+    shm_size: 2g
+    ports:
+      - "${NIMBUS_ZARR_PORT:-8010}:8010"
+    environment:
+      NIMBUS_DATA_DIR: /data/downloads
+      PYTHONPATH: /app/src
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8010/readiness'))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  nimbus-mask:
+    build:
+      context: .
+      dockerfile: mask-service/Containerfile
+    restart: unless-stopped
+    command: ["uvicorn", "nimbuschain_mask_service.main:app", "--host", "0.0.0.0", "--port", "8020"]
+    environment:
+      <<: *runtime-env
+      NIMBUS_RUNTIME_ROLE: api
+    volumes: *runtime-volumes
+    ports:
+      - "${NIMBUS_MASK_PORT:-8020}:8020"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8020/health'))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  mongodb_data:

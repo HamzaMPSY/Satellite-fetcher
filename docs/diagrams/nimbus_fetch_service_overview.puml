@@ -1,0 +1,130 @@
+@startuml
+title Nimbus Fetch Service - Overview
+top to bottom direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+skinparam nodesep 30
+skinparam ranksep 35
+hide empty members
+
+package "API Contracts" {
+  interface JobSubmissionService
+  interface JobQueryService
+  interface JobControlService
+  interface EventStreamService
+  interface ArtifactCatalogService
+  interface ConversionService
+}
+
+package "Core" {
+  class NimbusFetcher <<facade>>
+  class Settings
+}
+
+package "Application Services" {
+  class PipelineStateService
+  class ArtifactRegistryService
+  class ManualConversionService
+  class FetchJobWorkflowService
+  class MaskJobWorkflowService
+  class JobExecutionRegistry
+  interface JobExecutionHandler
+  class CallbackJobExecutionHandler
+}
+
+package "Support Layer" {
+  class FetcherPathSupport
+  class FetcherStoreRecordSupport
+  class FetcherStatusTimelineSupport
+  class FetcherNormalizationSupport
+  class FetcherCubeSupport
+  class FetcherArtifactSupport
+  class FetcherJobSupport
+  class FetcherProviderSupport
+  class FetcherConversionSupport
+  class FetcherConversionPolicySupport
+  class FetcherDownloadCoordinatorSupport
+  class FetcherLifecycleSupport
+  class FetcherMaskApiSupport
+  class FetcherMaskPolicySupport
+  class FetcherOperationsSupport
+  class FetcherProgressSupport
+  class FetcherZarrContextSupport
+}
+
+package "Ports" {
+  interface ConverterPort
+  interface MaskPort
+  interface ArtifactRegistryPort
+  interface ProviderPort
+  interface CoordinatorAwareProviderPort
+  interface ProviderDefinitionPort
+}
+
+package "Registries" {
+  class StoreRegistry
+  class ExecutorRegistry
+  class ProviderRegistry
+}
+
+package "Infrastructure" {
+  interface JobStore
+  abstract class ExecutorBackend
+  class DownloadCoordinator
+}
+
+NimbusFetcher ..|> JobSubmissionService
+NimbusFetcher ..|> JobQueryService
+NimbusFetcher ..|> JobControlService
+NimbusFetcher ..|> EventStreamService
+NimbusFetcher ..|> ArtifactCatalogService
+NimbusFetcher ..|> ConversionService
+
+NimbusFetcher --> Settings
+NimbusFetcher *-- StoreRegistry
+NimbusFetcher *-- ExecutorRegistry
+NimbusFetcher *-- ProviderRegistry
+NimbusFetcher o-- JobStore
+NimbusFetcher o-- ExecutorBackend
+NimbusFetcher o-- ConverterPort
+NimbusFetcher o-- MaskPort
+NimbusFetcher o-- DownloadCoordinator
+
+NimbusFetcher *-- PipelineStateService
+NimbusFetcher *-- ArtifactRegistryService
+NimbusFetcher *-- ManualConversionService
+NimbusFetcher *-- FetchJobWorkflowService
+NimbusFetcher *-- MaskJobWorkflowService
+NimbusFetcher *-- JobExecutionRegistry
+
+JobExecutionRegistry o-- JobExecutionHandler
+CallbackJobExecutionHandler ..|> JobExecutionHandler
+
+NimbusFetcher *-- FetcherPathSupport
+NimbusFetcher *-- FetcherStoreRecordSupport
+NimbusFetcher *-- FetcherStatusTimelineSupport
+NimbusFetcher *-- FetcherNormalizationSupport
+NimbusFetcher *-- FetcherCubeSupport
+NimbusFetcher *-- FetcherArtifactSupport
+NimbusFetcher *-- FetcherJobSupport
+NimbusFetcher *-- FetcherProviderSupport
+NimbusFetcher *-- FetcherConversionSupport
+NimbusFetcher *-- FetcherConversionPolicySupport
+NimbusFetcher *-- FetcherDownloadCoordinatorSupport
+NimbusFetcher *-- FetcherLifecycleSupport
+NimbusFetcher *-- FetcherMaskApiSupport
+NimbusFetcher ..> FetcherMaskPolicySupport
+NimbusFetcher *-- FetcherOperationsSupport
+NimbusFetcher *-- FetcherProgressSupport
+NimbusFetcher *-- FetcherZarrContextSupport
+
+CoordinatorAwareProviderPort --|> ProviderPort
+
+note bottom of NimbusFetcher
+Public facade / composition root.
+Owns lifecycle and delegates
+most behavior to services/supports.
+end note
+
+@enduml

@@ -1,0 +1,4 @@
+-r runtime-common.txt
+fastai>=2.7.18,<3
+omnicloudmask[legacy]>=1.7.1
+omniwatermask>=0.4.3

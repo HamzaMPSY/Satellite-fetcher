@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbus-api
+  namespace: nimbuschain
+spec:
+  replicas: 1
+  template:
+    spec:
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: fix-downloads-permissions
+          image: ghcr.io/nimbuschain/nimbus-api:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - mkdir -p /data/downloads && chown -R 10001:10001 /data && chmod -R g+rwX /data
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: downloads
+              mountPath: /data

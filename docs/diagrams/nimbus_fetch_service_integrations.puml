@@ -1,0 +1,114 @@
+@startuml
+title Nimbus Fetch Service - Workflows, Registries, Integrations
+left to right direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+skinparam nodesep 25
+skinparam ranksep 35
+hide empty members
+
+package "Workflow Layer" {
+  class NimbusFetcher
+  class ManualConversionService
+  class FetchJobWorkflowService
+  class MaskJobWorkflowService
+  class PipelineStateService
+  class ArtifactRegistryService
+  class JobExecutionRegistry
+  interface JobExecutionHandler
+  class CallbackJobExecutionHandler
+  class JobExecutionContext
+}
+
+package "Ports / Requests" {
+  interface ConverterPort
+  interface MaskPort
+  interface ProviderPort
+  interface CoordinatorAwareProviderPort
+  interface ProviderDefinitionPort
+  class ZarrConversionRequest
+  class GroupedCubeBuildRequest
+  class CubeBuildRequest
+  class MaskExecutionRequest
+  class ProviderCapabilities
+  class ProviderDownloadManagerConfig
+}
+
+package "Adapters / Providers" {
+  class ZarrServiceClient
+  class MaskServiceClient
+  abstract class ProviderBase
+  class CopernicusProvider
+  class UsgsProvider
+}
+
+package "Factories / Runtime" {
+  class ProviderRegistry
+  class _ProviderDefinitionAdapter
+  class DownloadCoordinator
+  class DownloadCoordinatorStore
+  class DownloadManager
+  class DownloadBatchResult
+  class GlobalBandwidthLimiter
+}
+
+package "Persistence / Execution" {
+  interface JobStore
+  abstract class ExecutorBackend
+  class InProcessExecutor
+  class CeleryExecutorStub
+  class RQExecutorStub
+  class ArqExecutorStub
+}
+
+NimbusFetcher *-- ManualConversionService
+NimbusFetcher *-- FetchJobWorkflowService
+NimbusFetcher *-- MaskJobWorkflowService
+NimbusFetcher *-- PipelineStateService
+NimbusFetcher *-- ArtifactRegistryService
+NimbusFetcher *-- JobExecutionRegistry
+
+JobExecutionRegistry o-- JobExecutionHandler
+CallbackJobExecutionHandler ..|> JobExecutionHandler
+CallbackJobExecutionHandler --> JobExecutionContext
+FetchJobWorkflowService --> JobExecutionContext
+MaskJobWorkflowService --> JobExecutionContext
+
+NimbusFetcher o-- ConverterPort
+NimbusFetcher o-- MaskPort
+NimbusFetcher o-- ProviderRegistry
+NimbusFetcher o-- DownloadCoordinator
+NimbusFetcher o-- JobStore
+NimbusFetcher o-- ExecutorBackend
+
+ConverterPort --> ZarrConversionRequest
+ConverterPort --> GroupedCubeBuildRequest
+ConverterPort --> CubeBuildRequest
+MaskPort --> MaskExecutionRequest
+ProviderPort --> ProviderCapabilities
+ProviderDefinitionPort --> ProviderDownloadManagerConfig
+CoordinatorAwareProviderPort --|> ProviderPort
+
+ZarrServiceClient ..|> ConverterPort
+MaskServiceClient ..|> MaskPort
+ProviderBase ..|> ProviderPort
+CopernicusProvider --|> ProviderBase
+UsgsProvider --|> ProviderBase
+
+ProviderRegistry --> ProviderDefinitionPort : create()/definition()
+_ProviderDefinitionAdapter ..|> ProviderDefinitionPort
+_ProviderDefinitionAdapter --> ProviderBase
+
+DownloadCoordinator --> DownloadCoordinatorStore
+DownloadCoordinator --> DownloadManager
+DownloadCoordinator --> ProviderRegistry
+DownloadCoordinator --> DownloadBatchResult
+DownloadCoordinatorStore --> GlobalBandwidthLimiter
+
+InProcessExecutor --|> ExecutorBackend
+CeleryExecutorStub --|> ExecutorBackend
+RQExecutorStub --|> ExecutorBackend
+ArqExecutorStub --|> ExecutorBackend
+
+@enduml

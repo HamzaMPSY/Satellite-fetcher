@@ -1,0 +1,28 @@
+ARG PYTHON_BASE=python:3.11.11-slim-bookworm
+FROM ${PYTHON_BASE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src \
+    HOME=/home/appuser
+
+WORKDIR /app
+
+RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin appuser
+
+COPY requirements/ui.txt /app/requirements/ui.txt
+COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
+RUN python -m pip install -r /app/requirements/ui.txt
+COPY --chown=appuser:appuser src/nimbuschain_fetch /app/src/nimbuschain_fetch
+COPY --chown=appuser:appuser src/nimbuschain_fetch_ui /app/src/nimbuschain_fetch_ui
+COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared
+COPY --chown=appuser:appuser data/Landsat-tiles /app/data/Landsat-tiles
+COPY --chown=appuser:appuser data/Sentinel-2-tiles /app/data/Sentinel-2-tiles
+
+USER appuser
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "src/nimbuschain_fetch_ui/app.py", "--server.address=0.0.0.0", "--server.port=8501"]

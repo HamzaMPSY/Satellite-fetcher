@@ -1,0 +1,28 @@
+ARG PYTHON_BASE=python:3.11.11-slim-bookworm
+FROM ${PYTHON_BASE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/appuser \
+    PYTHONPATH=/app/src
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates libexpat1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin appuser
+
+COPY requirements/zarr-service.txt /app/requirements/zarr-service.txt
+COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
+RUN python -m pip install -r /app/requirements/zarr-service.txt
+COPY --chown=appuser:appuser src/nimbuschain_zarr_service /app/src/nimbuschain_zarr_service
+COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared
+
+USER appuser
+
+EXPOSE 8010
+
+CMD ["uvicorn", "nimbuschain_zarr_service.main:app", "--host", "0.0.0.0", "--port", "8010"]
