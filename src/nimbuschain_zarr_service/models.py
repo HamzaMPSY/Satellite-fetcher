@@ -526,13 +526,20 @@ class GroupedCubeSkippedRecord:
     group_key: str
     reason: str
     candidate_scene_ids: list[str] = field(default_factory=list)
+    error_code: str | None = None
+    message: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "group_key": self.group_key,
             "reason": self.reason,
             "candidate_scene_ids": list(self.candidate_scene_ids),
         }
+        if self.error_code:
+            payload["error_code"] = self.error_code
+        if self.message:
+            payload["message"] = self.message
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -545,15 +552,19 @@ class GroupedCubeSummaryRecord:
     tiles_skipped: list[dict[str, Any]] = field(default_factory=list)
     stage_label: str | None = None
     date_range: dict[str, Any] = field(default_factory=dict)
+    error_code: str | None = None
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
             "reason": self.reason,
+            "error_code": self.error_code,
             "cube_outputs": list(self.cube_outputs),
             "items": list(self.items),
             "tiles_built": list(self.tiles_built),
             "tiles_skipped": list(self.tiles_skipped),
             "stage_label": self.stage_label,
             "date_range": dict(self.date_range),
+            "diagnostics": list(self.diagnostics),
         }

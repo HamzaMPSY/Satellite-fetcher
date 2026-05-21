@@ -194,6 +194,9 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
             for item in list(timeline.get("stages") or [])
             if isinstance(item, dict)
         ]
+        conversion_metadata = dict(
+            result_payload.get("conversion_metadata") or row.get("conversion_metadata") or {}
+        )
         raw_outputs = _string_list(result_payload.get("raw_outputs") or row.get("raw_outputs"))
         zarr_outputs = _string_list(result_payload.get("zarr_outputs") or row.get("zarr_outputs"))
         cube_outputs = _string_list(result_payload.get("cube_outputs") or row.get("cube_outputs"))
@@ -231,6 +234,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                 results_by_name[stage_name] = stage_result
                 continue
             if stage_name == "fetch":
+                fetch_duration_override = _download_window_duration_seconds(pipeline_metadata)
                 stage_result = _stage_result_dict(
                     "fetch",
                     status=_status_from_outputs(
@@ -241,6 +245,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                     outputs=raw_outputs,
                     timeline_stages=_select_timeline_stages(timeline_stages, ["search", "download"]),
                     metadata={"runner": "provider_download"},
+                    duration_seconds_override=fetch_duration_override,
                     error=_stage_error(job_state, errors, has_outputs=bool(raw_outputs)),
                 )
                 results.append(stage_result)
@@ -253,6 +258,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                 sen2like_timeline_stages = _select_timeline_stages(timeline_stages, ["sen2like"])
                 sen2like_status = str(pipeline_metadata.get("sen2like_status") or "").strip().lower()
                 sen2like_error = str(pipeline_metadata.get("sen2like_error") or "").strip()
+                sen2like_duration_override = _sen2like_duration_seconds(pipeline_metadata)
                 sen2like_metadata = {
                     "runner": "sen2like_service",
                     "service_url": pipeline_metadata.get("sen2like_service_url"),
@@ -271,6 +277,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                             **sen2like_metadata,
                             "normalized_output_count": len(sen2like_outputs),
                         },
+                        duration_seconds_override=sen2like_duration_override,
                     )
                     results.append(stage_result)
                     results_by_name[stage_name] = stage_result
@@ -291,6 +298,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                             "fallback_error": sen2like_error or None,
                             "raw_output_count": len(fallback_outputs),
                         },
+                        duration_seconds_override=sen2like_duration_override,
                     )
                     results.append(stage_result)
                     results_by_name[stage_name] = stage_result
@@ -306,6 +314,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                             errors,
                             has_outputs=False,
                         ),
+                        duration_seconds_override=sen2like_duration_override,
                     )
                     results.append(stage_result)
                     results_by_name[stage_name] = stage_result
@@ -347,7 +356,14 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                     ),
                     outputs=zarr_outputs,
                     timeline_stages=_select_timeline_stages(timeline_stages, ["convert", "ready"]),
-                    metadata={"runner": "zarr_service"},
+                    metadata={
+                        "runner": "zarr_service",
+                        "zarr_status": conversion_metadata.get("status"),
+                        "zarr_error_code": conversion_metadata.get("error_code"),
+                    },
+                    duration_seconds_override=_positive_float(
+                        conversion_metadata.get("duration_seconds")
+                    ),
                     error=_stage_error(job_state, errors, has_outputs=bool(zarr_outputs)),
                 )
                 results.append(stage_result)
@@ -409,10 +425,12 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
                     "runner": "cube_builder",
                     "cube_mode": str(pipeline_metadata.get("cube_mode") or "none"),
                     "cube_status": cube_status or None,
+                    "cube_error_code": pipeline_metadata.get("cube_error_code"),
                     "cube_layout": pipeline_metadata.get("cube_layout"),
                     "cube_output_count": pipeline_metadata.get("cube_output_count"),
                     "cube_tiles_built": pipeline_metadata.get("cube_tiles_built"),
                     "cube_tiles_skipped": pipeline_metadata.get("cube_tiles_skipped"),
+                    "cube_diagnostics": pipeline_metadata.get("cube_diagnostics"),
                     "cube_date_range": pipeline_metadata.get("cube_date_range"),
                     "reason": cube_reason if status == StageStatus.skipped.value else None,
                 }
@@ -444,6 +462,7 @@ def _stage_result_dict(
     timeline_stages: list[dict[str, Any]],
     metadata: dict[str, Any],
     error: str | None = None,
+    duration_seconds_override: float | None = None,
 ) -> dict[str, Any]:
     stage_status = StageStatus(status)
     started_at = _first_value(timeline_stages, "started_at")
@@ -453,6 +472,8 @@ def _stage_result_dict(
         for item in timeline_stages
         if item.get("duration_seconds") is not None
     )
+    if duration_seconds_override is not None:
+        duration_seconds = duration_seconds_override
     result = StageResult(
         name=name,
         status=stage_status,
@@ -581,6 +602,32 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value] if value.strip() else []
     return [str(item) for item in list(value or []) if str(item).strip()]
+
+
+def _positive_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0.0 else None
+
+
+def _download_window_duration_seconds(pipeline_metadata: dict[str, Any]) -> float | None:
+    download_telemetry = dict(pipeline_metadata.get("download_telemetry") or {})
+    durations = [
+        duration
+        for duration in (
+            _positive_float(pipeline_metadata.get("download_window_seconds")),
+            _positive_float(download_telemetry.get("duration_seconds")),
+        )
+        if duration is not None
+    ]
+    return max(durations) if durations else None
+
+
+def _sen2like_duration_seconds(pipeline_metadata: dict[str, Any]) -> float | None:
+    sen2like_response = dict(pipeline_metadata.get("sen2like_response") or {})
+    return _positive_float(sen2like_response.get("duration_seconds"))
 
 
 def _now_iso() -> str:

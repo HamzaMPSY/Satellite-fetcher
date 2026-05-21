@@ -880,6 +880,7 @@ class WaterRuntimeSummary:
     model_profile: str = ""
     model_attempt_count: int = 0
     model_attempts: list[dict[str, Any]] = field(default_factory=list)
+    model_auxiliary_options: dict[str, Any] = field(default_factory=dict)
     runtime_warning: str = ""
     fallback_trigger: str = ""
     scratch_root: str = ""
@@ -903,6 +904,7 @@ class WaterRuntimeSummary:
             model_profile=_text(data.get("model_profile")),
             model_attempt_count=_int(data.get("model_attempt_count")),
             model_attempts=[_dict(item) for item in list(data.get("model_attempts") or [])],
+            model_auxiliary_options=_dict(data.get("model_auxiliary_options")),
             runtime_warning=_text(data.get("runtime_warning")),
             fallback_trigger=_text(data.get("fallback_trigger")),
             scratch_root=_text(data.get("scratch_root")),
@@ -925,6 +927,7 @@ class WaterRuntimeSummary:
             "model_profile": self.model_profile,
             "model_attempt_count": int(self.model_attempt_count),
             "model_attempts": [dict(item) for item in self.model_attempts],
+            "model_auxiliary_options": dict(self.model_auxiliary_options),
             "runtime_warning": self.runtime_warning,
             "fallback_trigger": self.fallback_trigger,
             "scratch_root": self.scratch_root,
@@ -1088,6 +1091,7 @@ class WaterMaskState:
     fallback_trigger: str = ""
     model_profile: str = ""
     model_attempt_count: int = 0
+    model_auxiliary_options: dict[str, Any] = field(default_factory=dict)
     tile_size: int = 0
     tile_sizing: dict[str, Any] = field(default_factory=dict)
     scratch_root: str = ""
@@ -1126,6 +1130,7 @@ class WaterMaskState:
             fallback_trigger=_text(data.get("fallback_trigger")),
             model_profile=_text(data.get("model_profile")),
             model_attempt_count=_int(data.get("model_attempt_count")),
+            model_auxiliary_options=_dict(data.get("model_auxiliary_options")),
             tile_size=_int(data.get("tile_size")),
             tile_sizing=_dict(data.get("tile_sizing")),
             scratch_root=_text(data.get("scratch_root")),
@@ -1164,6 +1169,7 @@ class WaterMaskState:
             "fallback_trigger": self.fallback_trigger,
             "model_profile": self.model_profile,
             "model_attempt_count": int(self.model_attempt_count),
+            "model_auxiliary_options": dict(self.model_auxiliary_options),
             "tile_size": int(self.tile_size),
             "tile_sizing": dict(self.tile_sizing),
             "scratch_root": self.scratch_root,

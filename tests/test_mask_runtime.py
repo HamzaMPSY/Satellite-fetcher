@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import time
 import types
 from pathlib import Path
 
@@ -333,7 +335,7 @@ def test_integrated_mask_workers_use_remote_runtime_when_external_service_has_mp
     ) == 2
 
 
-def test_omniwater_model_enables_osm_priors_by_default(monkeypatch) -> None:
+def test_omniwater_model_disables_osm_priors_by_default(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_make_water_mask(**kwargs):
@@ -356,11 +358,120 @@ def test_omniwater_model_enables_osm_priors_by_default(monkeypatch) -> None:
         inference_device=None,
     )
 
-    assert captured["use_osm_water"] is True
-    assert captured["use_osm_building"] is True
-    assert captured["use_osm_roads"] is True
+    assert captured["use_osm_water"] is False
+    assert captured["use_osm_building"] is False
+    assert captured["use_osm_roads"] is False
+    assert captured["use_cache"] is True
     assert captured["batch_size"] == 1
     assert captured["optimise_model"] is False
+
+
+def test_omniwater_model_disables_osm_priors_for_large_scenes(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_make_water_mask(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setenv("NIMBUS_WATERMASK_USE_OSM_WATER", "true")
+    monkeypatch.setenv("NIMBUS_WATERMASK_USE_OSM_BUILDING", "true")
+    monkeypatch.setenv("NIMBUS_WATERMASK_USE_OSM_ROADS", "true")
+    monkeypatch.setenv("NIMBUS_WATERMASK_OSM_MAX_SCENE_SPAN_METERS", "50000")
+    monkeypatch.setattr(omniwater_module, "resolve_inference_device", lambda **kwargs: "cpu")
+
+    _result, runtime_summary = _run_omniwater_model(
+        make_water_mask=fake_make_water_mask,
+        scene_dir=Path("/tmp/scene"),
+        scene_paths=[Path("/tmp/scene/tile.tif")],
+        output_dir=Path("/tmp/out"),
+        cache_dir=Path("/tmp/cache"),
+        tile_size=512,
+        tile_sizing={"scene_ground_span_meters": 109800.0},
+        inference_device=None,
+    )
+
+    assert captured["use_osm_water"] is False
+    assert captured["use_osm_building"] is False
+    assert captured["use_osm_roads"] is False
+    aux = runtime_summary["auxiliary_options"]
+    assert aux["disabled_reason"].startswith("scene_ground_span_exceeds_osm_guard")
+
+
+def test_omniwater_model_configures_writable_osmnx_cache(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    fake_osmnx = types.SimpleNamespace(
+        settings=types.SimpleNamespace(use_cache=True, cache_folder="./cache")
+    )
+
+    def fake_make_water_mask(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setitem(sys.modules, "osmnx", fake_osmnx)
+    monkeypatch.delenv("NIMBUS_WATERMASK_OSMNX_CACHE_DIR", raising=False)
+    monkeypatch.delenv("NIMBUS_WATERMASK_OSMNX_USE_CACHE", raising=False)
+    monkeypatch.setattr(omniwater_module, "resolve_inference_device", lambda **kwargs: "cpu")
+
+    cache_dir = tmp_path / "cache"
+    _run_omniwater_model(
+        make_water_mask=fake_make_water_mask,
+        scene_dir=tmp_path / "scene",
+        scene_paths=[tmp_path / "scene" / "tile.tif"],
+        output_dir=tmp_path / "out",
+        cache_dir=cache_dir,
+        tile_size=512,
+        inference_device=None,
+    )
+
+    assert captured["cache_dir"] == cache_dir
+    assert captured["use_cache"] is True
+    assert fake_osmnx.settings.use_cache is True
+    assert fake_osmnx.settings.cache_folder == str(cache_dir / "osmnx")
+    assert (cache_dir / "osmnx").is_dir()
+
+
+def test_omniwater_model_emits_progress_from_written_outputs(monkeypatch, tmp_path) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_make_water_mask(**kwargs):
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        first = output_dir / "rgbnir_tile_0001_OmniWaterMask_0.4.3.tif"
+        second = output_dir / "rgbnir_tile_0002_OmniWaterMask_0.4.3.tif"
+        first.write_bytes(b"fake")
+        time.sleep(0.03)
+        second.write_bytes(b"fake")
+        time.sleep(0.03)
+        return [first, second]
+
+    def capture(stage_name, payload):
+        events.append((stage_name, payload.to_dict()))
+
+    monkeypatch.setenv("NIMBUS_WATERMASK_MODEL_PROGRESS_SECONDS", "0.01")
+    monkeypatch.setattr(omniwater_module, "resolve_inference_device", lambda **kwargs: "cpu")
+
+    result, runtime_summary = _run_omniwater_model(
+        make_water_mask=fake_make_water_mask,
+        scene_dir=tmp_path / "scene",
+        scene_paths=[tmp_path / "scene" / "tile-1.tif", tmp_path / "scene" / "tile-2.tif"],
+        output_dir=tmp_path / "out",
+        cache_dir=tmp_path / "cache",
+        tile_size=512,
+        inference_device=None,
+        stage_callback=capture,
+        source_zarr_uri="/data/source.zarr",
+        target_zarr_uri="/data/target.zarr",
+        scene_id="scene-1",
+    )
+
+    assert len(result) == 2
+    assert runtime_summary["profile"] == "cpu_default"
+    progress_events = [payload for stage, payload in events if stage == "water_masking_progress"]
+    assert progress_events
+    assert progress_events[-1]["tiles_completed"] == 2
+    assert progress_events[-1]["tiles_total"] == 2
+    assert progress_events[-1]["status"] == "model_inference"
+    assert progress_events[-1]["scene_id"] == "scene-1"
 
 
 def test_omniwater_model_retries_with_compact_mps_profile(monkeypatch) -> None:

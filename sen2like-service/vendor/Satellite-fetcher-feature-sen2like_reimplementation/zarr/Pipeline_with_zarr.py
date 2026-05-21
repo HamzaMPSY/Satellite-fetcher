@@ -81,6 +81,23 @@ def _running_inside_spark_executor() -> bool:
     return os.environ.get(_IN_SPARK_EXECUTOR_ENV, "") == "1"
 
 
+def _effective_internal_workers(workers: Any, job_count: int, label: str) -> int:
+    try:
+        requested = int(workers)
+    except (TypeError, ValueError):
+        requested = 1
+    requested = max(1, requested)
+    effective = min(requested, max(1, int(job_count)), 32)
+    if _running_inside_spark_executor() and effective > 1:
+        log.info(
+            "[%s] Product-level Spark parallelism is active; using 1 internal "
+            "raster worker to avoid nested GDAL/thread contention.",
+            label,
+        )
+        return 1
+    return effective
+
+
 def _get_spark(app_name: str = "sen2like", workers: int = 4):
     from pyspark.sql import SparkSession
     existing = SparkSession.getActiveSession()
@@ -169,6 +186,113 @@ def _outputs_from_ctx_data(step_name: str, ctx_data: dict) -> list[str]:
 def _input_paths_from_config(config: dict) -> dict[str, str]:
     keys = ["landsat_path", "s2_path", "gri_path", "dem_path", "lut_path", "zarr_path"]
     return {k: str(config[k]) for k in keys if config.get(k)}
+
+
+_SUPPORTED_SPACECRAFT = ("LANDSAT_8", "LANDSAT_9")
+_DEFAULT_SPACECRAFT = "LANDSAT_8"
+
+
+def _detect_spacecraft(landsat_path: str | Path) -> str:
+    """Return 'LANDSAT_8' or 'LANDSAT_9' from the scene metadata."""
+    scene_dir = Path(str(landsat_path))
+    mtl_files = _landsat_mtl_candidates(scene_dir)
+    if not mtl_files:
+        log.debug(
+            "[spacecraft] No MTL metadata in %s - defaulting to %s",
+            scene_dir,
+            _DEFAULT_SPACECRAFT,
+        )
+        return _DEFAULT_SPACECRAFT
+
+    for mtl_path in mtl_files:
+        spacecraft = _spacecraft_from_mtl(mtl_path)
+        if not spacecraft:
+            continue
+        if spacecraft not in _SUPPORTED_SPACECRAFT:
+            log.warning(
+                "[spacecraft] Unsupported spacecraft '%s' in %s - defaulting to %s. "
+                "Supported: %s",
+                spacecraft,
+                mtl_path.name,
+                _DEFAULT_SPACECRAFT,
+                _SUPPORTED_SPACECRAFT,
+            )
+            return _DEFAULT_SPACECRAFT
+        log.info("[spacecraft] Detected %s from %s", spacecraft, mtl_path.name)
+        return spacecraft
+
+    log.warning(
+        "[spacecraft] Could not read SPACECRAFT_ID from %s - defaulting to %s",
+        [path.name for path in mtl_files],
+        _DEFAULT_SPACECRAFT,
+    )
+    return _DEFAULT_SPACECRAFT
+
+
+def _landsat_mtl_candidates(scene_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for pattern in ("*_MTL.json", "*_MTL.txt", "*_MTL.xml"):
+        candidates.extend(sorted(scene_dir.glob(pattern)))
+    if not candidates:
+        for pattern in ("**/*_MTL.json", "**/*_MTL.txt", "**/*_MTL.xml"):
+            candidates.extend(sorted(scene_dir.glob(pattern)))
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def _spacecraft_from_mtl(mtl_path: Path) -> str | None:
+    suffix = mtl_path.suffix.lower()
+    try:
+        if suffix == ".json":
+            mtl = json.loads(mtl_path.read_text())
+            value = (
+                mtl.get("LANDSAT_METADATA_FILE", {})
+                   .get("IMAGE_ATTRIBUTES", {})
+                   .get("SPACECRAFT_ID")
+            )
+            return _normalize_spacecraft(value)
+        if suffix == ".txt":
+            for line in mtl_path.read_text(errors="ignore").splitlines():
+                if "SPACECRAFT_ID" not in line or "=" not in line:
+                    continue
+                return _normalize_spacecraft(line.split("=", 1)[1])
+        if suffix == ".xml":
+            import xml.etree.ElementTree as ET
+
+            root = ET.parse(mtl_path).getroot()
+            for element in root.iter():
+                if element.tag.split("}")[-1] == "SPACECRAFT_ID":
+                    return _normalize_spacecraft(element.text)
+    except Exception as exc:
+        log.warning("[spacecraft] Could not parse %s (%s)", mtl_path.name, exc)
+    return None
+
+
+def _normalize_spacecraft(value: object | None) -> str | None:
+    normalized = str(value or "").strip().strip('"').replace(" ", "_").upper()
+    return normalized or None
+
+
+def _spacecraft_short_tag(spacecraft: str) -> str:
+    """Short tag used for LUT filenames and the atm module: 'L8' or 'L9'."""
+    return "L9" if spacecraft == "LANDSAT_9" else "L8"
+
+
+def _config_for_landsat_product(base_config: dict, landsat_path: str | Path) -> dict:
+    spacecraft = _detect_spacecraft(landsat_path)
+    sensor_tag = _spacecraft_short_tag(spacecraft)
+    config = {**base_config, "landsat_path": str(landsat_path)}
+    config["mission"] = spacecraft
+    config["atm_sensor_tag"] = sensor_tag
+    config["lut_path"] = str(_BASE / "lut" / f"lut_6s_{sensor_tag}.json")
+    config["sbaf"] = {**dict(config.get("sbaf") or {}), "mission": spacecraft}
+    return config
 
 
 def _using_zarr(config: dict) -> bool:
@@ -1230,10 +1354,12 @@ class BRDFAdjustmentStep:
                         clip_min=clip_min, clip_max=clip_max)
             return band
 
+        effective_workers = _effective_internal_workers(workers, len(bands), "brdf")
+
         if in_executor:
-            completed_bands = _run_parallel_threads(_run_ls8_band_local, bands, workers)
+            completed_bands = _run_parallel_threads(_run_ls8_band_local, bands, effective_workers)
         else:
-            spark = _get_spark(workers=workers)
+            spark = _get_spark(workers=effective_workers)
             sc    = spark.sparkContext
             _base_str = str(_BASE)
             _ls_input, _ls_outdir = ls_input, ls_outdir
@@ -1275,8 +1401,9 @@ class BRDFAdjustmentStep:
                             clip_min=_c_min, clip_max=_c_max)
                 return band
 
+            effective_workers = _effective_internal_workers(workers, len(bands), "brdf")
             if in_executor:
-                _run_parallel_threads(_run_s2_local, bands, workers)
+                _run_parallel_threads(_run_s2_local, bands, effective_workers)
             else:
                 def _spark_s2_band(band: str) -> str:
                     import sys as _sys
@@ -1379,10 +1506,12 @@ class DataFusionStep:
                 except Exception as exc:
                     return (band, str(exc))
 
+            effective_workers = _effective_internal_workers(workers, len(jobs), "fusion")
+
             if in_executor:
-                results = _run_parallel_threads(_process, jobs, workers)
+                results = _run_parallel_threads(_process, jobs, effective_workers)
             else:
-                spark = _get_spark(workers=workers)
+                spark = _get_spark(workers=effective_workers)
                 sc    = spark.sparkContext
                 _base_str = str(_BASE)
 
@@ -1398,7 +1527,7 @@ class DataFusionStep:
                         return (band, str(exc))
 
                 results = (
-                    sc.parallelize(jobs, numSlices=min(workers, len(jobs)))
+                    sc.parallelize(jobs, numSlices=min(effective_workers, len(jobs)))
                     .map(_spark_process).collect()
                 )
 
@@ -1425,7 +1554,9 @@ class DataFusionStep:
 # ===========================================================================
 
 def _run_parallel_threads(fn, items, workers: int) -> list:
-    effective = min(workers, len(items), 32)
+    if not items:
+        return []
+    effective = min(max(1, int(workers)), len(items), 32)
     results = []
     with ThreadPoolExecutor(max_workers=effective) as pool:
         futures = {pool.submit(fn, item): item for item in items}
@@ -1790,7 +1921,7 @@ def run_many(
     product_ids: list[str],
     config: dict,
     working_dir: str,
-    workers: int = 1,
+    workers: int = 4,
     only: list[str] | None = None,
     resume: bool = True,
 ):
@@ -1807,6 +1938,8 @@ def run_many(
         global atm_mod
         _os.environ[_IN_SPARK_EXECUTOR_ENV] = "1"
         base = bc_base.value
+        if not globals().get("_bootstrap_done", False):
+            _bootstrap(base)
         for d in [f"{base}/Geometric_Processing", f"{base}/atmospheric_correction",
                   f"{base}/SBAF", f"{base}/Valid_Pixel_Mask",
                   f"{base}/BRDF_Adjustment", f"{base}/data_fusion"]:
@@ -1818,10 +1951,8 @@ def run_many(
             )
 
         pcfg = {**bc_config.value}
-        # Only override landsat_path if the product_id looks like a path
-        # (backward-compat for GeoTIFF mode).
         if not pcfg.get("zarr_path"):
-            pcfg["landsat_path"] = product_id
+            pcfg = _config_for_landsat_product(pcfg, product_id)
 
         use_zarr = bool(pcfg.get("zarr_path"))
         steps    = ([ZarrIngestionStep] if use_zarr else []) + [
@@ -1964,6 +2095,8 @@ if __name__ == "__main__":
                             "clip_min": 0.8, "clip_max": 1.2},
         "data_fusion":     {"workers": args.workers},
     }
+    if args.products:
+        config = _config_for_landsat_product(config, args.products[0])
 
     use_zarr = bool(args.zarr_path)
     step_classes = ([ZarrIngestionStep] if use_zarr else []) + [

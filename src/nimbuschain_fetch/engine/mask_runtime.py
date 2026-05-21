@@ -135,6 +135,7 @@ def run_in_place_mask_pipeline(
         "threshold": threshold,
         "include_shadows": include_shadows,
         "water_backend": water_backend_name,
+        "fail_on_error": bool(fail_on_error),
         "mask_mode": mask_mode,
     }
 

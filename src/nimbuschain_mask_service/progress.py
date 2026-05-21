@@ -9,7 +9,12 @@ from nimbuschain_mask_service.models import ProgressEvent, ProgressRecord, Stage
 
 _LOCK = threading.RLock()
 _PROGRESS: dict[str, dict[str, Any]] = {}
+_CANCEL_REQUESTS: set[str] = set()
 _MAX_HISTORY = 256
+
+
+class MaskJobCancelled(RuntimeError):
+    """Raised when a remote mask job receives an explicit cancellation request."""
 
 
 def _now_iso() -> str:
@@ -106,3 +111,38 @@ def clear_progress(job_id: str) -> None:
         return
     with _LOCK:
         _PROGRESS.pop(normalized_job_id, None)
+
+
+def request_cancel(job_id: str) -> dict[str, Any]:
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id:
+        return {}
+    with _LOCK:
+        _CANCEL_REQUESTS.add(normalized_job_id)
+    return update_progress(
+        normalized_job_id,
+        stage_name="mask_request_cancelled",
+        payload=StageEventPayload.from_mapping({"cancel_requested": True}),
+        status="cancelled",
+    )
+
+
+def clear_cancel(job_id: str) -> None:
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id:
+        return
+    with _LOCK:
+        _CANCEL_REQUESTS.discard(normalized_job_id)
+
+
+def is_cancel_requested(job_id: str | None) -> bool:
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id:
+        return False
+    with _LOCK:
+        return normalized_job_id in _CANCEL_REQUESTS
+
+
+def raise_if_cancel_requested(job_id: str | None) -> None:
+    if is_cancel_requested(job_id):
+        raise MaskJobCancelled("Mask job cancellation requested.")

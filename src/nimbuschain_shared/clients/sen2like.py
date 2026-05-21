@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -47,6 +48,9 @@ class Sen2LikeServiceClient:
         cleanup_dry_run: bool = False,
         timeout_seconds: float | None = None,
         spark_master: str | None = None,
+        preprocess_target_shape: str | None = None,
+        direct_zarr: bool | None = None,
+        zarr_output_dir: str | None = None,
     ) -> dict[str, Any]:
         response = self._session.post(
             f"{self.service_url}/normalize",
@@ -67,6 +71,9 @@ class Sen2LikeServiceClient:
                 "cleanup_dry_run": bool(cleanup_dry_run),
                 "timeout_seconds": timeout_seconds,
                 "spark_master": spark_master,
+                "preprocess_target_shape": preprocess_target_shape,
+                "direct_zarr": direct_zarr,
+                "zarr_output_dir": zarr_output_dir,
             },
             timeout=(30, None),
         )
@@ -76,6 +83,32 @@ class Sen2LikeServiceClient:
         if response.status_code >= 400:
             raise ValueError(self._error_detail(payload, response, prefix="Sen2Like request was rejected"))
         return payload
+
+    def cancel_job(self, job_id: str) -> bool:
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_job_id:
+            return False
+        quoted_job_id = quote(normalized_job_id, safe="")
+        last_error: requests.RequestException | None = None
+        for method_name, path in (
+            ("delete", f"/jobs/{quoted_job_id}"),
+            ("post", f"/jobs/{quoted_job_id}/cancel"),
+        ):
+            request_method = getattr(self._session, method_name, None)
+            if not callable(request_method):
+                continue
+            try:
+                response = request_method(f"{self.service_url}{path}", timeout=10)
+                if getattr(response, "status_code", None) == 404:
+                    continue
+                response.raise_for_status()
+                return True
+            except requests.RequestException as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise RuntimeError(f"Sen2Like cancellation request failed: {last_error}") from last_error
+        return False
 
     def _get_json(self, path: str) -> tuple[int, dict[str, Any]]:
         response = self._session.get(f"{self.service_url}{path}", timeout=30)

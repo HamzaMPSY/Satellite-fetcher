@@ -16,6 +16,7 @@ from rasterio.transform import from_origin
 import zarr
 
 from nimbuschain_mask_service.service import MaskService
+from nimbuschain_shared.zarr import ConversionError
 from nimbuschain_zarr_service.service import ZarrConversionService
 
 
@@ -200,6 +201,14 @@ def test_sentinel2_manual_watermask_creates_masked_copy_without_mutating_source(
     assert group.attrs["water_mask_status"] == "written"
     assert group.attrs["water_mask_tile_size"] == result["tile_size"]
     assert group.attrs["water_mask"]["tile_size"] == result["tile_size"]
+    assert group.attrs["water_mask_model_name"] == "omniwatermask"
+    assert group.attrs["water_mask_model_version"] == "test"
+    assert group.attrs["water_mask"]["model_auxiliary_options"]["use_osm_water"] is False
+    water_attrs = group["masks"]["water"].attrs
+    assert water_attrs["model_name"] == "omniwatermask"
+    assert water_attrs["model_version"] == "test"
+    assert water_attrs["tile_size"] == 512
+    assert water_attrs["model_auxiliary_options"]["use_osm_water"] is False
 
 
 def test_landsat_manual_watermask_creates_masked_copy_without_mutating_source(
@@ -248,6 +257,40 @@ def test_landsat_manual_watermask_creates_masked_copy_without_mutating_source(
     assert group.attrs["water_mask_status"] == "written"
 
 
+def test_manual_omniwater_hydrates_missing_dataset_summary_from_zarr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_omniwatermask(monkeypatch)
+    scene_id = "S2A_MSIL1C_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
+    raw_root = _build_s2_bundle(tmp_path / "raw", scene_id=scene_id)
+    output_uri = str((tmp_path / "out" / "summary-from-zarr.zarr").resolve())
+
+    written_uri, _family, _summary, _dataset_summary = ZarrConversionService().convert(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        scene_id=scene_id,
+        raw_uri=str(raw_root),
+        output_uri=output_uri,
+        product_type="S2MSI1C",
+    )
+
+    result = MaskService().apply_omniwater_to_zarr(
+        zarr_uri=written_uri,
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI1C",
+        scene_id=scene_id,
+        acquisition_datetime=None,
+        dataset_summary={},
+        fail_on_error=True,
+    )
+
+    assert result["status"] == "written"
+    assert result["runtime_mode"] == "model"
+    assert result["input_bands"] == ["B04", "B03", "B02", "B08"]
+
+
 def test_manual_omniwater_stage_callback_reports_pipeline_steps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -278,15 +321,21 @@ def test_manual_omniwater_stage_callback_reports_pipeline_steps(
         stage_callback=lambda stage, payload: stages.append((stage, dict(payload))),
     )
 
-    assert [name for name, _payload in stages] == [
-        "water_masking_started",
-        "water_masking_finished",
-    ]
+    stage_names = [name for name, _payload in stages]
+    assert stage_names[0] == "water_masking_started"
+    assert "water_masking_progress" in stage_names
+    assert stage_names[-1] == "water_masking_finished"
     assert stages[0][1]["zarr_uri"] == output_uri
-    assert stages[1][1]["water_mask"]["status"] == "written"
-    assert stages[1][1]["water_mask"]["input_zarr_uri"] == output_uri
-    assert stages[1][1]["water_mask"]["output_zarr_uri"] == output_uri
-    assert Path(str(stages[1][1]["water_mask"]["output_zarr_uri"])).exists()
+    progress_payloads = [
+        payload for name, payload in stages if name == "water_masking_progress"
+    ]
+    assert progress_payloads[-1]["status"] == "model_inference"
+    assert progress_payloads[-1]["tiles_completed"] == progress_payloads[-1]["tiles_total"]
+    finished_payload = stages[-1][1]
+    assert finished_payload["water_mask"]["status"] == "written"
+    assert finished_payload["water_mask"]["input_zarr_uri"] == output_uri
+    assert finished_payload["water_mask"]["output_zarr_uri"] == output_uri
+    assert Path(str(finished_payload["water_mask"]["output_zarr_uri"])).exists()
 
 
 def test_manual_omniwater_tiles_existing_zarr_and_writes_masks_in_place(
@@ -589,6 +638,53 @@ def test_manual_omniwater_uses_heuristic_fail_open_when_mps_model_runtime_is_uns
     masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
     assert masked_group.attrs["water_mask_status"] == "written"
     assert "water_probability" in masked_group["masks"]
+
+
+def test_manual_omniwater_fail_on_error_blocks_mps_heuristic_fail_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = types.ModuleType("omniwatermask")
+    module.__version__ = "test"
+
+    def make_water_mask(*, scene_paths, band_order, output_dir, **_kwargs):
+        raise RuntimeError("simulated OmniWater model crash")
+
+    module.make_water_mask = make_water_mask
+    monkeypatch.setitem(sys.modules, "omniwatermask", module)
+    monkeypatch.setenv("NIMBUS_WATERMASK_TILE_SIZE", "3")
+    monkeypatch.setattr(
+        "nimbuschain_mask_service.omniwater.resolve_inference_device",
+        lambda **kwargs: "mps",
+    )
+
+    scene_id = "S2A_MSIL1C_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
+    raw_root = _build_s2_bundle(tmp_path / "raw", scene_id=scene_id)
+    output_uri = str((tmp_path / "out" / "strict_model.zarr").resolve())
+
+    written_uri, _family, _summary, dataset_summary = ZarrConversionService().convert(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        scene_id=scene_id,
+        raw_uri=str(raw_root),
+        output_uri=output_uri,
+        product_type="S2MSI1C",
+    )
+
+    with pytest.raises(ConversionError, match="OmniWaterMask failed"):
+        MaskService().apply_omniwater_to_zarr(
+            zarr_uri=written_uri,
+            provider="copernicus",
+            collection="SENTINEL-2",
+            product_type="S2MSI1C",
+            scene_id=scene_id,
+            acquisition_datetime=dataset_summary.get("acquisition_datetime"),
+            dataset_summary=dataset_summary,
+            inference_device="mps",
+            fail_on_error=True,
+        )
+
+    _assert_zarr_has_no_water_mask(written_uri)
 
 
 def test_manual_omniwater_falls_back_when_scratch_export_runs_out_of_space(

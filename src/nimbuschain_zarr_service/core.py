@@ -40,6 +40,29 @@ from nimbuschain_zarr_service.storage_support import (
 from nimbuschain_zarr_service.utils.tile_math import TileMath
 
 
+def _create_array_compat(group: Any, name: str, *, data: Any | None = None, **kwargs: Any) -> Any:
+    if data is None:
+        return group.create_array(name, **kwargs)
+    try:
+        return group.create_array(name, data=data, **kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument 'data'" not in str(exc):
+            raise
+    payload = np.asarray(data)
+    fallback_kwargs = dict(kwargs)
+    fallback_kwargs.pop("shape", None)
+    fallback_kwargs.setdefault("dtype", payload.dtype)
+    array = group.create_array(name, shape=payload.shape, **fallback_kwargs)
+    array[...] = payload
+    return array
+
+
+def _zarr_text_array(values: list[str] | tuple[str, ...]) -> np.ndarray:
+    encoded = [str(value).encode("utf-8") for value in values]
+    width = max(1, max((len(value) for value in encoded), default=1))
+    return np.asarray(encoded, dtype=f"S{width}")
+
+
 def load_aligned_raster_stack(
     band_paths: dict[str, Path],
     *,
@@ -48,6 +71,7 @@ def load_aligned_raster_stack(
     categorical_bands: set[str] | None = None,
     target_pixel_size: float | None = None,
     target_grid: TargetGrid | None = None,
+    target_shape: tuple[int, int] | None = None,
 ) -> RasterStackRecord:
     try:
         import rasterio
@@ -69,6 +93,13 @@ def load_aligned_raster_stack(
     ref_name = reference_band if reference_band in band_paths else ordered_bands[0]
     if ref_name not in band_paths and target_grid is None:
         raise ConversionError(f"Reference band '{ref_name}' is not available.")
+
+    if target_grid is None and target_shape is not None:
+        target_grid = _build_exact_target_grid(
+            band_paths[ref_name],
+            height=int(target_shape[0]),
+            width=int(target_shape[1]),
+        )
 
     if target_grid is not None:
         ref_height = int(target_grid.height)
@@ -206,6 +237,7 @@ def inspect_aligned_raster_stack(
     categorical_bands: set[str] | None = None,
     target_pixel_size: float | None = None,
     target_grid: TargetGrid | None = None,
+    target_shape: tuple[int, int] | None = None,
 ) -> RasterStackRecord:
     try:
         import rasterio
@@ -224,6 +256,13 @@ def inspect_aligned_raster_stack(
     ref_name = reference_band if reference_band in band_paths else ordered_bands[0]
     if ref_name not in band_paths and target_grid is None:
         raise ConversionError(f"Reference band '{ref_name}' is not available.")
+
+    if target_grid is None and target_shape is not None:
+        target_grid = _build_exact_target_grid(
+            band_paths[ref_name],
+            height=int(target_shape[0]),
+            width=int(target_shape[1]),
+        )
 
     if target_grid is not None:
         ref_height = int(target_grid.height)
@@ -464,6 +503,7 @@ def stream_raster_stack_to_zarr(
     categorical_bands: set[str] | None = None,
     target_pixel_size: float | None = None,
     target_grid: TargetGrid | None = None,
+    target_shape: tuple[int, int] | None = None,
     output_mode: str = "w",
     array_name: str = "imagery",
     coord_name: str = "band",
@@ -490,6 +530,7 @@ def stream_raster_stack_to_zarr(
         categorical_bands=categorical_bands,
         target_pixel_size=target_pixel_size,
         target_grid=target_grid,
+        target_shape=target_shape,
     )
     band_names = list(stack.band_names)
     height = int(stack.height)
@@ -519,6 +560,10 @@ def stream_raster_stack_to_zarr(
         root = zarr.open_group(output_store, mode="a", zarr_format=2)
 
     group_attrs = dict(metadata)
+    if target_shape is not None and target_grid is None:
+        group_attrs["output_shape_policy"] = "exact_target_shape"
+        group_attrs["target_shape"] = [int(target_shape[0]), int(target_shape[1])]
+        group_attrs["target_shape_env"] = "NIMBUS_ZARR_TARGET_SHAPE"
     if coord_name == "band":
         group_attrs["band_names"] = band_names
     else:
@@ -527,27 +572,29 @@ def stream_raster_stack_to_zarr(
     root.attrs.update(group_attrs)
 
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
-    imagery = root.create_array(
+    imagery = _create_array_compat(
+        root,
         array_name,
         shape=(1, len(band_names), height, width),
         chunks=chunks,
         dtype=np.dtype(stack.dtype),
         compressor=compressor,
     )
-    root.create_array(
+    _create_array_compat(
+        root,
         coord_name,
-        data=np.asarray(band_names, dtype=f"<U{max(len(v) for v in band_names)}"),
+        data=_zarr_text_array(band_names),
         overwrite=True,
     )
     timestamp = _coerce_timestamp(acquisition_datetime)
     if "time" not in root:
-        root.create_array("time", data=np.asarray([timestamp.isoformat()], dtype="<U32"))
+        _create_array_compat(root, "time", data=_zarr_text_array([timestamp.isoformat()]))
     x_coords, y_coords = _derive_spatial_coords(transform, width=width, height=height)
     if x_coords is not None and y_coords is not None:
         if "x" not in root:
-            root.create_array("x", data=x_coords, chunks=(min(chunk_spec.x, width),))
+            _create_array_compat(root, "x", data=x_coords, chunks=(min(chunk_spec.x, width),))
         if "y" not in root:
-            root.create_array("y", data=y_coords, chunks=(min(chunk_spec.y, height),))
+            _create_array_compat(root, "y", data=y_coords, chunks=(min(chunk_spec.y, height),))
 
     quadkey_attrs: dict[str, Any] | None = None
 
@@ -685,6 +732,7 @@ def stream_raster_product_to_zarr(
 ) -> tuple[str, DatasetZarrSummaryRecord]:
     has_ancillary = bool(ancillary_band_paths and ancillary_layer_names)
     imagery_span = 0.9 if has_ancillary else 1.0
+    target_shape = _target_shape_from_env()
 
     def _forward_progress(*, offset: float, span: float) -> Callable[[dict[str, Any]], None] | None:
         if progress_callback is None:
@@ -710,6 +758,7 @@ def stream_raster_product_to_zarr(
         reference_band=reference_band,
         categorical_bands=categorical_imagery_layers,
         target_pixel_size=target_pixel_size,
+        target_shape=target_shape,
         output_mode="w",
         array_name="imagery",
         coord_name="band",
@@ -849,6 +898,53 @@ def _quadkey_index_zoom() -> int:
     except ValueError:
         value = 12
     return max(1, min(value, 23))
+
+
+def _target_shape_from_env() -> tuple[int, int] | None:
+    raw = str(os.getenv("NIMBUS_ZARR_TARGET_SHAPE", "512x512") or "").strip().lower()
+    if raw in {"", "native", "none", "off", "false", "0"}:
+        return None
+    normalized = raw.replace(" ", "").replace(",", "x").replace(":", "x")
+    parts = [part for part in normalized.split("x") if part]
+    if len(parts) == 1:
+        try:
+            side = int(parts[0])
+        except ValueError:
+            side = 512
+        side = max(1, side)
+        return side, side
+    try:
+        first = int(parts[0])
+        second = int(parts[1])
+    except (IndexError, ValueError):
+        return 512, 512
+    return max(1, first), max(1, second)
+
+
+def _build_exact_target_grid(reference_path: Path, *, height: int, width: int) -> TargetGrid:
+    try:
+        import rasterio
+        from rasterio.transform import array_bounds, from_origin
+    except ImportError as exc:
+        raise ConversionDependencyError(
+            "Raster support is not available in the zarr-service runtime "
+            f"({exc}). Ensure rasterio is installed."
+        ) from exc
+
+    with rasterio.open(reference_path) as ref_src:
+        left, bottom, right, top = array_bounds(ref_src.height, ref_src.width, ref_src.transform)
+        x_resolution = abs(float(right - left)) / max(1, int(width))
+        y_resolution = abs(float(top - bottom)) / max(1, int(height))
+        transform = from_origin(left, top, x_resolution, y_resolution)
+        crs = ref_src.crs.to_string() if ref_src.crs else None
+    return TargetGrid(
+        height=max(1, int(height)),
+        width=max(1, int(width)),
+        crs=crs,
+        transform=list(transform)[:6],
+        pixel_size=[x_resolution, y_resolution],
+        reference_band=None,
+    )
 
 
 def _estimate_native_zoom(pixel_size: Any) -> int | None:

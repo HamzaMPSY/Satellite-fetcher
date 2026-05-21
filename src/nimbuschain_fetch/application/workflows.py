@@ -29,6 +29,13 @@ from nimbuschain_fetch.models import (
 from nimbuschain_fetch.security.paths import sanitize_output_dir
 
 
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class FetchJobWorkflowService:
     def __init__(self, runtime: Any):
         self._rt = runtime
@@ -40,6 +47,30 @@ class FetchJobWorkflowService:
             store.set_result_record(result)
             return
         store.set_result(result.job_id, result.to_row())
+
+    def _register_sen2like_direct_zarr_artifacts(
+        self,
+        *,
+        job_id: str,
+        provider_name: str,
+        collection: str,
+        items: list[dict[str, Any]],
+    ) -> None:
+        for item in items:
+            zarr_uri = str(item.get("zarr_uri") or "").strip()
+            if not zarr_uri:
+                continue
+            self._rt._register_zarr_artifact(
+                job_id=job_id,
+                provider_name=provider_name,
+                collection=collection,
+                scene_id=str(item.get("scene_id") or self._rt._scene_id_from_raw_uri(zarr_uri)),
+                raw_uri=str(item.get("normalized_uri") or ""),
+                zarr_uri=zarr_uri,
+                data_family=str(item.get("data_family") or "optical"),
+                conversion_summary=dict(item.get("summary") or {}),
+                dataset_summary=dict(item.get("dataset_summary") or {}),
+            )
 
     def _current_job_pipeline_metadata(
         self,
@@ -62,6 +93,96 @@ class FetchJobWorkflowService:
         return PipelineMetadataRecord.from_mapping(
             self._rt._merged_pipeline_metadata(job_id, payload)
         )
+
+    def _with_successful_resume_orchestrator(
+        self,
+        metadata: PipelineMetadataRecord,
+        *,
+        raw_outputs: list[str],
+        zarr_outputs: list[str],
+        conversion_metadata: ConversionMetadataRecord,
+    ) -> PipelineMetadataRecord:
+        payload = metadata.to_dict()
+        if str(payload.get("sen2like_status") or "").strip().lower() != "written":
+            return metadata
+
+        plan = [
+            {"name": "fetch", "depends_on": []},
+            {"name": "sen2like", "depends_on": ["fetch"]},
+            {"name": "zarr", "depends_on": ["sen2like"]},
+        ]
+        previous_fetch = next(
+            (
+                dict(stage)
+                for stage in list(payload.get("stage_results") or [])
+                if isinstance(stage, dict) and str(stage.get("name") or "") == "fetch"
+            ),
+            None,
+        )
+        fetch_stage = previous_fetch or {
+            "name": "fetch",
+            "status": "succeeded",
+            "outputs": list(raw_outputs),
+            "metadata": {"runner": "provider_download", "resumed_from_existing_outputs": True},
+            "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "duration_seconds": 0,
+        }
+        fetch_stage["status"] = "succeeded"
+        fetch_stage["outputs"] = list(raw_outputs)
+        fetch_stage["error"] = None
+
+        response = payload.get("sen2like_response")
+        response_metadata = response if isinstance(response, dict) else {}
+        sen2like_duration = _float_or_none(response_metadata.get("duration_seconds"))
+        conversion_duration = _float_or_none(conversion_metadata.payload.get("duration_seconds"))
+        now = self._rt._now_iso()
+        stage_results = [
+            fetch_stage,
+            {
+                "name": "sen2like",
+                "status": "succeeded",
+                "outputs": list(payload.get("sen2like_outputs") or payload.get("zarr_input_outputs") or []),
+                "metadata": {
+                    "runner": "sen2like_service",
+                    "service_url": payload.get("sen2like_service_url"),
+                    "sen2like_status": "written",
+                    "sen2like_input_count": payload.get("sen2like_input_count"),
+                    "preprocess_target_shape": payload.get("sen2like_preprocess_target_shape"),
+                },
+                "error": None,
+                "started_at": None,
+                "finished_at": None,
+                "duration_seconds": sen2like_duration,
+            },
+            {
+                "name": "zarr",
+                "status": "succeeded",
+                "outputs": list(zarr_outputs),
+                "metadata": {
+                    "runner": conversion_metadata.payload.get("runner") or "zarr_service",
+                    "zarr_output_count": len(zarr_outputs),
+                },
+                "error": None,
+                "started_at": None,
+                "finished_at": None,
+                "duration_seconds": conversion_duration,
+            },
+        ]
+        payload["stage_plan"] = plan
+        payload["stage_results"] = stage_results
+        payload["orchestrator"] = {
+            "version": 1,
+            "status": "succeeded",
+            "started_at": dict(payload.get("orchestrator") or {}).get("started_at"),
+            "finished_at": now,
+            "stage_count": len(plan),
+            "plan": plan,
+            "stage_results": stage_results,
+            "error": None,
+        }
+        return PipelineMetadataRecord.from_mapping(payload)
 
     @staticmethod
     def _conversion_metadata_record(
@@ -468,27 +589,84 @@ class FetchJobWorkflowService:
                 is_cancelled_now=is_cancelled_now,
             )
             zarr_input_outputs = list(sen2like_routing.conversion_inputs)
+            direct_zarr_outputs = list(sen2like_routing.direct_zarr_outputs)
+            direct_zarr_items = list(sen2like_routing.direct_zarr_items)
             pipeline_metadata = sen2like_routing.pipeline_metadata
-            zarr_conversion_provider = "copernicus" if sen2like_routing.routed else None
-            zarr_conversion_collection = "SENTINEL-2" if sen2like_routing.routed else None
-            zarr_conversion_product_type = "S2MSI2A" if sen2like_routing.routed else None
+            zarr_conversion_provider = "copernicus" if sen2like_routing.routed and zarr_input_outputs else None
+            zarr_conversion_collection = "SENTINEL-2" if sen2like_routing.routed and zarr_input_outputs else None
+            zarr_conversion_product_type = "S2MSI2A" if sen2like_routing.routed and zarr_input_outputs else None
             pre_zarr_result_paths = [
                 *raw_result_paths,
-                *(zarr_input_outputs if sen2like_routing.routed else []),
+                *(sen2like_routing.sen2like_outputs if sen2like_routing.routed else []),
             ]
 
-            zarr_outputs, conversion_metadata = rt._convert_raw_outputs(
-                job_id=job_id,
-                provider_name=provider_name,
-                collection=request.collection,
-                product_type=getattr(request, "product_type", None),
-                raw_outputs=zarr_input_outputs,
-                is_cancelled=is_cancelled_now,
-                pipeline_metadata=pipeline_metadata.to_dict(),
-                conversion_provider_name=zarr_conversion_provider,
-                conversion_collection=zarr_conversion_collection,
-                conversion_product_type=zarr_conversion_product_type,
-            )
+            if zarr_input_outputs:
+                converted_zarr_outputs, conversion_metadata = rt._convert_raw_outputs(
+                    job_id=job_id,
+                    provider_name=provider_name,
+                    collection=request.collection,
+                    product_type=getattr(request, "product_type", None),
+                    raw_outputs=zarr_input_outputs,
+                    is_cancelled=is_cancelled_now,
+                    pipeline_metadata=pipeline_metadata.to_dict(),
+                    conversion_provider_name=zarr_conversion_provider,
+                    conversion_collection=zarr_conversion_collection,
+                    conversion_product_type=zarr_conversion_product_type,
+                )
+            elif direct_zarr_outputs:
+                converted_zarr_outputs = []
+                conversion_metadata = {
+                    "status": "written",
+                    "stage": "sen2like_direct_zarr",
+                    "count": len(direct_zarr_outputs),
+                    "items": list(direct_zarr_items),
+                    "parallel_workers": 1,
+                    "duration_seconds": float(
+                        dict(sen2like_routing.response.get("metadata") or {}).get(
+                            "direct_zarr_duration_seconds"
+                        )
+                        or 0.0
+                    ),
+                    "conversion_provider": "copernicus",
+                    "conversion_collection": "SENTINEL-2",
+                    "conversion_product_type": "S2MSI2A",
+                    "runner": "sen2like_direct_zarr",
+                    "skipped_standalone_zarr": True,
+                }
+            else:
+                converted_zarr_outputs, conversion_metadata = rt._convert_raw_outputs(
+                    job_id=job_id,
+                    provider_name=provider_name,
+                    collection=request.collection,
+                    product_type=getattr(request, "product_type", None),
+                    raw_outputs=zarr_input_outputs,
+                    is_cancelled=is_cancelled_now,
+                    pipeline_metadata=pipeline_metadata.to_dict(),
+                    conversion_provider_name=zarr_conversion_provider,
+                    conversion_collection=zarr_conversion_collection,
+                    conversion_product_type=zarr_conversion_product_type,
+                )
+            zarr_outputs = rt._merge_paths(direct_zarr_outputs, converted_zarr_outputs)
+            if direct_zarr_outputs and converted_zarr_outputs:
+                existing_conversion_items = list(dict(conversion_metadata).get("items") or [])
+                conversion_metadata = {
+                    **dict(conversion_metadata),
+                    "status": "written",
+                    "stage": "mixed_sen2like_direct_and_zarr_service",
+                    "count": len(zarr_outputs),
+                    "items": [*direct_zarr_items, *existing_conversion_items],
+                    "direct_zarr_outputs": direct_zarr_outputs,
+                    "converted_zarr_outputs": converted_zarr_outputs,
+                    "direct_zarr_items": direct_zarr_items,
+                    "skipped_standalone_zarr": False,
+                }
+            if direct_zarr_items:
+                self._register_sen2like_direct_zarr_artifacts(
+                    job_id=job_id,
+                    provider_name=provider_name,
+                    collection=request.collection,
+                    items=direct_zarr_items,
+                )
             final_paths = [*pre_zarr_result_paths, *zarr_outputs]
             conversion_metadata_record = self._conversion_metadata_record(conversion_metadata)
             conversion_status = str(conversion_metadata_record.payload.get("status") or "")
@@ -800,6 +978,18 @@ class FetchJobWorkflowService:
         total_mask_outputs = max(1, len(zarr_outputs))
         mask_inference_device = str(getattr(request, "inference_device", "") or "").strip() or None
         water_inference_device = str(getattr(request, "water_inference_device", "") or "").strip() or None
+        water_backend_name = str(
+            getattr(request, "water_backend", None)
+            or getattr(rt.settings, "nimbus_integrated_mask_water_backend", "omniwatermask")
+            or "omniwatermask"
+        ).strip().lower() or "omniwatermask"
+        mask_fail_on_error = bool(
+            getattr(
+                request,
+                "fail_on_error",
+                getattr(rt.settings, "nimbus_integrated_mask_fail_on_error", True),
+            )
+        )
         remote_mask_runtime = rt._remote_mask_runtime()
         mask_workers = rt._integrated_mask_max_workers(
             total=len(zarr_outputs),
@@ -971,10 +1161,10 @@ class FetchJobWorkflowService:
                 inference_device=mask_inference_device,
                 include_shadows=True,
                 overwrite=True,
-                water_backend_name="auto",
+                water_backend_name=water_backend_name,
                 water_overwrite=True,
                 water_inference_device=water_inference_device,
-                fail_on_error=False,
+                fail_on_error=mask_fail_on_error,
                 mask_mode="integrated",
                 include_resolve_stage=False,
                 resolve_progress=None,
@@ -1362,7 +1552,38 @@ class FetchJobWorkflowService:
         )
         pipeline_metadata = PipelineMetadataRecord.from_mapping(
             existing_result.get("pipeline_metadata") or current_row.get("pipeline_metadata")
-        ).merged_with({"sen2like_resume_failed": True})
+        ).merged_with(
+            {
+                "sen2like_status": "failed",
+                "sen2like_error": error,
+                "sen2like_resume_failed": True,
+                "zarr_input_source": "sen2like",
+                "zarr_input_outputs": [],
+            }
+        )
+        pipeline_payload = pipeline_metadata.to_dict()
+        for stage in list(pipeline_payload.get("stage_results") or []):
+            if isinstance(stage, dict) and str(stage.get("name") or "") == "sen2like":
+                stage["status"] = "failed"
+                stage["error"] = error
+                metadata = stage.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                    stage["metadata"] = metadata
+                metadata["sen2like_status"] = "failed"
+        orchestrator_payload = pipeline_payload.get("orchestrator")
+        if isinstance(orchestrator_payload, dict):
+            orchestrator_payload["status"] = "failed"
+            orchestrator_payload["error"] = error
+            for stage in list(orchestrator_payload.get("stage_results") or []):
+                if isinstance(stage, dict) and str(stage.get("name") or "") == "sen2like":
+                    stage["status"] = "failed"
+                    stage["error"] = error
+                    metadata = stage.get("metadata")
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                        stage["metadata"] = metadata
+                    metadata["sen2like_status"] = "failed"
         zarr_outputs = list(existing_result.get("zarr_outputs") or current_row.get("zarr_outputs") or [])
         self._store_result_record(
             JobResultRecord(
@@ -1377,7 +1598,7 @@ class FetchJobWorkflowService:
                 checksums=dict(existing_result.get("checksums") or {}),
                 metadata=dict(existing_result.get("metadata") or {}),
                 manifest_entry=dict(existing_result.get("manifest_entry") or {}),
-                pipeline_metadata=pipeline_metadata.to_dict(),
+                pipeline_metadata=pipeline_payload,
                 conversion_metadata=conversion_metadata.to_dict(),
             )
         )
@@ -1388,7 +1609,7 @@ class FetchJobWorkflowService:
             errors=[error],
             pipeline_state=pipeline_state.value,
             pipeline_step=pipeline_step,
-            pipeline_metadata=pipeline_metadata.to_dict(),
+            pipeline_metadata=pipeline_payload,
             conversion_metadata=conversion_metadata.to_dict(),
             raw_outputs=raw_outputs,
             zarr_outputs=zarr_outputs,
@@ -1447,6 +1668,12 @@ class FetchJobWorkflowService:
                     "zarr_parallel_workers": int(conversion_metadata_record.payload.get("parallel_workers", 1) or 1),
                 }
             ),
+        )
+        final_pipeline_metadata = self._with_successful_resume_orchestrator(
+            final_pipeline_metadata,
+            raw_outputs=raw_outputs,
+            zarr_outputs=zarr_outputs,
+            conversion_metadata=conversion_metadata_record,
         )
         if requested_mask_types:
             final_pipeline_metadata.payload["mask_types"] = requested_mask_types

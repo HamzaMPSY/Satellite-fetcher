@@ -68,6 +68,37 @@ def test_search_download_request_rejects_download_only_with_cube_mode() -> None:
         )
 
 
+def test_usgs_pipeline_requests_are_coerced_to_landsat_l1_for_sen2like() -> None:
+    request = SearchDownloadRequest(
+        job_type="search_download",
+        provider=ProviderName.usgs,
+        collection="landsat_ot_c2_l2",
+        product_type="9L2SP",
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 5),
+        aoi=AOIInput(wkt="POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))"),
+    )
+
+    assert request.collection == "landsat_ot_c2_l1"
+    assert request.product_type == "9L1TP"
+
+
+def test_usgs_download_only_keeps_requested_landsat_level() -> None:
+    request = SearchDownloadRequest(
+        job_type="search_download",
+        provider=ProviderName.usgs,
+        collection="landsat_ot_c2_l2",
+        product_type="L2SP",
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 5),
+        aoi=AOIInput(wkt="POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))"),
+        download_only=True,
+    )
+
+    assert request.collection == "landsat_ot_c2_l2"
+    assert request.product_type == "L2SP"
+
+
 def test_search_download_request_accepts_daily_mosaic_cube_options() -> None:
     request = SearchDownloadRequest(
         job_type="search_download",

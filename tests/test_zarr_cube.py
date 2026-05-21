@@ -14,6 +14,14 @@ from nimbuschain_zarr_service.cube import (
 )
 
 
+def _labels(array) -> list[str]:
+    values = np.asarray(array[:]).tolist()
+    return [
+        value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+        for value in values
+    ]
+
+
 class _ChunkGuardArray:
     def __init__(self, data: np.ndarray, *, chunks: tuple[int, ...]) -> None:
         self.data = np.asarray(data)
@@ -141,9 +149,9 @@ def test_build_time_cube_stacks_scenes_in_timestamp_order(tmp_path: Path) -> Non
         "2026-01-01T10:00:00+00:00",
         "2026-01-02T10:00:00+00:00",
     ]
-    assert root["time"][:].tolist() == summary["time_values"]
-    assert root["scene_id"][:].tolist() == ["scene-a", "scene-b"]
-    assert root["source_zarr_uri"][:].tolist() == [str(second.resolve()), str(first.resolve())]
+    assert _labels(root["time"]) == summary["time_values"]
+    assert _labels(root["scene_id"]) == ["scene-a", "scene-b"]
+    assert _labels(root["source_zarr_uri"]) == [str(second.resolve()), str(first.resolve())]
     assert tuple(root["imagery"].shape) == (2, 2, 2, 3)
     assert np.all(root["imagery"][0, :, :, :] == 11)
     assert np.all(root["imagery"][1, :, :, :] == 22)
@@ -182,7 +190,7 @@ def test_build_time_cube_stacks_ancillary_when_schema_matches(tmp_path: Path) ->
     root = zarr.open_group(output, mode="r", zarr_format=2)
     assert summary["ancillary_written"] is True
     assert summary["ancillary_layer_names"] == ["SCL", "AOT"]
-    assert root["ancillary_layer"][:].tolist() == ["SCL", "AOT"]
+    assert _labels(root["ancillary_layer"]) == ["SCL", "AOT"]
     assert tuple(root["ancillary"].shape) == (2, 2, 2, 3)
     assert np.all(root["ancillary"][0, :, :, :] == 7)
     assert np.all(root["ancillary"][1, :, :, :] == 9)
@@ -375,6 +383,11 @@ def test_build_grouped_time_cubes_groups_compact_landsat_scene_ids(tmp_path: Pat
             "group_key": "202026",
             "reason": "fewer_than_two_unique_times",
             "candidate_scene_ids": ["LC82020262026097LGN00"],
+            "error_code": "CUBE_GROUP_FEWER_THAN_TWO_UNIQUE_TIMES",
+            "message": (
+                "This cube group has fewer than two unique acquisition times; "
+                "a time cube needs at least two dates in the same group."
+            ),
         }
     ]
     assert summary["items"][0]["source_scene_count"] == 3

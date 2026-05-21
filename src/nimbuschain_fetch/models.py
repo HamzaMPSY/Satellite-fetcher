@@ -17,6 +17,7 @@ from nimbuschain_fetch.geometry.aoi import validate_aoi_payload
 
 
 COLLECTION_RE = re.compile(r"^[A-Za-z0-9._\-/]{1,120}$")
+_USGS_LANDSAT_COLLECTION_RE = re.compile(r"^landsat", re.IGNORECASE)
 
 
 def _normalize_mask_type_values(values: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -28,6 +29,12 @@ def _normalize_mask_type_values(values: list[str] | tuple[str, ...] | None) -> l
         if candidate not in normalized:
             normalized.append(candidate)
     return normalized
+
+
+def _sen2like_landsat_product_type(product_type: str | None) -> str:
+    value = str(product_type or "").strip().upper()
+    satellite_prefix = value[:1] if value[:1] in {"8", "9"} else ""
+    return f"{satellite_prefix}L1TP" if satellite_prefix else "L1TP"
 
 
 class ProviderName(str, Enum):
@@ -147,6 +154,13 @@ class SearchDownloadRequest(BaseModel):
             raise ValueError("download_only cannot be combined with mask_types.")
         if self.download_only and self.cube_mode != "none":
             raise ValueError("download_only requires cube_mode='none'.")
+        if (
+            self.provider == ProviderName.usgs
+            and not self.download_only
+            and _USGS_LANDSAT_COLLECTION_RE.search(self.collection)
+        ):
+            self.collection = "landsat_ot_c2_l1"
+            self.product_type = _sen2like_landsat_product_type(self.product_type)
         if self.cube_mode == "after_mask" and not self.mask_types:
             raise ValueError("cube_mode='after_mask' requires at least one mask_type.")
         has_cube_options = (

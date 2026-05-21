@@ -179,8 +179,14 @@ def _normalize_local_uri(path: str | Path) -> Path:
 
 def _read_band_names(group: Any) -> list[str]:
     if "band" not in group:
-        return [str(item) for item in list(group.attrs.get("band_names") or [])]
-    return [str(item) for item in np.asarray(group["band"][:]).tolist()]
+        return [_decode_label(item) for item in list(group.attrs.get("band_names") or [])]
+    return [_decode_label(item) for item in np.asarray(group["band"][:]).tolist()]
+
+
+def _decode_label(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _clean_attr(value: Any) -> str | None:

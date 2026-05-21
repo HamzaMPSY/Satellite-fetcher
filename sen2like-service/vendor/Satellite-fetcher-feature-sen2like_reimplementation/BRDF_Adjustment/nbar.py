@@ -68,6 +68,16 @@ NODATA     = -9999.0
 CHUNKS     = {"x": 1024, "y": 1024}
 DEG2RAD    = np.float32(np.pi / 180.0)
 
+
+def _raster_write_threads() -> str:
+    configured = (
+        os.getenv("GDAL_NUM_THREADS")
+        or os.getenv("NIMBUS_SEN2LIKE_GDAL_NUM_THREADS")
+        or "1"
+    )
+    value = str(configured).strip()
+    return value or "1"
+
 # ---------------------------------------------------------------------------
 # BRDF kernels (dask versions — still used by S2 per-pixel path)
 # ---------------------------------------------------------------------------
@@ -467,7 +477,7 @@ def process_ls8(ls8_dir, bands, outdir, use_band_ids=False,
             tiled=True,
             blockxsize=512,
             blockysize=512,
-            num_threads="ALL_CPUS",
+            num_threads=_raster_write_threads(),
         )
 
     written = sorted(Path(outdir).glob("NBAR_*.tif"))
@@ -748,8 +758,15 @@ def process_s2(safe_dir, bands, outdir, use_band_ids=False,
         fname = f"NBAR_{band_id}.tif" if use_band_ids else f"NBAR_{band}.tif"
         out_path = os.path.join(outdir, fname)
         log.info("[S2]  writing -> %s", out_path)
-        out_xr.rio.to_raster(out_path, compress="deflate", dtype="float32",
-                              tiled=True, blockxsize=512, blockysize=512)
+        out_xr.rio.to_raster(
+            out_path,
+            compress="deflate",
+            dtype="float32",
+            tiled=True,
+            blockxsize=512,
+            blockysize=512,
+            num_threads=_raster_write_threads(),
+        )
 
     written = sorted(Path(outdir).glob("NBAR_*.tif"))
     log.info("[S2] process_s2 complete — %d NBAR files written: %s",

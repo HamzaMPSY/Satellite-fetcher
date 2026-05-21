@@ -8,6 +8,7 @@ from nimbuschain_fetch.pipeline.core import PipelineContext, StageResult
 
 
 Sen2LikeServiceClient: Any | None = None
+DEFAULT_SEN2LIKE_WORKERS = 4
 
 
 def is_landsat_selection(
@@ -100,6 +101,11 @@ class Sen2LikeStage:
             for item in list(payload.get("outputs") or [])
             if item.get("normalized_uri") or item.get("output_dir")
         ]
+        direct_zarr_outputs = [
+            str(item.get("zarr_uri"))
+            for item in list(payload.get("outputs") or [])
+            if item.get("zarr_uri") and item.get("zarr_exists", True)
+        ]
         metadata: dict[str, Any] = {
             "provider": context.provider,
             "collection": context.collection,
@@ -109,6 +115,7 @@ class Sen2LikeStage:
             "landsat_input": landsat_inputs[0],
             "landsat_inputs": landsat_inputs,
             "sen2like_response": payload,
+            "sen2like_direct_zarr_outputs": direct_zarr_outputs,
         }
         if not outputs:
             if self.allow_raw_fallback:
@@ -129,7 +136,9 @@ class Sen2LikeStage:
 
         resolved_outputs = outputs
         context.set("sen2like_outputs", resolved_outputs)
-        context.set("zarr_inputs", resolved_outputs)
+        if direct_zarr_outputs:
+            context.set("sen2like_direct_zarr_outputs", direct_zarr_outputs)
+        context.set("zarr_inputs", direct_zarr_outputs or resolved_outputs)
         return StageResult.succeeded_result(
             self.name,
             outputs=resolved_outputs,
@@ -245,7 +254,10 @@ class Sen2LikeStage:
             from nimbuschain_shared.clients.sen2like import Sen2LikeServiceClient as _Client
 
             Sen2LikeServiceClient = _Client
-        workers = int(context.payload.get("sen2like_workers") or context.get("sen2like_workers", 1))
+        workers = int(
+            context.payload.get("sen2like_workers")
+            or context.get("sen2like_workers", DEFAULT_SEN2LIKE_WORKERS)
+        )
         client = Sen2LikeServiceClient(service_url=service_url)
         try:
             return client.normalize(

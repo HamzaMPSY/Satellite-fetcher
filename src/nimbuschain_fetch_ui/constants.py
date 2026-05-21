@@ -53,7 +53,7 @@ MCFG = MapConfig()
 
 PROVIDERS: Dict[str, List[str]] = {
     "Copernicus": ["SENTINEL-1", "SENTINEL-2", "SENTINEL-3", "SENTINEL-5P"],
-    "USGS": ["landsat_ot_c2_l1", "landsat_ot_c2_l2"],
+    "USGS": ["landsat_ot_c2_l1"],
 }
 
 PRODUCT_TYPES: Dict[str, List[str]] = {
@@ -68,7 +68,7 @@ PRODUCT_TYPES: Dict[str, List[str]] = {
         "L2__NO2___", "L2__CH4___", "L2__CO____",
         "L2__O3____", "L2__SO2___", "L2__HCHO__",
     ],
-    "landsat_ot_c2_l1": ["L1TP", "L1GT", "L1GS"],
+    "landsat_ot_c2_l1": ["L1TP"],
     "landsat_ot_c2_l2": ["L2SP", "L2SR"],
 }
 

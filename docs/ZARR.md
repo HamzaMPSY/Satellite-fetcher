@@ -75,6 +75,7 @@ Rules:
 Typical examples:
 - Sentinel-2 L1C imagery layers: `B01` through `B12` plus `B8A`
 - Sentinel-2 L2A imagery layers: `B01` through `B12` plus `B8A`, excluding `B10`
+- Landsat normalized through Sen2Like: Sentinel-like imagery layers `B02`, `B03`, `B04`, `B08`, `B11`, `B12`, with `VALIDITY_MASK` in `ancillary` when present
 - Landsat L1 imagery layers: `B1` through `B11`
 - Landsat L2 imagery layers: `SR_B1` through `SR_B7`, plus `ST_B10` when present
 - Sentinel-1 imagery layers: exact source polarization names such as `VV`, `VH`, `HH`, `HV`

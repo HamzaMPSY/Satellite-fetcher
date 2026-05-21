@@ -89,6 +89,7 @@ class MaskService:
             acquisition_datetime=acquisition_datetime,
             dataset_summary=dataset_summary,
             output_zarr_uri=output_zarr_uri,
+            backend=backend,
             overwrite=overwrite,
             inference_device=inference_device,
             fail_on_error=fail_on_error,

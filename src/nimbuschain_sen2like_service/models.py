@@ -27,7 +27,7 @@ class Sen2LikeNormalizeRequest(BaseModel):
     products: list[str] = Field(default_factory=list)
     landsat_path: str | None = None
     working_dir: str | None = None
-    workers: int = Field(default=1, ge=1, le=128)
+    workers: int = Field(default=4, ge=1, le=128)
     steps: list[str] | None = None
     s2_path: str | None = None
     no_resume: bool = False
@@ -38,6 +38,9 @@ class Sen2LikeNormalizeRequest(BaseModel):
     cleanup_dry_run: bool = False
     timeout_seconds: float | None = Field(default=None, gt=0)
     spark_master: str | None = None
+    preprocess_target_shape: str | None = None
+    direct_zarr: bool | None = None
+    zarr_output_dir: str | None = None
     extra_args: list[str] = Field(default_factory=list)
 
     @field_validator("products")
@@ -67,6 +70,18 @@ class Sen2LikeNormalizeRequest(BaseModel):
             )
         return normalized
 
+    @field_validator("preprocess_target_shape")
+    @classmethod
+    def _strip_preprocess_target_shape(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
+
+    @field_validator("zarr_output_dir")
+    @classmethod
+    def _strip_zarr_output_dir(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
+
     def product_inputs(self) -> list[str]:
         products = list(self.products)
         if self.landsat_path and self.landsat_path.strip():
@@ -83,6 +98,12 @@ class Sen2LikeProductOutput(BaseModel):
     output_dir: str
     manifest_path: str | None = None
     normalized_uri: str | None = None
+    zarr_uri: str | None = None
+    zarr_exists: bool = False
+    zarr_data_family: str | None = None
+    zarr_summary: dict[str, Any] | None = None
+    zarr_dataset_summary: dict[str, Any] | None = None
+    zarr_error: str | None = None
     exists: bool = False
 
 

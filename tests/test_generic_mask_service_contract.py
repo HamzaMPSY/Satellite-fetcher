@@ -24,6 +24,35 @@ from nimbuschain_mask_service.sensor_mapping import resolve_sensor_mask_spec
 from nimbuschain_mask_service.service import MaskService
 
 
+def test_mask_service_forwards_explicit_water_backend_to_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_apply_to_zarr(self, **kwargs):  # noqa: ANN001
+        del self
+        captured.update(kwargs)
+        return {"status": "written", "backend": kwargs.get("backend")}
+
+    monkeypatch.setattr(mask_service_module.WaterMaskWorkflowService, "apply_to_zarr", _fake_apply_to_zarr)
+
+    result = MaskService().apply_omniwater_to_zarr(
+        job_id="job-water-backend",
+        zarr_uri="/tmp/source.zarr",
+        provider="usgs",
+        collection="landsat-c2-l1",
+        product_type="L1TP",
+        scene_id="LC09_TEST",
+        acquisition_datetime="2026-04-10T10:40:36Z",
+        dataset_summary={},
+        backend="heuristic",
+        output_zarr_uri="/tmp/output.zarr",
+        overwrite=True,
+        fail_on_error=True,
+    )
+
+    assert result["backend"] == "heuristic"
+    assert captured["backend"] == "heuristic"
+
+
 def _write_source_zarr(root: Path) -> Path:
     source = root / "source.zarr"
     group = zarr.open_group(str(source), mode="w", zarr_format=2)
@@ -1134,6 +1163,51 @@ def test_remote_mask_service_client_retries_once_after_service_restart() -> None
     assert result["status"] == "written"
     assert captured["posts"] == 2
     assert captured["health_checks"] >= 1
+
+
+def test_remote_mask_service_client_does_not_retry_strict_model_after_restart() -> None:
+    captured: dict[str, object] = {"posts": 0, "health_checks": 0}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _FakeSession:
+        def post(self, url: str, *, json: dict[str, object], timeout, params=None):  # noqa: A002
+            captured["posts"] = int(captured["posts"]) + 1
+            assert url == "http://nimbus-mask:8020/apply"
+            assert json["fail_on_error"] is True
+            raise requests.ConnectionError("Remote end closed connection without response")
+
+        def get(self, url: str, *, timeout):
+            captured["health_checks"] = int(captured["health_checks"]) + 1
+            return _FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    client = MaskServiceClient(service_url="http://nimbus-mask:8020")
+    client._session = _FakeSession()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        client.apply_masks_to_zarr(
+            zarr_uri="/tmp/source.zarr",
+            provider="copernicus",
+            collection="SENTINEL-2",
+            product_type="S2MSI2A",
+            scene_id="S2A_SCENE",
+            acquisition_datetime="2026-04-01T10:00:00Z",
+            dataset_summary={"shape": [1, 12, 4, 4]},
+            mask_types=["water"],
+            water_backend="omniwatermask",
+            fail_on_error=True,
+        )
+
+    assert "mask process may have restarted" in str(excinfo.value).lower()
+    assert captured["posts"] == 1
+    assert captured["health_checks"] == 0
 
 
 def test_remote_mask_service_client_forwards_progress_callbacks_during_apply() -> None:

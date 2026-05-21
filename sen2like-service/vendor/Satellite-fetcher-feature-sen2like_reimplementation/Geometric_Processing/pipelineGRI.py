@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+import os
 import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,6 +42,7 @@ class GRIConfig:
     gri_path: Path
     gri_band: int            = 1
     target_resolution: float = 10.0
+    target_shape: Optional[Tuple[int, int]] = None
     resampling_method: Resampling = Resampling.bilinear
     max_shift_pixels: float  = 50.0
     upsample_factor: int     = 8
@@ -109,6 +111,68 @@ def load_gri(config: GRIConfig) -> xr.DataArray:
         abs(float(gri.rio.resolution()[0])),
     )
     return gri
+
+
+def _parse_target_shape(raw: object | None) -> Optional[Tuple[int, int]]:
+    text = str(raw or "").strip().lower()
+    if text in {"", "native", "none", "off", "false", "0"}:
+        return None
+    normalized = text.replace(" ", "").replace(",", "x").replace(":", "x")
+    parts = [part for part in normalized.split("x") if part]
+    try:
+        if len(parts) == 1:
+            side = max(1, int(parts[0]))
+            return side, side
+        return max(1, int(parts[0])), max(1, int(parts[1]))
+    except (IndexError, ValueError):
+        logger.warning("[geo] Invalid target shape %r — falling back to 512x512", raw)
+        return 512, 512
+
+
+def _resolve_target_shape(config: GRIConfig) -> Optional[Tuple[int, int]]:
+    if config.target_shape is not None:
+        return max(1, int(config.target_shape[0])), max(1, int(config.target_shape[1]))
+    return _parse_target_shape(
+        os.getenv("NIMBUS_SEN2LIKE_PREPROCESS_TARGET_SHAPE")
+        or os.getenv("NIMBUS_ZARR_TARGET_SHAPE")
+        or "512x512"
+    )
+
+
+def _resize_gri_to_target_shape(
+    gri_clipped: xr.DataArray,
+    *,
+    target_shape: Tuple[int, int],
+) -> xr.DataArray:
+    height, width = int(target_shape[0]), int(target_shape[1])
+    if gri_clipped.rio.height == height and gri_clipped.rio.width == width:
+        return gri_clipped
+
+    from rasterio.transform import from_bounds
+
+    bounds = gri_clipped.rio.bounds()
+    transform = from_bounds(
+        bounds[0],
+        bounds[1],
+        bounds[2],
+        bounds[3],
+        width,
+        height,
+    )
+    resized = gri_clipped.rio.reproject(
+        gri_clipped.rio.crs,
+        transform=transform,
+        shape=(height, width),
+        resampling=Resampling.bilinear,
+        nodata=0,
+    )
+    logger.info(
+        "GRI target grid forced to %dx%d | resolution: %.2f x %.2f m",
+        height, width,
+        abs(float(resized.rio.resolution()[0])),
+        abs(float(resized.rio.resolution()[1])),
+    )
+    return resized
 
 
 def build_gri(
@@ -450,6 +514,12 @@ def reproject_and_align(
 
     logger.info("Zone commune : %.1f %.1f %.1f %.1f", *overlap)
     gri_clipped = gri.rio.clip_box(*overlap)
+    target_shape = _resolve_target_shape(config)
+    if target_shape is not None:
+        gri_clipped = _resize_gri_to_target_shape(
+            gri_clipped,
+            target_shape=target_shape,
+        )
 
     # Single reproject directly onto the clipped GRI grid. This replaces
     # the former two-step process (reproject to full GRI, then reproject
@@ -910,13 +980,19 @@ def process_scene(
 
     # Sidecar JSON avec le shift appliqué (pour traçabilité)
     shift_mag_px = float(np.hypot(row_shift, col_shift))
-    shift_m = shift_mag_px * config.target_resolution
+    output_res = tuple(abs(float(value)) for value in da_coreg.rio.resolution())
+    shift_m = shift_mag_px * output_res[0]
     sidecar = {
         "row_shift_px": float(row_shift),
         "col_shift_px": float(col_shift),
         "shift_mag_px": shift_mag_px,
         "shift_mag_m":  shift_m,
         "applied":      shift_mag_px > 1e-4,
+        "output_shape": [
+            int(da_coreg.rio.height),
+            int(da_coreg.rio.width),
+        ],
+        "output_resolution_m": [output_res[0], output_res[1]],
     }
     (out_dir / "_geo_shift.json").write_text(json.dumps(sidecar, indent=2))
 

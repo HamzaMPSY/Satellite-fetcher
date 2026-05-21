@@ -6,7 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from nimbuschain_mask_service.dependencies import get_mask_service
 from nimbuschain_mask_service.models import StageEventPayload
-from nimbuschain_mask_service.progress import get_progress, update_progress
+from nimbuschain_mask_service.progress import (
+    MaskJobCancelled,
+    clear_cancel,
+    get_progress,
+    request_cancel,
+    update_progress,
+)
 from nimbuschain_mask_service.schema import default_mask_model
 from nimbuschain_mask_service.service import MaskService, support_status
 from nimbuschain_shared.contracts.mask import MaskApplyRequest
@@ -41,6 +47,18 @@ def progress(job_id: str) -> dict[str, object]:
     return record
 
 
+@router.delete("/jobs/{job_id}")
+def cancel(job_id: str) -> dict[str, object]:
+    request_cancel(job_id)
+    return {"job_id": job_id, "cancel_requested": True}
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_post(job_id: str) -> dict[str, object]:
+    request_cancel(job_id)
+    return {"job_id": job_id, "cancel_requested": True}
+
+
 @router.post("/apply")
 def apply(
     request: MaskApplyRequest,
@@ -51,6 +69,7 @@ def apply(
     progress_callback = _build_progress_callback(normalized_job_id)
 
     if normalized_job_id:
+        clear_cancel(normalized_job_id)
         update_progress(
             normalized_job_id,
             stage_name="mask_request_received",
@@ -83,6 +102,25 @@ def apply(
             water_inference_device=request.water.inference_device,
             stage_callback=progress_callback,
         )
+    except MaskJobCancelled as exc:
+        if normalized_job_id:
+            update_progress(
+                normalized_job_id,
+                stage_name="mask_request_cancelled",
+                payload=StageEventPayload(error=str(exc)),
+                status="cancelled",
+            )
+        return {
+            "status": "cancelled",
+            "reason": str(exc),
+            "mask_types": list(request.mask_types),
+            "input_zarr_uri": request.source_zarr_uri,
+            "output_zarr_uri": request.output_zarr_uri or request.source_zarr_uri,
+            "masked_zarr_uri": None,
+            "masked_zarr_outputs": [],
+            "water_mask": {},
+            "cloud_mask": {},
+        }
     except Exception as exc:
         if normalized_job_id:
             update_progress(
@@ -94,6 +132,13 @@ def apply(
         raise
     if normalized_job_id:
         status_value = str(result.get("status") or "").strip().lower()
+        progress_status = (
+            "finished"
+            if status_value == "written"
+            else "cancelled"
+            if status_value == "cancelled"
+            else "failed"
+        )
         update_progress(
             normalized_job_id,
             stage_name="mask_request_finished",
@@ -103,7 +148,7 @@ def apply(
                 "output_zarr_uri": result.get("output_zarr_uri"),
                 "mask_types": list(result.get("mask_types") or []),
             }),
-            status="finished" if status_value == "written" else "failed",
+            status=progress_status,
         )
     return result
 

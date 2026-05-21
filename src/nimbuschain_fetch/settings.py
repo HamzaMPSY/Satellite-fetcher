@@ -33,6 +33,14 @@ class Settings(BaseSettings):
 
     nimbus_data_dir: Path = Field(default=Path("./data/downloads"), alias="NIMBUS_DATA_DIR")
     nimbus_mask_service_url: str | None = Field(default=None, alias="NIMBUS_MASK_SERVICE_URL")
+    nimbus_integrated_mask_water_backend: str = Field(
+        default="omniwatermask",
+        alias="NIMBUS_INTEGRATED_MASK_WATER_BACKEND",
+    )
+    nimbus_integrated_mask_fail_on_error: bool = Field(
+        default=True,
+        alias="NIMBUS_INTEGRATED_MASK_FAIL_ON_ERROR",
+    )
     nimbus_zarr_service_url: str | None = Field(default=None, alias="NIMBUS_ZARR_SERVICE_URL")
     nimbus_sen2like_service_url: str | None = Field(
         default=None,
@@ -43,7 +51,7 @@ class Settings(BaseSettings):
         alias="NIMBUS_SEN2LIKE_WORK_DIR",
     )
     nimbus_sen2like_workers: int = Field(
-        default=1,
+        default=4,
         alias="NIMBUS_SEN2LIKE_WORKERS",
         ge=1,
         le=128,
@@ -56,6 +64,32 @@ class Settings(BaseSettings):
     nimbus_sen2like_raw_fallback: bool = Field(
         default=False,
         alias="NIMBUS_SEN2LIKE_RAW_FALLBACK",
+    )
+    nimbus_sen2like_nested_band_parallelism: bool = Field(
+        default=True,
+        alias="NIMBUS_SEN2LIKE_NESTED_BAND_PARALLELISM",
+    )
+    nimbus_sen2like_band_workers: int = Field(
+        default=2,
+        alias="NIMBUS_SEN2LIKE_BAND_WORKERS",
+        ge=1,
+        le=32,
+    )
+    nimbus_sen2like_safe_retry: bool = Field(
+        default=True,
+        alias="NIMBUS_SEN2LIKE_SAFE_RETRY",
+    )
+    nimbus_sen2like_preprocess_target_shape: str | None = Field(
+        default="512x512",
+        alias="NIMBUS_SEN2LIKE_PREPROCESS_TARGET_SHAPE",
+    )
+    nimbus_sen2like_direct_zarr: bool = Field(
+        default=True,
+        alias="NIMBUS_SEN2LIKE_DIRECT_ZARR",
+    )
+    nimbus_sen2like_zarr_dir: str | None = Field(
+        default=None,
+        alias="NIMBUS_SEN2LIKE_ZARR_DIR",
     )
     nimbus_runtime_role: str = Field(default="all", alias="NIMBUS_RUNTIME_ROLE")
     nimbus_executor_backend: str = Field(default="inprocess", alias="NIMBUS_EXECUTOR_BACKEND")
@@ -201,6 +235,9 @@ class Settings(BaseSettings):
         "nimbus_usgs_username",
         "nimbus_usgs_token",
         "nimbus_sen2like_work_dir",
+        "nimbus_sen2like_preprocess_target_shape",
+        "nimbus_sen2like_zarr_dir",
+        "nimbus_integrated_mask_water_backend",
         mode="before",
     )
     @classmethod

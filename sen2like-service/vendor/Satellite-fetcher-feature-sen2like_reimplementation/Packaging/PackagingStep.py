@@ -132,6 +132,9 @@ def _safe_matches_context(safe_dir: Path, product_level: str, acq_date: str) -> 
     return safe_dir.name.startswith(expected_prefix)
 
 
+_MTL_KV_RE = re.compile(r'^\s*([A-Z0-9_]+)\s*=\s*"?([^"]*)"?\s*$')
+
+
 # ===========================================================================
 # PackagingStep
 # ===========================================================================
@@ -167,7 +170,7 @@ class PackagingStep:
         if not safe_root.exists():
             return
 
-        acq_date = _extract_acquisition_date(ctx.product_id)
+        acq_date = _resolve_acquisition_metadata(ctx)["date"]
 
         matching = [
             s for s in safe_root.glob("*.SAFE")
@@ -211,11 +214,16 @@ class PackagingStep:
 
         # ── Identifiers ────────────────────────────────────────────────
         mgrs_tile  = self._resolve_mgrs_tile(ctx, fused_path)
-        acq_date   = _extract_acquisition_date(ctx.product_id)
-        safe_name  = _build_safe_name(mgrs_tile, product_level, baseline, acq_date)
-        granule_id = _build_granule_id(product_level, mgrs_tile, acq_date, baseline)
+        acq_meta   = _resolve_acquisition_metadata(ctx)
+        acq_date   = acq_meta["date"]
+        acq_stamp  = acq_meta["timestamp"]
+        ctx.data["source_product_id"] = acq_meta["product_id"]
+        ctx.data["acquisition_datetime"] = acq_meta["iso"]
+        safe_name  = _build_safe_name(mgrs_tile, product_level, baseline, acq_stamp)
+        granule_id = _build_granule_id(product_level, mgrs_tile, acq_stamp, baseline)
 
         log.info("[packaging] Acquisition date : %s", acq_date)
+        log.info("[packaging] Acquisition time : %s", acq_meta["iso"])
         log.info("[packaging] MGRS tile        : %s", mgrs_tile)
         log.info("[packaging] Product level    : %s", product_level)
 
@@ -574,17 +582,21 @@ def _write_product_metadata(
     quant: int,
 ) -> None:
     now  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    source_product_id = str(ctx.data.get("source_product_id") or ctx.product_id)
+    acquisition_time = str(ctx.data.get("acquisition_datetime") or "").strip()
     root = ET.Element(f"Level-{product_level}_Product_Metadata")
     root.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
 
     gi = ET.SubElement(root, "General_Info")
     ET.SubElement(gi, "Product_Info").text     = product_level
-    ET.SubElement(gi, "Product_ID").text       = ctx.product_id
+    ET.SubElement(gi, "Product_ID").text       = source_product_id
     ET.SubElement(gi, "MGRS_Tile").text        = mgrs_tile
     ET.SubElement(gi, "Processing_Level").text = product_level
     ET.SubElement(gi, "Baseline").text         = baseline
     ET.SubElement(gi, "Generation_Time").text  = now
     ET.SubElement(gi, "Acquisition_Date").text = acq_date
+    if acquisition_time:
+        ET.SubElement(gi, "Acquisition_Time").text = acquisition_time
     ET.SubElement(gi, "Input_Product").text    = str(ctx.config.get("landsat_path", ""))
     if ctx.config.get("s2_path"):
         ET.SubElement(gi, "S2_Reference").text = str(ctx.config["s2_path"])
@@ -627,13 +639,14 @@ def _write_tile_metadata(
     product_level: str,
 ) -> None:
     """Write tile-level metadata XML inside the GRANULE directory."""
+    sensing_time = str(ctx.data.get("acquisition_datetime") or "").strip()
+    if not sensing_time:
+        sensing_time = f"{acq_date[:4]}-{acq_date[4:6]}-{acq_date[6:8]}T00:00:00Z"
     root = ET.Element(f"Level-{product_level}_Tile_Metadata")
     gi   = ET.SubElement(root, "General_Info")
     ET.SubElement(gi, "TILE_ID").text      = mgrs_tile
     ET.SubElement(gi, "DATASTRIP_ID").text = f"DS_{mgrs_tile}_{acq_date}"
-    ET.SubElement(gi, "SENSING_TIME").text = (
-        f"{acq_date[:4]}-{acq_date[4:6]}-{acq_date[6:8]}T00:00:00Z"
-    )
+    ET.SubElement(gi, "SENSING_TIME").text = sensing_time
 
     geo_info = ET.SubElement(root, "Geometric_Info")
     tci      = ET.SubElement(geo_info, "Tile_Coordinate_Info")
@@ -677,13 +690,14 @@ def _write_inspire_metadata(
 ) -> None:
     """Write a minimal INSPIRE discovery metadata file."""
     now  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    source_product_id = str(ctx.data.get("source_product_id") or ctx.product_id)
     root = ET.Element("MD_Metadata")
     root.set("xmlns",     "http://www.isotc211.org/2005/gmd")
     root.set("xmlns:gco", "http://www.isotc211.org/2005/gco")
 
     fid = ET.SubElement(root, "fileIdentifier")
     ET.SubElement(fid, "{http://www.isotc211.org/2005/gco}CharacterString").text = (
-        f"{ctx.product_id}_{mgrs_tile}"
+        f"{source_product_id}_{mgrs_tile}"
     )
     lang = ET.SubElement(root, "language")
     ET.SubElement(lang, "{http://www.isotc211.org/2005/gco}CharacterString").text = "eng"
@@ -706,7 +720,7 @@ def _write_inspire_metadata(
     ci_cit = ET.SubElement(cit, "CI_Citation")
     title  = ET.SubElement(ci_cit, "title")
     ET.SubElement(title, "{http://www.isotc211.org/2005/gco}CharacterString").text = (
-        f"Sentinel-2 Like {ctx.product_id} {product_level} Tile {mgrs_tile} {acq_date}"
+        f"Sentinel-2 Like {source_product_id} {product_level} Tile {mgrs_tile} {acq_date}"
     )
 
     _write_xml(root, safe_dir / "INSPIRE.xml")
@@ -770,15 +784,9 @@ def _write_xml(root: ET.Element, path: Path) -> None:
 # ===========================================================================
 
 def _extract_acquisition_date(product_id: str) -> str:
-    # Strategy 1 — token split (reliable for standard naming)
-    for token in product_id.split("_"):
-        if len(token) == 8 and token.isdigit() and token[:2] in ("19", "20"):
-            return token
-
-    # Strategy 2 — substring scan (handles non-standard separators)
-    matches = re.findall(r"(?<!\d)((?:19|20)\d{6})(?!\d)", product_id)
-    if matches:
-        return matches[0]
+    date_value = _try_extract_acquisition_date(product_id)
+    if date_value:
+        return date_value
 
     # Strategy 3 — last resort fallback
     today = time.strftime("%Y%m%d", time.gmtime())
@@ -789,17 +797,128 @@ def _extract_acquisition_date(product_id: str) -> str:
     return today
 
 
+def _try_extract_acquisition_date(product_id: str) -> str:
+    # Strategy 1 — token split (reliable for standard naming)
+    for token in product_id.split("_"):
+        if len(token) == 8 and token.isdigit() and token[:2] in ("19", "20"):
+            return token
+
+    # Strategy 2 — substring scan (handles non-standard separators)
+    matches = re.findall(r"(?<!\d)((?:19|20)\d{6})(?!\d)", product_id)
+    if matches:
+        return matches[0]
+
+    return ""
+
+
+def _resolve_acquisition_metadata(ctx) -> dict[str, str]:
+    for mtl_path in _candidate_mtl_paths(ctx):
+        values = _read_mtl_values(mtl_path)
+        date_value = _normalize_mtl_date(values.get("DATE_ACQUIRED"))
+        if not date_value:
+            continue
+        time_value = str(values.get("SCENE_CENTER_TIME") or "00:00:00Z")
+        product_id = str(values.get("LANDSAT_PRODUCT_ID") or ctx.product_id).strip()
+        return {
+            "date": date_value,
+            "timestamp": _build_acquisition_timestamp(date_value, time_value),
+            "iso": _build_acquisition_iso(date_value, time_value),
+            "product_id": product_id,
+            "source": str(mtl_path),
+        }
+
+    date_value = _try_extract_acquisition_date(str(ctx.product_id))
+    if not date_value:
+        raise RuntimeError(
+            "[packaging] Could not resolve acquisition metadata from Landsat MTL "
+            f"or product id '{ctx.product_id}'. Refusing to write a SAFE product "
+            "with a synthetic acquisition date."
+        )
+    return {
+        "date": date_value,
+        "timestamp": f"{date_value}T000000",
+        "iso": f"{date_value[:4]}-{date_value[4:6]}-{date_value[6:8]}T00:00:00Z",
+        "product_id": str(ctx.product_id),
+        "source": "",
+    }
+
+
+def _candidate_mtl_paths(ctx) -> list[Path]:
+    candidates: list[Path] = []
+    for raw in (
+        getattr(ctx, "product_id", ""),
+        getattr(ctx, "config", {}).get("landsat_path", ""),
+    ):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        if path.is_file() and path.name.endswith("_MTL.txt"):
+            candidates.append(path)
+        elif path.is_dir():
+            candidates.extend(sorted(path.glob("*_MTL.txt")))
+            candidates.extend(sorted(path.glob("**/*_MTL.txt")))
+    return list(dict.fromkeys(candidates))
+
+
+def _read_mtl_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        match = _MTL_KV_RE.match(line)
+        if not match:
+            continue
+        key, value = match.groups()
+        values[key] = value.strip().strip('"')
+    return values
+
+
+def _normalize_mtl_date(value: str | None) -> str:
+    text = str(value or "").strip().strip('"')
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if match:
+        return "".join(match.groups())
+    if re.fullmatch(r"\d{8}", text):
+        return text
+    return ""
+
+
+def _build_acquisition_timestamp(acq_date: str, scene_center_time: str | None) -> str:
+    match = re.search(r"(\d{2}):(\d{2}):(\d{2})", str(scene_center_time or ""))
+    if not match:
+        return f"{acq_date}T000000"
+    return f"{acq_date}T{match.group(1)}{match.group(2)}{match.group(3)}"
+
+
+def _build_acquisition_iso(acq_date: str, scene_center_time: str | None) -> str:
+    text = str(scene_center_time or "00:00:00Z").strip().strip('"')
+    match = re.match(r"(?P<hms>\d{2}:\d{2}:\d{2})(?:\.(?P<fraction>\d+))?Z?$", text)
+    if not match:
+        text = "00:00:00Z"
+    else:
+        hms = match.group("hms")
+        fraction = str(match.group("fraction") or "")
+        text = hms
+        if fraction:
+            text = f"{text}.{fraction[:6]}"
+        text = f"{text}Z"
+    return f"{acq_date[:4]}-{acq_date[4:6]}-{acq_date[6:8]}T{text}"
+
+
 def _build_safe_name(
     mgrs_tile: str,
     product_level: str,
     baseline: str,
-    acq_date: str,
+    acquisition_timestamp: str,
 ) -> str:
     """Build the .SAFE folder name following the official sen2like convention."""
     baseline_tag = baseline.replace(".", "")
     timestamp    = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     return (
-        f"S2L_MSI{product_level}_{acq_date}T000000_"
+        f"S2L_MSI{product_level}_{acquisition_timestamp}_"
         f"N{baseline_tag}_R000_{mgrs_tile}_{timestamp}.SAFE"
     )
 
@@ -807,9 +926,9 @@ def _build_safe_name(
 def _build_granule_id(
     product_level: str,
     mgrs_tile: str,
-    acq_date: str,
+    acquisition_timestamp: str,
     baseline: str,
 ) -> str:
     """Build the GRANULE sub-folder ID consistent with *product_level*."""
     baseline_tag = baseline.replace(".", "")
-    return f"{product_level}_{mgrs_tile}_{acq_date}T000000_N{baseline_tag}_R000"
+    return f"{product_level}_{mgrs_tile}_{acquisition_timestamp}_N{baseline_tag}_R000"

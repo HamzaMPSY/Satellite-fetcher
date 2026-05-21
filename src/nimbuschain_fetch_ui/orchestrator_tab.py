@@ -190,7 +190,7 @@ def render_orchestrator_tab(
             options=target_stage_options,
             key="orch_target_stage",
         )
-        default_sen2like_workers = int(os.getenv("NIMBUS_SEN2LIKE_WORKERS", "1") or 1)
+        default_sen2like_workers = int(os.getenv("NIMBUS_SEN2LIKE_WORKERS", "4") or 4)
         sen2like_workers = int(
             st.session_state.get("orch_sen2like_workers", default_sen2like_workers)
         )

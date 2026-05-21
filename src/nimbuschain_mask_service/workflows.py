@@ -37,6 +37,7 @@ from nimbuschain_mask_service.models import (
     WaterMaskState,
 )
 from nimbuschain_mask_service.ports import StageCallback
+from nimbuschain_mask_service.progress import MaskJobCancelled, raise_if_cancel_requested
 from nimbuschain_mask_service.registry import CloudBackendRegistry, WaterBackendRegistry, registry_status
 from nimbuschain_mask_service.runtime import (
     normalize_device_name,
@@ -104,7 +105,9 @@ class WaterMaskWorkflowService:
         fail_on_error: bool = False,
         stage_callback: StageCallback | None = None,
     ) -> dict[str, Any]:
+        raise_if_cancel_requested(job_id)
         descriptor = self._registry.resolve(backend)
+        raise_if_cancel_requested(job_id)
         result = descriptor.run(
             WaterBackendRunRequest(
                 job_id=job_id,
@@ -153,6 +156,7 @@ class CloudMaskWorkflowService:
         include_shadows: bool = True,
     ) -> dict[str, Any]:
         del acquisition_datetime, overwrite
+        raise_if_cancel_requested(job_id)
         target_zarr_uri = str(output_zarr_uri or source_zarr_uri).strip()
         source_path = local_path_for_uri(source_zarr_uri)
         output_path = local_path_for_uri(target_zarr_uri)
@@ -170,8 +174,10 @@ class CloudMaskWorkflowService:
                         "scene_id": scene_id,
                     }),
                 )
+            raise_if_cancel_requested(job_id)
             if not output_path.exists() and source_path.resolve() != output_path.resolve():
                 copy_source_zarr(source_zarr_uri=source_zarr_uri, output_zarr_uri=target_zarr_uri)
+            raise_if_cancel_requested(job_id)
             root = open_zarr_group(target_zarr_uri, mode="a")
             context = read_context(root, zarr_uri=target_zarr_uri)
             sensor = resolve_sensor_mask_spec(
@@ -202,6 +208,7 @@ class CloudMaskWorkflowService:
             }
 
             write_summary, inference_summary = _run_cloud_inference_tiled(
+                job_id=job_id,
                 root=root,
                 context=context,
                 sensor=sensor,
@@ -262,7 +269,7 @@ class CloudMaskWorkflowService:
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
-            cancelled = isinstance(exc, asyncio.CancelledError) or isinstance(
+            cancelled = isinstance(exc, (asyncio.CancelledError, MaskJobCancelled)) or isinstance(
                 exc,
                 (BrokenPipeError, ConnectionResetError),
             )
@@ -359,6 +366,7 @@ class CombinedMaskWorkflowService:
         cloud_runner = cloud_runner or self._cloud_workflow.apply_to_zarr
         water_runner = water_runner or self._water_workflow.apply_to_zarr
 
+        raise_if_cancel_requested(job_id)
         if "cloud" in normalized_mask_types:
             cloud_mask = CloudMaskState.from_mapping(cloud_runner(
                 job_id=job_id,
@@ -380,6 +388,7 @@ class CombinedMaskWorkflowService:
             ))
 
         cloud_written = str(cloud_mask.status or "").strip().lower() == "written"
+        raise_if_cancel_requested(job_id)
         if "water" in normalized_mask_types and ("cloud" not in normalized_mask_types or cloud_written):
             water_input_zarr_uri = (
                 masked_zarr_uri
@@ -523,6 +532,8 @@ def _combine_status(mask_types: list[str], *, water_mask: dict[str, Any], cloud_
     if "cloud" in mask_types:
         statuses.append(str(cloud_mask.get("status") or "").strip().lower())
     normalized = [status for status in statuses if status]
+    if any(status == "cancelled" for status in normalized):
+        return "cancelled"
     if normalized and all(status == "written" for status in normalized):
         return "written"
     if normalized and all(status == "skipped" for status in normalized):
@@ -682,6 +693,7 @@ def _iter_windows(*, height: int, width: int, tile_size: int):
 
 def _run_cloud_inference_tiled(
     *,
+    job_id: str | None = None,
     root: Any,
     context: Any,
     sensor: Any,
@@ -699,6 +711,7 @@ def _run_cloud_inference_tiled(
     target_zarr_uri: str = "",
     scene_id: str = "",
 ) -> tuple[MaskWriteSummary, CloudInferenceSummary]:
+    raise_if_cancel_requested(job_id)
     imagery = root["imagery"]
     height = int(imagery.shape[2])
     width = int(imagery.shape[3])
@@ -802,12 +815,14 @@ def _run_cloud_inference_tiled(
         hard_limit=4,
     )
     windows = list(_iter_windows(height=height, width=width, tile_size=tile_size))
+    raise_if_cancel_requested(job_id)
     should_trim_memory = (
         str(backend_descriptor.name) == "omnicloudmask"
         and normalize_device_name(resolved_device) == "cpu"
     )
 
     def process_window(window: tuple[int, int, int, int]) -> tuple[tuple[int, int, int, int], Any]:
+        raise_if_cancel_requested(job_id)
         row_start, row_stop, col_start, col_stop = window
         try:
             channels_result = service_module.read_required_channels_window(
@@ -841,6 +856,7 @@ def _run_cloud_inference_tiled(
         else:
             channels, _missing = channels_result
             valid_mask = None
+        raise_if_cancel_requested(job_id)
         if valid_mask is not None and not bool(np.asarray(valid_mask, dtype=bool).any()):
             tile_height = row_stop - row_start
             tile_width = col_stop - col_start
@@ -868,6 +884,7 @@ def _run_cloud_inference_tiled(
                 ),
             )
         try:
+            raise_if_cancel_requested(job_id)
             result = service_module.run_cloud_inference(
                 sensor=sensor,
                 channels=channels,
@@ -901,6 +918,7 @@ def _run_cloud_inference_tiled(
                 raise
         return window, result
 
+    executor: ThreadPoolExecutor | None = None
     if tile_workers <= 1 or len(windows) <= 1:
         results_iter = map(process_window, windows)
     else:
@@ -909,6 +927,7 @@ def _run_cloud_inference_tiled(
 
     try:
         for window, result in results_iter:
+            raise_if_cancel_requested(job_id)
             row_start, row_stop, col_start, col_stop = window
             tile_index += 1
             summary = (
@@ -948,11 +967,15 @@ def _run_cloud_inference_tiled(
             if should_trim_memory and (tile_index == total_tiles or tile_index % 4 == 0):
                 gc.collect()
     finally:
-        if tile_workers > 1 and len(windows) > 1:
-            executor.shutdown(wait=True)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
         if should_trim_memory:
             gc.collect()
 
+    raise_if_cancel_requested(job_id)
     total_pixels = max(1, valid_pixels_total or total_pixels)
     cloud_fraction = float(cloud_pixels / total_pixels)
     backend_name = str(backend_descriptor.name)

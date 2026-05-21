@@ -16,6 +16,16 @@ import rasterio
 from rasterio.transform import Affine
 
 
+def _raster_write_threads() -> str:
+    configured = (
+        os.getenv("GDAL_NUM_THREADS")
+        or os.getenv("NIMBUS_SEN2LIKE_GDAL_NUM_THREADS")
+        or "1"
+    )
+    value = str(configured).strip()
+    return value or "1"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sensor detection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,7 +187,7 @@ def process_band(
         "blockxsize": 512,
         "blockysize": 512,
         "bigtiff":    "IF_SAFER",
-        "num_threads": "ALL_CPUS",
+        "num_threads": _raster_write_threads(),
     }
 
     os.makedirs(output_dir, exist_ok=True)

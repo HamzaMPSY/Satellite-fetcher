@@ -224,6 +224,69 @@ def _run_parallel_threads(
     return results
 
 
+def _effective_internal_workers(workers: Any, job_count: int, label: str) -> int:
+    try:
+        requested = int(workers)
+    except (TypeError, ValueError):
+        requested = 1
+    requested = max(1, requested)
+    effective = min(requested, max(1, int(job_count)), 32)
+    if _running_inside_spark_executor() and effective > 1:
+        if _env_flag("NIMBUS_SEN2LIKE_NESTED_BAND_PARALLELISM", default=True):
+            band_limit = _env_int("NIMBUS_SEN2LIKE_BAND_WORKERS", default=min(2, effective), minimum=1, maximum=32)
+            nested_workers = min(effective, band_limit)
+            log.info(
+                "[%s] Product-level Spark parallelism is active; also using %d "
+                "internal band worker(s) because NIMBUS_SEN2LIKE_NESTED_BAND_PARALLELISM is enabled.",
+                label,
+                nested_workers,
+            )
+            return nested_workers
+        log.info(
+            "[%s] Product-level Spark parallelism is active; using 1 internal "
+            "raster worker to avoid nested GDAL/thread contention.",
+            label,
+        )
+        return 1
+    return effective
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, *, default: int, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None and str(raw).strip() else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(int(minimum), min(int(value), int(maximum)))
+
+
+def _gri_is_usable(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with rasterio.open(path) as src:
+            bounds = src.bounds
+            bounds_values = (bounds.left, bounds.bottom, bounds.right, bounds.top)
+            return (
+                src.width > 0
+                and src.height > 0
+                and src.crs is not None
+                and bounds.left < bounds.right
+                and bounds.bottom < bounds.top
+                and all(np.isfinite(value) for value in bounds_values)
+            )
+    except Exception as exc:
+        log.warning("[geo] GRI %s is not usable (%s)", path, exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Pipeline scaffolding
 # ---------------------------------------------------------------------------
@@ -274,42 +337,100 @@ _DEFAULT_SPACECRAFT = "LANDSAT_8"
 
 
 def _detect_spacecraft(landsat_path: str | Path) -> str:
-    """Return 'LANDSAT_8' or 'LANDSAT_9' from the scene's MTL JSON."""
+    """Return 'LANDSAT_8' or 'LANDSAT_9' from the scene metadata."""
     scene_dir = Path(str(landsat_path))
-    mtl_files = list(scene_dir.glob("*_MTL.json"))
+    mtl_files = _landsat_mtl_candidates(scene_dir)
     if not mtl_files:
-        log.debug("[spacecraft] No MTL.json in %s — defaulting to %s",
+        log.debug("[spacecraft] No MTL metadata in %s — defaulting to %s",
                   scene_dir, _DEFAULT_SPACECRAFT)
         return _DEFAULT_SPACECRAFT
 
+    for mtl_path in mtl_files:
+        spacecraft = _spacecraft_from_mtl(mtl_path)
+        if not spacecraft:
+            continue
+        if spacecraft not in _SUPPORTED_SPACECRAFT:
+            log.warning(
+                "[spacecraft] Unsupported spacecraft '%s' in %s — defaulting to %s. "
+                "Supported: %s",
+                spacecraft, mtl_path.name, _DEFAULT_SPACECRAFT, _SUPPORTED_SPACECRAFT,
+            )
+            return _DEFAULT_SPACECRAFT
+        log.info("[spacecraft] Detected %s from %s", spacecraft, mtl_path.name)
+        return spacecraft
+
+    log.warning(
+        "[spacecraft] Could not read SPACECRAFT_ID from %s — defaulting to %s",
+        [path.name for path in mtl_files],
+        _DEFAULT_SPACECRAFT,
+    )
+    return _DEFAULT_SPACECRAFT
+
+
+def _landsat_mtl_candidates(scene_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for pattern in ("*_MTL.json", "*_MTL.txt", "*_MTL.xml"):
+        candidates.extend(sorted(scene_dir.glob(pattern)))
+    if not candidates:
+        for pattern in ("**/*_MTL.json", "**/*_MTL.txt", "**/*_MTL.xml"):
+            candidates.extend(sorted(scene_dir.glob(pattern)))
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def _spacecraft_from_mtl(mtl_path: Path) -> str | None:
+    suffix = mtl_path.suffix.lower()
     try:
-        mtl = json.loads(mtl_files[0].read_text())
-        spacecraft = (
-            mtl.get("LANDSAT_METADATA_FILE", {})
-               .get("IMAGE_ATTRIBUTES", {})
-               .get("SPACECRAFT_ID", _DEFAULT_SPACECRAFT)
-        )
-        spacecraft = spacecraft.replace(" ", "_").upper()
+        if suffix == ".json":
+            mtl = json.loads(mtl_path.read_text())
+            value = (
+                mtl.get("LANDSAT_METADATA_FILE", {})
+                   .get("IMAGE_ATTRIBUTES", {})
+                   .get("SPACECRAFT_ID")
+            )
+            return _normalize_spacecraft(value)
+        if suffix == ".txt":
+            for line in mtl_path.read_text(errors="ignore").splitlines():
+                if "SPACECRAFT_ID" not in line or "=" not in line:
+                    continue
+                return _normalize_spacecraft(line.split("=", 1)[1])
+        if suffix == ".xml":
+            import xml.etree.ElementTree as ET
+
+            root = ET.parse(mtl_path).getroot()
+            for element in root.iter():
+                if element.tag.split("}")[-1] == "SPACECRAFT_ID":
+                    return _normalize_spacecraft(element.text)
     except Exception as exc:
-        log.warning("[spacecraft] Could not parse %s (%s) — defaulting to %s",
-                    mtl_files[0].name, exc, _DEFAULT_SPACECRAFT)
-        return _DEFAULT_SPACECRAFT
+        log.warning("[spacecraft] Could not parse %s (%s)", mtl_path.name, exc)
+    return None
 
-    if spacecraft not in _SUPPORTED_SPACECRAFT:
-        log.warning(
-            "[spacecraft] Unsupported spacecraft '%s' in %s — defaulting to %s. "
-            "Supported: %s",
-            spacecraft, mtl_files[0].name, _DEFAULT_SPACECRAFT, _SUPPORTED_SPACECRAFT,
-        )
-        return _DEFAULT_SPACECRAFT
 
-    log.info("[spacecraft] Detected %s from %s", spacecraft, mtl_files[0].name)
-    return spacecraft
+def _normalize_spacecraft(value: object | None) -> str | None:
+    normalized = str(value or "").strip().strip('"').replace(" ", "_").upper()
+    return normalized or None
 
 
 def _spacecraft_short_tag(spacecraft: str) -> str:
     """Short tag used for LUT filenames and the atm module: 'L8' or 'L9'."""
     return "L9" if spacecraft == "LANDSAT_9" else "L8"
+
+
+def _config_for_landsat_product(base_config: dict, landsat_path: str | Path) -> dict:
+    spacecraft = _detect_spacecraft(landsat_path)
+    sensor_tag = _spacecraft_short_tag(spacecraft)
+    config = {**base_config, "landsat_path": str(landsat_path)}
+    config["mission"] = spacecraft
+    config["atm_sensor_tag"] = sensor_tag
+    config["lut_path"] = str(_BASE / "lut" / f"lut_6s_{sensor_tag}.json")
+    config["sbaf"] = {**dict(config.get("sbaf") or {}), "mission": spacecraft}
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -1073,6 +1194,15 @@ class GeometricProcessingStep:
         try:
             return self._do_geometric_processing(ctx)
         except Exception as exc:
+            if not _env_flag("NIMBUS_SEN2LIKE_ALLOW_GEO_SKIP", False):
+                message = (
+                    "[geo:geometry_required_failed] Co-registration failed and "
+                    "NIMBUS_SEN2LIKE_ALLOW_GEO_SKIP is not enabled. Refusing to "
+                    "produce a Landsat-grid Sen2Like output; fix the GRI/cache "
+                    "or enable the debug skip flag explicitly."
+                )
+                log.error("%s (%s: %s)", message, type(exc).__name__, exc, exc_info=True)
+                raise RuntimeError(f"{message} Root cause: {type(exc).__name__}: {exc}") from exc
             log.warning(
                 "[geo] Co-registration failed (%s: %s) — skipping geometric "
                 "processing. Downstream steps will operate on the original "
@@ -1137,19 +1267,41 @@ class GeometricProcessingStep:
             "gri_cache_dir",
             str(_BASE / "Geometric_Processing" / "gri"),
         ))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        unusable_paths: set[Path] = set()
 
-        # Try the MGRS-keyed cache/fetch path first.
+        # Prefer local cache, then build the missing GRI on demand by default.
+        # Set NIMBUS_SEN2LIKE_GRI_AUTO_FETCH=false for strict offline runs.
+        mgrs_tile = None
         try:
-            from Geometric_Processing.gri_fetch import derive_mgrs_tile, get_or_fetch_gri
+            from Geometric_Processing.gri_fetch import derive_mgrs_tile
             mgrs_tile = derive_mgrs_tile(ctx.config["landsat_path"])
             if mgrs_tile:
-                return get_or_fetch_gri(mgrs_tile, cache_dir)
-            log.warning("[geo] Could not derive MGRS tile — trying legacy gri_path")
+                cached_gri = cache_dir / f"GRI_{mgrs_tile}.tif"
+                if cached_gri.exists():
+                    if _gri_is_usable(cached_gri):
+                        log.info("[geo] Using cached GRI: %s", cached_gri)
+                        return cached_gri
+                    unusable_paths.add(cached_gri.resolve(strict=False))
+                    log.warning("[geo] Cached GRI for %s is not usable: %s", mgrs_tile, cached_gri)
+                if _env_flag("NIMBUS_SEN2LIKE_GRI_AUTO_FETCH", True):
+                    from Geometric_Processing.gri_fetch import get_or_fetch_gri
+                    if cached_gri.exists():
+                        cached_gri.unlink(missing_ok=True)
+                    return get_or_fetch_gri(mgrs_tile, cache_dir, landsat_scene=ctx.config["landsat_path"])
+                log.info(
+                    "[geo] GRI cache miss for %s (%s); auto-fetch disabled. "
+                    "Trying legacy gri_path.",
+                    mgrs_tile,
+                    cached_gri,
+                )
+            else:
+                log.warning("[geo] Could not derive MGRS tile — trying legacy gri_path")
         except ImportError as exc:
             log.warning("[geo] gri_fetch module unavailable (%s) — trying legacy gri_path", exc)
         except Exception as exc:
             log.warning(
-                "[geo] GRI fetch/cache failed (%s) — trying legacy gri_path",
+                "[geo] GRI cache lookup failed (%s) — trying legacy gri_path",
                 exc,
             )
 
@@ -1157,13 +1309,19 @@ class GeometricProcessingStep:
         legacy = ctx.config.get("gri_path")
         if legacy:
             legacy_path = Path(str(legacy))
-            if legacy_path.exists():
+            legacy_key = legacy_path.resolve(strict=False)
+            if legacy_path.exists() and legacy_key not in unusable_paths and _gri_is_usable(legacy_path):
                 log.info("[geo] Using legacy gri_path: %s", legacy_path)
                 return legacy_path
+            if legacy_path.exists() and legacy_key not in unusable_paths:
+                log.warning("[geo] Legacy GRI is not usable: %s", legacy_path)
 
+        auto_fetch = _env_flag("NIMBUS_SEN2LIKE_GRI_AUTO_FETCH", True)
+        fetch_hint = "enabled" if auto_fetch else "disabled"
+        tile_hint = f" for {mgrs_tile}" if mgrs_tile else ""
         raise FileNotFoundError(
-            "No GRI available: MGRS-keyed cache/fetch did not succeed and "
-            f"legacy gri_path ({legacy}) is not usable."
+            f"No local GRI available{tile_hint}: cache lookup did not find a usable "
+            f"GRI and auto-fetch is {fetch_hint}; legacy gri_path ({legacy}) is not usable."
         )
 
 
@@ -1530,9 +1688,7 @@ class BRDFAdjustmentStep:
             process_ls8(ls_input, [band], ls_outdir, clip_min=clip_min, clip_max=clip_max)
             return band
 
-        # Cap at min(workers, len(bands)): never exceed the user's
-        # requested concurrency, and never more threads than there is work.
-        effective_workers = min(workers, len(bands))
+        effective_workers = _effective_internal_workers(workers, len(bands), "brdf")
 
         if not _use_spark(len(bands)):
             log.info(
@@ -1588,7 +1744,7 @@ class BRDFAdjustmentStep:
         s2_outdir = str(s2_out)
         _cmin, _cmax = clip_min, clip_max
 
-        effective_workers = min(workers, len(bands))
+        effective_workers = _effective_internal_workers(workers, len(bands), "brdf")
 
         def _run_band_local(band: str) -> str:
             process_s2(s2_input, [band], s2_outdir, clip_min=_cmin, clip_max=_cmax)
@@ -1744,12 +1900,14 @@ class DataFusionStep:
             except Exception as exc:
                 return (band, str(exc))
 
+        effective_workers = _effective_internal_workers(workers, len(jobs), "fusion")
+
         if not _use_spark(len(jobs)):
-            log.info("[fusion] Running threaded band processing (workers=%d)…", workers)
-            results = _run_parallel_threads(_run_band, jobs, workers)
+            log.info("[fusion] Running threaded band processing (workers=%d)…", effective_workers)
+            results = _run_parallel_threads(_run_band, jobs, effective_workers)
         else:
-            log.info("[fusion] Running Spark band processing (workers=%d)…", workers)
-            spark = _get_spark(workers=workers)
+            log.info("[fusion] Running Spark band processing (workers=%d)…", effective_workers)
+            spark = _get_spark(workers=effective_workers)
             base_str = str(_BASE)
 
             def _spark_band(job):
@@ -1765,7 +1923,7 @@ class DataFusionStep:
 
             results = (
                 spark.sparkContext
-                .parallelize(jobs, numSlices=min(workers, len(jobs)))
+                .parallelize(jobs, numSlices=min(effective_workers, len(jobs)))
                 .map(_spark_band)
                 .collect()
             )
@@ -2467,11 +2625,11 @@ def run_many(
     product_ids: list[str],
     config: dict,
     working_dir: str,
-    workers: int = 1,
+    workers: int = 4,
     only: list[str] | None = None,
     resume: bool = True,
     fallback_on_router_error: bool = False,  
-) -> None:
+) -> int:
     """Process many Landsat scenes in parallel via Spark."""
     spark = _get_spark(workers=workers)
     sc = spark.sparkContext
@@ -2514,7 +2672,7 @@ def run_many(
 
         from Packaging.PackagingStep import PackagingStep as _PackagingStep
 
-        product_config = {**bc_config.value, "landsat_path": landsat_path}
+        product_config = _config_for_landsat_product(bc_config.value, landsat_path)
         pipeline = _register_all_steps(
             Pipeline(product_config, bc_working_dir.value),
             _PackagingStep,
@@ -2537,12 +2695,14 @@ def run_many(
         .collect()
     )
 
+    failure_count = 0
     for pid, results in zip(product_ids, all_results):
         if len(results) == 1 and results[0].get("skipped"):
             log.info("Product %s SKIPPED by router (class=%s).", pid, results[0].get("tile_class"))
             continue
         failed = [r for r in results if not r["success"]]
         if failed:
+            failure_count += 1
             log.error("Product %s FAILED at: %s — %s", pid, failed[0]["step"], failed[0]["error"])
         else:
             log.info("Product %s completed successfully.", pid)
@@ -2555,6 +2715,7 @@ def run_many(
         log.info("[report] Multi-product report → %s", report_path)
     except Exception as exc:
         log.warning("[report] Could not generate multi-product report: %s", exc)
+    return 1 if failure_count else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2562,18 +2723,15 @@ def run_many(
 # ---------------------------------------------------------------------------
 
 def _build_default_config(args: argparse.Namespace) -> dict:
-    spacecraft = _detect_spacecraft(args.products[0])
-    sensor_tag = _spacecraft_short_tag(spacecraft)   # "L8" or "L9"
-
-    return {
+    config = {
         "landsat_path": args.products[0],
         "s2_path":      args.s2_path,
         "gri_path":     str(_BASE / "Geometric_Processing" / "gri" / "GRI_T31UDQ.tif"),
         "gri_cache_dir": str(_BASE / "Geometric_Processing" / "gri"),
         "dem_path":     None,
-        "lut_path":     str(_BASE / "lut" / f"lut_6s_{sensor_tag}.json"),
+        "lut_path":     str(_BASE / "lut" / "lut_6s_L8.json"),
 
-        "atm_sensor_tag": sensor_tag,
+        "atm_sensor_tag": "L8",
 
         "geometric_processing": {
             "resolution": 10.0,
@@ -2584,7 +2742,7 @@ def _build_default_config(args: argparse.Namespace) -> dict:
         "atmospheric_correction": {},
 
         "sbaf": {
-            "mission":      spacecraft,         # "LANDSAT_8" or "LANDSAT_9"
+            "mission":      _DEFAULT_SPACECRAFT,
             "s2_target":    "Sentinel-2A",
             "adaptive":     True,
             "chunks":       1024,
@@ -2626,6 +2784,7 @@ def _build_default_config(args: argparse.Namespace) -> dict:
             "dry_run":      args.cleanup_dry_run,
         },
     }
+    return _config_for_landsat_product(config, args.products[0])
 
 
 def _parse_args() -> argparse.Namespace:
@@ -2701,7 +2860,7 @@ def main() -> int:
             Pipeline(config, args.working_dir),
             PackagingStep,
         )
-        pipeline.run(
+        results = pipeline.run(
             args.products[0],
             only         = routed_steps,
             resume       = resume,
@@ -2716,8 +2875,10 @@ def main() -> int:
             log.warning("[report] Could not generate HTML report: %s", exc)
 
         _stop_spark_if_active()
+        if any(not result.success for result in results):
+            return 1
     else:
-        run_many(
+        return run_many(
             args.products,
             config,
             args.working_dir,

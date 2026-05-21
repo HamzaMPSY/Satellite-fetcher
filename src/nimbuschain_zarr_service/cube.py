@@ -15,6 +15,7 @@ from rasterio.warp import reproject, transform_bounds
 
 import numpy as np
 
+from nimbuschain_shared import error_codes
 from nimbuschain_zarr_service.core import (
     ConversionDependencyError,
     ConversionError,
@@ -385,6 +386,112 @@ def build_time_cube(
     ).to_dict()
 
 
+def _cube_diagnostic(code: str, message: str, **details: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "code": str(code or "").strip(),
+        "message": str(message or "").strip(),
+    }
+    clean_details = {
+        key: value
+        for key, value in details.items()
+        if value not in (None, "", [], {})
+    }
+    if clean_details:
+        payload["details"] = clean_details
+    return payload
+
+
+def _grouped_cube_error_code(reason: str, tiles_skipped: list[dict[str, Any]]) -> str:
+    explicit_codes = {
+        str(item.get("error_code") or "").strip()
+        for item in tiles_skipped
+        if isinstance(item, dict) and str(item.get("error_code") or "").strip()
+    }
+    group_keys = {
+        str(item.get("group_key") or "").strip()
+        for item in tiles_skipped
+        if isinstance(item, dict) and str(item.get("group_key") or "").strip()
+    }
+    skipped_reasons = {
+        str(item.get("reason") or "").strip().lower()
+        for item in tiles_skipped
+        if isinstance(item, dict) and str(item.get("reason") or "").strip()
+    }
+    if len(group_keys) > 1 and skipped_reasons <= {"fewer_than_two_unique_times"}:
+        return error_codes.CUBE_SPLIT_ACROSS_TILE_GROUPS
+    if explicit_codes == {error_codes.CUBE_GROUP_FEWER_THAN_TWO_UNIQUE_TIMES}:
+        return error_codes.CUBE_NO_GROUPS_WITH_MULTIPLE_TIMES
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_reason == "no_source_zarrs":
+        return error_codes.CUBE_NO_SOURCE_ZARRS
+    if normalized_reason == "no_scenes_in_date_range":
+        return error_codes.CUBE_NO_SCENES_IN_DATE_RANGE
+    if normalized_reason == "no_groups_with_multiple_times":
+        return error_codes.CUBE_NO_GROUPS_WITH_MULTIPLE_TIMES
+    return error_codes.CUBE_RUNTIME_ERROR
+
+
+def _grouped_cube_diagnostics(
+    *,
+    status: str,
+    reason: str,
+    error_code: str | None,
+    tiles_skipped: list[dict[str, Any]],
+    tiles_built: list[str],
+) -> list[dict[str, Any]]:
+    if str(status or "").strip().lower() != "skipped":
+        return []
+    diagnostics: list[dict[str, Any]] = []
+    normalized_code = str(error_code or "").strip()
+    if normalized_code:
+        group_keys = [
+            str(item.get("group_key") or "").strip()
+            for item in tiles_skipped
+            if isinstance(item, dict) and str(item.get("group_key") or "").strip()
+        ]
+        diagnostics.append(
+            _cube_diagnostic(
+                normalized_code,
+                _grouped_cube_error_message(normalized_code, reason),
+                skipped_groups=group_keys,
+                built_groups=list(tiles_built),
+            )
+        )
+    for item in tiles_skipped:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("error_code") or "").strip()
+        if not code:
+            continue
+        diagnostics.append(
+            _cube_diagnostic(
+                code,
+                str(item.get("message") or _grouped_cube_error_message(code, item.get("reason"))),
+                group_key=item.get("group_key"),
+                candidate_scene_ids=list(item.get("candidate_scene_ids") or []),
+            )
+        )
+    return diagnostics
+
+
+def _grouped_cube_error_message(code: str, reason: Any) -> str:
+    normalized_code = str(code or "").strip()
+    if normalized_code == error_codes.CUBE_SPLIT_ACROSS_TILE_GROUPS:
+        return (
+            "The selected scenes were split across multiple tile groups, so no group "
+            "had at least two dates to stack into a cube."
+        )
+    if normalized_code == error_codes.CUBE_NO_GROUPS_WITH_MULTIPLE_TIMES:
+        return "No cube group contains at least two unique acquisition times."
+    if normalized_code == error_codes.CUBE_GROUP_FEWER_THAN_TWO_UNIQUE_TIMES:
+        return "This cube group contains fewer than two unique acquisition times."
+    if normalized_code == error_codes.CUBE_NO_SOURCE_ZARRS:
+        return "No source Zarr datasets were provided to the cube builder."
+    if normalized_code == error_codes.CUBE_NO_SCENES_IN_DATE_RANGE:
+        return "No source scene acquisition time falls inside the requested cube date range."
+    return str(reason or "Cube build did not produce an output.").strip()
+
+
 def build_grouped_time_cubes(
     source_zarr_uris: list[str],
     output_dir: str,
@@ -400,6 +507,13 @@ def build_grouped_time_cubes(
         return GroupedCubeSummaryRecord(
             status="skipped",
             reason="no_source_zarrs",
+            error_code=error_codes.CUBE_NO_SOURCE_ZARRS,
+            diagnostics=[
+                _cube_diagnostic(
+                    error_codes.CUBE_NO_SOURCE_ZARRS,
+                    "No source Zarr datasets were provided to the cube builder.",
+                )
+            ],
         ).to_dict()
 
     resolved_include_masks = _include_masks_for_stage(stage_label) if include_masks is None else bool(include_masks)
@@ -419,6 +533,15 @@ def build_grouped_time_cubes(
         return GroupedCubeSummaryRecord(
             status="skipped",
             reason="no_scenes_in_date_range",
+            error_code=error_codes.CUBE_NO_SCENES_IN_DATE_RANGE,
+            diagnostics=[
+                _cube_diagnostic(
+                    error_codes.CUBE_NO_SCENES_IN_DATE_RANGE,
+                    "No source scene acquisition time falls inside the requested cube date range.",
+                    start_date=start_bound.isoformat() if start_bound else None,
+                    end_date=end_bound.isoformat() if end_bound else None,
+                )
+            ],
         ).to_dict()
 
     grouped: dict[str, list[SourceScene]] = {}
@@ -443,6 +566,11 @@ def build_grouped_time_cubes(
                     group_key=group_key,
                     reason="fewer_than_two_unique_times",
                     candidate_scene_ids=[scene.scene_id for scene in ordered],
+                    error_code=error_codes.CUBE_GROUP_FEWER_THAN_TWO_UNIQUE_TIMES,
+                    message=(
+                        "This cube group has fewer than two unique acquisition times; "
+                        "a time cube needs at least two dates in the same group."
+                    ),
                 ).to_dict()
             )
             continue
@@ -519,9 +647,11 @@ def build_grouped_time_cubes(
 
     status = "written" if cube_outputs else "skipped"
     reason = "" if cube_outputs else "no_groups_with_multiple_times"
+    error_code = None if cube_outputs else _grouped_cube_error_code(reason, tiles_skipped)
     return GroupedCubeSummaryRecord(
         status=status,
         reason=reason,
+        error_code=error_code,
         cube_outputs=cube_outputs,
         items=items,
         tiles_built=tiles_built,
@@ -531,6 +661,13 @@ def build_grouped_time_cubes(
             "start_date": start_bound.isoformat() if start_bound else None,
             "end_date": end_bound.isoformat() if end_bound else None,
         },
+        diagnostics=_grouped_cube_diagnostics(
+            status=status,
+            reason=reason,
+            error_code=error_code,
+            tiles_skipped=tiles_skipped,
+            tiles_built=tiles_built,
+        ),
     ).to_dict()
 
 

@@ -219,3 +219,51 @@ def test_modular_pipeline_stage_results_use_row_timeline_when_metadata_is_sparse
     by_name = {str(stage["name"]): stage for stage in stage_results}
     assert by_name["fetch"]["duration_seconds"] == 3.0
     assert by_name["zarr"]["duration_seconds"] == 3.0
+
+
+def test_modular_pipeline_stage_results_use_runtime_duration_metadata() -> None:
+    row = {
+        "job_id": "job-4",
+        "job_type": "search_download",
+        "provider": "usgs",
+        "collection": "landsat_ot_c2_l1",
+        "product_type": "L1TP",
+        "state": "succeeded",
+        "pipeline_state": "zarr_written",
+        "raw_outputs": ["/data/raw/LC08.tar", "/data/raw/LC09.tar"],
+        "zarr_outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"],
+        "pipeline_metadata": {
+            "download_window_seconds": 192.699,
+            "download_telemetry": {"duration_seconds": 192.0},
+            "sen2like_status": "written",
+            "sen2like_outputs": ["/data/s2l/a.SAFE", "/data/s2l/b.SAFE"],
+            "sen2like_response": {"duration_seconds": 63.035},
+            "timeline": {
+                "stages": [
+                    {"key": "search", "status": "done", "duration_seconds": 2.846},
+                    {"key": "download", "status": "done", "duration_seconds": 0.0},
+                ]
+            },
+        },
+        "pipeline_timeline": {},
+    }
+    store = FakeStore(JobRowRecord.from_row(row))
+    handler = ModularPipelineJobExecutionHandler(
+        runtime=FakeRuntime(store),
+        workflow=FakeWorkflow(store),
+    )
+
+    stage_results = handler._stage_results_from_job(
+        row=row,
+        result={},
+        plan=[
+            {"name": "fetch", "depends_on": []},
+            {"name": "sen2like", "depends_on": ["fetch"]},
+            {"name": "zarr", "depends_on": ["sen2like"]},
+        ],
+    )
+
+    by_name = {str(stage["name"]): stage for stage in stage_results}
+    assert by_name["fetch"]["duration_seconds"] == 192.699
+    assert by_name["sen2like"]["duration_seconds"] == 63.035
+    assert by_name["zarr"]["status"] == "succeeded"

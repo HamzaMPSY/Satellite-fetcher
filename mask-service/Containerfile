@@ -6,12 +6,37 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     HOME=/home/appuser \
-    PYTHONPATH=/app/src
+    PYTHONPATH=/app/src \
+    XDG_CACHE_HOME=/data/downloads/mask-cache/xdg \
+    HF_HOME=/data/downloads/mask-cache/huggingface \
+    TORCH_HOME=/data/downloads/mask-cache/torch \
+    MPLCONFIGDIR=/data/downloads/mask-cache/matplotlib \
+    NIMBUS_WATERMASK_OSMNX_CACHE_DIR=/data/downloads/mask-cache/osmnx \
+    NIMBUS_WATERMASK_OSMNX_USE_CACHE=true \
+    NIMBUS_WATERMASK_MODEL_DIR=/data/downloads/mask-cache/omniwater-models \
+    NIMBUS_WATERMASK_BATCH_SIZE=1 \
+    NIMBUS_WATERMASK_TILE_SIZE=512 \
+    NIMBUS_WATERMASK_INFERENCE_PATCH_SIZE=128 \
+    NIMBUS_WATERMASK_INFERENCE_OVERLAP_SIZE=32 \
+    NIMBUS_WATERMASK_MODEL_PROGRESS_SECONDS=5 \
+    NIMBUS_WATERMASK_USE_OSM_WATER=false \
+    NIMBUS_WATERMASK_USE_OSM_BUILDING=false \
+    NIMBUS_WATERMASK_USE_OSM_ROADS=false \
+    NIMBUS_WATERMASK_OSM_MAX_SCENE_SPAN_METERS=50000
 
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates libexpat1 && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libexpat1 \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libxcb1 && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 

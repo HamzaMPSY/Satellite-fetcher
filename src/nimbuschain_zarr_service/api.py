@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -277,10 +276,11 @@ def build_grouped_cubes(payload: BuildGroupedCubesRequest, request: Request) -> 
         raise
 
     logger.info(
-        "grouped_cube_build_completed job_id=%s pipeline_id=%s status=%s outputs=%s",
+        "grouped_cube_build_completed job_id=%s pipeline_id=%s status=%s error_code=%s outputs=%s",
         payload.job_id,
         payload.pipeline_id,
         cube_summary.get("status"),
+        cube_summary.get("error_code"),
         len(list(cube_summary.get("cube_outputs") or [])),
         extra={"request_id": request_id},
     )

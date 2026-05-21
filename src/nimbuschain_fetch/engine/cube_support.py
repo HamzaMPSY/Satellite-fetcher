@@ -8,6 +8,7 @@ from typing import Any
 from nimbuschain_fetch.domain.metadata import PipelineMetadataRecord
 from nimbuschain_fetch.models import ArtifactType, PipelineState
 from nimbuschain_shared.dto import GroupedCubeBuildRequest
+from nimbuschain_shared import error_codes
 from nimbuschain_shared.runtime import normalize_device_name, resolve_inference_device
 
 
@@ -225,6 +226,7 @@ class FetcherCubeSupport:
                     "cube_stage": cube_mode,
                     "cube_status": "skipped",
                     "cube_reason": reason,
+                    "cube_error_code": error_codes.CUBE_UNSUPPORTED_LAYOUT_FOR_INPUTS,
                     "cube_output_dir": output_dir,
                     "cube_output_count": 0,
                     "cube_outputs": [],
@@ -232,7 +234,14 @@ class FetcherCubeSupport:
                     "cube_tiles_built": [],
                     "cube_tiles_skipped": [
                         {
+                            "error_code": error_codes.CUBE_UNSUPPORTED_LAYOUT_FOR_INPUTS,
                             "reason": "unsupported_cube_layout_for_inputs",
+                            "message": reason,
+                        }
+                    ],
+                    "cube_diagnostics": [
+                        {
+                            "code": error_codes.CUBE_UNSUPPORTED_LAYOUT_FOR_INPUTS,
                             "message": reason,
                         }
                     ],
@@ -247,16 +256,19 @@ class FetcherCubeSupport:
                     event_type="job.cube_skipped",
                     event_payload={
                         "cube_mode": cube_mode,
+                        "error_code": error_codes.CUBE_UNSUPPORTED_LAYOUT_FOR_INPUTS,
                         "reason": reason,
                     },
                 )
                 return {
                     "status": "skipped",
                     "reason": reason,
+                    "error_code": error_codes.CUBE_UNSUPPORTED_LAYOUT_FOR_INPUTS,
                     "cube_outputs": [],
                     "items": [],
                     "tiles_built": [],
                     "tiles_skipped": list(skipped_metadata["cube_tiles_skipped"]),
+                    "diagnostics": list(skipped_metadata["cube_diagnostics"]),
                     "stage_label": cube_mode,
                     "date_range": requested_date_range,
                     "pipeline_metadata": skipped_metadata,
@@ -265,6 +277,7 @@ class FetcherCubeSupport:
                 **queued_metadata,
                 "cube_status": "failed",
                 "cube_reason": str(exc),
+                "cube_error_code": error_codes.CUBE_RUNTIME_ERROR,
                 "cube_output_count": 0,
                 "cube_outputs": [],
             }
@@ -277,6 +290,7 @@ class FetcherCubeSupport:
                 event_type="job.cube_failed",
                 event_payload={
                     "cube_mode": cube_mode,
+                    "error_code": error_codes.CUBE_RUNTIME_ERROR,
                     "error": str(exc),
                 },
             )
@@ -299,12 +313,14 @@ class FetcherCubeSupport:
             "cube_stage": cube_mode,
             "cube_status": str(cube_summary.get("status") or "").strip() or "skipped",
             "cube_reason": str(cube_summary.get("reason") or "").strip() or "",
+            "cube_error_code": str(cube_summary.get("error_code") or "").strip() or None,
             "cube_output_dir": output_dir,
             "cube_output_count": len(cube_outputs),
             "cube_outputs": cube_outputs,
             "cube_items": cube_items,
             "cube_tiles_built": list(cube_summary.get("tiles_built") or []),
             "cube_tiles_skipped": list(cube_summary.get("tiles_skipped") or []),
+            "cube_diagnostics": list(cube_summary.get("diagnostics") or []),
             "cube_date_range": dict(cube_summary.get("date_range") or requested_date_range),
         }
         if cube_outputs:
@@ -331,7 +347,9 @@ class FetcherCubeSupport:
                 event_type="job.cube_skipped",
                 event_payload={
                     "cube_mode": cube_mode,
+                    "error_code": str(cube_summary.get("error_code") or "").strip() or None,
                     "reason": str(cube_summary.get("reason") or "").strip() or "no_groups_with_multiple_times",
+                    "diagnostics": list(cube_summary.get("diagnostics") or []),
                 },
             )
         return {

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from nimbuschain_fetch.models import PipelineState
+from nimbuschain_shared import error_codes
 
 
 def convert_raw_outputs(
@@ -26,8 +27,13 @@ def convert_raw_outputs(
     conversion_product_type: str | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     if not raw_outputs:
-        return [], {"status": "skipped", "reason": "no_raw_outputs"}
+        return [], {
+            "status": "skipped",
+            "reason": "no_raw_outputs",
+            "error_code": error_codes.ZARR_NO_RAW_OUTPUTS,
+        }
 
+    overall_started_mono = time.monotonic()
     total = max(1, len(raw_outputs))
     effective_conversion_provider = str(conversion_provider_name or provider_name).strip()
     effective_conversion_collection = str(conversion_collection or collection).strip()
@@ -192,6 +198,7 @@ def convert_raw_outputs(
             "count": len(zarr_outputs),
             "items": conversions,
             "parallel_workers": 1,
+            "duration_seconds": time.monotonic() - overall_started_mono,
             "conversion_provider": effective_conversion_provider,
             "conversion_collection": effective_conversion_collection,
             "conversion_product_type": effective_conversion_product_type,
@@ -401,6 +408,7 @@ def convert_raw_outputs(
         "count": len(zarr_outputs),
         "items": conversions,
         "parallel_workers": max_workers,
+        "duration_seconds": time.monotonic() - overall_started_mono,
         "conversion_provider": effective_conversion_provider,
         "conversion_collection": effective_conversion_collection,
         "conversion_product_type": effective_conversion_product_type,

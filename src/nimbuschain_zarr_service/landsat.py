@@ -195,15 +195,6 @@ def build_landsat_dataset(
             pixel_size=imagery_stack.pixel_size,
             reference_band=imagery_stack.reference_band,
         )
-        grid = GridMetadataRecord(
-            height=int(dataset_summary.shape[2]),
-            width=int(dataset_summary.shape[3]),
-            dtype=str(dataset_summary.dtype or "unknown"),
-            crs=dataset_summary.crs,
-            transform=dataset_summary.transform,
-            pixel_size=dataset_summary.pixel_size,
-            reference_band=reference_band,
-        )
         summary = _summarize_landsat_product(
             provider=provider,
             collection=collection,

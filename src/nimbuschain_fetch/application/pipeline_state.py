@@ -112,12 +112,27 @@ class PipelineStateService:
     ) -> dict[str, Any]:
         row_now = self._store.get_job_record(job_id) or JobRowRecord(job_id=job_id)
         existing_pipeline_metadata = dict(row_now.pipeline_metadata)
+        existing_timeline = existing_pipeline_metadata.get("timeline")
+        incoming_timeline = (
+            pipeline_metadata.get("timeline")
+            if isinstance(pipeline_metadata, dict)
+            else None
+        )
         merged = dict(existing_pipeline_metadata)
         if pipeline_metadata is not None:
             merged.update(pipeline_metadata)
-        timeline = merged.get("timeline")
-        if isinstance(timeline, dict):
-            merged["timeline"] = dict(timeline)
-        elif isinstance(existing_pipeline_metadata.get("timeline"), dict):
-            merged["timeline"] = dict(existing_pipeline_metadata["timeline"])
+        if isinstance(existing_timeline, dict) and isinstance(incoming_timeline, dict):
+            merged["timeline"] = dict(
+                incoming_timeline
+                if _timeline_updated_at(incoming_timeline) >= _timeline_updated_at(existing_timeline)
+                else existing_timeline
+            )
+        elif isinstance(incoming_timeline, dict):
+            merged["timeline"] = dict(incoming_timeline)
+        elif isinstance(existing_timeline, dict):
+            merged["timeline"] = dict(existing_timeline)
         return merged
+
+
+def _timeline_updated_at(timeline: dict[str, Any]) -> str:
+    return str(timeline.get("updated_at") or "")

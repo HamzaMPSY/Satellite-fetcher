@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -39,15 +40,18 @@ class FetcherConversionSupport:
             product_type=self._rt._normalize_product_type_for_zarr(product_type),
             progress_callback=progress_callback,
         )
+        started_mono = time.monotonic()
         written_uri, data_family, conversion_summary, dataset_summary = self._run_converter(
             converter,
             convert_request,
         )
+        duration_seconds = time.monotonic() - started_mono
         return {
             "raw_uri": raw_uri,
             "scene_id": scene_id,
             "zarr_uri": written_uri,
             "data_family": data_family,
+            "duration_seconds": duration_seconds,
             "summary": conversion_summary,
             "dataset_summary": dataset_summary,
         }

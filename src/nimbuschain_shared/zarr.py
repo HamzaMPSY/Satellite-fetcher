@@ -11,8 +11,8 @@ ZARR_FORMAT_VERSION = 1
 class ChunkShape:
     time: int = 1
     band: int = 1
-    y: int = 1024
-    x: int = 1024
+    y: int = 512
+    x: int = 512
 
 
 class ConversionError(ValueError):

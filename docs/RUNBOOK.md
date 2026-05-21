@@ -27,12 +27,15 @@ Landsat jobs require Sen2Like to produce real Sentinel-like outputs before Zarr
 conversion. The default local profile is fail-closed:
 
 ```bash
-NIMBUS_SEN2LIKE_WORKERS=1
+NIMBUS_SEN2LIKE_WORKERS=4
 NIMBUS_SEN2LIKE_TIMEOUT_SECONDS=3600
 NIMBUS_SEN2LIKE_RAW_FALLBACK=false
 NIMBUS_SEN2LIKE_MEM_LIMIT=24g
 NIMBUS_SEN2LIKE_SHM_SIZE=8g
+NIMBUS_SEN2LIKE_GRI_AUTO_FETCH=true
+NIMBUS_SEN2LIKE_ALLOW_GEO_SKIP=false
 NIMBUS_SEN2LIKE_GDAL_CACHEMAX=256
+NIMBUS_SEN2LIKE_GDAL_NUM_THREADS=1
 NIMBUS_SEN2LIKE_JAVA_TOOL_OPTIONS=-Xmx1536m -XX:MaxRAMPercentage=55
 NIMBUS_SEN2LIKE_MALLOC_ARENA_MAX=2
 NIMBUS_SEN2LIKE_OMP_NUM_THREADS=1
@@ -45,14 +48,54 @@ On macOS with Podman, give the VM enough memory before starting the stack:
 ```bash
 podman machine stop
 podman machine set --memory 32768
+podman machine set --cpus 8
 podman machine start
 ```
 
 After restart, verify `podman machine inspect` reports `Memory: 32768` and
-`podman inspect nimbus-sen2like` shows about 24 GB memory limit plus 8 GB
-shared memory. If Sen2Like is killed or returns no normalized output, the
-Landsat job should fail at `sen2like_failed` instead of continuing with raw
-`.tar` inputs.
+`CPUs: 8`, and `podman inspect nimbus-sen2like` shows about 24 GB memory limit
+plus 8 GB shared memory. Sen2Like also mounts `nimbus_sen2like_lut_cache` at
+`/app/sen2like/lut` so generated 6S LUTs survive container recreation. If
+Sen2Like is killed or returns no normalized output, the Landsat job should fail
+at `sen2like_failed` instead of continuing with raw `.tar` inputs.
+
+`NIMBUS_SEN2LIKE_GRI_AUTO_FETCH=true` makes Sen2Like build a missing
+`GRI_<tile>.tif` on demand before geometric co-registration. Geometry is
+fail-closed by default: if the GRI cannot be found or built, the job fails
+instead of producing a Landsat-grid Sen2Like output. `NIMBUS_SEN2LIKE_ALLOW_GEO_SKIP=true`
+is a debug-only escape hatch for intentionally reproducing the old skip behavior.
+
+### Water mask cache profile
+
+OmniWaterMask uses OSMnx for OpenStreetMap priors. OSMnx defaults to a relative
+`./cache` directory, which is not writable in the `/app` workdir used by the
+Podman container. Keep the mask caches on the shared data volume:
+
+```bash
+NIMBUS_WATERMASK_OSMNX_CACHE_DIR=/data/downloads/mask-cache/osmnx
+NIMBUS_WATERMASK_OSMNX_USE_CACHE=true
+NIMBUS_WATERMASK_USE_OSM_WATER=true
+NIMBUS_WATERMASK_USE_OSM_BUILDING=true
+NIMBUS_WATERMASK_USE_OSM_ROADS=true
+NIMBUS_WATERMASK_MODEL_DIR=/data/downloads/mask-cache/omniwater-models
+NIMBUS_MASK_XDG_CACHE_HOME=/data/downloads/mask-cache/xdg
+NIMBUS_MASK_HF_HOME=/data/downloads/mask-cache/huggingface
+NIMBUS_MASK_TORCH_HOME=/data/downloads/mask-cache/torch
+NIMBUS_MASK_MPLCONFIGDIR=/data/downloads/mask-cache/matplotlib
+NIMBUS_WATERMASK_BATCH_SIZE=2
+NIMBUS_WATERMASK_TILE_SIZE=2048
+NIMBUS_WATERMASK_MODEL_PROGRESS_SECONDS=5
+```
+
+If mask logs contain `Permission denied: 'cache'`, the running container is still
+using OSMnx's default relative cache. Rebuild/recreate `nimbus-mask` after
+applying the env above; do not restart it while an active water-mask job is
+running unless you are willing to interrupt that request.
+
+For full Sentinel-like scenes on CPU, keep `NIMBUS_WATERMASK_TILE_SIZE=2048` in
+the local stack. The library default remains 512 px, but 512 px creates 484
+OmniWater model calls for a 10980 x 10980 scene; 2048 px reduces that to 36
+larger calls without changing the water-mask backend.
 
 ### Optional: Copernicus account-pool test mode
 

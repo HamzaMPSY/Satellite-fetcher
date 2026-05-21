@@ -13,7 +13,7 @@ from nimbuschain_sen2like_service.models import (
     Sen2LikeNormalizeRequest,
     Sen2LikeNormalizeResponse,
 )
-from nimbuschain_sen2like_service.runner import readiness_payload, run_sen2like
+from nimbuschain_sen2like_service.runner import cancel_sen2like_job, readiness_payload, run_sen2like
 
 
 logger = logging.getLogger("nimbus.sen2like")
@@ -56,6 +56,14 @@ def create_app() -> FastAPI:
             "pyspark": True,
         }
 
+    @app.delete("/jobs/{job_id}")
+    @app.post("/jobs/{job_id}/cancel")
+    def cancel(job_id: str) -> dict[str, object]:
+        return {
+            "job_id": job_id,
+            "cancel_requested": bool(cancel_sen2like_job(job_id)),
+        }
+
     @app.post("/normalize", response_model=Sen2LikeNormalizeResponse)
     @app.post("/v1/normalize", response_model=Sen2LikeNormalizeResponse)
     def normalize(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse:
@@ -68,6 +76,8 @@ def create_app() -> FastAPI:
         except Exception as exc:
             logger.exception("sen2like_normalize_failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if response.status == "cancelled":
+            raise HTTPException(status_code=409, detail=response.model_dump())
         if response.status != "succeeded":
             raise HTTPException(status_code=500, detail=response.model_dump())
         return response

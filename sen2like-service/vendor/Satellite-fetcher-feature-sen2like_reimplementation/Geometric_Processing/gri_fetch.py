@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import shutil
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import rasterio
-from rasterio.crs import CRS
-from rasterio.warp import transform
-
 log = logging.getLogger("sen2like")
 
-_WGS84 = CRS.from_epsg(4326)
+_WGS84_EPSG = 4326
 
 # Planetary Computer STAC endpoint for sentinel-2-l2a.
 _PC_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
@@ -21,6 +21,13 @@ _PC_COLLECTION = "sentinel-2-l2a"
 # Cloud-cover and recency bounds when searching for a GRI source scene.
 _MAX_CLOUD_COVER_PCT = 10
 _SEARCH_LOOKBACK_DAYS = 365 * 3  # search up to 3 years back if needed
+_SEARCH_FORWARD_DAYS = 60
+
+_MTL_DATE_RE = re.compile(r"^\s*DATE_ACQUIRED\s*=\s*\"?(\d{4}-\d{2}-\d{2})\"?", re.MULTILINE)
+_LANDSAT_PRODUCT_DATE_RE = re.compile(r"_(\d{8})_")
+_LANDSAT_COMPACT_RE = re.compile(
+    r"^L[A-Z]\d(?P<path>\d{3})(?P<row>\d{3})(?P<year>\d{4})(?P<doy>\d{3})"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +41,15 @@ def derive_mgrs_tile(scene_dir: str | Path) -> str | None:
         log.warning(
             "[gri-fetch] `mgrs` library not installed — cannot derive MGRS tile. "
             "Install with: pip install mgrs"
+        )
+        return None
+    try:
+        import rasterio
+        from rasterio.crs import CRS
+        from rasterio.warp import transform
+    except ImportError:
+        log.warning(
+            "[gri-fetch] `rasterio` library not installed — cannot derive MGRS tile."
         )
         return None
 
@@ -60,7 +76,7 @@ def derive_mgrs_tile(scene_dir: str | Path) -> str | None:
             b = src.bounds
             cx = b.left + (b.right - b.left) / 2.0
             cy = b.bottom + (b.top - b.bottom) / 2.0
-            xs, ys = transform(src.crs, _WGS84, [cx], [cy])
+            xs, ys = transform(src.crs, CRS.from_epsg(_WGS84_EPSG), [cx], [cy])
             lon, lat = float(xs[0]), float(ys[0])
     except Exception as exc:
         log.warning("[gri-fetch] Could not read centre from %s: %s", ref_tif.name, exc)
@@ -85,11 +101,103 @@ def derive_mgrs_tile(scene_dir: str | Path) -> str | None:
         return None
 
 
+def derive_landsat_date(scene_dir: str | Path) -> datetime | None:
+    scene_path = Path(str(scene_dir))
+
+    if scene_path.exists():
+        for mtl_path in sorted(scene_path.glob("*_MTL.txt")):
+            try:
+                match = _MTL_DATE_RE.search(mtl_path.read_text(encoding="utf-8", errors="ignore"))
+            except OSError as exc:
+                log.warning("[gri-fetch] Could not read %s: %s", mtl_path.name, exc)
+                continue
+            if match:
+                try:
+                    return datetime.strptime(match.group(1), "%Y-%m-%d")
+                except ValueError:
+                    log.warning("[gri-fetch] Invalid DATE_ACQUIRED in %s: %s", mtl_path.name, match.group(1))
+
+    for candidate in (scene_path.name, str(scene_dir)):
+        match = _LANDSAT_PRODUCT_DATE_RE.search(candidate)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y%m%d")
+            except ValueError:
+                pass
+
+        match = _LANDSAT_COMPACT_RE.match(candidate)
+        if match:
+            try:
+                year = int(match.group("year"))
+                doy = int(match.group("doy"))
+                return datetime(year, 1, 1) + timedelta(days=doy - 1)
+            except (TypeError, ValueError):
+                pass
+
+    log.warning("[gri-fetch] Could not derive Landsat acquisition date from %s", scene_dir)
+    return None
+
+
+def _gri_file_is_usable(path: Path) -> bool:
+    try:
+        import rasterio
+    except ImportError:
+        return path.exists() and path.stat().st_size > 0
+
+    try:
+        with rasterio.open(path) as src:
+            return bool(src.count > 0 and src.width > 0 and src.height > 0)
+    except Exception as exc:
+        log.warning("[gri-fetch] Cached GRI is not readable yet/anymore (%s): %s", path, exc)
+        return False
+
+
+@contextmanager
+def _gri_build_lock(lock_path: Path, timeout_seconds: float = 900.0):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        try:
+            import fcntl
+        except ImportError:
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                try:
+                    os.mkdir(str(lock_path) + ".d")
+                    break
+                except FileExistsError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out waiting for GRI lock: {lock_path}")
+                    time.sleep(0.5)
+            try:
+                yield
+            finally:
+                shutil.rmtree(str(lock_path) + ".d", ignore_errors=True)
+            return
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for GRI lock: {lock_path}")
+                time.sleep(0.5)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 # ---------------------------------------------------------------------------
 # Planetary Computer search & download
 # ---------------------------------------------------------------------------
 
-def _fetch_s2_safe_for_tile(mgrs_tile: str, target_dir: Path) -> Path:
+def _fetch_s2_safe_for_tile(
+    mgrs_tile: str,
+    target_dir: Path,
+    landsat_date: datetime | None = None,
+) -> Path:
     try:
         from pystac_client import Client
         import planetary_computer
@@ -104,11 +212,21 @@ def _fetch_s2_safe_for_tile(mgrs_tile: str, target_dir: Path) -> Path:
     mgrs_code = mgrs_tile.lstrip("T")
     log.info("[gri-fetch] Searching Planetary Computer for tile %s…", mgrs_tile)
 
-    # Pour cette scène Landsat de 2025-06-16, cherche une S2 de juin-août 2025
-    from datetime import datetime as _dt
-    landsat_date = _dt(2025, 6, 16)  # ou extrait du nom de la scène
-    start = landsat_date - timedelta(days=30)
-    end   = landsat_date + timedelta(days=60)
+    if landsat_date is None:
+        landsat_date = datetime.utcnow()
+        log.warning(
+            "[gri-fetch] Landsat date unavailable; using current UTC date for "
+            "Sentinel-2 GRI search window: %s",
+            landsat_date.date().isoformat(),
+        )
+    start = landsat_date - timedelta(days=_SEARCH_LOOKBACK_DAYS)
+    end = landsat_date + timedelta(days=_SEARCH_FORWARD_DAYS)
+    log.info(
+        "[gri-fetch] Sentinel-2 GRI search window for %s: %s/%s",
+        mgrs_tile,
+        start.date().isoformat(),
+        end.date().isoformat(),
+    )
 
     catalog = Client.open(
         _PC_STAC_URL,
@@ -129,8 +247,8 @@ def _fetch_s2_safe_for_tile(mgrs_tile: str, target_dir: Path) -> Path:
     if not items:
         raise RuntimeError(
             f"[gri-fetch] No cloud-free (<{_MAX_CLOUD_COVER_PCT}%) Sentinel-2 "
-            f"scene found for tile {mgrs_tile} in the last "
-            f"{_SEARCH_LOOKBACK_DAYS // 365} years."
+            f"scene found for tile {mgrs_tile} between "
+            f"{start.date().isoformat()} and {end.date().isoformat()}."
         )
 
     last_err = None
@@ -219,38 +337,55 @@ def _fetch_s2_safe_for_tile(mgrs_tile: str, target_dir: Path) -> Path:
 # Cache-first GRI lookup
 # ---------------------------------------------------------------------------
 
-def get_or_fetch_gri(mgrs_tile: str, cache_dir: Path) -> Path:
+def get_or_fetch_gri(
+    mgrs_tile: str,
+    cache_dir: Path,
+    landsat_scene: str | Path | None = None,
+) -> Path:
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     gri_path = cache_dir / f"GRI_{mgrs_tile}.tif"
-    if gri_path.exists():
-        log.info("[gri-fetch] Cache hit: %s", gri_path.name)
+    lock_path = cache_dir / f".GRI_{mgrs_tile}.lock"
+
+    with _gri_build_lock(lock_path):
+        if gri_path.exists() and _gri_file_is_usable(gri_path):
+            log.info("[gri-fetch] Cache hit: %s", gri_path.name)
+            return gri_path
+        if gri_path.exists():
+            log.warning("[gri-fetch] Removing unusable cached GRI before rebuild: %s", gri_path)
+            gri_path.unlink(missing_ok=True)
+
+        log.info("[gri-fetch] Cache miss for %s — fetching from Planetary Computer…", mgrs_tile)
+
+        # Download the S2 SAFE to a temp directory; delete it after build.
+        with tempfile.TemporaryDirectory(prefix="gri_s2_") as tmpdir:
+            tmp_path = Path(tmpdir)
+            tmp_gri = cache_dir / f".GRI_{mgrs_tile}.{os.getpid()}.tmp.tif"
+            tmp_gri.unlink(missing_ok=True)
+            safe_dir = _fetch_s2_safe_for_tile(
+                mgrs_tile,
+                tmp_path,
+                landsat_date=derive_landsat_date(landsat_scene) if landsat_scene else None,
+            )
+
+            log.info("[gri-fetch] Building GRI from downloaded scene…")
+            try:
+                # Import inside function so pipelineGRI doesn't load at module import.
+                from Geometric_Processing.pipelineGRI import build_gri
+                build_gri(sentinel2_safe=safe_dir, gri_out=tmp_gri, resolution=10.0)
+                if not tmp_gri.exists():
+                    raise RuntimeError(f"build_gri did not produce {tmp_gri}")
+                if not _gri_file_is_usable(tmp_gri):
+                    raise RuntimeError(f"build_gri produced an unreadable GRI: {tmp_gri}")
+                os.replace(tmp_gri, gri_path)
+            except Exception as exc:
+                tmp_gri.unlink(missing_ok=True)
+                gri_path.unlink(missing_ok=True)
+                raise RuntimeError(f"[gri-fetch] build_gri failed: {exc}") from exc
+
+        if not gri_path.exists() or not _gri_file_is_usable(gri_path):
+            raise RuntimeError(f"[gri-fetch] build_gri did not produce a usable {gri_path}")
+
+        log.info("[gri-fetch] GRI cached → %s", gri_path)
         return gri_path
-
-    log.info("[gri-fetch] Cache miss for %s — fetching from Planetary Computer…", mgrs_tile)
-
-    # Download the S2 SAFE to a temp directory; delete it after build.
-    with tempfile.TemporaryDirectory(prefix="gri_s2_") as tmpdir:
-        tmp_path = Path(tmpdir)
-        safe_dir = _fetch_s2_safe_for_tile(mgrs_tile, tmp_path)
-
-        log.info("[gri-fetch] Building GRI from downloaded scene…")
-        try:
-            # Import inside function so pipelineGRI doesn't load at module import.
-            from pipelineGRI import build_gri
-            build_gri(sentinel2_safe=safe_dir, gri_out=gri_path, resolution=10.0)
-        except Exception as exc:
-            # Clean up partial output on failure.
-            if gri_path.exists():
-                try:
-                    gri_path.unlink()
-                except OSError:
-                    pass
-            raise RuntimeError(f"[gri-fetch] build_gri failed: {exc}") from exc
-
-    if not gri_path.exists():
-        raise RuntimeError(f"[gri-fetch] build_gri did not produce {gri_path}")
-
-    log.info("[gri-fetch] GRI cached → %s", gri_path)
-    return gri_path

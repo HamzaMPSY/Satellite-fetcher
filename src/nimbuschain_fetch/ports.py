@@ -164,6 +164,9 @@ class MaskPort(Protocol):
     def schema(self) -> dict[str, Any]:
         ...
 
+    def cancel_job(self, job_id: str) -> bool:
+        ...
+
     def apply_mask_request(
         self,
         request: MaskExecutionRequest,

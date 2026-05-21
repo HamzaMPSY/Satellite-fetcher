@@ -169,8 +169,9 @@ def normalize_public_uri(source_zarr_uri: str) -> str:
 
 
 def string_array(values: list[str]) -> np.ndarray:
-    width = max(1, max(len(str(value)) for value in values))
-    return np.asarray([str(value) for value in values], dtype=f"<U{width}")
+    encoded = [str(value).encode("utf-8") for value in values]
+    width = max(1, max((len(value) for value in encoded), default=1))
+    return np.asarray(encoded, dtype=f"S{width}")
 
 
 def sanitize_layer_metadata(metadata: dict[str, Any]) -> dict[str, Any]:

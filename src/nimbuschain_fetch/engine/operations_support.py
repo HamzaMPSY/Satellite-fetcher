@@ -28,11 +28,15 @@ class FetcherOperationsSupport:
             return False
 
         if state == JobState.queued.value:
+            await self._request_remote_mask_cancel(job_id)
+            await self._request_remote_sen2like_cancel(job_id)
             self._rt._mark_cancelled(job_id, "cancelled_while_queued")
             return True
 
         self._rt.store.update_job(job_id, state=JobState.cancel_requested.value)
         self._rt.store.append_event(job_id, "job.cancel_requested", {"state": JobState.cancel_requested.value})
+        await self._request_remote_mask_cancel(job_id)
+        await self._request_remote_sen2like_cancel(job_id)
         if self._rt._execution_enabled and self._rt._executor is not None:
             await self._rt._executor.cancel(job_id)
         return True
@@ -79,6 +83,14 @@ class FetcherOperationsSupport:
                 except Exception:
                     continue
 
+        remote_mask_cancelled = 0
+        remote_sen2like_cancelled = 0
+        for job_id in active_job_ids:
+            if await self._request_remote_mask_cancel(job_id):
+                remote_mask_cancelled += 1
+            if await self._request_remote_sen2like_cancel(job_id):
+                remote_sen2like_cancelled += 1
+
         for job_id in active_job_ids:
             self._rt._mark_cancelled(job_id, "runtime_reset")
             self._rt._cancel_check_cache[job_id] = (time.monotonic() + 60.0, True)
@@ -105,10 +117,61 @@ class FetcherOperationsSupport:
             "jobs_cancelled": len(active_job_ids),
             "job_ids": active_job_ids,
             "executor_cancellations_requested": executor_cancelled,
+            "remote_mask_cancellations_requested": remote_mask_cancelled,
+            "remote_sen2like_cancellations_requested": remote_sen2like_cancelled,
             "coordinator_tasks_cancelled": int(coordinator_reset.get("tasks_cancelled", 0) or 0),
             "coordinator_task_ids": list(coordinator_reset.get("task_ids") or []),
             "worker_heartbeats_cleared": workers_cleared,
         }
+
+    async def _request_remote_mask_cancel(self, job_id: str) -> bool:
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_job_id:
+            return False
+        try:
+            masker = self._rt._masker()
+            cancel = getattr(masker, "cancel_job", None)
+            if not callable(cancel):
+                return False
+            return bool(await anyio.to_thread.run_sync(cancel, normalized_job_id))
+        except Exception as exc:
+            try:
+                self._rt.store.append_event(
+                    normalized_job_id,
+                    "job.remote_mask_cancel_failed",
+                    {"error": str(exc)},
+                )
+            except Exception:
+                pass
+            return False
+
+    async def _request_remote_sen2like_cancel(self, job_id: str) -> bool:
+        normalized_job_id = str(job_id or "").strip()
+        service_url = str(self._rt.settings.nimbus_sen2like_service_url or "").strip()
+        if not normalized_job_id or not service_url:
+            return False
+        client = None
+        try:
+            from nimbuschain_shared.clients.sen2like import Sen2LikeServiceClient
+
+            client = Sen2LikeServiceClient(service_url=service_url)
+            return bool(await anyio.to_thread.run_sync(client.cancel_job, normalized_job_id))
+        except Exception as exc:
+            try:
+                self._rt.store.append_event(
+                    normalized_job_id,
+                    "job.remote_sen2like_cancel_failed",
+                    {"error": str(exc)},
+                )
+            except Exception:
+                pass
+            return False
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def list_jobs(
         self,

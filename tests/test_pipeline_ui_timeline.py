@@ -10,7 +10,6 @@ from nimbuschain_fetch_ui.app import (
     _format_runtime_duration,
     _job_pipeline_path_lines,
     _job_pipeline_style,
-    _job_pipeline_summary,
     _job_pipeline_substate,
     _job_elapsed_seconds,
     _job_has_pipeline_warnings,
@@ -243,6 +242,81 @@ def test_pipeline_display_stages_match_landsat_dag_vocabulary() -> None:
     assert display_stages[1]["detail_label"] == "Landsat normalized before Zarr"
 
 
+def test_pipeline_display_overlays_live_metadata_when_stage_results_are_empty() -> None:
+    item = {
+        "state": "running",
+        "pipeline_state": "running_cloud_inference",
+        "provider": "usgs",
+        "collection": "landsat_ot_c2_l1",
+        "product_type": "L1TP",
+        "zarr_outputs": [
+            "/data/zarr/S2L_MSIL2F_20260418_T31UDQ.zarr",
+            "/data/zarr/S2L_MSIL2F_20260409_T31UCQ.zarr",
+        ],
+        "cube_outputs": [],
+        "pipeline_metadata": {
+            "stage_results": [],
+            "sen2like_outputs": [
+                "/data/sen2like/S2L_MSIL2F_20260418_T31UDQ.SAFE",
+                "/data/sen2like/S2L_MSIL2F_20260409_T31UCQ.SAFE",
+            ],
+            "sen2like_response": {"duration_seconds": 641.6},
+            "cube_status": "skipped",
+            "cube_reason": "no_groups_with_multiple_times",
+            "cube_tiles_skipped": [
+                {
+                    "group_key": "31UCQ",
+                    "reason": "fewer_than_two_unique_times",
+                    "candidate_scene_ids": ["S2L_MSIL2F_20260409_T31UCQ"],
+                },
+                {
+                    "group_key": "31UDQ",
+                    "reason": "fewer_than_two_unique_times",
+                    "candidate_scene_ids": ["S2L_MSIL2F_20260418_T31UDQ"],
+                },
+            ],
+        },
+    }
+    legacy_timeline_stages = [
+        {"key": "search", "label": "Search", "status": "done", "duration_seconds": 1.0, "step_count": 1},
+        {"key": "download", "label": "Download", "status": "done", "duration_seconds": 2.0, "step_count": 1},
+        {
+            "key": "convert",
+            "label": "Convert",
+            "status": "done",
+            "duration_seconds": 0.0,
+            "started_at": "2026-05-20T09:51:45+00:00",
+            "finished_at": "2026-05-20T09:51:45+00:00",
+            "step_count": 0,
+        },
+        {
+            "key": "cube",
+            "label": "Cube",
+            "status": "done",
+            "duration_seconds": 0.0,
+            "started_at": "2026-05-20T09:51:45+00:00",
+            "finished_at": "2026-05-20T09:51:45+00:00",
+            "step_count": 0,
+        },
+        {"key": "cloud", "label": "Cloud", "status": "running", "duration_seconds": 50.0, "step_count": 1},
+    ]
+
+    display_stages = _display_pipeline_stages(item, {}, legacy_timeline_stages)
+    by_key = {stage["key"]: stage for stage in display_stages}
+
+    assert by_key["sen2like"]["duration_seconds"] == 641.6
+    assert by_key["sen2like"]["detail_label"] == "Landsat normalized before Zarr · 2 outputs"
+    assert by_key["zarr"]["detail_label"] == "Zarr conversion · 2 outputs"
+    assert by_key["zarr"]["duration_seconds"] is None
+    assert by_key["cube"]["status"] == "skipped"
+    assert by_key["cube"]["duration_seconds"] is None
+    assert by_key["cube"]["detail_label"] == (
+        "CUBE_SPLIT_ACROSS_TILE_GROUPS: "
+        "Cube not built because scenes are split across tile groups (T31UCQ, T31UDQ); "
+        "select at least two dates for the same tile/path-row"
+    )
+
+
 def test_pipeline_display_prefers_modular_stage_results() -> None:
     item = {
         "pipeline_metadata": {
@@ -288,6 +362,55 @@ def test_pipeline_display_prefers_modular_stage_results() -> None:
     assert display_stages[2]["duration_seconds"] == 5.0
 
 
+def test_pipeline_display_overlays_runtime_durations_on_sparse_stage_results() -> None:
+    item = {
+        "state": "succeeded",
+        "pipeline_state": "zarr_written",
+        "pipeline_metadata": {
+            "orchestrator": {
+                "started_at": "2026-05-20T12:20:38+00:00",
+                "finished_at": "2026-05-20T12:25:13+00:00",
+            },
+            "download_window_seconds": 192.699,
+            "download_telemetry": {"duration_seconds": 192.0},
+            "sen2like_response": {"duration_seconds": 63.035},
+            "stage_plan": [
+                {"name": "fetch", "depends_on": []},
+                {"name": "sen2like", "depends_on": ["fetch"]},
+                {"name": "zarr", "depends_on": ["sen2like"]},
+            ],
+            "stage_results": [
+                {
+                    "name": "fetch",
+                    "status": "succeeded",
+                    "outputs": ["/data/raw/LC08.tar", "/data/raw/LC09.tar"],
+                    "duration_seconds": 2.846,
+                },
+                {
+                    "name": "sen2like",
+                    "status": "succeeded",
+                    "outputs": ["/data/s2l/a.SAFE", "/data/s2l/b.SAFE"],
+                    "duration_seconds": 0.0,
+                },
+                {
+                    "name": "zarr",
+                    "status": "succeeded",
+                    "outputs": ["/data/zarr/a.zarr", "/data/zarr/b.zarr"],
+                    "duration_seconds": 2.019,
+                },
+            ],
+        },
+    }
+
+    display_stages = _display_pipeline_stages(item, {}, [])
+    by_key = {stage["key"]: stage for stage in display_stages}
+
+    assert by_key["fetch"]["duration_seconds"] == 192.699
+    assert by_key["sen2like"]["duration_seconds"] == 63.035
+    assert by_key["zarr"]["duration_seconds"] == 2.019
+    assert _job_elapsed_seconds(item) == 275.0
+
+
 def test_pipeline_display_heals_optional_cube_skip_after_resumed_masks() -> None:
     item = {
         "state": "succeeded",
@@ -330,6 +453,7 @@ def test_pipeline_display_heals_optional_cube_skip_after_resumed_masks() -> None
     assert [stage["key"] for stage in display_stages] == ["fetch", "zarr", "cube", "mask"]
     assert [stage["status"] for stage in display_stages] == ["done", "done", "skipped", "done"]
     assert display_stages[2]["detail_label"] == (
+        "CUBE_UNSUPPORTED_LAYOUT_FOR_INPUTS: "
         "Cube not built because daily mosaic cubes currently require Sentinel-2 scene inputs"
     )
     assert display_stages[3]["detail_label"] == "OK: Masks written in-place on 2 scenes"
@@ -422,6 +546,7 @@ def test_pipeline_display_explains_landsat_raw_fallback_cube_skip_and_masks() ->
         "Zarr conversion used raw Landsat fallback · 2 outputs"
     )
     assert display_stages[3]["detail_label"] == (
+        "CUBE_NO_GROUPS_WITH_MULTIPLE_TIMES: "
         "Cube not built because each group has fewer than two acquisition times; "
         "select at least two dates for the same tile/path-row"
     )
@@ -518,6 +643,7 @@ def test_pipeline_display_heals_legacy_landsat_fallback_stage_results() -> None:
         "Degraded: raw Landsat inputs used because Sen2Like did not write outputs"
     )
     assert display_stages[3]["detail_label"] == (
+        "CUBE_NO_GROUPS_WITH_MULTIPLE_TIMES: "
         "Cube not built because each group has fewer than two acquisition times; "
         "select at least two dates for the same tile/path-row"
     )

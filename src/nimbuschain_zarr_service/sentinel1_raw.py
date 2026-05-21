@@ -15,8 +15,10 @@ from nimbuschain_zarr_service.core import (
     ConversionDependencyError,
     ConversionError,
     _coerce_timestamp,
+    _create_array_compat,
     _open_existing_output_store,
     _prepare_output_store,
+    _zarr_text_array,
     build_standard_dataset,
 )
 from nimbuschain_zarr_service.schema import ChunkShape, ZARR_FORMAT_VERSION
@@ -284,12 +286,13 @@ def convert_sentinel1_raw_to_zarr(
         compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE),
         fill_value=np.nan,
     )
-    root_group.create_array(
+    _create_array_compat(
+        root_group,
         "band",
-        data=np.asarray(ordered_bands, dtype=f"<U{max(len(v) for v in ordered_bands)}"),
+        data=_zarr_text_array(ordered_bands),
     )
     timestamp = _coerce_timestamp(acquisition)
-    root_group.create_array("time", data=np.asarray([timestamp.isoformat()], dtype="<U32"))
+    _create_array_compat(root_group, "time", data=_zarr_text_array([timestamp.isoformat()]))
     root_group.create_array(
         "x",
         data=np.arange(global_width, dtype=np.int32),

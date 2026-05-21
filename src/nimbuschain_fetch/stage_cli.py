@@ -74,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--cube-end-date", default=None)
         command.add_argument("--sen2like-service-url", default=None)
         command.add_argument("--sen2like-working-dir", default=None)
-        command.add_argument("--sen2like-workers", type=int, default=1)
+        command.add_argument("--sen2like-workers", type=int, default=4)
         command.add_argument(
             "--allow-sen2like-raw-fallback",
             action="store_true",

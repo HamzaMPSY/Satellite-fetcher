@@ -2245,6 +2245,8 @@ def _job_elapsed_seconds(item: dict[str, Any]) -> float | None:
         orchestrator.get("finished_at") or item.get("updated_at"),
     )
     if orchestrator_duration is not None:
+        if str(item.get("state") or "").strip().lower() in FINAL_JOB_STATES:
+            return orchestrator_duration
         if stage_duration is None:
             return orchestrator_duration
         if _stage_duration_looks_partial(
@@ -2335,10 +2337,17 @@ def _stage_display_has_warning(stage: dict[str, Any]) -> bool:
         return True
     if stage_key == "cube" and status == "skipped" and str(
         metadata.get("cube_status") or ""
-    ).strip().lower() == "failed":
+    ).strip().lower() in {"failed", "skipped"}:
         return bool(
-            str(metadata.get("reason") or metadata.get("cube_reason") or "").strip()
+            str(
+                metadata.get("error_code")
+                or metadata.get("cube_error_code")
+                or metadata.get("reason")
+                or metadata.get("cube_reason")
+                or ""
+            ).strip()
             or list(metadata.get("cube_tiles_skipped") or [])
+            or list(metadata.get("cube_diagnostics") or [])
         )
     return False
 
@@ -2739,7 +2748,7 @@ def _job_has_pipeline_warnings(item: dict[str, Any]) -> bool:
     zarr_input_source = str(pipeline_meta.get("zarr_input_source") or "").strip().lower()
     return sen2like_status == "raw_fallback" or (
         zarr_input_source == "raw" and bool(pipeline_meta.get("sen2like_required"))
-    )
+    ) or str(pipeline_meta.get("cube_status") or "").strip().lower() == "skipped"
 
 
 def _job_progress_visual_state(item: dict[str, Any]) -> str:
@@ -3999,6 +4008,8 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_
     missions = PROVIDERS.get(provider, [])
     if missions:
         ds = _ss("satellite", missions[0])
+        if st.session_state.get("sb_sat") not in missions:
+            st.session_state["sb_sat"] = ds if ds in missions else missions[0]
         satellite = st.sidebar.selectbox("Mission", missions, index=missions.index(ds) if ds in missions else 0, key="sb_sat")
     else:
         satellite = st.sidebar.text_input("Mission", value="", key="sb_sat_t")
@@ -4006,6 +4017,8 @@ def render_sidebar(sat_tiles, gdf, nocov, ncol, skey, all_tile_names=None, tile_
     prods = PRODUCT_TYPES.get(satellite, [])
     if prods:
         dp = _ss("product", prods[0])
+        if st.session_state.get("sb_prod") not in prods:
+            st.session_state["sb_prod"] = dp if dp in prods else prods[0]
         product = st.sidebar.selectbox("Product", prods, index=prods.index(dp) if dp in prods else 0, key="sb_prod")
     else:
         product = st.sidebar.text_input("Product", value="", key="sb_prod_t")

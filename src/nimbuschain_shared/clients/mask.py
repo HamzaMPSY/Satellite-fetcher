@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -134,6 +135,33 @@ class MaskServiceClient:
             },
         )
 
+    def cancel_job(self, job_id: str) -> bool:
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_job_id:
+            return False
+        assert self._session is not None
+        quoted_job_id = quote(normalized_job_id, safe="")
+        last_error: requests.RequestException | None = None
+        for method_name, path in (
+            ("delete", f"/jobs/{quoted_job_id}"),
+            ("post", f"/jobs/{quoted_job_id}/cancel"),
+        ):
+            request_method = getattr(self._session, method_name, None)
+            if not callable(request_method):
+                continue
+            try:
+                response = request_method(f"{self.service_url}{path}", timeout=10)
+                if getattr(response, "status_code", None) == 404:
+                    continue
+                response.raise_for_status()
+                return True
+            except requests.RequestException as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise RuntimeError(f"Mask service cancellation request failed: {last_error}") from last_error
+        return False
+
     def _apply_request(
         self,
         request: MaskApplyRequest,
@@ -176,6 +204,7 @@ class MaskServiceClient:
                 except requests.RequestException as exc:
                     should_retry = (
                         attempt < self.REMOTE_APPLY_MAX_RETRIES
+                        and not bool(request.fail_on_error)
                         and self._is_retryable_remote_error(exc)
                         and self._wait_for_remote_health()
                     )

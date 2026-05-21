@@ -244,6 +244,51 @@ class FakeSen2LikeClient:
         return payload
 
 
+class DirectZarrSen2LikeClient(FakeSen2LikeClient):
+    def normalize(self, **kwargs) -> dict[str, object]:
+        payload = super().normalize(**kwargs)
+        direct_items: list[dict[str, object]] = []
+        for output in list(payload.get("outputs") or []):
+            if not isinstance(output, dict):
+                continue
+            normalized_uri = str(output.get("normalized_uri") or "")
+            scene_id = Path(normalized_uri).stem or "scene"
+            zarr_uri = str(Path(str(kwargs.get("working_dir") or "/tmp")) / "direct-zarr" / f"{scene_id}.zarr")
+            Path(zarr_uri).mkdir(parents=True, exist_ok=True)
+            dataset_summary = {
+                "dimensions": ["time", "band", "y", "x"],
+                "shape": [1, 6, 512, 512],
+                "band_names": ["B02", "B03", "B04", "B08", "B11", "B12"],
+            }
+            summary = {"status": "written", "scene_id": scene_id}
+            output.update(
+                {
+                    "zarr_uri": zarr_uri,
+                    "zarr_exists": True,
+                    "zarr_data_family": "optical",
+                    "zarr_summary": summary,
+                    "zarr_dataset_summary": dataset_summary,
+                }
+            )
+            direct_items.append(
+                {
+                    "normalized_uri": normalized_uri,
+                    "scene_id": scene_id,
+                    "zarr_uri": zarr_uri,
+                    "data_family": "optical",
+                    "summary": summary,
+                    "dataset_summary": dataset_summary,
+                }
+            )
+        payload["metadata"] = {
+            "direct_zarr_status": "written",
+            "direct_zarr_outputs": [str(item["zarr_uri"]) for item in direct_items],
+            "direct_zarr_items": direct_items,
+            "direct_zarr_duration_seconds": 0.25,
+        }
+        return payload
+
+
 class FailingSen2LikeClient(FakeSen2LikeClient):
     def normalize(self, **_kwargs) -> dict[str, object]:
         type(self).calls.append(dict(_kwargs))
@@ -415,6 +460,7 @@ class RemoteLikeMaskService:
 
     def __init__(self, fetcher: NimbusFetcher):
         self.fetcher = fetcher
+        self.calls: list[dict[str, object]] = []
 
     def apply_masks_to_zarr(
         self,
@@ -430,6 +476,7 @@ class RemoteLikeMaskService:
         mask_types: list[str],
         **_kwargs,
     ) -> dict[str, object]:
+        self.calls.append(dict(_kwargs))
         row = self.fetcher.store.get_job(str(job_id))
         assert row is not None
         expected_pipeline = (
@@ -842,7 +889,59 @@ def test_landsat_job_routes_zarr_input_through_sen2like_service(monkeypatch, tmp
     assert "job.sen2like_written" in event_types
 
 
-def test_landsat_sen2like_router_calls_service_once_per_product(
+def test_landsat_job_uses_sen2like_direct_zarr_without_standalone_reconversion(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "nimbus_runtime_role": "all",
+            "nimbus_db_backend": "sqlite",
+            "nimbus_db_path": tmp_path / "nimbus.db",
+            "nimbus_data_dir": tmp_path / "downloads",
+            "nimbus_sen2like_service_url": "http://sen2like.test",
+            "nimbus_sen2like_work_dir": str(tmp_path / "sen2like"),
+            "nimbus_sen2like_direct_zarr": True,
+        }
+    )
+    fetcher = NimbusFetcher(
+        settings=settings,
+        provider_registry={"usgs": FakeUsgsProvider},
+    )
+    converter = FakeZarrConverter()
+    fetcher._zarr_converter = converter
+    DirectZarrSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        DirectZarrSen2LikeClient,
+    )
+
+    with NimbusFetcherClient(mode="direct", fetcher=fetcher) as client:
+        job_id = client.submit_job(_landsat_request_payload())
+        final_status = _wait_for_completion(client, job_id)
+        result = client.get_result(job_id)
+
+    assert final_status.state == JobState.succeeded
+    assert final_status.pipeline_state == PipelineState.zarr_written
+    assert final_status.zarr_outputs
+    assert converter.calls == []
+    assert result.pipeline_metadata["zarr_input_outputs"] == []
+    assert result.pipeline_metadata["zarr_prebuilt_outputs"] == final_status.zarr_outputs
+    assert result.pipeline_metadata["sen2like_direct_zarr_outputs"] == final_status.zarr_outputs
+    assert result.conversion_metadata["runner"] == "sen2like_direct_zarr"
+    assert result.conversion_metadata["skipped_standalone_zarr"] is True
+
+    stage_results = {
+        str(stage["name"]): str(stage["status"])
+        for stage in result.pipeline_metadata["stage_results"]
+    }
+    assert stage_results["fetch"] == "succeeded"
+    assert stage_results["sen2like"] == "succeeded"
+    assert stage_results["zarr"] == "succeeded"
+
+
+def test_landsat_sen2like_router_batches_products_for_spark_parallelism(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -867,16 +966,21 @@ def test_landsat_sen2like_router_calls_service_once_per_product(
         products=["/data/raw/LC08_A.tar", "/data/raw/LC09_B.tar"],
     )
 
-    assert len(FakeSen2LikeClient.calls) == 2
-    assert FakeSen2LikeClient.calls[0]["products"] == ["/data/raw/LC08_A.tar"]
-    assert FakeSen2LikeClient.calls[1]["products"] == ["/data/raw/LC09_B.tar"]
+    assert len(FakeSen2LikeClient.calls) == 1
+    assert FakeSen2LikeClient.calls[0]["products"] == [
+        "/data/raw/LC08_A.tar",
+        "/data/raw/LC09_B.tar",
+    ]
     assert FakeSen2LikeClient.calls[0]["pipeline_id"] == "job-42"
-    assert FakeSen2LikeClient.calls[0]["job_id"] == "job-42-1"
-    assert FakeSen2LikeClient.calls[1]["job_id"] == "job-42-2"
+    assert FakeSen2LikeClient.calls[0]["job_id"] == "job-42"
     assert FakeSen2LikeClient.calls[0]["working_dir"] == str(tmp_path / "sen2like" / "job-42")
     assert FakeSen2LikeClient.calls[0]["no_resume"] is True
-    assert response["metadata"]["execution_mode"] == "sequential_single_product"
-    assert response["duration_seconds"] == 2.5
+    assert response["metadata"]["execution_mode"] == "parallel_multi_product"
+    assert response["metadata"]["workers"] == 4
+    assert response["metadata"]["batched_product_count"] == 2
+    assert response["metadata"]["product_parallelism"] is True
+    assert response["metadata"]["tile_parallelism"] is True
+    assert response["duration_seconds"] == 1.25
     assert len(response["outputs"]) == 2
 
 
@@ -892,9 +996,24 @@ def test_landsat_sen2like_router_reuses_existing_safe_outputs(
         / "SAFE"
         / "S2L_MSIL2F_20260516T000000_N0500_R000_T31UDQ_20260516T000000.SAFE"
     )
-    safe_dir.mkdir(parents=True)
+    img_dir = (
+        safe_dir
+        / "GRANULE"
+        / "L2F_T31UDQ_20260516T000000_N0500_R000"
+        / "IMG_DATA"
+        / "RESOLUTION_10M"
+    )
+    img_dir.mkdir(parents=True)
     (safe_dir / "manifest.safe").write_text("<xml />", encoding="utf-8")
-    (safe_dir / "B02.TIF").write_bytes(b"fake-raster")
+    (safe_dir / "MTD_MSIL2F.xml").write_text("<xml />", encoding="utf-8")
+    (
+        safe_dir
+        / "GRANULE"
+        / "L2F_T31UDQ_20260516T000000_N0500_R000"
+        / "MTD_TL.xml"
+    ).write_text("<xml />", encoding="utf-8")
+    for band in ("B02", "B03", "B04", "B08", "B11", "B12"):
+        (img_dir / f"T31UDQ_20260516T000000_{band}_10m.TIF").write_bytes(b"fake-raster")
     runtime = SimpleNamespace(
         settings=SimpleNamespace(
             nimbus_sen2like_work_dir=str(work_dir),
@@ -928,6 +1047,74 @@ def test_landsat_sen2like_router_reuses_existing_safe_outputs(
         }
     ]
     assert response["metadata"]["reused_existing_output_count"] == 1
+    assert response["metadata"]["execution_mode"] == "resume_existing_safe"
+
+
+def test_landsat_sen2like_router_does_not_reuse_stale_safe_with_wrong_acquisition_time(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "sen2like"
+    input_dir = work_dir / "job-42" / "_inputs" / "LC08_A"
+    input_dir.mkdir(parents=True)
+    (input_dir / "LC08_L1TP_199026_20260418_20260424_02_T1_MTL.txt").write_text(
+        "\n".join(
+            [
+                'LANDSAT_PRODUCT_ID = "LC08_L1TP_199026_20260418_20260424_02_T1"',
+                "DATE_ACQUIRED = 2026-04-18",
+                'SCENE_CENTER_TIME = "10:40:22.8698510Z"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    safe_dir = (
+        work_dir
+        / "job-42"
+        / "LC08_A"
+        / "SAFE"
+        / "S2L_MSIL2F_20260518T000000_N0500_R000_T31UDQ_20260518T091343.SAFE"
+    )
+    img_dir = (
+        safe_dir
+        / "GRANULE"
+        / "L2F_T31UDQ_20260518T000000_N0500_R000"
+        / "IMG_DATA"
+        / "RESOLUTION_10M"
+    )
+    img_dir.mkdir(parents=True)
+    (safe_dir / "manifest.safe").write_text("<xml />", encoding="utf-8")
+    (safe_dir / "MTD_MSIL2F.xml").write_text("<xml />", encoding="utf-8")
+    (
+        safe_dir
+        / "GRANULE"
+        / "L2F_T31UDQ_20260518T000000_N0500_R000"
+        / "MTD_TL.xml"
+    ).write_text("<xml />", encoding="utf-8")
+    for band in ("B02", "B03", "B04", "B08", "B11", "B12"):
+        (img_dir / f"T31UDQ_20260518T000000_{band}_10m.TIF").write_bytes(b"fake-raster")
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            nimbus_sen2like_work_dir=str(work_dir),
+            nimbus_sen2like_workers=4,
+            nimbus_sen2like_timeout_seconds=600,
+        )
+    )
+    router = sen2like_normalization.Sen2LikeNormalizationRouter(runtime)
+    FakeSen2LikeClient.calls = []
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        FakeSen2LikeClient,
+    )
+
+    response = router._normalize(
+        service_url="http://sen2like.test",
+        job_id="job-42",
+        products=["/data/raw/LC08_A.tar"],
+    )
+
+    assert len(FakeSen2LikeClient.calls) == 1
+    assert response["metadata"]["reused_existing_output_count"] == 0
 
 
 def test_zarr_context_prefers_sen2like_conversion_sensor_metadata() -> None:
@@ -1152,7 +1339,8 @@ def test_single_job_can_continue_with_integrated_masking(pipeline_runtime) -> No
     client: NimbusFetcherClient = pipeline_runtime["client"]
     fetcher: NimbusFetcher = pipeline_runtime["fetcher"]
 
-    fetcher._mask_service = RemoteLikeMaskService(fetcher)
+    mask_service = RemoteLikeMaskService(fetcher)
+    fetcher._mask_service = mask_service
 
     job_id = client.submit_job(_request_payload(mask_types=["water", "cloud"]))
     final_status = _wait_for_completion(client, job_id)
@@ -1172,6 +1360,9 @@ def test_single_job_can_continue_with_integrated_masking(pipeline_runtime) -> No
     assert result.metadata["mask"]["mask_types"] == ["water", "cloud"]
     assert result.pipeline_metadata["mask_mode"] == "integrated"
     assert result.pipeline_metadata["mask_status"] == "written"
+    assert mask_service.calls
+    assert all(call["water_backend"] == "omniwatermask" for call in mask_service.calls)
+    assert all(call["fail_on_error"] is True for call in mask_service.calls)
     assert [stage["name"] for stage in result.pipeline_metadata["stage_results"]] == [
         "fetch",
         "zarr",

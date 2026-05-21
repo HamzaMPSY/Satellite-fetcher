@@ -510,6 +510,23 @@ curl -fsS http://127.0.0.1:8030/readiness
 
 The readiness payload must include `"sixs_executable_exists": true`.
 
+### Water mask logs show `Permission denied: 'cache'`
+
+This comes from OSMnx inside OmniWaterMask trying to write its default relative
+`./cache` folder under `/app`. Rebuild/recreate `nimbus-mask` with:
+
+```bash
+NIMBUS_WATERMASK_OSMNX_CACHE_DIR=/data/downloads/mask-cache/osmnx
+NIMBUS_WATERMASK_OSMNX_USE_CACHE=true
+NIMBUS_WATERMASK_BATCH_SIZE=2
+NIMBUS_WATERMASK_TILE_SIZE=512
+NIMBUS_WATERMASK_MODEL_PROGRESS_SECONDS=5
+```
+
+The water-mask request can keep running, but every tile may stay slow until the
+mask service is recreated with the writable cache settings. The local stack uses
+512 px water tiles so mask patches match the Zarr chunk size.
+
 ### Landsat daily mosaic
 
 Daily mosaic is not the primary Landsat layout. Use `grouped_time` for the

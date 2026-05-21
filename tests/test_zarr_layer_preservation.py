@@ -13,7 +13,16 @@ import rasterio
 from rasterio.transform import from_origin
 import zarr
 
+from nimbuschain_zarr_service.core import _create_array_compat
 from nimbuschain_zarr_service.service import ZarrConversionService
+
+
+def _labels(array) -> tuple[str, ...]:
+    values = np.asarray(array[:]).tolist()
+    return tuple(
+        value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+        for value in values
+    )
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,41 @@ def _write_raster(path: Path, *, shape: tuple[int, int], pixel_size: float, valu
         transform=transform,
     ) as dataset:
         dataset.write(data, 1)
+
+
+def test_create_array_compat_handles_legacy_zarr_without_data_keyword() -> None:
+    class LegacyArray:
+        def __init__(self, shape: tuple[int, ...], dtype: np.dtype):
+            self.data = np.zeros(shape, dtype=dtype)
+
+        def __setitem__(self, key: object, value: object) -> None:
+            self.data[key] = value
+
+    class LegacyGroup:
+        def __init__(self) -> None:
+            self.created_kwargs: dict[str, object] = {}
+            self.array: LegacyArray | None = None
+
+        def create_array(self, name: str, **kwargs: object) -> LegacyArray:
+            if "data" in kwargs:
+                raise TypeError("Group.create_array() got an unexpected keyword argument 'data'")
+            self.created_kwargs = {"name": name, **kwargs}
+            self.array = LegacyArray(
+                tuple(int(v) for v in kwargs["shape"]),  # type: ignore[index]
+                np.dtype(kwargs["dtype"]),
+            )
+            return self.array
+
+    group = LegacyGroup()
+    payload = np.asarray(["B02", "B03"], dtype="<U3")
+
+    array = _create_array_compat(group, "band", data=payload, overwrite=True)
+
+    assert group.created_kwargs["name"] == "band"
+    assert group.created_kwargs["shape"] == payload.shape
+    assert group.created_kwargs["dtype"] == payload.dtype
+    assert group.created_kwargs["overwrite"] is True
+    assert np.array_equal(array.data, payload)
 
 
 def _build_s2_bundle(root: Path, *, scene_id: str, l1c: bool) -> Path:
@@ -113,6 +157,12 @@ def _build_sen2like_bundle(root: Path, scene_id: str) -> Path:
             pixel_size=10.0,
             value=index,
         )
+    _write_raster(
+        img_root / "T31TDN_20260101T105501_VALIDITY_MASK_10m.TIF",
+        shape=(6, 6),
+        pixel_size=10.0,
+        value=1,
+    )
     return safe_root
 
 
@@ -273,7 +323,7 @@ def zarr_service() -> ZarrConversionService:
                 product_type="S2MSI2A",
                 scene_id="LC08_L1TP_190026_20260101_20260101_02_T1",
                 expected_band_names=("B02", "B03", "B04", "B08", "B11", "B12"),
-                expected_ancillary_names=(),
+                expected_ancillary_names=("VALIDITY_MASK",),
                 expected_pixel_size=(10.0, 10.0),
             ),
             _build_sen2like_bundle,
@@ -356,10 +406,12 @@ def zarr_service() -> ZarrConversionService:
 )
 def test_converter_preserves_exact_native_layers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     zarr_service: ZarrConversionService,
     case: LayerCase,
     builder,
 ) -> None:
+    monkeypatch.setenv("NIMBUS_ZARR_TARGET_SHAPE", "native")
     raw_root = builder(tmp_path, case.scene_id)
     output_uri = str((tmp_path / f"{case.name}.zarr").resolve())
 
@@ -390,8 +442,8 @@ def test_converter_preserves_exact_native_layers(
     assert isinstance(dataset_summary.get("quadkeys_index"), list)
     assert dataset_summary.get("quadkeys_index"), f"{case.name}: expected non-empty quadkeys_index"
 
-    group = zarr.open_group(str(written_uri), mode="r")
-    assert tuple(group["band"][:].tolist()) == case.expected_band_names
+    group = zarr.open_group(str(written_uri), mode="r", zarr_format=2)
+    assert _labels(group["band"]) == case.expected_band_names
     assert tuple(group["imagery"].shape) == tuple(dataset_summary["shape"])
     if case.expected_pixel_size is not None:
         assert tuple(group.attrs.get("reference_pixel_size") or []) == case.expected_pixel_size
@@ -412,11 +464,55 @@ def test_converter_preserves_exact_native_layers(
     if case.expected_ancillary_names:
         assert "ancillary" in group
         assert "ancillary_layer" in group
-        assert tuple(group["ancillary_layer"][:].tolist()) == case.expected_ancillary_names
+        assert _labels(group["ancillary_layer"]) == case.expected_ancillary_names
         assert tuple(group["ancillary"].shape) == tuple(dataset_summary["ancillary_shape"])
         assert dict(group.attrs.get("ancillary_metadata") or {})
     else:
         assert "ancillary" not in group
+
+
+def test_converter_defaults_to_exact_512_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    zarr_service: ZarrConversionService,
+) -> None:
+    monkeypatch.delenv("NIMBUS_ZARR_TARGET_SHAPE", raising=False)
+    scene_id = "S2A_MSIL2A_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
+    raw_root = _build_s2_bundle(tmp_path, scene_id=scene_id, l1c=False)
+    output_uri = str((tmp_path / "default_512.zarr").resolve())
+
+    written_uri, _data_family, _normalization_summary, dataset_summary = zarr_service.convert(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        scene_id=scene_id,
+        raw_uri=str(raw_root),
+        output_uri=output_uri,
+        product_type="S2MSI2A",
+    )
+
+    assert dataset_summary["shape"][-2:] == [512, 512]
+    assert dataset_summary["ancillary_shape"][-2:] == [512, 512]
+    group = zarr.open_group(str(written_uri), mode="r", zarr_format=2)
+    assert tuple(group["imagery"].shape[-2:]) == (512, 512)
+    assert tuple(group["ancillary"].shape[-2:]) == (512, 512)
+    assert group.attrs["output_shape_policy"] == "exact_target_shape"
+    assert group.attrs["target_shape"] == [512, 512]
+    assert _labels(group["band"]) == (
+        "B01",
+        "B02",
+        "B03",
+        "B04",
+        "B05",
+        "B06",
+        "B07",
+        "B08",
+        "B8A",
+        "B09",
+        "B11",
+        "B12",
+    )
+    assert group["band"].dtype.kind == "S"
+    assert group["time"].dtype.kind == "S"
 
 
 def test_landsat_converter_accepts_strict_satellite_prefixed_product_type(

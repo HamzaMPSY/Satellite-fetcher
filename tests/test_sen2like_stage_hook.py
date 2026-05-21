@@ -189,6 +189,7 @@ def test_sen2like_stage_normalizes_all_raw_uris(monkeypatch) -> None:
         "/data/downloads/raw/LC08_A",
         "/data/downloads/raw/LC08_B",
     ]
+    assert calls[0]["workers"] == 4
     assert results[-1].outputs == [
         "/tmp/sen2like/LC08_A/T31UDQ_L2F",
         "/tmp/sen2like/LC08_B/T31UDQ_L2F",
