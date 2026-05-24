@@ -11,7 +11,7 @@ from nimbuschain_mask_service.contracts import MaskApplyRequest
 from nimbuschain_mask_service import runtime
 import nimbuschain_mask_service.service as mask_service_module
 import nimbuschain_mask_service.omniwater as omniwater_module
-from nimbuschain_mask_service.omniwater import _run_omniwater_model
+from nimbuschain_mask_service.omniwater import _run_omniwater_model, _watermask_model_export_tile_policy
 from nimbuschain_mask_service.service import (
     _cloud_tile_size,
     _cloud_tile_sizing,
@@ -50,6 +50,46 @@ def test_parallel_worker_count_uses_gpu_safe_default(monkeypatch) -> None:
         cpu_default=3,
         gpu_default=1,
     ) == 3
+
+
+def test_omniwater_model_export_defaults_to_mask_tiles(monkeypatch) -> None:
+    monkeypatch.delenv("NIMBUS_WATERMASK_MODEL_TILE_SIZE", raising=False)
+
+    policy = _watermask_model_export_tile_policy(
+        height=10980,
+        width=10980,
+        mask_tile_size=512,
+    )
+
+    assert policy["export_tile_size"] == 512
+    assert policy["mask_tile_size"] == 512
+    assert policy["source"] == "mask_tile_default"
+
+
+def test_omniwater_model_export_can_use_full_scene(monkeypatch) -> None:
+    monkeypatch.setenv("NIMBUS_WATERMASK_MODEL_TILE_SIZE", "scene")
+
+    policy = _watermask_model_export_tile_policy(
+        height=10980,
+        width=10980,
+        mask_tile_size=512,
+    )
+
+    assert policy["export_tile_size"] == 10980
+    assert policy["source"] == "scene_override"
+
+
+def test_omniwater_model_export_can_follow_mask_tiles(monkeypatch) -> None:
+    monkeypatch.setenv("NIMBUS_WATERMASK_MODEL_TILE_SIZE", "mask")
+
+    policy = _watermask_model_export_tile_policy(
+        height=10980,
+        width=10980,
+        mask_tile_size=512,
+    )
+
+    assert policy["export_tile_size"] == 512
+    assert policy["source"] == "mask_tile_size"
 
 
 def test_mask_failure_step_prefers_stage_specific_water_failure() -> None:
@@ -335,7 +375,7 @@ def test_integrated_mask_workers_use_remote_runtime_when_external_service_has_mp
     ) == 2
 
 
-def test_omniwater_model_disables_osm_priors_by_default(monkeypatch) -> None:
+def test_omniwater_model_enables_osm_priors_by_default(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_make_water_mask(**kwargs):
@@ -358,10 +398,10 @@ def test_omniwater_model_disables_osm_priors_by_default(monkeypatch) -> None:
         inference_device=None,
     )
 
-    assert captured["use_osm_water"] is False
-    assert captured["use_osm_building"] is False
-    assert captured["use_osm_roads"] is False
-    assert captured["use_cache"] is True
+    assert captured["use_osm_water"] is True
+    assert captured["use_osm_building"] is True
+    assert captured["use_osm_roads"] is True
+    assert captured["use_cache"] is False
     assert captured["batch_size"] == 1
     assert captured["optimise_model"] is False
 
@@ -424,7 +464,7 @@ def test_omniwater_model_configures_writable_osmnx_cache(monkeypatch, tmp_path) 
     )
 
     assert captured["cache_dir"] == cache_dir
-    assert captured["use_cache"] is True
+    assert captured["use_cache"] is False
     assert fake_osmnx.settings.use_cache is True
     assert fake_osmnx.settings.cache_folder == str(cache_dir / "osmnx")
     assert (cache_dir / "osmnx").is_dir()

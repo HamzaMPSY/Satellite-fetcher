@@ -225,7 +225,7 @@ def apply_omniwatermask_to_zarr(
                         output_dir=output_dir,
                         cache_dir=cache_dir,
                         scene_dir=scene_dir,
-                        tile_size=int(tile_manifest["tile_size"]),
+                        tile_size=int(tile_manifest.get("export_tile_size") or tile_manifest["tile_size"]),
                         tile_sizing=dict(tile_manifest.get("tile_sizing") or {}),
                         inference_device=resolved_device,
                         stage_callback=stage_callback,
@@ -591,6 +591,7 @@ def _export_rgbnir_tiles(
     collection: str,
     product_type: str | None,
     inference_device: str | None = None,
+    force_export_tile_size: int | None = None,
 ) -> dict[str, Any]:
     raise_if_cancel_requested(job_id)
     try:
@@ -642,15 +643,22 @@ def _export_rgbnir_tiles(
         model_patch_size=_watermask_inference_patch_size(),
     )
     tile_size = int(tile_sizing["tile_size"])
+    export_policy = _watermask_model_export_tile_policy(
+        height=height,
+        width=width,
+        mask_tile_size=tile_size,
+        force_tile_size=force_export_tile_size,
+    )
+    export_tile_size = int(export_policy["export_tile_size"])
     tiles: list[OmniWaterTile] = []
     tiles_dir.mkdir(parents=True, exist_ok=True)
     tile_index = 0
-    for row_start in range(0, height, tile_size):
+    for row_start in range(0, height, export_tile_size):
         raise_if_cancel_requested(job_id)
-        row_stop = min(height, row_start + tile_size)
-        for col_start in range(0, width, tile_size):
+        row_stop = min(height, row_start + export_tile_size)
+        for col_start in range(0, width, export_tile_size):
             raise_if_cancel_requested(job_id)
-            col_stop = min(width, col_start + tile_size)
+            col_stop = min(width, col_start + export_tile_size)
             tile_index += 1
             tile_path = tiles_dir / f"rgbnir_tile_{tile_index:04d}.tif"
             tile_window = Window(
@@ -721,14 +729,75 @@ def _export_rgbnir_tiles(
                     col_stop=col_stop,
                 )
             )
+    tile_sizing_payload = tile_sizing.to_dict()
+    tile_sizing_payload.update(
+        {
+            "model_export_tile_size": export_tile_size,
+            "model_export_tile_count": len(tiles),
+            "model_export_policy": dict(export_policy),
+            "model_inference_patch_size": _watermask_inference_patch_size(),
+            "model_inference_overlap_size": _watermask_inference_overlap_size(),
+        }
+    )
     return {
         "tiles": tiles,
         "tile_size": tile_size,
-        "tile_sizing": tile_sizing.to_dict(),
+        "export_tile_size": export_tile_size,
+        "export_tile_count": len(tiles),
+        "tile_sizing": tile_sizing_payload,
         "height": height,
         "width": width,
         "transform": transform,
         "crs": crs,
+    }
+
+
+def _watermask_model_export_tile_policy(
+    *,
+    height: int,
+    width: int,
+    mask_tile_size: int,
+    force_tile_size: int | None = None,
+) -> dict[str, Any]:
+    max_dimension = max(1, int(max(height, width)))
+    raw = str(os.getenv("NIMBUS_WATERMASK_MODEL_TILE_SIZE") or "").strip().lower()
+    source = "mask_tile_default"
+    requested_value: str | None = raw or None
+
+    if force_tile_size is not None:
+        value = int(force_tile_size)
+        source = "forced"
+        requested_value = str(force_tile_size)
+    elif raw in {"", "auto"}:
+        value = int(mask_tile_size)
+    elif raw in {"scene", "full", "native"}:
+        value = max_dimension
+        source = "scene_override"
+    elif raw in {"mask", "tile", "tiles"}:
+        value = int(mask_tile_size)
+        source = "mask_tile_size"
+    else:
+        try:
+            value = int(raw)
+            source = "env_override"
+        except ValueError:
+            value = max_dimension
+            source = "invalid_env_fallback_scene"
+
+    value = max(1, min(max_dimension, int(value)))
+    return {
+        "source": source,
+        "env_var": "NIMBUS_WATERMASK_MODEL_TILE_SIZE",
+        "requested_env_value": requested_value,
+        "export_tile_size": value,
+        "mask_tile_size": int(mask_tile_size),
+        "scene_shape": [int(height), int(width)],
+        "scene_max_dimension": max_dimension,
+        "selection_rule": (
+            "Export one OmniWater model input per 512 mask tile by default so "
+            "the model output stays aligned with the Zarr mask grid. Set to "
+            "'scene' for one full-scene input, or an integer pixel size."
+        ),
     }
 
 
@@ -798,7 +867,7 @@ def _run_omniwater_model(
             "model_download_source": "hugging_face",
         }
         optional_kwargs = {
-            "use_cache": _bool_env("NIMBUS_WATERMASK_OSMNX_USE_CACHE", default=True),
+            "use_cache": False,
             "use_osm_water": auxiliary_options["use_osm_water"],
             "use_osm_building": auxiliary_options["use_osm_building"],
             "use_osm_roads": auxiliary_options["use_osm_roads"],
@@ -861,13 +930,13 @@ def _run_omniwater_model(
 
 def _omniwater_auxiliary_options(*, tile_sizing: dict[str, Any] | None) -> tuple[dict[str, bool], dict[str, Any]]:
     requested = {
-        "use_osm_water": _bool_env("NIMBUS_WATERMASK_USE_OSM_WATER", default=False),
-        "use_osm_building": _bool_env("NIMBUS_WATERMASK_USE_OSM_BUILDING", default=False),
-        "use_osm_roads": _bool_env("NIMBUS_WATERMASK_USE_OSM_ROADS", default=False),
+        "use_osm_water": _bool_env("NIMBUS_WATERMASK_USE_OSM_WATER", default=True),
+        "use_osm_building": _bool_env("NIMBUS_WATERMASK_USE_OSM_BUILDING", default=True),
+        "use_osm_roads": _bool_env("NIMBUS_WATERMASK_USE_OSM_ROADS", default=True),
     }
     summary: dict[str, Any] = {
         **requested,
-        "default": "disabled",
+        "default": "enabled",
         "guard_env": "NIMBUS_WATERMASK_OSM_MAX_SCENE_SPAN_METERS",
     }
     span_m = _float_or_none(dict(tile_sizing or {}).get("scene_ground_span_meters"))
@@ -892,9 +961,9 @@ def _omniwater_auxiliary_options(*, tile_sizing: dict[str, Any] | None) -> tuple
 def _watermask_osm_max_scene_span_meters() -> float:
     raw = str(os.getenv("NIMBUS_WATERMASK_OSM_MAX_SCENE_SPAN_METERS") or "").strip()
     try:
-        return float(raw) if raw else 50000.0
+        return float(raw) if raw else 0.0
     except ValueError:
-        return 50000.0
+        return 0.0
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -1233,13 +1302,11 @@ def _run_water_fallback_window(
         cloud_block = np.asarray(cloud_mask, dtype=np.uint8) > 0
         if valid_mask is not None:
             cloud_block = np.logical_and(cloud_block, np.asarray(valid_mask, dtype=bool))
+        # Compatibility metric only: water and cloud are independent output layers.
         cloud_blocked_pixels = int(cloud_block.sum())
-        probability = np.where(cloud_block, 0.0, probability)
 
     raw_mask = probability >= float(threshold)
     refined_mask = _refine_binary_mask(raw_mask)
-    if cloud_mask is not None:
-        refined_mask = np.logical_and(refined_mask, np.asarray(cloud_mask, dtype=np.uint8) == 0)
     if valid_mask is not None:
         valid = np.asarray(valid_mask, dtype=bool)
         if valid.shape != probability.shape:
@@ -1328,8 +1395,8 @@ def _write_model_water_outputs(
             cloud_block = cloud_window > 0
             if valid_mask is not None:
                 cloud_block = np.logical_and(cloud_block, valid_mask)
+            # Compatibility metric only: model water output must still be allowed under cloud.
             cloud_blocked_pixels += int(cloud_block.sum())
-            tile_mask = np.where(cloud_block, 0, tile_mask).astype(np.uint8, copy=False)
         if valid_mask is not None:
             tile_mask = np.where(valid_mask, tile_mask, 0).astype(np.uint8, copy=False)
             tile_valid_pixels = int(valid_mask.sum())

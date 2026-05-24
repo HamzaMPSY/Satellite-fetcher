@@ -901,7 +901,7 @@ def _quadkey_index_zoom() -> int:
 
 
 def _target_shape_from_env() -> tuple[int, int] | None:
-    raw = str(os.getenv("NIMBUS_ZARR_TARGET_SHAPE", "512x512") or "").strip().lower()
+    raw = str(os.getenv("NIMBUS_ZARR_TARGET_SHAPE", "native") or "").strip().lower()
     if raw in {"", "native", "none", "off", "false", "0"}:
         return None
     normalized = raw.replace(" ", "").replace(",", "x").replace(":", "x")
@@ -910,14 +910,14 @@ def _target_shape_from_env() -> tuple[int, int] | None:
         try:
             side = int(parts[0])
         except ValueError:
-            side = 512
+            return None
         side = max(1, side)
         return side, side
     try:
         first = int(parts[0])
         second = int(parts[1])
     except (IndexError, ValueError):
-        return 512, 512
+        return None
     return max(1, first), max(1, second)
 
 

@@ -185,6 +185,39 @@ class CloudMaskWorkflowService:
                 collection=collection or context.collection,
                 product_type=product_type or context.product_type,
             )
+            metadata = {
+                "provider": provider,
+                "collection": collection,
+                "product_type": product_type,
+                "scene_id": scene_id,
+                "input_zarr_uri": source_zarr_uri,
+                "output_zarr_uri": target_zarr_uri,
+                "storage_mode": storage_mode,
+                "include_shadows": bool(include_shadows),
+            }
+            native_payload = _try_write_native_cloud_mask_from_ancillary(
+                root=root,
+                sensor=sensor,
+                backend_request=backend,
+                threshold=threshold,
+                metadata=metadata,
+                include_shadows=include_shadows,
+                source_zarr_uri=source_zarr_uri,
+                target_zarr_uri=target_zarr_uri,
+                storage_mode=storage_mode,
+            )
+            if native_payload is not None:
+                if stage_callback is not None:
+                    stage_callback(
+                        "cloud_masking_finished",
+                        StageEventPayload.from_mapping({
+                            "zarr_uri": source_zarr_uri,
+                            "output_zarr_uri": target_zarr_uri,
+                            "scene_id": scene_id,
+                            "cloud_mask": native_payload,
+                        }),
+                    )
+                return native_payload
             backend_request = _effective_cloud_backend_request(
                 backend=backend,
                 inference_device=inference_device,
@@ -196,16 +229,6 @@ class CloudMaskWorkflowService:
                 backend=backend_name,
                 threshold=threshold,
             )
-            metadata = {
-                "provider": provider,
-                "collection": collection,
-                "product_type": product_type,
-                "scene_id": scene_id,
-                "input_zarr_uri": source_zarr_uri,
-                "output_zarr_uri": target_zarr_uri,
-                "storage_mode": storage_mode,
-                "include_shadows": bool(include_shadows),
-            }
 
             write_summary, inference_summary = _run_cloud_inference_tiled(
                 job_id=job_id,
@@ -604,6 +627,207 @@ def _should_cleanup_failed_cloud_output(output_path: Path) -> bool:
     return "water" not in masks
 
 
+def _try_write_native_cloud_mask_from_ancillary(
+    *,
+    root: Any,
+    sensor: Any,
+    backend_request: str | None,
+    threshold: float,
+    metadata: dict[str, Any],
+    include_shadows: bool,
+    source_zarr_uri: str,
+    target_zarr_uri: str,
+    storage_mode: str,
+) -> dict[str, Any] | None:
+    if not _should_use_native_cloud_mask(backend_request):
+        return None
+    native_layer = _read_ancillary_layer(root, candidate_names=("CLOUD_MASK", "CLD"))
+    if native_layer is None:
+        return None
+
+    layer_name, raw_mask = native_layer
+
+    decoded = _decode_native_cloud_mask(raw_mask, include_shadows=include_shadows)
+    cloud_mask = decoded["mask"]
+    cloud_only_mask = decoded["cloud_only"]
+    shadow_mask = decoded["shadow"]
+    observed_mask = decoded.get("observed")
+    if observed_mask is not None:
+        observed = np.asarray(observed_mask, dtype=bool)
+        valid_pixels = int(observed.sum())
+    else:
+        valid_pixels = int(cloud_mask.size)
+
+    cloud_arr, cloud_prob_arr = prepare_cloud_output_arrays(root, overwrite=True)
+    cloud_data = cloud_mask.astype(np.uint8, copy=False)
+    probability = cloud_data.astype(np.float32, copy=False)
+    cloud_arr[0, :, :] = cloud_data
+    cloud_prob_arr[0, :, :] = probability
+
+    denominator = max(1, valid_pixels)
+    cloud_pixels = int(cloud_data.sum())
+    cloud_only_pixels = int(np.asarray(cloud_only_mask, dtype=np.uint64).sum())
+    shadow_pixels = int(np.asarray(shadow_mask, dtype=np.uint64).sum())
+    imagery = root["imagery"]
+    output_tile_size = int(imagery.chunks[-1]) if getattr(imagery, "chunks", None) else 512
+    tile_sizing = {
+        "source": "native_ancillary",
+        "mask_kind": "cloud",
+        "backend": "sen2like_native",
+        "tile_size": output_tile_size,
+        "scene_shape": [int(imagery.shape[2]), int(imagery.shape[3])],
+        "source_layer": layer_name,
+    }
+    summary = CloudInferenceSummary(
+        backend="sen2like_native",
+        sensor=sensor.sensor_key,
+        cloud_fraction=float(cloud_pixels / denominator),
+        cloud_only_fraction=float(cloud_only_pixels / denominator),
+        shadow_fraction=float(shadow_pixels / denominator),
+        includes_shadows=bool(include_shadows),
+        confidence_available=False,
+        class_labels={
+            "0": "clear",
+            "1": "native_cloud_or_shadow",
+        },
+        class_histogram={
+            "0": int(max(0, denominator - cloud_pixels)),
+            "1": int(cloud_pixels),
+        },
+        mask_source=f"ancillary/{layer_name}",
+        probability_source="native_binary_mask",
+        requested_threshold=float(threshold),
+        threshold_for_mask=None,
+        sensor_recipe=sensor.sensor_key,
+        valid_pixels=int(valid_pixels),
+        tile_size=output_tile_size,
+        tiles_total=1,
+        tile_workers=1,
+        tile_sizing=tile_sizing,
+    )
+    write_summary = MaskWriteSummary.from_mapping(finalize_cloud_outputs(
+        root,
+        threshold=float(threshold),
+        backend="sen2like_native",
+        sensor_key=sensor.sensor_key,
+        input_bands=(),
+        metadata=MaskWriterMetadata.from_mapping({
+            **metadata,
+            "source_mask_raster": f"ancillary/{layer_name}",
+            "input_zarr_uri": source_zarr_uri,
+            "output_zarr_uri": target_zarr_uri,
+            "storage_mode": storage_mode,
+        }),
+        cloud_fraction=float(cloud_pixels / denominator),
+        cloud_arr=cloud_arr,
+        cloud_prob_arr=cloud_prob_arr,
+        summary=summary,
+    ))
+    return CloudMaskState(
+        status="written",
+        input_zarr_uri=source_zarr_uri,
+        output_zarr_uri=target_zarr_uri,
+        storage_mode=storage_mode,
+        mask_path=write_summary.mask_path,
+        probability_path=write_summary.probability_path,
+        shape=list(write_summary.mask_shape),
+        dtype=write_summary.mask_dtype,
+        classes=dict(write_summary.classes),
+        threshold=float(threshold),
+        backend="sen2like_native",
+        sensor=sensor.sensor_key,
+        input_bands=[],
+        written_at=write_summary.written_at,
+        inference=summary,
+        tile_size=output_tile_size,
+        tile_sizing=tile_sizing,
+        include_shadows=bool(include_shadows),
+        cloud_fraction=float(cloud_pixels / denominator),
+        cloud_only_fraction=float(cloud_only_pixels / denominator),
+        shadow_fraction=float(shadow_pixels / denominator),
+        mask_source=f"ancillary/{layer_name}",
+        probability_source="native_binary_mask",
+        sensor_recipe=sensor.sensor_key,
+        backend_request=str(backend_request or "auto"),
+    ).to_dict()
+
+
+def _should_use_native_cloud_mask(backend_request: str | None) -> bool:
+    value = str(backend_request or "auto").strip().lower()
+    return value in {"", "auto", "native", "sen2like", "sen2like_native"}
+
+
+def _read_ancillary_layer(
+    root: Any,
+    *,
+    candidate_names: tuple[str, ...],
+) -> tuple[str, np.ndarray] | None:
+    if "ancillary" not in root:
+        return None
+    layer_names = _ancillary_layer_names(root)
+    if not layer_names:
+        return None
+    normalized_candidates = {
+        str(name).strip().upper(): str(name).strip().upper()
+        for name in candidate_names
+    }
+    for index, layer_name in enumerate(layer_names):
+        normalized = layer_name.strip().upper()
+        if normalized in normalized_candidates:
+            return normalized_candidates[normalized], np.asarray(root["ancillary"][0, index, :, :])
+    return None
+
+
+def _ancillary_layer_names(root: Any) -> list[str]:
+    names: list[str] = []
+    if "ancillary_layer" in root:
+        raw_values = np.asarray(root["ancillary_layer"][:]).tolist()
+        for value in raw_values:
+            if isinstance(value, bytes):
+                names.append(value.decode("utf-8", errors="replace"))
+            else:
+                names.append(str(value))
+    if not names:
+        names = [str(value) for value in list(root.attrs.get("ancillary_layer_names") or [])]
+    return names
+
+
+def _decode_native_cloud_mask(raw_mask: np.ndarray, *, include_shadows: bool) -> dict[str, np.ndarray]:
+    mask = np.asarray(raw_mask)
+    if mask.size == 0:
+        empty = np.zeros(mask.shape, dtype=bool)
+        return {"mask": empty, "cloud_only": empty, "shadow": empty, "observed": empty}
+
+    finite_max = float(np.nanmax(mask.astype(np.float32, copy=False)))
+    if finite_max <= 1.0:
+        cloud_only = mask.astype(bool, copy=False)
+        shadow = np.zeros_like(cloud_only, dtype=bool)
+        observed = np.ones(mask.shape, dtype=bool)
+        return {
+            "mask": cloud_only,
+            "cloud_only": cloud_only,
+            "shadow": shadow,
+            "observed": observed,
+        }
+
+    packed = mask.astype(np.uint16, copy=False)
+    observed = (packed & (1 << 0)) == 0
+    cloud_only = np.logical_and((packed & (1 << 1)) != 0, observed)
+    shadow = np.logical_and((packed & (1 << 2)) != 0, observed)
+    snow = np.logical_and((packed & (1 << 3)) != 0, observed)
+    if include_shadows:
+        combined = np.logical_or.reduce((cloud_only, shadow, snow))
+    else:
+        combined = np.logical_or(cloud_only, snow)
+        shadow = np.zeros_like(cloud_only, dtype=bool)
+    return {
+        "mask": combined,
+        "cloud_only": cloud_only,
+        "shadow": shadow,
+        "observed": observed,
+    }
+
+
 def _effective_cloud_backend_request(*, backend: str | None, inference_device: str | None) -> str:
     del inference_device
     requested = str(backend or "auto").strip().lower()
@@ -683,6 +907,61 @@ def _cloud_tile_sizing(
     )
 
 
+def _cloud_model_tile_policy(
+    *,
+    height: int,
+    width: int,
+    mask_tile_size: int,
+    backend_name: str,
+) -> dict[str, Any]:
+    max_dimension = max(1, int(max(height, width)))
+    normalized_backend = str(backend_name or "").strip().lower()
+    if normalized_backend != "omnicloudmask":
+        return {
+            "source": "mask_tile_size",
+            "env_var": "NIMBUS_CLOUDMASK_MODEL_TILE_SIZE",
+            "requested_env_value": None,
+            "tile_size": int(mask_tile_size),
+            "mask_tile_size": int(mask_tile_size),
+            "scene_shape": [int(height), int(width)],
+            "scene_max_dimension": max_dimension,
+        }
+
+    raw = str(os.getenv("NIMBUS_CLOUDMASK_MODEL_TILE_SIZE") or "").strip().lower()
+    source = "mask_tile_size"
+    requested_value: str | None = raw or None
+    if raw in {"scene", "full", "native"}:
+        value = max_dimension
+        source = "scene_override"
+    elif raw in {"", "auto", "mask", "tile", "tiles"}:
+        value = int(mask_tile_size)
+        if raw in {"mask", "tile", "tiles"}:
+            source = "mask_tile_size_override"
+    else:
+        try:
+            value = int(raw)
+            source = "env_override"
+        except ValueError:
+            value = int(mask_tile_size)
+            source = "invalid_env_fallback_mask"
+
+    value = max(1, int(value))
+    return {
+        "source": source,
+        "env_var": "NIMBUS_CLOUDMASK_MODEL_TILE_SIZE",
+        "requested_env_value": requested_value,
+        "tile_size": value,
+        "mask_tile_size": int(mask_tile_size),
+        "scene_shape": [int(height), int(width)],
+        "scene_max_dimension": max_dimension,
+        "selection_rule": (
+            "OmniCloudMask can use a larger model window than the 512 output/chunk "
+            "tile size so it keeps scene context. Use 'scene' for one full-scene "
+            "model pass, 'mask' for the 512 mask tile size, or an integer pixel size."
+        ),
+    }
+
+
 def _iter_windows(*, height: int, width: int, tile_size: int):
     for row_start in range(0, height, tile_size):
         row_stop = min(height, row_start + tile_size)
@@ -757,7 +1036,21 @@ def _run_cloud_inference_tiled(
             product_type=product_type,
             dataset_summary=effective_dataset_summary,
         )
-        tile_size = int(tile_sizing["tile_size"])
+        mask_tile_size = int(tile_sizing["tile_size"])
+        model_tile_policy = _cloud_model_tile_policy(
+            height=height,
+            width=width,
+            mask_tile_size=mask_tile_size,
+            backend_name=str(backend_descriptor.name),
+        )
+        tile_size = int(model_tile_policy["tile_size"])
+        tile_sizing_payload = dict(tile_sizing)
+        tile_sizing_payload.update(
+            {
+                "model_tile_size": tile_size,
+                "model_tile_policy": dict(model_tile_policy),
+            }
+        )
     except TypeError as exc:
         if (
             "backend_name" not in str(exc)
@@ -806,6 +1099,20 @@ def _run_cloud_inference_tiled(
             "requested_env_value": None,
             "invalid_env_value": None,
         }
+        model_tile_policy = _cloud_model_tile_policy(
+            height=height,
+            width=width,
+            mask_tile_size=int(tile_size),
+            backend_name=str(backend_descriptor.name),
+        )
+        tile_size = int(model_tile_policy["tile_size"])
+        tile_sizing_payload = dict(tile_sizing)
+        tile_sizing_payload.update(
+            {
+                "model_tile_size": tile_size,
+                "model_tile_policy": dict(model_tile_policy),
+            }
+        )
     total_tiles = ((height + tile_size - 1) // tile_size) * ((width + tile_size - 1) // tile_size)
     tile_workers = parallel_worker_count(
         device=resolved_device,
@@ -1003,7 +1310,7 @@ def _run_cloud_inference_tiled(
             "probability_source": probability_source,
             "requested_threshold": float(threshold),
             "threshold_for_mask": None if backend_name == "omnicloudmask" else float(threshold),
-            "tile_sizing": dict(tile_sizing),
+            "tile_sizing": dict(tile_sizing_payload),
         },
     ))
     inference_summary = CloudInferenceSummary(
@@ -1022,7 +1329,7 @@ def _run_cloud_inference_tiled(
         tile_size=tile_size,
         tiles_total=total_tiles,
         tile_workers=tile_workers,
-        tile_sizing=dict(tile_sizing),
+        tile_sizing=dict(tile_sizing_payload),
     )
     return (
         write_summary,

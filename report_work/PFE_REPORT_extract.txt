@@ -1,0 +1,240 @@
+[0002] (Normal) End-of-Studies Project Report
+[0003] (Heading 4) In Consideration of obtaining a Software Engineering Degree
+[0004] (Heading 4) Major: Computer Engineering
+[0006] (Normal) Promotion 2025 / 2026
+[0008] (Normal) Internship carried out within:
+[0010] (Normal) Written by Mr. Mehdi Dinari
+[0011] (Normal) Defense date : ………………………………..
+[0012] (Normal) Jury Members:
+[0013] (Normal) Mr. Hamza El Makrini                                                       Internship mentor
+[0014] (Normal) Mr. Abdelhak Boulaalam                                                                School Tutor (ENSAF)                                             Mr.                                                                                                       Professor, ENSAF                                                 Mr.                                                                                                       Professor, ENSAF
+[0016] (Normal) Dedication
+[0018] (Body Text) This work is dedicated to my family, my supervisors, and my friends.
+[0019] (Normal) Thank you for all your support.
+[0020] (Heading 1) Acknowledgments
+[0022] (Body Text) I would like to thank my mentor, Mr. Hamza El makrini, for providing invaluable guidance and unwavering support throughout my internship. The advice, patience, and support I received from her have been instrumental in shaping the quality of my work and have contributed significantly to my personal and professional growth. I am sincerely thankful for the wealth of knowledge I have gained under her mentorship, and I recognize the profound impact it has had on my development.
+[0024] (Body Text) I would also like to express my sincere appreciation to my school mentor, Mr. Boulaalam Abdelhak, for his guidance, support, and the tremendous impact he has had on my academic journey. I am grateful for his expertise and the constructive feedback he provided, which greatly influenced my studies. his commitment to my success has made a significant impact on my learning experience, and I am truly thankful for his contributions.
+[0026] (Body Text) I extend my heartfelt appreciation to my managers, Mr. Faical Tabouti
+[0027] (Body Text) and Mr. Sam Batterman, for their constant presence and availability whenever I needed assistance. Your contributions in creating a supportive environment have been invaluable to this journey.
+[0029] (Body Text) Additionally, I want to extend my gratitude to the administration and all the professors, teachers, and instructors at ENSA Fès for their efforts in giving the knowledge and skills, leading to significant growth in my career.
+[0031] (Body Text) Finally, I would like to thank all the members of the jury for honoring me by accepting to participate in this defense and evaluating this work.
+[0033] (Heading 1) Abstract
+[0036] (Normal) This report presents the design and implementation of an end-to-end satellite imagery acquisition and processing pipeline developed during an internship within Oracle's Digital Government context. The project addresses a practical need shared by public-sector geospatial use cases: analysts need a reliable way to define an area of interest, preview available scenes, launch provider downloads, normalize outputs into analysis-ready structures, and monitor the full execution lifecycle from a single operational interface.
+[0037] (Normal) To answer this need, I contributed to a service-oriented platform composed of a FastAPI backend, background workers, a Streamlit user interface, an internal Zarr conversion runtime, and a mask service for cloud and water processing. The pipeline supports provider preview, asynchronous job orchestration, provider-aware download coordination, conversion of raw scenes to normalized scene-level Zarr stores, optional time-cube building, and execution both locally and on Oracle Cloud Infrastructure. The resulting platform improves traceability, reduces manual intervention, and provides a solid base for operational Earth-observation workflows.
+[0038] (Normal) Keywords: Remote Sensing, Geospatial Pipelines, Satellite Imagery, Zarr, Microservices, Oracle Cloud Infrastructure
+[0041] (Heading 1) Résumé
+[0043] (Normal) Ce rapport présente la conception et la mise en oeuvre d'une pipeline de téléchargement et de traitement d'images satellitaires développée dans le cadre d'un stage au sein du contexte Digital Government d'Oracle. Le projet répond à un besoin opérationnel concret: permettre à un utilisateur de définir une zone d'intérêt, de prévisualiser les scènes disponibles, de lancer les téléchargements depuis plusieurs fournisseurs, de normaliser les sorties dans un format exploitable et de suivre tout le cycle d'exécution depuis une interface unique.
+[0044] (Normal) Pour répondre à ce besoin, j'ai contribué à une plateforme orientée services composée d'un backend FastAPI, de workers d'arriere-plan, d'une interface Streamlit, d'un runtime interne de conversion vers Zarr et d'un service de masquage nuages/eau. La pipeline prend en charge la prévisualisation des produits, l'orchestration asynchrone des jobs, la coordination des téléchargements selon les contraintes des fournisseurs, la conversion des scènes brutes vers des Zarr normalisés, la construction optionnelle de cubes temporels, ainsi que l'exécution en local ou sur Oracle Cloud Infrastructure. L'ensemble améliore la traçabilité, réduit l'intervention manuelle et fournit une base robuste pour des traitements géospatiaux opérationnels.
+[0049] (Heading 1) ملخص
+[0052] (Normal) يعرض هذا التقرير تصميم وتنفيذ منصة تشغيل لمعالجة صور الأقمار الصناعية طُورت خلال فترة التدريب في سياق فريق Digital Government داخل Oracle. يهدف المشروع إلى حل مشكلة عملية تتمثل في تشتت خطوات العمل بين المعاينة والتنزيل والمعالجة والتطبيع والمتابعة التشغيلية، وهو ما يصعّب إعادة الاستخدام والمراقبة والنشر في البيئات الحقيقية.
+[0054] (Normal) ولمعالجة ذلك، ساهمتُ في بناء منصة تعتمد على خدمات مترابطة تضم واجهة FastAPI، وعمالاً في الخلفية، وواجهة Streamlit، وخدمة داخلية لتحويل البيانات إلى Zarr، وخدمة للأقنعة المائية والسحابية. تدعم المنصة معاينة المنتجات، وجدولة التنزيلات بشكل غير متزامن، وتطبيع المشاهد إلى مخازن Zarr، وبناء مكعبات زمنية اختيارية، إضافة إلى التشغيل المحلي أو على Oracle Cloud Infrastructure. وقد حسّنت هذه البنية من قابلية التتبع، وقللت التدخل اليدوي، ووفرت أساساً صلباً لسير عمل تشغيلي في مجال مراقبة الأرض.
+[0055] (Normal) الكلمات المفتاحية
+[0056] (Normal) الاستشعار عن بُعد، خطوط المعالجة الجغرافية المكانية، صور الأقمار الصناعية، Zarr، الخدمات المصغرة، Oracle Cloud Infrastructure
+[0063] (Normal) Mots-clés: Télédétection, Pipelines géospatiales, Imagerie satellitaire, Zarr, Microservices, Oracle Cloud Infrastructure
+[0066] (Normal) List of Figures
+[0070] (Normal) 1
+[0072] (Normal) Chapter1
+[0073] (Normal) General Context
+[0082] (Normal) Introduction
+[0084] (Normal) This section describes the foundational aspects of the internship context, setting the stage for a comprehensive understanding of the project ahead. It begins with the host organization, unraveling its rich history, intricate structure, and vibrant culture. Subsequently, the focus shifts towards shedding light on the project itself, offering insights into its problematic, solution, and scope.
+[0085] (Normal) Presentation of the host organization
+[0087] (Normal) Introduction
+[0089] (Normal) In today's world, businesses, tech companies, and the public sector rely heavily on databases for data storage and utilize cloud services to manage their IT infrastructure and essential tools like ERP, CRM, SCM, EPM, and SPM. These technologies play a crucial role and are considered indispensable.
+[0090] (Normal) Oracle, a leading US multinational in computer technology, not only uses these tools extensively but also develops and provides them to customers. The company values innovation and customer satisfaction highly.
+[0091] (Normal) The first part of this project offers a comprehensive overview of Oracle Corporation and its Moroccan Research & Development Center (MADC), including their business scope, mission, organizational culture, and structure. [1]
+[0092] (Normal) Oracle Corporation
+[0094] (Normal) History
+[0096] (Normal) Oracle Corporation, headquartered in Austin, Texas, began its journey in 1977 when Larry Ellison, Bob Miner, and Ed Oates founded it under the name Software Development Laboratories (SDL). Initially focusing on developing the Oracle Database, a relational database management system (RDBMS), it quickly became the company's flagship product.
+[0097] (Normal) Over time, Oracle expanded its offerings to include enterprise software, cloud computing, hardware systems, and consulting services.
+[0098] (Body Text) A significant milestone occurred in 2010 with the acquisition of Sun Microsystems, granting Oracle access to pivotal technologies like Java and the Solaris operating system.
+[0099] (Body Text) Today, Oracle stands as a leading provider of cloud-based IT infrastructure and software, facilitating organizational growth, efficiency gains, and performance enhancements. Notably, Oracle pioneered the world's first and only autonomous database, along with Oracle Cloud, to streamline data management and enhance security for clients. [1]
+[0103] (Normal) Figure 1: Oracle Corporation Logo
+[0104] (Normal) Oracle MADC
+[0106] (Normal) Figure 2: Oracle MADC Location
+[0108] (Normal) The first Oracle R&D center in Africa and one of only a few in the world, the Oracle MADC Morocco Research and Development Center, is a software development center established by Oracle Corporation in Casablanca, Morocco. The center was inaugurated in 2015 and is one of Oracle's key development centers in the EMEA region. The center is staffed by highly skilled and talented software developers, engineers, and project managers who work on a variety of projects across various Oracle product lines utilizing the newest
+[0109] (Normal) trends in innovation, such as artificial intelligence, augmented/virtual/mixed reality, big data analytics, Blockchain, cloud computing, cybersecurity, internet of things, machine learning, mobile computing, serverless computing. The center's researchers make use of all these technologies to tackle the most pressing problems facing business, science, and the public sector.
+[0110] (Normal) Expansion of internship and graduate recruitment initiatives and joint research projects with regional universities are all be part of this global program.
+[0111] (Body Text) Oracle MADC has been successful in delivering several high-quality products and solutions, such as Oracle Cloud Infrastructure (OCI), Autonomous Data Warehouse (ADW), etc. [1]
+[0114] (Normal) Figure 3: MADC Major milestones
+[0118] (Normal) Oracle Labs
+[0120] (Body Text) The research and development division of Oracle is called Oracle Labs. which focuses primarily on creating technologies that will keep Oracle at the forefront of the IT industry. Researchers at Oracle Labs pursue innovative methodologies and approaches, frequently taking on challenges or projects that would be difficult to complete within a product development organization or that involved high risk or uncertainty. Real-world applications are the focus of Oracle Labs research, and the researchers are working to create technologies that will eventually have a big impact on how society and technology evolve. For instance, work done in Oracle Labs led to the development of chip multithreading and the Java computer language.
+[0121] (Body Text) Oracle's quest for research and development is greatly supported by Oracle Labs. Oracle can recognize challenges, find creative solutions, and create new products that can spur growth and innovation in the future because of its well-rounded research portfolio. [1]
+[0122] (Normal) Business area of activity
+[0124] (Body Text) Oracle provides a variety of goods and services to its clients. Software development tools, cloud services, training, consultancy, and credentials are just a few of the goods and services offered here. One of the brands Oracle offers is Oracle Database, which has held the top spot since 1979 and is supported by cloud artificial intelligence. SaaS, PaaS, IaaS, and DaaS are just a few of the integrated solutions offered by Oracle Cloud Infrastructure for business, IT, and development needs. Oracle Middleware is also a platform that is integrated for creating and running intelligent, agile applications while increasing technical efficiency using contemporary software designs. Oracle Services, which include Oracle Advanced Customer Support Services, Oracle Premium Support, Oracle Consulting, Oracle Financing, and Oracle Managed Cloud Services. [1]
+[0125] (Normal) Organizational structure
+[0127] (Body Text) Oracle Corporation has a hierarchical organizational structure with three main business divisions: Hardware, Services, Cloud and License. Each segment is divided into smaller business units focused on goods, services, or geographical areas. The Board of Directors oversees the company's performance and strategic direction, while the Executive Leadership Team manages daily operations. Functional divisions, including sales, marketing, finance, human resources, legal, and IT, fall under the Executive Leadership Team. Business units are arranged by region, product, and service, with a senior VP or general manager overseeing each unit's operations. The employees are subordinated to both a functional manager and a business unit manager in the matrix-based organizational structure of the business units. [1]
+[0130] (Normal) Figure 4: Executive Leadership Board
+[0131] (Normal) In general, Oracle's organizational structure is built to encourage teamwork, creativity, and client attention. While the matrix form enables people to work across many functions and business divisions to achieve shared goals, the hierarchical structure promotes effective decision-making and communication. [1]
+[0132] (Normal) Organizational culture
+[0134] (Normal) Oracle has a strong corporate culture that prioritizes innovation, client focus, and excellence. The company's history of innovation, emphasis on customer satisfaction, and dedication to fostering a friendly and collaborative work environment all have a bearing on the company's culture. [1]
+[0135] (Normal) Oracle's culture places a strong emphasis on the following:
+[0137] (Normal) innovation: which is one of its defining characteristics. The business has a lengthy history of creating cutting-edge goods and technology that have revolutionized the tech sector. This culture of innovation is promoted by a dedication to research and development as well as by giving staff members the tools and encouragement they require to test out fresh concepts and create new products.
+[0138] (Normal) Customer Satisfaction: Oracle's customer-centric approach to business reflects its commitment to providing goods and services that satisfy the needs of its clients.
+[0140] (Normal) Topic context
+[0142] (Normal) General context of the project
+[0144] (Body Text) Before presenting the technical contribution, it is useful to position the internship inside the Digital Government environment in which it was carried out. In such contexts, geospatial information is not valuable only because it exists, but because it can be transformed into reliable digital services that support operational decisions.
+[0145] (Body Text) Satellite imagery is especially relevant for agriculture, land-use observation, water monitoring and environmental reporting. However, the real challenge is rarely limited to accessing the imagery itself. Public-sector teams also need reproducible execution, runtime visibility, controlled downloads, normalized outputs and deployment options adapted to the target infrastructure.
+[0146] (Body Text) In practice, these requirements are often handled through fragmented scripts, manual checks and provider-specific procedures. This fragmentation increases the effort needed to launch a workflow, follow progress, recover from failures and reuse outputs in later analytical stages.
+[0147] (Body Text) The Digital Government team therefore had a concrete engineering need: to transform a scattered satellite-processing workflow into a reusable platform that can expose provider preview, asynchronous execution, normalized data products and operator-friendly monitoring under one coherent software architecture.
+[0148] (Body Text) This need becomes even stronger when several providers, missions, product types and runtime environments must coexist, especially if the same platform is expected to run locally during development and on cloud infrastructure for heavy workloads.
+[0149] (Body Text) The project addressed in this internship answers this operational need through a full satellite-data pipeline rather than through a standalone research prototype.
+[0150] (Body Text) Instead of focusing on a single downstream analytical model, the work concentrates on the software backbone required to search scenes, stage downloads, convert products, generate analysis-ready outputs and expose results in a form that can be reused by later applications.
+[0151] (Body Text) This orientation is aligned with the broader Digital Government vision: building reusable digital capabilities that can later support several public-sector scenarios with different business rules and data volumes.
+[0152] (Body Text) From a software-engineering perspective, the project combines backend APIs, background processing, specialized geospatial runtimes, user-facing interfaces and cloud deployment concerns inside one operational chain.
+[0153] (Body Text) The resulting platform is therefore not only a development artifact, but also a basis for future geospatial services that require reliability, observability and extensibility.
+[0154] (Body Text) This context explains why architecture, runtime behavior and deployment strategy are central to the project narrative.
+[0155] (Normal) Problematic
+[0156] (Body Text) The initial problem was the absence of an end-to-end operational pipeline able to manage satellite imagery from preview to analysis-ready output. Existing workflows were fragmented across provider-specific utilities, local scripts and ad hoc processing steps. This fragmentation made it difficult to track progress, recover from interruptions, control throughput, preserve output lineage and expose the overall process to non-expert users through a single interface.
+[0157] (Normal) Solution
+[0158] (Body Text) To address this problem, I contributed to the design and implementation of a unified platform composed of a FastAPI backend, asynchronous workers, a Streamlit interface, an internal Zarr conversion runtime and a masking runtime. The platform allows a user to define an AOI, preview provider products, launch a pipeline job, coordinate downloads, normalize raw scenes into Zarr stores, optionally build time cubes, apply cloud or water masks, and monitor every stage through persistent job state and runtime health endpoints.
+[0159] (Normal) Conclusion
+[0161] (Body Text) This chapter introduced the host organization and the business context of the internship, then clarified the engineering problem tackled during the project. The remaining chapters describe the technical foundations, data flow, implementation choices and operational results of the satellite-processing pipeline.
+[0165] (Normal) 2
+[0169] (Normal) Chapter 2
+[0170] (Normal) Project Management
+[0173] (Normal) Introduction
+[0175] (Normal) In this chapter, we are going to take a closer look at the organizational aspects of our project. We delve into the methods and tools employed to streamline our workflow, enhance collaboration, and ensure efficient task completion. Effective organization serves as the backbone of any successful project. It is what helps teams work together seamlessly, communicate effectively, and deliver high-quality results on time and within budget. Throughout this chapter, our approach to project organization is outlined, emphasizing the strategies, tools, and techniques helping us in achieving our goals.
+[0176] (Normal) Internship Process
+[0178] (Normal) Onboarding phase
+[0180] (Normal) The initial stages of my internship at Oracle involved getting acquainted with the company's inner workings and the Morocco Research and Development Center (MADC). This included meetings with key figures, such as the HR manager and program manager, as well as other Oracle Morocco team members. I also received my internship equipment and participated in introductory sessions with my mentor and my team, which helped me understand the project's objectives and expectations after setting up my workstation, which included configuring SSO, VPN, and BitLocker.
+[0183] (Normal) Figure 5: Jira Ticket Example
+[0188] (Normal) Training phase
+[0190] (Normal) I completed a comprehensive compliance training program. This training covered
+[0191] (Normal) essential company policies and regulations, providing a solid foundation for my internship,
+[0192] (Normal) and ensuring that I was aware of my responsibilities and the company's expectations.
+[0193] (Normal) Following this, I started a series of generic training sessions, which focused on building my
+[0194] (Normal) technical foundation in areas such as OCI-Oracle Cloud Infrastructure, DevOps, and Linux.
+[0200] (Normal) Figure 6: Generic Training
+[0205] (Body Text) Once I had completed these foundational training sessions, I moved on to specific training, related to my project requirements, such as taking courses of APEX foundations and building small applications to practice.
+[0207] (Normal) Management tools
+[0209] (Body Text) To facilitate collaboration and organization at work, we utilized various management tools, which will be discussed in the following sections.
+[0210] (Heading 5) Confluence
+[0212] (Body Text) Starting with Confluence, that provided a centralized platform for knowledge sharing and documentation. This tool facilitated the documentation of tasks and research throughout my internship. Additionally, Confluence served as a repository for project-related information and details. [3]
+[0213] (Heading 5) Zoom
+[0215] (Body Text) Another tool that we use is Zoom, a video conferencing platform, which enabled me to participate in virtual meetings with my team. It is a user-friendly and efficient solution for remote communication and collaboration enabling clear and uninterrupted conversations. [4]
+[0216] (Heading 5) Jira
+[0218] (Body Text) Jira, a software application developed by Atlassian, used to track issues, manage projects, and automate workflows allows you for the assignment of issues to team members, setting priorities, and categorizing them for better organization. With Jira, tasks are tracked to ensure staying on top assignments and meeting deadlines and updating their status according to progress. The platform supported various project management methodologies, including Agile, Scrum, and Kanban, and offered features like boards, backlogs, and sprints to facilitate agile workflows. [5]
+[0219] (Heading 5) Slack
+[0221] (Body Text) Relying on Slack, a centralized hub for team communication and collaboration, facilitated sharing information, discussing project updates, and connecting with the team in real-time. Its channels, direct messaging, and file-sharing features proved particularly useful for staying organized and informed throughout the internship.
+[0222] (Body Text) Additionally, the search feature in different Slack channels has been invaluable for debugging, saving significant time by enabling quick retrieval and reference of similar internal errors shared by others. [6]
+[0225] (Normal) Project Methodology
+[0227] (Body Text) Throughout this internship, the team employed the Scrum framework, which is a core component of the Agile methodology.
+[0228] (Body Text) To illustrate how this approach works, let's consider a simple example. Suppose we are building a to-do list app, and our product owner has prioritized two features for our first
+[0229] (Body Text) sprint: adding new tasks and marking tasks as completed. The team starts working on these tasks; while reviewing each other's work and testing the features to ensure they meet the acceptance criteria, defined at the beginning. At the end of the sprint, a working increment of the app is delivered, which includes the ability to add new tasks and mark them as completed.
+[0230] (Body Text) The product backlog is prioritized by the product owner, ensuring that we were always working on the most valuable features. Given that requirements are still unclear and subject to change over time, this approach was the most suitable to get the results wanted.
+[0231] (Body Text) Furthermore, Scrum framework is known to facilitate open communication, collaboration, and continuous improvement. So, by embracing Agile principles, the team was able to respond to change, iterate quickly, and deliver a high-quality product that met the stakeholders' expectations. Those principles are the following:
+[0232] (List Paragraph) Customer satisfaction through early and continuous delivery of valuable software.
+[0233] (List Paragraph) Welcome changing requirements, even late in development. Agile processes harness change for the customer's competitive advantage.
+[0234] (List Paragraph) Deliver working software frequently, with a preference for shorter timescales.
+[0236] (List Paragraph) Collaboration between business stakeholders and developers throughout the project.
+[0237] (List Paragraph) Build projects around motivated individuals. Give them the environment and support they need and trust them to get the job done.
+[0238] (List Paragraph) The most efficient and effective method of conveying information to and within a development team is face-to-face conversation.
+[0239] (List Paragraph) Working software is the primary measure of progress.
+[0241] (List Paragraph) Agile processes promote sustainable development. The sponsors, developers, and users should be able to maintain a constant pace indefinitely.
+[0242] (List Paragraph) Continuous attention to technical excellence and good design enhances agility.
+[0244] (List Paragraph) Simplicity—the art of maximizing the amount of work not done—is essential.
+[0246] (List Paragraph) The best architectures, requirements, and designs emerge from self-organizing teams.
+[0247] (List Paragraph) At regular intervals, the team reflects on how to become more effective, then tunes and adjusts its behavior accordingly.[7]
+[0259] (Normal) Figure 7: Agile Methodology
+[0262] (Body Text) In my case, I've had additional meetings with different members of the team. These meetings served essentially as opportunities to discuss tasks in detail.
+[0263] (Normal) Gantt chart
+[0265] (Body Text) A Gantt chart, named after its creator Henry L. Gantt, serves as a visual guide in project management. It lays out tasks along a timeline with horizontal bars, showing how different tasks depend on each other and the overall timeline of a project. This tool simplifies complex project details into a clear visual format, helping project managers navigate through the many layers of tasks, milestones, and deadlines with precision. As projects evolve over time, the Gantt chart remains an essential tool, providing a clear path to completion and ensuring everything stays on track. The following Gantt chart provides the timeline of my internship during the first four month, from the onboarding process to the writing of this report.
+[0268] (Normal) Figure 8: Gantt Chart
+[0272] (Normal) Conclusion
+[0274] (Body Text) In this chapter, the organizational dimensions of our project are presented, uncovering methods and tools designed to streamline our workflow, foster collaboration, and optimize efficiency. The strategies, tools, and techniques discussed serve as the invisible threads that weave together our team's efforts, enabling us to navigate complexities and deliver exceptional outcomes.
+[0287] (Normal) 3
+[0291] (Normal) Chapter 3
+[0292] (Normal) Foundations and State-of-the-Art
+[0296] (Normal) Introduction
+[0298] (Normal) This chapter presents the technical foundations behind the satellite-processing platform developed during the internship. The project does not target a single isolated algorithm; instead, it addresses the engineering problem of turning heterogeneous satellite products into an operational, traceable and reusable pipeline. The following sections summarize the data foundations, execution concepts and architectural alternatives that guided the final design.
+[0300] (Normal) Theoretical Background
+[0302] (Normal) Building an operational Earth-observation pipeline requires more than geospatial knowledge alone. It also requires understanding how satellite products are packaged, how long-running tasks are orchestrated, how multidimensional raster outputs are represented and how runtime state is exposed to users and operators. These concerns define the engineering backbone of the project.
+[0303] (Normal) Remote Sensing and Satellite Products
+[0305] (Normal) The platform works with institutional satellite data providers such as Copernicus and USGS. These ecosystems expose products with different acquisition strategies, file formats, metadata conventions and access constraints. A practical pipeline therefore needs to abstract provider differences while preserving the scientific meaning of the downloaded scenes.
+[0308] (Normal) Figure 9: Earth observation and remote sensing workflow
+[0311] (Normal) Service-Oriented Geospatial Pipelines
+[0313] (Normal) Operational Earth-observation systems are more reliable when they separate the control plane from the execution plane. The control plane receives user intent, validates parameters and records state, while the execution plane performs the heavy tasks such as downloads, conversions and post-processing.
+[0314] (Normal) In this project, the public API centralizes preview, job creation, credential checks, artifact registration and runtime status retrieval.
+[0315] (Normal) Background workers execute long-running actions such as scene download, Zarr conversion, time-cube generation and masking without blocking the user interface.
+[0316] (Normal (Web)) This service-oriented design improves reproducibility, observability and deployment flexibility compared with isolated scripts.
+[0318] (Normal) Cloud-Native Data Representation with Zarr
+[0320] (Normal) Zarr is well suited to multidimensional satellite data because it stores chunked arrays, metadata and derived layers in a structure that can be accessed locally or through object storage. In this project, it is used as the normalized output format for scene-level products and for time cubes built from several scenes.
+[0324] (Normal) Asynchronous Execution Foundations
+[0325] (Normal) API Runtime and Public Endpoints:
+[0327] (Normal) The FastAPI backend exposes endpoints for provider preview, job submission, provider status, worker status, mask health, artifact registration and result discovery.
+[0328] (Normal) This runtime acts as the control plane: it validates requests, stores pipeline state and coordinates specialized execution services.
+[0331] (Normal) Figure 10: Multi-service architecture of the platform
+[0334] (Normal) Worker Runtime and Background Jobs:
+[0335] (Normal) The worker processes queued jobs asynchronously and keeps a heartbeat so that the platform can distinguish alive, stale and unavailable execution nodes.
+[0337] (Normal) Long-running tasks are detached from the HTTP request/response lifecycle and continue under a single persistent job identifier.
+[0338] (Normal) Each pipeline run progresses through search, download, conversion, optional cube construction, optional mask generation and final readiness.
+[0342] (Normal) Download Coordinator and Provider Limits:
+[0343] (Normal) A dedicated coordinator manages active tasks while enforcing control-plane limits and data-plane limits that differ by provider.
+[0347] (Normal) The coordinator also keeps per-account state for Copernicus downloads, making account-pool strategies possible when several credentials are configured.
+[0348] (Normal) Retries, cooldown windows and task requeueing help the system recover from transient provider or network issues without losing the whole pipeline run.
+[0351] (Normal) Artifact Lineage and State Persistence:
+[0353] (Normal) Jobs, runtime events, outputs and coordinator tasks are persisted in SQLite so that the platform can restart cleanly and maintain traceability.
+[0356] (Normal) Optional Accelerators and Deployment Modes:
+[0358] (Normal) The platform supports several execution modes, from a fully local setup to GPU-backed runtimes and a hybrid Oracle Cloud Infrastructure deployment.
+[0361] (Normal) Local and Hybrid Modes:
+[0362] (Normal) Local mode is useful for development and debugging, while hybrid modes can externalize selected services such as masking when the host platform requires a specific accelerator path.
+[0364] (Normal) OCI Full Mode:
+[0365] (Normal) In OCI full mode, the API, worker, Zarr runtime and mask runtime execute on a remote GPU VM, while the Streamlit UI remains on the developer laptop and communicates through SSH tunnels and a bastion session.
+[0367] (Normal) Operational Optimization:
+[0369] (Normal) Provider-specific scheduling, health endpoints, runtime roles and script-based stack control make the platform easier to operate than a one-shot experimentation workflow.
+[0370] (Normal) Storage Flexibility:
+[0371] (Normal) Raw bundles and normalized outputs can target the local filesystem or OCI object storage, which keeps the processing chain close to the data when needed.
+[0372] (Normal) Mask Services:
+[0374] (Normal) Cloud and water masks are handled as explicit runtime stages that enrich existing Zarr stores instead of being hard-coded into the download step.
+[0375] (Normal) This makes masking reusable and lets the pipeline stop at Zarr-only, cube-before-mask or cube-after-mask depending on the selected scenario.
+[0376] (Normal) Observability:
+[0378] (Normal) The user interface surfaces provider health, active stage, bytes downloaded, pipeline timeline, generated artifacts and runtime status so that problems are visible before they become silent failures.
+[0379] (Normal) These capabilities are essential in operational contexts where long downloads and large raster products are common.
+[0380] (Normal) Runtime Separation:
+[0383] (Normal) Optional Post-processing Stages
+[0385] (Normal) Once raw scenes are available, the platform can normalize them into scene-level Zarr stores while preserving imagery bands, ancillary layers and provenance metadata.
+[0386] (Normal) It can then build grouped time cubes by Sentinel-2 tile or Landsat path/row, using the real acquisition timestamps from the selected scene outputs.
+[0387] (Normal) When masking is enabled, the mask service updates the chosen Zarr store and records the generated layers as pipeline artifacts.
+[0388] (Normal) The same orchestration path remains attached to one job identifier from the first preview call to the final ready state.
+[0389] (Normal) This end-to-end continuity is one of the main engineering goals of the project.
+[0391] (Normal) Figure 11: Pipeline stages from preview to ready
+[0395] (Normal) State of the Art and Related Systems
+[0397] (Normal) Many Earth-observation teams still rely on fragmented toolchains composed of shell scripts, notebooks and provider-specific utilities. Current practice is progressively moving toward cloud-native, service-oriented pipelines that are easier to monitor and scale.
+[0400] (Normal) Monolithic download scripts:
+[0402] (Normal) Simple shell-driven flows are fast to start with, but they make retry management, progress visibility and output lineage difficult as soon as multiple scenes or providers are involved.
+[0404] (Normal) Notebook-based processing:
+[0406] (Normal) Notebooks remain valuable for exploration, yet they are not ideal as an operational backbone for long-running downloads, artifact registration and repeatable deployment.
+[0407] (Normal) Synchronous web applications
+[0409] (Normal) A synchronous web application can preview data effectively, but it becomes fragile when the same process must also handle heavy downloads and conversions.
+[0411] (Normal) Cloud-native EO pipelines
+[0413] (Normal) Modern geospatial systems increasingly combine APIs, asynchronous workers, chunked storage formats such as Zarr and object-storage backends to bridge user interaction and production execution.
+[0415] (Normal) Why the chosen architecture
+[0417] (Normal) The architecture adopted in this project follows this trend while remaining intentionally lightweight: it separates public API, worker logic, conversion and masking services, but keeps the overall stack simple enough for iterative development inside the internship context.
+[0418] (Normal) This balance between modularity and pragmatism is what makes the resulting platform suitable for Digital Government experimentation.
+[0422] (Normal) Conclusion
+[0424] (Normal) This chapter established the engineering foundations of the project: heterogeneous satellite products, asynchronous orchestration, cloud-native outputs, provider-aware coordination and flexible deployment modes. These concepts drive the design choices described in the following chapters.
+[0465] (Normal) Webography
+[0467] (Normal) [1] O. MADC, "Oracle content".
+[0468] (Normal) [2] [Online]. Available: https://www.gdrc.org/u-gov/egov-03.html.
+[0469] (Normal) [3] [Online]. Available: https://www.atlassian.com/fr/software/confluence.
+[0470] (Normal) [4] [Online]. Available: https://zoom.us/.
+[0471] (Normal) [5] [Online]. Available: https://www.atlassian.com/fr/software/jira.
+[0472] (Normal) [6] [Online]. Available: https://slack.com/.
+[0473] (Normal) [7] [Online]. Available: https://www.agilealliance.org/agile101/12-principles-behind-the-agile-manifesto/.
+[0474] (Normal) [8] European Space Agency (ESA). Sentinel-2 User Handbook.
+[0475] (Normal) [9] Copernicus Data Space Ecosystem documentation.
+[0476] (Normal) [10] U.S. Geological Survey. Machine-to-Machine (M2M) API documentation.
+[0477] (Normal) [11] Zarr Developers. Zarr documentation and specification.
+[0478] (Normal) [12] [Online]. Available: https://fastapi.tiangolo.com/.
+[0479] (Normal) [13] [Online]. Available: https://streamlit.io/.
+[0480] (Normal) [14] [Online]. Available: https://sqlite.org/.
+[0481] (Normal) [15] Oracle Cloud Infrastructure Object Storage documentation.
+[0482] (Normal) [16] Oracle Cloud Infrastructure Bastion documentation.
+[0483] (Normal) [17] [Online]. Available: https://gdal.org/.
+[0484] (Normal) [18] [Online]. Available: https://rasterio.readthedocs.io/.
+[0485] (Normal) [19] U.S. Geological Survey. Landsat Collection 2 science product documentation.
+[0486] (Normal) [20] NimbusChain internal technical documentation: README.md, docs/ZARR.md, docs/API_REFERENCE.md and docs/RUNBOOK.md.
+[0487] (Normal) [21] [Online]. Available: https://docs.xarray.dev/.
+
+[TABLE 0] rows=1 cols=1
+Design and Implementation of an End-to-End Satellite Imagery Acquisition and Processing Pipeline

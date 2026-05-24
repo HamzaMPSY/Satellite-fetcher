@@ -107,7 +107,7 @@ def _load_zarr_rgb(zarr_dir: Path) -> tuple[str, np.ndarray]:
     except ModuleNotFoundError as exc:
         raise SystemExit("Missing zarr. Install it in the same env as napari.") from exc
 
-    root = zarr.open_group(str(zarr_dir), mode="r")
+    root = zarr.open_group(str(zarr_dir), mode="r", use_consolidated=False)
     band_names = _read_zarr_band_names(root)
     band_index = {name: index for index, name in enumerate(band_names)}
     missing = [band for band in RGB_BANDS if band not in band_index]
@@ -151,7 +151,7 @@ def _load_zarr_masks(zarr_dir: Path) -> dict[str, np.ndarray]:
     except ModuleNotFoundError as exc:
         raise SystemExit("Missing zarr. Install it in the same env as napari.") from exc
 
-    root = zarr.open_group(str(zarr_dir), mode="r")
+    root = zarr.open_group(str(zarr_dir), mode="r", use_consolidated=False)
     if "masks" not in root:
         print(f"[warn] no masks group in {zarr_dir}")
         return {}

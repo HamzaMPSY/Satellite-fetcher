@@ -203,12 +203,66 @@ def test_sentinel2_manual_watermask_creates_masked_copy_without_mutating_source(
     assert group.attrs["water_mask"]["tile_size"] == result["tile_size"]
     assert group.attrs["water_mask_model_name"] == "omniwatermask"
     assert group.attrs["water_mask_model_version"] == "test"
-    assert group.attrs["water_mask"]["model_auxiliary_options"]["use_osm_water"] is False
+    assert group.attrs["water_mask"]["model_auxiliary_options"]["use_osm_water"] is True
     water_attrs = group["masks"]["water"].attrs
     assert water_attrs["model_name"] == "omniwatermask"
     assert water_attrs["model_version"] == "test"
     assert water_attrs["tile_size"] == 512
-    assert water_attrs["model_auxiliary_options"]["use_osm_water"] is False
+    assert water_attrs["model_auxiliary_options"]["use_osm_water"] is True
+
+
+def test_sentinel2_model_watermask_allows_cloud_water_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_omniwatermask(monkeypatch)
+    scene_id = "S2A_MSIL1C_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
+    raw_root = _build_s2_bundle(tmp_path / "raw", scene_id=scene_id)
+    output_uri = str((tmp_path / "out" / "s2_cloud_overlap.zarr").resolve())
+
+    written_uri, _family, _summary, dataset_summary = ZarrConversionService().convert(
+        provider="copernicus",
+        collection="SENTINEL-2",
+        scene_id=scene_id,
+        raw_uri=str(raw_root),
+        output_uri=output_uri,
+        product_type="S2MSI1C",
+    )
+
+    group = zarr.open_group(written_uri, mode="a", zarr_format=2)
+    height = int(dataset_summary["shape"][2])
+    width = int(dataset_summary["shape"][3])
+    cloud = np.zeros((1, height, width), dtype=np.uint8)
+    cloud[0, 1:4, 1:4] = 1
+    masks_group = group.require_group("masks")
+    masks_group.create_array("cloud", data=cloud, chunks=(1, height, width), overwrite=True)
+    masks_group.create_array(
+        "cloud_probability",
+        data=cloud.astype(np.float32),
+        chunks=(1, height, width),
+        overwrite=True,
+    )
+
+    result = MaskService().apply_omniwater_to_zarr(
+        zarr_uri=written_uri,
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI1C",
+        scene_id=scene_id,
+        acquisition_datetime=dataset_summary.get("acquisition_datetime"),
+        dataset_summary=dataset_summary,
+    )
+
+    assert result["status"] == "written", result
+    assert result["runtime_mode"] == "model", result
+    masked_group = zarr.open_group(str(result["output_zarr_uri"]), mode="r", use_consolidated=False)
+    water = np.asarray(masked_group["masks"]["water"][0], dtype=np.uint8)
+    cloud_mask = np.asarray(masked_group["masks"]["cloud"][0], dtype=np.uint8)
+    overlap = np.logical_and(water > 0, cloud_mask > 0)
+
+    assert int(water[cloud_mask > 0].sum()) == int(cloud_mask.sum())
+    assert int(overlap.sum()) == int(cloud_mask.sum())
+    assert result["cloud_blocked_fraction"] > 0.0
 
 
 def test_landsat_manual_watermask_creates_masked_copy_without_mutating_source(

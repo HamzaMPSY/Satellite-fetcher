@@ -29,7 +29,7 @@ def open_zarr_group(zarr_uri: str, *, mode: str = "r") -> Any:
     store_path = local_path_for_uri(zarr_uri)
     if not store_path.exists():
         raise ConversionError(f"Output store does not exist yet: {store_path}")
-    return zarr.open_group(str(store_path), mode=mode, zarr_format=2)
+    return zarr.open_group(str(store_path), mode=mode, zarr_format=2, use_consolidated=False)
 
 
 def delete_mask_layers(zarr_uri: str, *, layer_names: tuple[str, ...]) -> None:

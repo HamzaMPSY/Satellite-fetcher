@@ -70,7 +70,7 @@ class Settings(BaseSettings):
         alias="NIMBUS_SEN2LIKE_NESTED_BAND_PARALLELISM",
     )
     nimbus_sen2like_band_workers: int = Field(
-        default=2,
+        default=4,
         alias="NIMBUS_SEN2LIKE_BAND_WORKERS",
         ge=1,
         le=32,
@@ -80,11 +80,11 @@ class Settings(BaseSettings):
         alias="NIMBUS_SEN2LIKE_SAFE_RETRY",
     )
     nimbus_sen2like_preprocess_target_shape: str | None = Field(
-        default="512x512",
+        default="native",
         alias="NIMBUS_SEN2LIKE_PREPROCESS_TARGET_SHAPE",
     )
     nimbus_sen2like_direct_zarr: bool = Field(
-        default=True,
+        default=False,
         alias="NIMBUS_SEN2LIKE_DIRECT_ZARR",
     )
     nimbus_sen2like_zarr_dir: str | None = Field(

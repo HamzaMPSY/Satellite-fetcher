@@ -149,6 +149,24 @@ def test_cloud_first_obstruction_improves_water_output(case_name: str, sensor: S
     )
 
 
+@pytest.mark.parametrize("case_name,sensor", _sensor_case_specs())
+def test_water_fallback_allows_cloud_water_overlap(case_name: str, sensor: SensorMaskSpec) -> None:
+    channels, masks = _synthetic_scene(sensor)
+    probability, water_mask, summary = _run_water_fallback_window(
+        sensor=sensor,
+        channels=channels,
+        threshold=float(sensor.water_threshold_default),
+        cloud_mask=masks["open_water"].astype(np.uint8),
+    )
+
+    water_mask = np.asarray(water_mask, dtype=np.uint8)
+    assert float(water_mask[masks["open_water"]].mean()) >= 0.80, (
+        f"{case_name}: cloud overlap should not erase water pixels"
+    )
+    assert float(np.asarray(probability, dtype=np.float32)[masks["open_water"]].mean()) > 0.0
+    assert summary["cloud_blocked_pixels"] == int(masks["open_water"].sum())
+
+
 def _write_source_zarr_from_scene(
     root: Path,
     *,
@@ -286,8 +304,8 @@ def test_combined_water_cloud_run_preserves_both_masks_and_probabilities(tmp_pat
     cloud_mask = np.asarray(derived["masks"]["cloud"][0], dtype=np.uint8)
     water_mask = np.asarray(derived["masks"]["water"][0], dtype=np.uint8)
     assert float(cloud_mask[_cloud_target_mask(masks)].mean()) >= 0.90
+    assert float(cloud_mask[masks["cloud_shadow"]].mean()) >= 0.70
     assert float(water_mask[masks["open_water"]].mean()) >= 0.80
-    assert float(water_mask[masks["cloud_shadow"]].mean()) <= 0.25
 
 
 @pytest.mark.parametrize(

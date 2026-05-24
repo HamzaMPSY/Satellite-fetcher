@@ -16,6 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NIMBUS_WATERMASK_MODEL_DIR=/data/downloads/mask-cache/omniwater-models \
     NIMBUS_WATERMASK_BATCH_SIZE=1 \
     NIMBUS_WATERMASK_TILE_SIZE=512 \
+    NIMBUS_WATERMASK_MODEL_TILE_SIZE=4096 \
     NIMBUS_WATERMASK_INFERENCE_PATCH_SIZE=128 \
     NIMBUS_WATERMASK_INFERENCE_OVERLAP_SIZE=32 \
     NIMBUS_WATERMASK_MODEL_PROGRESS_SECONDS=5 \
@@ -43,6 +44,13 @@ RUN apt-get update && \
 COPY requirements/mask-service.txt /app/requirements/mask-service.txt
 COPY requirements/runtime-common.txt /app/requirements/runtime-common.txt
 RUN python -m pip install -r /app/requirements/mask-service.txt
+ENV NIMBUS_WATERMASK_INFERENCE_PATCH_SIZE=512 \
+    NIMBUS_WATERMASK_INFERENCE_OVERLAP_SIZE=128 \
+    NIMBUS_WATERMASK_MODEL_TILE_SIZE=4096 \
+    NIMBUS_WATERMASK_USE_OSM_WATER=false \
+    NIMBUS_WATERMASK_USE_OSM_BUILDING=false \
+    NIMBUS_WATERMASK_USE_OSM_ROADS=false \
+    NIMBUS_WATERMASK_OSM_MAX_SCENE_SPAN_METERS=50000
 COPY --chown=appuser:appuser src/nimbuschain_mask_service /app/src/nimbuschain_mask_service
 COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared
 

@@ -53,7 +53,14 @@ _S2_SPECTRAL_CODES = (
 )
 _S2_L2A_SPECTRAL_CODES = tuple(code for code in _S2_SPECTRAL_CODES if code != "B10")
 _SEN2LIKE_SPECTRAL_CODES = ("B02", "B03", "B04", "B08", "B11", "B12")
-_S2_CATEGORICAL_LAYER_TOKENS = {"SCL", "CLD", "SNW", "TCI", "VALIDITY_MASK"}
+_S2_CATEGORICAL_LAYER_TOKENS = {
+    "SCL",
+    "CLD",
+    "SNW",
+    "TCI",
+    "CLOUD_MASK",
+    "VALIDITY_MASK",
+}
 _S2_PREFERRED_IMAGERY_REFERENCE = ("B04", "B03", "B02", "B08")
 _S2_DYNAMIC_TOKENS = (
     "AOT",
@@ -61,6 +68,7 @@ _S2_DYNAMIC_TOKENS = (
     "SCL",
     "CLDPRB",
     "SNWPRB",
+    "CLOUD_MASK",
     "CLD",
     "SNW",
     "TCI",
@@ -76,7 +84,8 @@ _ANCILLARY_PRIORITY = {
     "CLD": 5,
     "SNW": 6,
     "TCI": 7,
-    "VALIDITY_MASK": 8,
+    "CLOUD_MASK": 8,
+    "VALIDITY_MASK": 9,
 }
 _LANDSAT_ANGLE_TOKENS = {"SAA", "SZA", "VAA", "VZA"}
 
@@ -648,16 +657,8 @@ def _prepare_sentinel2_layers(
     raster_files = [
         path
         for path in extracted.root.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in {".jp2", ".tif", ".tiff"}
-        and "img_data" in str(path.parent).lower()
+        if path.is_file() and path.suffix.lower() in {".jp2", ".tif", ".tiff"}
     ]
-    if not raster_files:
-        raster_files = [
-            path
-            for path in extracted.root.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".jp2", ".tif", ".tiff"}
-        ]
     if not raster_files:
         raise ConversionError("No Sentinel-2 raster files were found in the SAFE product.")
 

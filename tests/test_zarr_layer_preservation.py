@@ -163,6 +163,16 @@ def _build_sen2like_bundle(root: Path, scene_id: str) -> Path:
         pixel_size=10.0,
         value=1,
     )
+    _write_raster(
+        safe_root
+        / "GRANULE"
+        / "L2F_T31TDN_A20260101T105501"
+        / "QI_DATA"
+        / "T31TDN_20260101T105501_CLOUD_MASK.TIF",
+        shape=(2, 2),
+        pixel_size=30.0,
+        value=128,
+    )
     return safe_root
 
 
@@ -323,7 +333,7 @@ def zarr_service() -> ZarrConversionService:
                 product_type="S2MSI2A",
                 scene_id="LC08_L1TP_190026_20260101_20260101_02_T1",
                 expected_band_names=("B02", "B03", "B04", "B08", "B11", "B12"),
-                expected_ancillary_names=("VALIDITY_MASK",),
+                expected_ancillary_names=("CLOUD_MASK", "VALIDITY_MASK"),
                 expected_pixel_size=(10.0, 10.0),
             ),
             _build_sen2like_bundle,
@@ -471,7 +481,7 @@ def test_converter_preserves_exact_native_layers(
         assert "ancillary" not in group
 
 
-def test_converter_defaults_to_exact_512_shape(
+def test_converter_defaults_to_native_shape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     zarr_service: ZarrConversionService,
@@ -479,7 +489,7 @@ def test_converter_defaults_to_exact_512_shape(
     monkeypatch.delenv("NIMBUS_ZARR_TARGET_SHAPE", raising=False)
     scene_id = "S2A_MSIL2A_20260101T105501_N0511_R051_T31TDN_20260101T145209.SAFE"
     raw_root = _build_s2_bundle(tmp_path, scene_id=scene_id, l1c=False)
-    output_uri = str((tmp_path / "default_512.zarr").resolve())
+    output_uri = str((tmp_path / "default_native.zarr").resolve())
 
     written_uri, _data_family, _normalization_summary, dataset_summary = zarr_service.convert(
         provider="copernicus",
@@ -490,13 +500,13 @@ def test_converter_defaults_to_exact_512_shape(
         product_type="S2MSI2A",
     )
 
-    assert dataset_summary["shape"][-2:] == [512, 512]
-    assert dataset_summary["ancillary_shape"][-2:] == [512, 512]
+    assert dataset_summary["shape"][-2:] == [6, 6]
+    assert dataset_summary["ancillary_shape"][-2:] == [6, 6]
     group = zarr.open_group(str(written_uri), mode="r", zarr_format=2)
-    assert tuple(group["imagery"].shape[-2:]) == (512, 512)
-    assert tuple(group["ancillary"].shape[-2:]) == (512, 512)
-    assert group.attrs["output_shape_policy"] == "exact_target_shape"
-    assert group.attrs["target_shape"] == [512, 512]
+    assert tuple(group["imagery"].shape[-2:]) == (6, 6)
+    assert tuple(group["ancillary"].shape[-2:]) == (6, 6)
+    assert "output_shape_policy" not in group.attrs
+    assert "target_shape" not in group.attrs
     assert _labels(group["band"]) == (
         "B01",
         "B02",

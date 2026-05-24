@@ -27,7 +27,7 @@ DEFAULT_TIMEOUT_SECONDS = 3600.0
 DEFAULT_SPARK_DRIVER_MEMORY = "1g"
 DEFAULT_SPARK_EXECUTOR_MEMORY = "1g"
 DEFAULT_SPARK_PYTHON_WORKER_MEMORY = "256m"
-DEFAULT_PREPROCESS_TARGET_SHAPE = "512x512"
+DEFAULT_PREPROCESS_TARGET_SHAPE = "native"
 _ORIGINAL_SUBPROCESS_RUN = subprocess.run
 _PROCESS_LOCK = threading.RLock()
 _RUNNING_PROCESSES: dict[str, subprocess.Popen[str]] = {}
@@ -872,7 +872,7 @@ def _attach_direct_zarr_outputs(
 def _direct_zarr_enabled(request: Sen2LikeNormalizeRequest) -> bool:
     if request.direct_zarr is not None:
         return bool(request.direct_zarr)
-    return _env_flag_value(os.getenv("NIMBUS_SEN2LIKE_DIRECT_ZARR"), default=True)
+    return _env_flag_value(os.getenv("NIMBUS_SEN2LIKE_DIRECT_ZARR"), default=False)
 
 
 def _direct_zarr_output_root(request: Sen2LikeNormalizeRequest) -> Path:
@@ -975,14 +975,14 @@ def _parse_target_shape(raw: str | None) -> tuple[int, int] | None:
         try:
             side = int(parts[0])
         except ValueError:
-            side = 512
+            return None
         side = max(1, side)
         return side, side
     try:
         height = int(parts[0])
         width = int(parts[1])
     except (IndexError, ValueError):
-        return 512, 512
+        return None
     return max(1, height), max(1, width)
 
 

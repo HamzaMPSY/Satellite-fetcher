@@ -206,7 +206,7 @@ class Sen2LikeNormalizationRouter:
                 "sen2like_preprocess_target_shape": _settings_str(
                     self._rt.settings,
                     "nimbus_sen2like_preprocess_target_shape",
-                    default="512x512",
+                    default="native",
                 ),
                 "sen2like_working_dir": _job_working_dir(
                     self._rt.settings.nimbus_sen2like_work_dir,
@@ -426,12 +426,12 @@ class Sen2LikeNormalizationRouter:
                         preprocess_target_shape=_settings_str(
                             self._rt.settings,
                             "nimbus_sen2like_preprocess_target_shape",
-                            default="512x512",
+                            default="native",
                         ),
                         direct_zarr=_settings_bool(
                             self._rt.settings,
                             "nimbus_sen2like_direct_zarr",
-                            default=True,
+                            default=False,
                         ),
                         zarr_output_dir=_settings_optional_str(
                             self._rt.settings,
@@ -495,7 +495,7 @@ class Sen2LikeNormalizationRouter:
                     "preprocess_target_shape": _settings_str(
                         self._rt.settings,
                         "nimbus_sen2like_preprocess_target_shape",
-                        default="512x512",
+                        default="native",
                     ),
                     "product_parallelism": (
                         len(missing_products) > 1
@@ -508,7 +508,7 @@ class Sen2LikeNormalizationRouter:
                     "direct_zarr_requested": _settings_bool(
                         self._rt.settings,
                         "nimbus_sen2like_direct_zarr",
-                        default=True,
+                        default=False,
                     ),
                     "direct_zarr_output_dir": _settings_optional_str(
                         self._rt.settings,
@@ -573,7 +573,7 @@ def _direct_zarr_metadata_from_outputs(
     direct_zarr_outputs = list(routed["direct_zarr_outputs"])
     direct_zarr_items = list(routed["direct_zarr_items"])
     sen2like_outputs = list(routed["sen2like_outputs"])
-    if not _settings_bool(settings, "nimbus_sen2like_direct_zarr", default=True):
+    if not _settings_bool(settings, "nimbus_sen2like_direct_zarr", default=False):
         status = "skipped"
     elif direct_zarr_outputs and len(direct_zarr_outputs) >= len(sen2like_outputs):
         status = "written"
@@ -690,7 +690,7 @@ def _with_existing_direct_zarr_output(
     *,
     settings: Any,
 ) -> dict[str, Any]:
-    if not _settings_bool(settings, "nimbus_sen2like_direct_zarr", default=True):
+    if not _settings_bool(settings, "nimbus_sen2like_direct_zarr", default=False):
         return output
     normalized_uri = str(output.get("normalized_uri") or "").strip()
     if not normalized_uri:

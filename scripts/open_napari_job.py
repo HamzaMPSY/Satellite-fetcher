@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.abc
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
@@ -18,6 +20,31 @@ from nimbuschain_rgb_viewer_service.presets import choose_rgb_bands
 os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 
 
+class _BlockNumbaImport(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname: str, path=None, target=None):
+        if fullname == "numba" or fullname.startswith("numba."):
+            raise ImportError("numba disabled for this napari preview")
+        return None
+
+
+def _disable_numba_for_napari() -> None:
+    if any(isinstance(finder, _BlockNumbaImport) for finder in sys.meta_path):
+        return
+    for module_name in list(sys.modules):
+        if module_name == "numba" or module_name.startswith("numba."):
+            sys.modules.pop(module_name, None)
+    sys.meta_path.insert(0, _BlockNumbaImport())
+
+
+def _configure_napari_runtime_cache() -> None:
+    cache_root = Path("/private/tmp/nimbus-napari")
+    cache_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(cache_root / "numba"))
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_root / "matplotlib"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(cache_root / "xdg-cache"))
+    os.environ.setdefault("XDG_CONFIG_HOME", str(cache_root / "xdg-config"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Open Nimbus Zarr outputs in Napari.")
     parser.add_argument("--job-id", help="Fetch zarr_outputs/cube_outputs from the local API.")
@@ -26,6 +53,9 @@ def main() -> None:
     parser.add_argument("--cube", action="append", default=[], help="Cube Zarr path to open.")
     parser.add_argument("--max-size", type=int, default=1400, help="Max preview width/height per layer.")
     parser.add_argument("--no-masks", action="store_true", help="Do not add masks/* label layers.")
+    parser.add_argument("--masks-visible", action="store_true", help="Open binary cloud/water masks as visible overlays.")
+    parser.add_argument("--probability-visible", action="store_true", help="Open probability/debug mask layers as visible overlays.")
+    parser.add_argument("--allow-numba", action="store_true", help="Let napari import numba instead of blocking it.")
     args = parser.parse_args()
 
     zarr_paths = [Path(item) for item in args.zarr]
@@ -40,11 +70,21 @@ def main() -> None:
     if not zarr_paths and not cube_paths:
         raise SystemExit("No existing Zarr outputs were found to open.")
 
+    _configure_napari_runtime_cache()
+    if not args.allow_numba:
+        _disable_numba_for_napari()
     import napari
 
     viewer = napari.Viewer(title=f"Nimbus job {args.job_id or 'Zarr outputs'}")
     for path in zarr_paths:
-        _add_scene(viewer, path, max_size=args.max_size, include_masks=not args.no_masks)
+        _add_scene(
+            viewer,
+            path,
+            max_size=args.max_size,
+            include_masks=not args.no_masks,
+            masks_visible=args.masks_visible,
+            probability_visible=args.probability_visible,
+        )
     for path in cube_paths:
         _add_cube(viewer, path, max_size=args.max_size)
 
@@ -85,8 +125,16 @@ def _unique_existing(paths: list[Path]) -> list[Path]:
     return existing
 
 
-def _add_scene(viewer: Any, path: Path, *, max_size: int, include_masks: bool) -> None:
-    group = zarr.open_group(str(path), mode="r", zarr_format=2)
+def _add_scene(
+    viewer: Any,
+    path: Path,
+    *,
+    max_size: int,
+    include_masks: bool,
+    masks_visible: bool,
+    probability_visible: bool,
+) -> None:
+    group = zarr.open_group(str(path), mode="r", zarr_format=2, use_consolidated=False)
     rgb, rgb_bands, stride = _render_rgb(group, max_size=max_size, time_index=0)
     scene_id = _scene_id(group, path)
     viewer.add_image(
@@ -106,20 +154,25 @@ def _add_scene(viewer: Any, path: Path, *, max_size: int, include_masks: bool) -
                     mask.astype(np.float32, copy=False),
                     name=f"{scene_id} {mask_name}",
                     colormap="magma" if "cloud" in mask_name else "viridis",
+                    contrast_limits=(0.0, 1.0),
                     opacity=0.35,
-                    visible=False,
+                    blending="additive",
+                    visible=probability_visible,
                 )
             else:
-                viewer.add_labels(
-                    mask.astype(np.uint8, copy=False),
+                viewer.add_image(
+                    (mask > 0).astype(np.float32, copy=False),
                     name=f"{scene_id} {mask_name}",
-                    opacity=0.35,
-                    visible=False,
+                    colormap="red" if mask_name == "cloud" else "blue",
+                    contrast_limits=(0.0, 1.0),
+                    opacity=0.38 if mask_name == "cloud" else 0.48,
+                    blending="additive",
+                    visible=masks_visible,
                 )
 
 
 def _add_cube(viewer: Any, path: Path, *, max_size: int) -> None:
-    group = zarr.open_group(str(path), mode="r", zarr_format=2)
+    group = zarr.open_group(str(path), mode="r", zarr_format=2, use_consolidated=False)
     imagery = group["imagery"]
     time_count = int(imagery.shape[0])
     rgb_frames = []
@@ -175,7 +228,13 @@ def _stretch_channel(channel: np.ndarray) -> np.ndarray:
 
 def _read_band_names(group: Any) -> list[str]:
     if "band" in group:
-        return [str(item) for item in np.asarray(group["band"][:]).tolist()]
+        names: list[str] = []
+        for item in np.asarray(group["band"][:]).tolist():
+            if isinstance(item, (bytes, bytearray)):
+                names.append(item.decode("utf-8"))
+            else:
+                names.append(str(item))
+        return names
     return [str(item) for item in list(group.attrs.get("band_names") or [])]
 
 
