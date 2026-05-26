@@ -14,14 +14,17 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from nimbuschain_sen2like_service.models import (
+from nimbuschain_shared.contracts.sen2like import (
     Sen2LikeNormalizeRequest,
     Sen2LikeNormalizeResponse,
     Sen2LikeProductOutput,
 )
 
 
-DEFAULT_VENDOR_SUBDIR = "sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation"
+DEFAULT_VENDOR_SUBDIR = (
+    "src/nimbuschain_sen2like_service/vendor/"
+    "Satellite-fetcher-feature-sen2like_reimplementation"
+)
 DEFAULT_SPARK_LOCAL_DIRS = "/tmp/nimbus-sen2like-spark"
 DEFAULT_TIMEOUT_SECONDS = 3600.0
 DEFAULT_SPARK_DRIVER_MEMORY = "1g"

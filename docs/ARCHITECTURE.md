@@ -11,11 +11,11 @@ Browser
             -> MongoDB or SQLite store
             -> nimbus-worker (download + Zarr execution)
             -> nimbus-sen2like-service (Landsat -> Sentinel-2-like normalization)
-            -> nimbus-zarr runtime/library (internal conversion code)
+            -> nimbus-zarr-service (HTTP conversion runtime)
             -> nimbus-mask-service (cloud/water masking runtime)
 ```
 
-The UI never executes downloads directly. It submits jobs to the API. The worker owns execution from search to download to Zarr conversion. The mask service owns cloud and water masking on existing Zarr outputs. The Zarr package is reused as worker-internal conversion logic, while the backend exposes converter and mask health/schema endpoints for the UI.
+The UI never executes downloads directly. It submits jobs to the API. The worker owns execution from search to download to Sen2Like, Zarr conversion and optional mask/cube stages. Sen2Like, Zarr and Mask are standalone internal HTTP services in compose and Kubernetes. The backend exposes converter and mask health/schema endpoints for the UI while keeping those internal services off the public control plane.
 
 The production job runtime is still Nimbus-first: public routes keep using the existing API, worker, job store and `NimbusFetcher` behavior. The new `nimbuschain_fetch.pipeline` package is an incremental orchestration foundation for splitting the runtime into explicit stages without changing those public contracts.
 
@@ -79,7 +79,7 @@ Main role:
 - return structured execution status, output paths, stdout/stderr tails and duration
 
 Key code:
-- `sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/`
+- `src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/`
 - `sen2like-service/Containerfile`
 - `src/nimbuschain_sen2like_service/`
 - `src/nimbuschain_shared/clients/sen2like.py`
@@ -92,6 +92,7 @@ Main role:
 - route QA, masks, classification, cloud, snow, angle, aerosol, and other support rasters into ancillary arrays
 - write `imagery(time, band, y, x)` Zarr stores, plus `ancillary(time, ancillary_layer, y, x)` when needed
 - provide reusable conversion code used by the worker and by backend-owned manual conversion routes
+- run as the `nimbus-zarr` internal HTTP service on port `8010` in compose and Kubernetes
 
 Key code:
 - `src/nimbuschain_zarr_service/main.py`

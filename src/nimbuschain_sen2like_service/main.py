@@ -7,7 +7,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 
 from nimbuschain_sen2like_service import __version__
-from nimbuschain_sen2like_service.models import (
+from nimbuschain_shared.contracts.sen2like import (
     ALLOWED_CLEANUP_MODES,
     ALLOWED_STEPS,
     Sen2LikeNormalizeRequest,

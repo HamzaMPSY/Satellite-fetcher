@@ -12,21 +12,26 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nimbuschain_shared.clients.sen2like import Sen2LikeServiceClient
+from nimbuschain_shared.contracts.sen2like import Sen2LikeNormalizeRequest
 from nimbuschain_sen2like_service.main import create_app
-from nimbuschain_sen2like_service.models import Sen2LikeNormalizeRequest
 from nimbuschain_sen2like_service.runner import build_command, readiness_payload, run_sen2like
 
 
 _REQUIRED_TEST_BANDS = ("B02", "B03", "B04", "B08", "B11", "B12")
 
 
-def _load_packaging_step_module():
-    vendor_root = (
+def _repo_sen2like_vendor_root() -> Path:
+    return (
         Path(__file__).resolve().parents[1]
-        / "sen2like-service"
+        / "src"
+        / "nimbuschain_sen2like_service"
         / "vendor"
         / "Satellite-fetcher-feature-sen2like_reimplementation"
     )
+
+
+def _load_packaging_step_module():
+    vendor_root = _repo_sen2like_vendor_root()
     if str(vendor_root) not in sys.path:
         sys.path.insert(0, str(vendor_root))
     from Packaging import PackagingStep
@@ -35,12 +40,7 @@ def _load_packaging_step_module():
 
 
 def _load_pipeline_module(monkeypatch, tmp_path: Path):
-    vendor_root = (
-        Path(__file__).resolve().parents[1]
-        / "sen2like-service"
-        / "vendor"
-        / "Satellite-fetcher-feature-sen2like_reimplementation"
-    )
+    vendor_root = _repo_sen2like_vendor_root()
     if str(vendor_root) not in sys.path:
         sys.path.insert(0, str(vendor_root))
     module = importlib.import_module("Pipeline")
