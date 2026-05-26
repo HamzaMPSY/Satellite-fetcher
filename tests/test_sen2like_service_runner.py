@@ -78,6 +78,67 @@ def test_sen2like_request_defaults_to_parallel_workers() -> None:
     assert Sen2LikeNormalizeRequest().workers == 4
 
 
+def test_sen2like_client_uses_shared_normalize_contract() -> None:
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "status": "succeeded",
+                "job_id": "job-1",
+                "pipeline_id": "pipe-1",
+                "trace_id": None,
+                "products": ["/data/raw/LC08_SCENE.tar"],
+                "working_dir": "/data/downloads/sen2like/job-1",
+                "outputs": [
+                    {
+                        "product": "/data/raw/LC08_SCENE.tar",
+                        "output_dir": "/data/downloads/sen2like/job-1/LC08_SCENE",
+                        "normalized_uri": (
+                            "/data/downloads/sen2like/job-1/LC08_SCENE/SAFE/"
+                            "S2L_SCENE.SAFE"
+                        ),
+                        "exists": True,
+                    }
+                ],
+                "duration_seconds": 1.25,
+                "return_code": 0,
+                "command": ["python", "Pipeline.py"],
+            }
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.posts: list[dict[str, object]] = []
+
+        def post(self, url: str, **kwargs):
+            self.posts.append({"url": url, **kwargs})
+            return FakeResponse()
+
+        def close(self) -> None:
+            pass
+
+    client = Sen2LikeServiceClient(service_url="http://sen2like.test")
+    fake_session = FakeSession()
+    client._session = fake_session  # type: ignore[assignment]
+
+    payload = client.normalize(
+        products=[" /data/raw/LC08_SCENE.tar "],
+        job_id="job-1",
+        pipeline_id="pipe-1",
+        working_dir="/data/downloads/sen2like/job-1",
+        workers=6,
+        steps=["packaging"],
+    )
+
+    request_json = fake_session.posts[0]["json"]
+    assert request_json["products"] == ["/data/raw/LC08_SCENE.tar"]
+    assert request_json["workers"] == 6
+    assert request_json["steps"] == ["packaging"]
+    assert "trace_id" not in request_json
+    assert payload["outputs"][0]["normalized_uri"].endswith("S2L_SCENE.SAFE")
+
+
 def test_sen2like_command_preserves_pipeline_entrypoint(tmp_path: Path) -> None:
     vendor_root = tmp_path / "vendor"
     vendor_root.mkdir()

@@ -5,6 +5,12 @@ from typing import Any
 from urllib.parse import quote
 
 import requests
+from pydantic import ValidationError
+
+from nimbuschain_shared.contracts.sen2like import (
+    Sen2LikeNormalizeRequest,
+    Sen2LikeNormalizeResponse,
+)
 
 
 class Sen2LikeServiceClient:
@@ -52,29 +58,36 @@ class Sen2LikeServiceClient:
         direct_zarr: bool | None = None,
         zarr_output_dir: str | None = None,
     ) -> dict[str, Any]:
+        request = Sen2LikeNormalizeRequest(
+            job_id=job_id,
+            pipeline_id=pipeline_id,
+            trace_id=trace_id,
+            products=list(products),
+            working_dir=working_dir,
+            workers=int(workers),
+            steps=list(steps) if steps else None,
+            s2_path=s2_path,
+            no_resume=bool(no_resume),
+            no_routing=bool(no_routing),
+            router_fallback_ok=bool(router_fallback_ok),
+            exclude_water=bool(exclude_water),
+            cleanup_mode=cleanup_mode,
+            cleanup_dry_run=bool(cleanup_dry_run),
+            timeout_seconds=timeout_seconds,
+            spark_master=spark_master,
+            preprocess_target_shape=preprocess_target_shape,
+            direct_zarr=direct_zarr,
+            zarr_output_dir=zarr_output_dir,
+        )
+        return self.normalize_request(request).model_dump(mode="json")
+
+    def normalize_request(
+        self,
+        request: Sen2LikeNormalizeRequest,
+    ) -> Sen2LikeNormalizeResponse:
         response = self._session.post(
             f"{self.service_url}/normalize",
-            json={
-                "job_id": job_id,
-                "pipeline_id": pipeline_id,
-                "trace_id": trace_id,
-                "products": list(products),
-                "working_dir": working_dir,
-                "workers": int(workers),
-                "steps": list(steps) if steps else None,
-                "s2_path": s2_path,
-                "no_resume": bool(no_resume),
-                "no_routing": bool(no_routing),
-                "router_fallback_ok": bool(router_fallback_ok),
-                "exclude_water": bool(exclude_water),
-                "cleanup_mode": cleanup_mode,
-                "cleanup_dry_run": bool(cleanup_dry_run),
-                "timeout_seconds": timeout_seconds,
-                "spark_master": spark_master,
-                "preprocess_target_shape": preprocess_target_shape,
-                "direct_zarr": direct_zarr,
-                "zarr_output_dir": zarr_output_dir,
-            },
+            json=request.model_dump(mode="json", exclude_none=True),
             timeout=(30, None),
         )
         payload = self._response_payload(response)
@@ -82,7 +95,12 @@ class Sen2LikeServiceClient:
             raise RuntimeError(self._error_detail(payload, response, prefix="Sen2Like service failed"))
         if response.status_code >= 400:
             raise ValueError(self._error_detail(payload, response, prefix="Sen2Like request was rejected"))
-        return payload
+        try:
+            return Sen2LikeNormalizeResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise RuntimeError(
+                "Sen2Like service response did not match the shared contract."
+            ) from exc
 
     def cancel_job(self, job_id: str) -> bool:
         normalized_job_id = str(job_id or "").strip()
