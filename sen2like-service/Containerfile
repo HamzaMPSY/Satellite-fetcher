@@ -8,8 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/appuser \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
-    PYTHONPATH=/app/src:/app/sen2like \
-    NIMBUS_SEN2LIKE_VENDOR_DIR=/app/sen2like \
+    SEN2LIKE_VENDOR_DIR=/app/src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation \
+    PYTHONPATH=/app/src:/app/src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation \
+    NIMBUS_SEN2LIKE_VENDOR_DIR=/app/src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation \
     NIMBUS_SEN2LIKE_WORK_DIR=/data/downloads/sen2like \
     NIMBUS_SEN2LIKE_WORKERS=4 \
     NIMBUS_SEN2LIKE_BAND_WORKERS=4 \
@@ -20,7 +21,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NIMBUS_SEN2LIKE_SPARK_DRIVER_MEMORY=1g \
     NIMBUS_SEN2LIKE_SPARK_EXECUTOR_MEMORY=1g \
     NIMBUS_SEN2LIKE_SPARK_PYTHON_WORKER_MEMORY=256m \
-    LANDSAT_UPSAMPLING_BASE=/app/sen2like \
+    LANDSAT_UPSAMPLING_BASE=/app/src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation \
     GDAL_CACHEMAX=256 \
     GDAL_NUM_THREADS=1 \
     JAVA_TOOL_OPTIONS="-Xmx1536m -XX:MaxRAMPercentage=55" \
@@ -52,7 +53,7 @@ RUN apt-get update && \
     python3 -m venv /opt/venv && \
     useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
-COPY sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/requirements.txt /app/requirements/sen2like-upstream.txt
+COPY src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/requirements.txt /app/requirements/sen2like-upstream.txt
 RUN python -m pip install --upgrade pip "setuptools<81" wheel && \
     grep -viE '^(GDAL|podman-compose|opencv-python-headless|pyrasterframes|zarr)==' \
       /app/requirements/sen2like-upstream.txt > /app/requirements/sen2like-container.txt && \
@@ -68,7 +69,6 @@ RUN python -m pip install --upgrade pip "setuptools<81" wheel && \
 COPY --chown=appuser:appuser src/nimbuschain_sen2like_service /app/src/nimbuschain_sen2like_service
 COPY --chown=appuser:appuser src/nimbuschain_zarr_service /app/src/nimbuschain_zarr_service
 COPY --chown=appuser:appuser src/nimbuschain_shared /app/src/nimbuschain_shared
-COPY --chown=appuser:appuser sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation /app/sen2like
 
 USER appuser
 

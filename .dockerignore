@@ -15,8 +15,8 @@ cache
 download
 output
 zarr
-!sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/zarr
-!sen2like-service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/zarr/**
+!src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/zarr
+!src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/zarr/**
 zarr_watermask
 
 .DS_Store
@@ -29,6 +29,7 @@ data/downloads
 data/nimbus.db
 data/nimbus.db-shm
 data/nimbus.db-wal
+report_work
 *.zarr
 tmp_mask_cloud_service.zarr
 tmp_zarr_preview.png

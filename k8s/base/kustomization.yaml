@@ -13,6 +13,12 @@ resources:
   - api-deployment.yaml
   - api-service.yaml
   - worker-deployment.yaml
+  - zarr-deployment.yaml
+  - zarr-service.yaml
+  - mask-deployment.yaml
+  - mask-service.yaml
+  - sen2like-deployment.yaml
+  - sen2like-service.yaml
   - ui-deployment.yaml
   - ui-service.yaml
   - api-hpa.yaml
@@ -22,4 +28,10 @@ images:
   - name: ghcr.io/nimbuschain/nimbus-api
     newTag: latest
   - name: ghcr.io/nimbuschain/nimbus-ui
+    newTag: latest
+  - name: ghcr.io/nimbuschain/nimbus-zarr
+    newTag: latest
+  - name: ghcr.io/nimbuschain/nimbus-mask
+    newTag: latest
+  - name: ghcr.io/nimbuschain/nimbus-sen2like
     newTag: latest

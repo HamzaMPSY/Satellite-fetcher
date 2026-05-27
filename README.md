@@ -5,6 +5,7 @@ NimbusChain Fetch is a multi-service satellite data platform composed of:
 - a FastAPI orchestrator for jobs, events, artifacts and health
 - a worker that executes Copernicus and USGS jobs in the background
 - a Streamlit UI for AOI selection, pipeline tracking and manual operations
+- a standalone Sen2Like service for Landsat-to-Sentinel-like normalization
 - a standalone Zarr conversion service reached over HTTP
 - a standalone mask service for cloud and water masking reached over HTTP
 
@@ -19,11 +20,11 @@ The repository is intentionally small in scope: it focuses on raw scene acquisit
 - convert downloaded scenes to Zarr with sensor-aware band preservation
 - apply cloud and water masks to existing Zarr outputs
 - run locally with Podman or Docker-compatible compose
-- deploy to Minikube with the provided Kubernetes manifests
+- deploy to Minikube or OMK with the provided Kubernetes manifests
 
 ## Architecture overview
 
-NimbusChain Fetch is organized around one public backend and two internal compute services.
+NimbusChain Fetch is organized around one public backend and three internal compute services.
 
 ```text
 Browser
@@ -31,6 +32,7 @@ Browser
        -> nimbus-api
             -> MongoDB or SQLite job store
             -> nimbus-worker
+            -> nimbus-sen2like (HTTP)
             -> nimbus-zarr (HTTP)
             -> nimbus-mask (HTTP)
 ```
@@ -42,7 +44,9 @@ Runtime responsibilities:
 - `nimbus-api`
   Public FastAPI entrypoint. It validates requests, exposes `/v1/...` endpoints, serves health/status, and orchestrates jobs through the shared fetch engine.
 - `nimbus-worker`
-  Background runtime role that polls the job store, claims queued jobs, executes provider downloads, updates pipeline state, and triggers remote conversion/masking work.
+  Background runtime role that polls the job store, claims queued jobs, executes provider downloads, updates pipeline state, and triggers remote normalization/conversion/masking work.
+- `nimbus-sen2like`
+  Dedicated normalization microservice that converts Landsat inputs into Sentinel-like outputs before Zarr conversion.
 - `nimbus-zarr`
   Dedicated conversion microservice that reads raw products and writes normalized Zarr outputs.
 - `nimbus-mask`
@@ -57,6 +61,7 @@ The current communication model is:
 - UI -> API: HTTP
 - API -> UI: HTTP responses plus server-sent events for live job/event updates
 - API/worker -> job store: direct persistence calls through the configured store backend
+- Fetch engine -> Sen2Like service: HTTP through the Sen2Like service client for Landsat normalization
 - Fetch engine -> Zarr service: HTTP through `ZarrServiceClient`
 - Fetch engine -> mask service: HTTP through `MaskServiceClient`
 
@@ -65,7 +70,7 @@ In practice this means:
 - the UI only talks to the fetch API
 - the fetch API is the only public control-plane surface
 - the worker performs background execution by reading and updating shared job state
-- conversion and masking are delegated to dedicated internal services over HTTP
+- Landsat normalization, conversion and masking are delegated to dedicated internal services over HTTP
 
 ## DTOs and contracts
 
@@ -145,17 +150,27 @@ The mask service returns structured masking results and exposes progress events 
 src/nimbuschain_fetch/            Core engine, workflows, providers, worker, stores
 src/nimbuschain_fetch_service/    FastAPI API layer and public orchestration endpoints
 src/nimbuschain_fetch_ui/         Streamlit frontend
+src/nimbuschain_sen2like_service/ Standalone Sen2Like HTTP wrapper
 src/nimbuschain_zarr_service/     Standalone Zarr conversion service
 src/nimbuschain_mask_service/     Standalone cloud/water mask service
+src/nimbuschain_rgb_viewer_service/ RGB preview helper service
 src/nimbuschain_shared/           Shared clients, DTOs, contracts, and runtime helpers
+src/nimbuschain_fetch_ui/pages/   Streamlit page-level views
+src/nimbuschain_fetch_ui/components/ Reusable Streamlit components
+src/nimbuschain_fetch_ui/services/ UI service and formatting helpers
 
 Containerfile                     API/worker image
 ui/Containerfile                  UI image
 zarr-service/Containerfile        Zarr service image
 mask-service/Containerfile        Mask service image
-podman-compose.yml                Local Podman stack
-docker-compose.yml                Local Docker-compatible stack
-k8s/                              Kubernetes base + overlay
+sen2like-service/Containerfile    Sen2Like service image
+deploy/compose/compose.yml        Canonical local compose stack
+deploy/compose/compose.dev.yml    Local dev compose override
+deploy/compose/compose.mask-external.yml External mask-service override
+podman-compose.yml                Compatibility include for the canonical stack
+docker-compose.yml                Compatibility include for the canonical stack
+k8s/                              Kubernetes base, Minikube overlay, and OMK overlay
+legacy/                           Older root scripts/providers kept out of active service paths
 
 data/Landsat-tiles/               Tracked Landsat tile index
 data/Sentinel-2-tiles/            Tracked Sentinel-2 tile index
@@ -169,7 +184,19 @@ cd /path/to/Satellite-fetcher
 cp .env.example .env
 ```
 
-Then start the API, worker, UI, Zarr service, and mask service with the container or host-process commands appropriate for your environment.
+Start the API, worker, UI, Sen2Like, Zarr service, and mask service with the canonical compose stack:
+
+```bash
+docker compose -f deploy/compose/compose.yml up --build
+```
+
+For Podman-compatible environments, use:
+
+```bash
+podman compose -f deploy/compose/compose.yml up --build
+```
+
+The root `docker-compose*.yml` and `podman-compose*.yml` files are compatibility includes that point at `deploy/compose/`.
 
 ## Health endpoints
 
@@ -205,9 +232,14 @@ Ignored locally:
 - `docs/MANUAL_CLI_TESTS.md`
 - `docs/MASTER_DIAGRAM.md`
 - `docs/RUNBOOK.md`
+- `docs/RUNBOOK_OKE.md`
 - `docs/API_REFERENCE.md`
 - `docs/ZARR.md`
 - `docs/PRODUCT_BANDS.md`
+- `docs/SERVICE_COMMUNICATION.md`
+- `docs/STORAGE_AND_SECRETS.md`
+- `docs/VALIDATION.md`
+- `docs/need_to_be_organize.md`
 
 ## Cube builder
 

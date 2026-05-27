@@ -151,6 +151,21 @@ cp .env.example .env
 
 After that, start the API/worker/UI/runtime services with the container or host-process commands appropriate for your environment. The old helper startup scripts have been removed and will be replaced later.
 
+Canonical compose entrypoint:
+
+```bash
+docker compose -f deploy/compose/compose.yml up --build
+```
+
+Podman-compatible entrypoint:
+
+```bash
+podman compose -f deploy/compose/compose.yml up --build
+```
+
+The root `docker-compose*.yml` and `podman-compose*.yml` files are compatibility
+includes for users who still reference the old root filenames.
+
 ## 4. Local URLs
 
 - UI: [http://127.0.0.1:8501](http://127.0.0.1:8501)

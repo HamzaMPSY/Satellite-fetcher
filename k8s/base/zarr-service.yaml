@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nimbus-zarr
+  namespace: nimbuschain
+  labels:
+    app: nimbus-zarr
+spec:
+  selector:
+    app: nimbus-zarr
+  ports:
+    - name: http
+      port: 8010
+      targetPort: http

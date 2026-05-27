@@ -1,20 +1,2 @@
-services:
-  nimbus-api:
-    volumes:
-      - ./src:/app/src
-
-  nimbus-worker:
-    volumes:
-      - ./src:/app/src
-
-  nimbus-ui:
-    volumes:
-      - ./src:/app/src
-
-  nimbus-zarr:
-    volumes:
-      - ./src:/app/src
-
-  nimbus-mask:
-    volumes:
-      - ./src:/app/src
+include:
+  - deploy/compose/compose.dev.yml

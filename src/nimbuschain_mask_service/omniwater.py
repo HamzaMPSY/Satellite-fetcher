@@ -1302,11 +1302,13 @@ def _run_water_fallback_window(
         cloud_block = np.asarray(cloud_mask, dtype=np.uint8) > 0
         if valid_mask is not None:
             cloud_block = np.logical_and(cloud_block, np.asarray(valid_mask, dtype=bool))
-        # Compatibility metric only: water and cloud are independent output layers.
         cloud_blocked_pixels = int(cloud_block.sum())
+        probability = np.where(cloud_block, 0.0, probability)
 
     raw_mask = probability >= float(threshold)
     refined_mask = _refine_binary_mask(raw_mask)
+    if cloud_mask is not None:
+        refined_mask = np.logical_and(refined_mask, np.asarray(cloud_mask, dtype=np.uint8) == 0)
     if valid_mask is not None:
         valid = np.asarray(valid_mask, dtype=bool)
         if valid.shape != probability.shape:
@@ -1395,8 +1397,8 @@ def _write_model_water_outputs(
             cloud_block = cloud_window > 0
             if valid_mask is not None:
                 cloud_block = np.logical_and(cloud_block, valid_mask)
-            # Compatibility metric only: model water output must still be allowed under cloud.
             cloud_blocked_pixels += int(cloud_block.sum())
+            tile_mask = np.where(cloud_block, 0, tile_mask).astype(np.uint8, copy=False)
         if valid_mask is not None:
             tile_mask = np.where(valid_mask, tile_mask, 0).astype(np.uint8, copy=False)
             tile_valid_pixels = int(valid_mask.sum())

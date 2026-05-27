@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbus-zarr
+  namespace: nimbuschain
+  labels:
+    app: nimbus-zarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nimbus-zarr
+  template:
+    metadata:
+      labels:
+        app: nimbus-zarr
+    spec:
+      containers:
+        - name: zarr
+          image: ghcr.io/nimbuschain/nimbus-zarr:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8010
+          envFrom:
+            - configMapRef:
+                name: nimbus-config
+            - secretRef:
+                name: nimbus-secrets
+          volumeMounts:
+            - name: downloads
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+      volumes:
+        - name: downloads
+          persistentVolumeClaim:
+            claimName: nimbus-downloads-pvc

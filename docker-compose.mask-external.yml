@@ -1,19 +1,2 @@
-services:
-  nimbus-api:
-    depends_on:
-      - mongodb
-    environment:
-      NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-http://host.containers.internal:8020}
-
-  nimbus-worker:
-    depends_on:
-      - mongodb
-    environment:
-      NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-http://host.containers.internal:8020}
-
-  nimbus-mask:
-    command: ["sh", "-lc", "sleep infinity"]
-    restart: "no"
-    ports: []
-    healthcheck:
-      disable: true
+include:
+  - deploy/compose/compose.mask-external.yml

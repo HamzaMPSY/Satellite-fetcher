@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbus-mask
+  namespace: nimbuschain
+  labels:
+    app: nimbus-mask
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nimbus-mask
+  template:
+    metadata:
+      labels:
+        app: nimbus-mask
+    spec:
+      containers:
+        - name: mask
+          image: ghcr.io/nimbuschain/nimbus-mask:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8020
+          envFrom:
+            - configMapRef:
+                name: nimbus-config
+            - secretRef:
+                name: nimbus-secrets
+          volumeMounts:
+            - name: downloads
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+      volumes:
+        - name: downloads
+          persistentVolumeClaim:
+            claimName: nimbus-downloads-pvc

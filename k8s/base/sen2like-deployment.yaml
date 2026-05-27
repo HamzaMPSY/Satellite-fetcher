@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbus-sen2like
+  namespace: nimbuschain
+  labels:
+    app: nimbus-sen2like
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nimbus-sen2like
+  template:
+    metadata:
+      labels:
+        app: nimbus-sen2like
+    spec:
+      containers:
+        - name: sen2like
+          image: ghcr.io/nimbuschain/nimbus-sen2like:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8030
+          envFrom:
+            - configMapRef:
+                name: nimbus-config
+            - secretRef:
+                name: nimbus-secrets
+          volumeMounts:
+            - name: downloads
+              mountPath: /data
+            - name: sen2like-lut-cache
+              mountPath: /app/src/nimbuschain_sen2like_service/vendor/Satellite-fetcher-feature-sen2like_reimplementation/lut
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 90
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "6"
+              memory: 24Gi
+      volumes:
+        - name: downloads
+          persistentVolumeClaim:
+            claimName: nimbus-downloads-pvc
+        - name: sen2like-lut-cache
+          emptyDir: {}

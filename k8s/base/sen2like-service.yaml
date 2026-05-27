@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nimbus-sen2like
+  namespace: nimbuschain
+  labels:
+    app: nimbus-sen2like
+spec:
+  selector:
+    app: nimbus-sen2like
+  ports:
+    - name: http
+      port: 8030
+      targetPort: http

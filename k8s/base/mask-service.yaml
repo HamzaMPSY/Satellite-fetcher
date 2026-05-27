@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nimbus-mask
+  namespace: nimbuschain
+  labels:
+    app: nimbus-mask
+spec:
+  selector:
+    app: nimbus-mask
+  ports:
+    - name: http
+      port: 8020
+      targetPort: http
