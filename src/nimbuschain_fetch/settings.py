@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from nimbuschain_fetch.launch_modes import (
     PipelineLaunchMode,
     default_host_mps_mask_url,
+    default_host_mps_sen2like_url,
     normalize_pipeline_launch_mode,
     service_defaults,
 )
@@ -43,6 +44,10 @@ class Settings(BaseSettings):
     nimbus_host_mps_mask_url: str = Field(
         default_factory=default_host_mps_mask_url,
         alias="NIMBUS_HOST_MPS_MASK_URL",
+    )
+    nimbus_host_mps_sen2like_url: str = Field(
+        default_factory=default_host_mps_sen2like_url,
+        alias="NIMBUS_HOST_MPS_SEN2LIKE_URL",
     )
     nimbus_mask_service_url: str | None = Field(default=None, alias="NIMBUS_MASK_SERVICE_URL")
     nimbus_integrated_mask_water_backend: str = Field(
@@ -90,6 +95,14 @@ class Settings(BaseSettings):
     nimbus_sen2like_safe_retry: bool = Field(
         default=True,
         alias="NIMBUS_SEN2LIKE_SAFE_RETRY",
+    )
+    nimbus_sen2like_batch_products: bool = Field(
+        default=False,
+        alias="NIMBUS_SEN2LIKE_BATCH_PRODUCTS",
+    )
+    nimbus_sen2like_product_parallel_requests: bool = Field(
+        default=True,
+        alias="NIMBUS_SEN2LIKE_PRODUCT_PARALLEL_REQUESTS",
     )
     nimbus_sen2like_preprocess_target_shape: str | None = Field(
         default="native",
@@ -237,6 +250,7 @@ class Settings(BaseSettings):
         "nimbus_copernicus_download_url",
         "nimbus_usgs_service_url",
         "nimbus_host_mps_mask_url",
+        "nimbus_host_mps_sen2like_url",
         "nimbus_mask_service_url",
         "nimbus_zarr_service_url",
         "nimbus_sen2like_service_url",
@@ -372,6 +386,18 @@ class Settings(BaseSettings):
         if launch_mode is PipelineLaunchMode.mps:
             return str(self.nimbus_host_mps_mask_url or defaults.mask_service_url).strip()
         return str(self.nimbus_mask_service_url or defaults.mask_service_url).strip()
+
+    @property
+    def effective_sen2like_service_url(self) -> str:
+        launch_mode = normalize_pipeline_launch_mode(self.nimbus_pipeline_launch_mode)
+        defaults = service_defaults(launch_mode)
+        if launch_mode is PipelineLaunchMode.mps:
+            return str(
+                self.nimbus_host_mps_sen2like_url
+                or self.nimbus_sen2like_service_url
+                or defaults.sen2like_service_url
+            ).strip()
+        return str(self.nimbus_sen2like_service_url or defaults.sen2like_service_url).strip()
 
     @staticmethod
     def _normalize_copernicus_account_entry(

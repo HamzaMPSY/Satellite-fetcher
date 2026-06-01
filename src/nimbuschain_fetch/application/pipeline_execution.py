@@ -70,7 +70,7 @@ class ModularPipelineJobExecutionHandler(JobExecutionHandler):
             cube_mode=cube_mode,
             sen2like_service_url=getattr(
                 getattr(self._rt, "settings", None),
-                "nimbus_sen2like_service_url",
+                "effective_sen2like_service_url",
                 None,
             ),
         )

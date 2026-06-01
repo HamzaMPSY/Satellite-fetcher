@@ -244,6 +244,33 @@ class FakeSen2LikeClient:
         return payload
 
 
+class ParallelTrackingSen2LikeClient(FakeSen2LikeClient):
+    calls: list[dict[str, object]] = []
+    _lock = threading.Lock()
+    _active_count = 0
+    max_active_count = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.calls = []
+        cls._active_count = 0
+        cls.max_active_count = 0
+
+    def normalize(self, **kwargs) -> dict[str, object]:
+        with type(self)._lock:
+            type(self)._active_count += 1
+            type(self).max_active_count = max(
+                type(self).max_active_count,
+                type(self)._active_count,
+            )
+        try:
+            time.sleep(0.05)
+            return super().normalize(**kwargs)
+        finally:
+            with type(self)._lock:
+                type(self)._active_count -= 1
+
+
 class DirectZarrSen2LikeClient(FakeSen2LikeClient):
     def normalize(self, **kwargs) -> dict[str, object]:
         payload = super().normalize(**kwargs)
@@ -941,7 +968,7 @@ def test_landsat_job_uses_sen2like_direct_zarr_without_standalone_reconversion(
     assert stage_results["zarr"] == "succeeded"
 
 
-def test_landsat_sen2like_router_batches_products_for_spark_parallelism(
+def test_landsat_sen2like_router_runs_products_in_parallel_by_default(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -950,6 +977,93 @@ def test_landsat_sen2like_router_batches_products_for_spark_parallelism(
             nimbus_sen2like_work_dir=str(tmp_path / "sen2like"),
             nimbus_sen2like_workers=4,
             nimbus_sen2like_timeout_seconds=600,
+        )
+    )
+    router = sen2like_normalization.Sen2LikeNormalizationRouter(runtime)
+    ParallelTrackingSen2LikeClient.reset()
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        ParallelTrackingSen2LikeClient,
+    )
+
+    response = router._normalize(
+        service_url="http://sen2like.test",
+        job_id="job-42",
+        products=["/data/raw/LC08_A.tar", "/data/raw/LC09_B.tar"],
+    )
+
+    assert len(ParallelTrackingSen2LikeClient.calls) == 2
+    assert sorted(
+        tuple(call["products"]) for call in ParallelTrackingSen2LikeClient.calls
+    ) == [
+        ("/data/raw/LC08_A.tar",),
+        ("/data/raw/LC09_B.tar",),
+    ]
+    assert {call["pipeline_id"] for call in ParallelTrackingSen2LikeClient.calls} == {"job-42"}
+    assert {call["job_id"] for call in ParallelTrackingSen2LikeClient.calls} == {
+        "job-42-1",
+        "job-42-2",
+    }
+    assert {
+        call["working_dir"] for call in ParallelTrackingSen2LikeClient.calls
+    } == {str(tmp_path / "sen2like" / "job-42")}
+    assert all(call["no_resume"] is True for call in ParallelTrackingSen2LikeClient.calls)
+    assert ParallelTrackingSen2LikeClient.max_active_count == 2
+    assert response["metadata"]["execution_mode"] == "parallel_single_product_requests"
+    assert response["metadata"]["service_request_mode"] == "parallel_single_product"
+    assert response["metadata"]["workers"] == 4
+    assert response["metadata"]["batched_product_count"] == 2
+    assert response["metadata"]["product_parallelism"] is True
+    assert response["metadata"]["tile_parallelism"] is True
+    assert response["metadata"]["band_parallelism"] is True
+    assert response["duration_seconds"] >= 0
+    assert len(response["outputs"]) == 2
+
+
+def test_landsat_sen2like_router_can_disable_parallel_product_requests(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            nimbus_sen2like_work_dir=str(tmp_path / "sen2like"),
+            nimbus_sen2like_workers=4,
+            nimbus_sen2like_timeout_seconds=600,
+            nimbus_sen2like_product_parallel_requests=False,
+        )
+    )
+    router = sen2like_normalization.Sen2LikeNormalizationRouter(runtime)
+    ParallelTrackingSen2LikeClient.reset()
+    monkeypatch.setattr(
+        sen2like_normalization,
+        "Sen2LikeServiceClient",
+        ParallelTrackingSen2LikeClient,
+    )
+
+    response = router._normalize(
+        service_url="http://sen2like.test",
+        job_id="job-42",
+        products=["/data/raw/LC08_A.tar", "/data/raw/LC09_B.tar"],
+    )
+
+    assert len(ParallelTrackingSen2LikeClient.calls) == 2
+    assert ParallelTrackingSen2LikeClient.max_active_count == 1
+    assert response["metadata"]["execution_mode"] == "sequential_single_product_requests"
+    assert response["metadata"]["service_request_mode"] == "sequential_single_product"
+    assert response["metadata"]["product_parallelism"] is False
+
+
+def test_landsat_sen2like_router_can_batch_products_when_enabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            nimbus_sen2like_work_dir=str(tmp_path / "sen2like"),
+            nimbus_sen2like_workers=4,
+            nimbus_sen2like_timeout_seconds=600,
+            nimbus_sen2like_batch_products=True,
         )
     )
     router = sen2like_normalization.Sen2LikeNormalizationRouter(runtime)
@@ -971,17 +1085,9 @@ def test_landsat_sen2like_router_batches_products_for_spark_parallelism(
         "/data/raw/LC08_A.tar",
         "/data/raw/LC09_B.tar",
     ]
-    assert FakeSen2LikeClient.calls[0]["pipeline_id"] == "job-42"
     assert FakeSen2LikeClient.calls[0]["job_id"] == "job-42"
-    assert FakeSen2LikeClient.calls[0]["working_dir"] == str(tmp_path / "sen2like" / "job-42")
-    assert FakeSen2LikeClient.calls[0]["no_resume"] is True
     assert response["metadata"]["execution_mode"] == "parallel_multi_product"
-    assert response["metadata"]["workers"] == 4
-    assert response["metadata"]["batched_product_count"] == 2
-    assert response["metadata"]["product_parallelism"] is True
-    assert response["metadata"]["tile_parallelism"] is True
-    assert response["duration_seconds"] == 1.25
-    assert len(response["outputs"]) == 2
+    assert response["metadata"]["service_request_mode"] == "batch_multi_product"
 
 
 def test_landsat_sen2like_router_reuses_existing_safe_outputs(

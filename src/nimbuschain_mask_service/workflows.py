@@ -754,7 +754,7 @@ def _try_write_native_cloud_mask_from_ancillary(
 
 def _should_use_native_cloud_mask(backend_request: str | None) -> bool:
     value = str(backend_request or "auto").strip().lower()
-    return value in {"", "auto", "native", "sen2like", "sen2like_native"}
+    return value in {"native", "sen2like", "sen2like_native"}
 
 
 def _read_ancillary_layer(

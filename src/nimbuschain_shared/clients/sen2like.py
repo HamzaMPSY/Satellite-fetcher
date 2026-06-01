@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -54,6 +55,9 @@ class Sen2LikeServiceClient:
         cleanup_dry_run: bool = False,
         timeout_seconds: float | None = None,
         spark_master: str | None = None,
+        nested_band_parallelism: bool | None = None,
+        band_workers: int | None = None,
+        safe_retry: bool | None = None,
         preprocess_target_shape: str | None = None,
         direct_zarr: bool | None = None,
         zarr_output_dir: str | None = None,
@@ -75,6 +79,9 @@ class Sen2LikeServiceClient:
             cleanup_dry_run=bool(cleanup_dry_run),
             timeout_seconds=timeout_seconds,
             spark_master=spark_master,
+            nested_band_parallelism=nested_band_parallelism,
+            band_workers=band_workers,
+            safe_retry=safe_retry,
             preprocess_target_shape=preprocess_target_shape,
             direct_zarr=direct_zarr,
             zarr_output_dir=zarr_output_dir,
@@ -161,6 +168,11 @@ class Sen2LikeServiceClient:
     def _summarize_structured_error(detail: Mapping[str, Any]) -> str:
         stderr_tail = str(detail.get("stderr_tail") or "").strip()
         lowered = stderr_tail.lower()
+        if "modulenotfounderror" in lowered:
+            match = re.search(r"No module named ['\"]([^'\"]+)['\"]", stderr_tail)
+            missing_module = match.group(1) if match else ""
+            suffix = f": {missing_module}" if missing_module else ""
+            return f"Sen2Like host runtime is missing a Python dependency{suffix}."
         if "failed to create a temp directory" in lowered:
             spark_dir = str(
                 dict(detail.get("metadata") or {}).get("spark_local_dirs")

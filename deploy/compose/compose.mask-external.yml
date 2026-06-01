@@ -6,6 +6,8 @@ services:
       NIMBUS_PIPELINE_LAUNCH_MODE: ${NIMBUS_PIPELINE_LAUNCH_MODE:-mps}
       NIMBUS_HOST_MPS_MASK_URL: ${NIMBUS_HOST_MPS_MASK_URL:-http://host.containers.internal:18021}
       NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-http://host.containers.internal:18021}
+      NIMBUS_HOST_MPS_SEN2LIKE_URL: ${NIMBUS_HOST_MPS_SEN2LIKE_URL:-http://host.containers.internal:18031}
+      NIMBUS_SEN2LIKE_SERVICE_URL: ${NIMBUS_SEN2LIKE_SERVICE_URL:-http://host.containers.internal:18031}
 
   nimbus-worker:
     depends_on:
@@ -14,6 +16,8 @@ services:
       NIMBUS_PIPELINE_LAUNCH_MODE: ${NIMBUS_PIPELINE_LAUNCH_MODE:-mps}
       NIMBUS_HOST_MPS_MASK_URL: ${NIMBUS_HOST_MPS_MASK_URL:-http://host.containers.internal:18021}
       NIMBUS_MASK_SERVICE_URL: ${NIMBUS_MASK_SERVICE_URL:-http://host.containers.internal:18021}
+      NIMBUS_HOST_MPS_SEN2LIKE_URL: ${NIMBUS_HOST_MPS_SEN2LIKE_URL:-http://host.containers.internal:18031}
+      NIMBUS_SEN2LIKE_SERVICE_URL: ${NIMBUS_SEN2LIKE_SERVICE_URL:-http://host.containers.internal:18031}
 
   nimbus-mask:
     command: ["sh", "-lc", "sleep infinity"]

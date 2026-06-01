@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,14 @@ DEFAULT_SPARK_DRIVER_MEMORY = "1g"
 DEFAULT_SPARK_EXECUTOR_MEMORY = "1g"
 DEFAULT_SPARK_PYTHON_WORKER_MEMORY = "256m"
 DEFAULT_PREPROCESS_TARGET_SHAPE = "native"
+_CONTAINER_DATA_PREFIXES = (
+    "/data/downloads",
+    "/app/data/downloads",
+    "/download",
+    "/downloads",
+    "/app/download",
+    "/app/downloads",
+)
 _ORIGINAL_SUBPROCESS_RUN = subprocess.run
 _PROCESS_LOCK = threading.RLock()
 _RUNNING_PROCESSES: dict[str, subprocess.Popen[str]] = {}
@@ -62,7 +71,7 @@ def resolve_vendor_root() -> Path:
 
 def resolve_working_dir(requested: str | None = None) -> Path:
     configured = requested or os.getenv("NIMBUS_SEN2LIKE_WORK_DIR") or "/data/downloads/sen2like"
-    return Path(configured).resolve()
+    return _local_path_for_data_uri(configured, allow_missing=True)
 
 
 def pipeline_path(vendor_root: Path | None = None) -> Path:
@@ -170,6 +179,7 @@ def run_sen2like(request: Sen2LikeNormalizeRequest) -> Sen2LikeNormalizeResponse
     env = os.environ.copy()
     env["LANDSAT_UPSAMPLING_BASE"] = str(vendor_root)
     env["PYTHONPATH"] = _prepend_path(str(vendor_root), env.get("PYTHONPATH"))
+    _apply_request_parallelism_env(request, env)
     spark_local_dirs = _prepare_spark_environment(env)
     if request.spark_master:
         env["SPARK_MASTER"] = request.spark_master
@@ -398,6 +408,8 @@ def readiness_payload() -> dict[str, Any]:
         "pipeline_py_exists": script.exists(),
         "sixs_executable": sixs_path,
         "sixs_executable_exists": sixs_path is not None,
+        "runtime_device": str(os.getenv("NIMBUS_SEN2LIKE_RUNTIME_DEVICE") or "").strip() or "cpu",
+        "host_data_dir": str(_host_data_root()),
     }
 
 
@@ -536,6 +548,20 @@ def _run_pipeline_with_safe_retry(
     return safe_completed
 
 
+def _apply_request_parallelism_env(
+    request: Sen2LikeNormalizeRequest,
+    env: dict[str, str],
+) -> None:
+    if request.nested_band_parallelism is not None:
+        env["NIMBUS_SEN2LIKE_NESTED_BAND_PARALLELISM"] = (
+            "true" if request.nested_band_parallelism else "false"
+        )
+    if request.band_workers is not None:
+        env["NIMBUS_SEN2LIKE_BAND_WORKERS"] = str(int(request.band_workers))
+    if request.safe_retry is not None:
+        env["NIMBUS_SEN2LIKE_SAFE_RETRY"] = "true" if request.safe_retry else "false"
+
+
 def _subprocess_attempt_summary(
     *,
     mode: str,
@@ -661,7 +687,7 @@ def _prepare_product_input(
     *,
     preprocess_target_shape: tuple[int, int] | None,
 ) -> PreparedProduct:
-    product_path = Path(product)
+    product_path = _local_path_for_data_uri(product, allow_missing=True)
     if _looks_like_tar_product(product_path):
         output_name = _tar_output_name(product_path)
         input_issue = _tar_input_issue(product_path)
@@ -688,7 +714,7 @@ def _prepare_product_input(
         )
     return PreparedProduct(
         original=product,
-        command_input=product,
+        command_input=str(product_path),
         output_name=Path(product).name,
         extracted=False,
         preprocess=_preprocess_disabled_metadata(preprocess_target_shape, reason="not_extracted"),
@@ -885,9 +911,106 @@ def _direct_zarr_output_root(request: Sen2LikeNormalizeRequest) -> Path:
         or ""
     ).strip()
     if configured:
-        return Path(configured).expanduser()
-    data_root = Path(str(os.getenv("NIMBUS_DATA_DIR") or "/data/downloads")).expanduser()
+        return _local_path_for_data_uri(configured, allow_missing=True)
+    data_root = _local_path_for_data_uri(
+        str(os.getenv("NIMBUS_DATA_DIR") or "/data/downloads"),
+        allow_missing=True,
+    )
     return data_root / "zarr"
+
+
+def _project_data_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "data" / "downloads"
+
+
+def _resolve_candidate(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except TypeError:  # pragma: no cover - compatibility guard
+        return path.expanduser().resolve()
+
+
+def _host_data_root() -> Path:
+    for raw in (
+        os.getenv("NIMBUS_HOST_DATA_DIR"),
+        os.getenv("NIMBUS_DATA_DIR"),
+        str(_project_data_root()),
+    ):
+        value = str(raw or "").strip()
+        if value:
+            return _resolve_candidate(Path(value))
+    return _resolve_candidate(_project_data_root())
+
+
+def _host_data_root_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for raw in (
+        os.getenv("NIMBUS_HOST_DATA_DIR"),
+        os.getenv("NIMBUS_DATA_DIR"),
+        str(_project_data_root()),
+    ):
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        candidate = _resolve_candidate(Path(value))
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+    return candidates
+
+
+def _map_container_data_uri(raw_value: str, *, allow_missing: bool) -> Path | None:
+    for prefix in _CONTAINER_DATA_PREFIXES:
+        if raw_value == prefix or raw_value.startswith(prefix + "/"):
+            suffix = raw_value[len(prefix) :].lstrip("/")
+            fallback: Path | None = None
+            for root in _host_data_root_candidates():
+                mapped = root / suffix if suffix else root
+                if mapped.exists():
+                    return _resolve_candidate(mapped)
+                if allow_missing and fallback is None:
+                    fallback = _resolve_candidate(mapped)
+            return fallback
+    return None
+
+
+def _map_data_downloads_suffix(candidate: Path, *, allow_missing: bool) -> Path | None:
+    parts = list(candidate.parts)
+    for idx in range(len(parts) - 1):
+        if parts[idx] == "data" and parts[idx + 1] == "downloads":
+            suffix = parts[idx + 2 :]
+            fallback: Path | None = None
+            for root in _host_data_root_candidates():
+                mapped = root.joinpath(*suffix)
+                if mapped.exists():
+                    return _resolve_candidate(mapped)
+                if allow_missing and fallback is None:
+                    fallback = _resolve_candidate(mapped)
+            return fallback
+    return None
+
+
+def _local_path_for_data_uri(uri: str, *, allow_missing: bool = True) -> Path:
+    raw_value = str(uri or "").strip()
+    if not raw_value:
+        return _resolve_candidate(Path("."))
+
+    mapped = _map_container_data_uri(raw_value, allow_missing=allow_missing)
+    if mapped is not None:
+        return mapped
+
+    candidate = Path(raw_value).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+
+    mapped = _map_data_downloads_suffix(candidate, allow_missing=allow_missing)
+    if mapped is not None:
+        return mapped
+
+    return _resolve_candidate(candidate)
 
 
 def _scene_id_from_normalized_uri(normalized_uri: str) -> str:
@@ -1506,13 +1629,14 @@ def _default_pyspark_submit_args(
     python_worker_memory: str,
     spark_local_dirs: str,
 ) -> str:
+    local_dir_conf = shlex.quote(f"spark.local.dir={spark_local_dirs}")
     return (
         f"--driver-memory {driver_memory} "
         f"--conf spark.driver.memory={driver_memory} "
         f"--conf spark.executor.memory={executor_memory} "
         f"--conf spark.python.worker.memory={python_worker_memory} "
         "--conf spark.sql.shuffle.partitions=1 "
-        f"--conf spark.local.dir={spark_local_dirs} "
+        f"--conf {local_dir_conf} "
         "pyspark-shell"
     )
 
@@ -1578,6 +1702,32 @@ def _response_metadata(
 ) -> dict[str, Any]:
     product_count = len(prepared_products)
     worker_count = int(request.workers)
+    nested_band_parallelism = (
+        bool(request.nested_band_parallelism)
+        if request.nested_band_parallelism is not None
+        else _env_flag_value(
+            os.getenv("NIMBUS_SEN2LIKE_NESTED_BAND_PARALLELISM"),
+            default=True,
+        )
+    )
+    band_workers = (
+        int(request.band_workers)
+        if request.band_workers is not None
+        else _env_int_value(
+            os.getenv("NIMBUS_SEN2LIKE_BAND_WORKERS"),
+            default=2,
+            minimum=1,
+            maximum=32,
+        )
+    )
+    safe_retry_enabled = (
+        bool(request.safe_retry)
+        if request.safe_retry is not None
+        else _env_flag_value(
+            os.getenv("NIMBUS_SEN2LIKE_SAFE_RETRY"),
+            default=True,
+        )
+    )
     metadata: dict[str, Any] = {
         "vendor_root": str(vendor_root),
         "pipeline_py": str(pipeline_path(vendor_root)),
@@ -1593,20 +1743,9 @@ def _response_metadata(
         "product_parallelism": product_count > 1 and worker_count > 1,
         "tile_parallelism": worker_count > 1,
         "band_parallelism": worker_count > 1,
-        "nested_band_parallelism": _env_flag_value(
-            os.getenv("NIMBUS_SEN2LIKE_NESTED_BAND_PARALLELISM"),
-            default=True,
-        ),
-        "band_workers": _env_int_value(
-            os.getenv("NIMBUS_SEN2LIKE_BAND_WORKERS"),
-            default=2,
-            minimum=1,
-            maximum=32,
-        ),
-        "safe_retry_enabled": _env_flag_value(
-            os.getenv("NIMBUS_SEN2LIKE_SAFE_RETRY"),
-            default=True,
-        ),
+        "nested_band_parallelism": nested_band_parallelism,
+        "band_workers": band_workers,
+        "safe_retry_enabled": safe_retry_enabled,
         "subprocess_attempts": [dict(item) for item in list(subprocess_attempts or [])],
         "tar_inputs_supported": True,
         "tar_inputs_are_extracted_before_pyspark": True,

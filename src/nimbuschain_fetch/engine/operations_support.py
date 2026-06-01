@@ -147,7 +147,14 @@ class FetcherOperationsSupport:
 
     async def _request_remote_sen2like_cancel(self, job_id: str) -> bool:
         normalized_job_id = str(job_id or "").strip()
-        service_url = str(self._rt.settings.nimbus_sen2like_service_url or "").strip()
+        service_url = str(
+            getattr(
+                self._rt.settings,
+                "effective_sen2like_service_url",
+                self._rt.settings.nimbus_sen2like_service_url,
+            )
+            or ""
+        ).strip()
         if not normalized_job_id or not service_url:
             return False
         client = None

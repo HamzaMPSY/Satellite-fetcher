@@ -49,6 +49,21 @@ mask-service = [
   "omnicloudmask[legacy]>=1.7.1",
   "omniwatermask>=0.4.3"
 ]
+sen2like-service = [
+  "dask[array]>=2024.9.0",
+  "GDAL>=3.12.0",
+  "mgrs>=1.5.0",
+  "opencv-python-headless>=4.9.0",
+  "planetary-computer>=1.0.0",
+  "Py6S>=1.9.2",
+  "pysolar>=0.13",
+  "pyspark>=4.0.0",
+  "pystac-client>=0.9.0",
+  "rioxarray>=0.17.0",
+  "scikit-image>=0.22.0",
+  "scipy>=1.11.4",
+  "sixs-bin>=0.11.3"
+]
 ui = [
   "streamlit>=1.38.0",
   "loguru>=0.7.2",

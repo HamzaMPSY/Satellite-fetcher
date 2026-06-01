@@ -17,6 +17,7 @@ from nimbuschain_fetch_service.api.converter import router as converter_router
 import nimbuschain_mask_service.inference as inference_module
 import nimbuschain_mask_service.service as mask_service_module
 from nimbuschain_mask_service.inference import run_cloud_inference
+from nimbuschain_mask_service.models import CloudInferenceSummary
 from nimbuschain_mask_service.service import MaskService
 
 
@@ -153,7 +154,94 @@ def test_omnicloudmask_branch_preserves_shadow_class_pixels(tmp_path: Path, monk
     assert masked.attrs["cloud_mask"]["tile_size"] == result["tile_size"]
 
 
-def test_auto_cloud_mask_prefers_sen2like_native_cloud_mask(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_auto_cloud_mask_uses_omnicloudmask_even_when_native_cloud_mask_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_cloud_shadow_scene(tmp_path)
+    group = zarr.open_group(str(source), mode="a", zarr_format=2)
+    height = int(group["imagery"].shape[2])
+    width = int(group["imagery"].shape[3])
+
+    native = np.full((height, width), 128, dtype=np.uint8)
+    native[0, 0] = 3
+    native[1:3, 1:3] = 2
+    native[7:9, 7:10] = 4
+    native[10:, :2] = 144
+    validity = np.ones((height, width), dtype=np.uint8)
+    validity[1:3, 1:3] = 0
+    validity[7:9, 7:10] = 0
+    group.create_array(
+        "ancillary",
+        data=np.stack([native, validity], axis=0)[np.newaxis, :, :, :],
+        chunks=(1, 1, height, width),
+        overwrite=True,
+    )
+    group.create_array(
+        "ancillary_layer",
+        data=np.asarray(["CLOUD_MASK", "VALIDITY_MASK"], dtype="U13"),
+        overwrite=True,
+    )
+    group.attrs["ancillary_layer_names"] = ["CLOUD_MASK", "VALIDITY_MASK"]
+    zarr.consolidate_metadata(str(source))
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_omnicloudmask(*_args, **_kwargs):
+        calls.append(dict(_kwargs))
+        cloud_mask = np.zeros((height, width), dtype=np.uint8)
+        cloud_mask[4:6, 4:6] = 1
+        return inference_module.CloudMaskResult(
+            probability=cloud_mask.astype(np.float32),
+            mask=cloud_mask,
+            summary=CloudInferenceSummary(
+                backend="omnicloudmask",
+                sensor="sentinel2",
+                cloud_fraction=float(cloud_mask.mean()),
+                cloud_only_fraction=float(cloud_mask.mean()),
+                shadow_fraction=0.0,
+                includes_shadows=True,
+                confidence_available=False,
+                class_histogram={
+                    "0": int(cloud_mask.size - cloud_mask.sum()),
+                    "1": int(cloud_mask.sum()),
+                },
+                mask_source="class_map",
+                probability_source="class_map",
+                requested_threshold=0.45,
+                threshold_for_mask=None,
+                valid_pixels=int(cloud_mask.size),
+            ),
+        )
+
+    monkeypatch.setattr(mask_service_module, "run_cloud_inference", _fake_omnicloudmask)
+    result = MaskService().apply_cloud_to_zarr(
+        job_id="job-cloud-native",
+        source_zarr_uri=str(source),
+        output_zarr_uri=str(source),
+        provider="copernicus",
+        collection="SENTINEL-2",
+        product_type="S2MSI2A",
+        scene_id="S2L_MSIL2F_20260101T105501_N0500_R000_T31TDN_20260101T105501",
+        acquisition_datetime=None,
+        dataset_summary={"shape": [1, 12, height, width], "pixel_size": [10.0, 10.0]},
+        backend="auto",
+        include_shadows=True,
+    )
+
+    masked = zarr.open_group(str(source), mode="r", zarr_format=2)
+    cloud_mask = np.asarray(masked["masks"]["cloud"][0, :, :])
+    assert calls
+    assert result["backend"] == "omnicloudmask"
+    assert result["mask_source"] == "class_map"
+    assert np.all(cloud_mask[4:6, 4:6] == 1)
+    assert masked.attrs["cloud_mask"]["backend"] == "omnicloudmask"
+
+
+def test_explicit_native_cloud_mask_uses_sen2like_ancillary_cloud_mask(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source = _write_cloud_shadow_scene(tmp_path)
     group = zarr.open_group(str(source), mode="a", zarr_format=2)
     height = int(group["imagery"].shape[2])
@@ -182,7 +270,7 @@ def test_auto_cloud_mask_prefers_sen2like_native_cloud_mask(tmp_path: Path, monk
     zarr.consolidate_metadata(str(source))
 
     def _should_not_call_omnicloudmask(*_args, **_kwargs):
-        raise AssertionError("auto cloud mask should use native CLOUD_MASK before OmniCloudMask")
+        raise AssertionError("explicit native cloud mask should not call OmniCloudMask")
 
     monkeypatch.setattr(mask_service_module, "run_cloud_inference", _should_not_call_omnicloudmask)
     result = MaskService().apply_cloud_to_zarr(
@@ -195,7 +283,7 @@ def test_auto_cloud_mask_prefers_sen2like_native_cloud_mask(tmp_path: Path, monk
         scene_id="S2L_MSIL2F_20260101T105501_N0500_R000_T31TDN_20260101T105501",
         acquisition_datetime=None,
         dataset_summary={"shape": [1, 12, height, width], "pixel_size": [10.0, 10.0]},
-        backend="auto",
+        backend="native",
         include_shadows=True,
     )
 

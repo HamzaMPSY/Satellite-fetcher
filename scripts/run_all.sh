@@ -83,15 +83,19 @@ case "$(printf '%s' "$LAUNCH_MODE" | tr '[:upper:]' '[:lower:]')" in
     ;;
 esac
 
-COMPOSE_PROJECT_NAME_VALUE="${COMPOSE_PROJECT_NAME:-${NIMBUS_COMPOSE_PROJECT_NAME:-backendnimbus}}"
-COMPOSE_ARGS=(--project-name "$COMPOSE_PROJECT_NAME_VALUE" -f "$ROOT_DIR/deploy/compose/compose.yml")
-if [ "$LAUNCH_MODE" = "mps" ]; then
-  COMPOSE_ARGS+=(-f "$ROOT_DIR/deploy/compose/compose.mask-external.yml")
-fi
-
 if [ ! -f .env ]; then
   cp .env.example .env
   echo "Created .env from .env.example"
+fi
+
+COMPOSE_PROJECT_NAME_VALUE="${COMPOSE_PROJECT_NAME:-${NIMBUS_COMPOSE_PROJECT_NAME:-backendnimbus}}"
+COMPOSE_ARGS=(
+  --project-name "$COMPOSE_PROJECT_NAME_VALUE"
+  --env-file "$ROOT_DIR/.env"
+  -f "$ROOT_DIR/deploy/compose/compose.yml"
+)
+if [ "$LAUNCH_MODE" = "mps" ]; then
+  COMPOSE_ARGS+=(-f "$ROOT_DIR/deploy/compose/compose.mask-external.yml")
 fi
 
 apply_launch_mode() {
@@ -99,12 +103,16 @@ apply_launch_mode() {
 
   if [ "$LAUNCH_MODE" = "mps" ]; then
     local host_mps_port="${NIMBUS_HOST_MPS_MASK_PORT:-18021}"
+    local host_sen2like_port="${NIMBUS_HOST_MPS_SEN2LIKE_PORT:-18031}"
     export NIMBUS_HOST_MPS_MASK_PORT="$host_mps_port"
+    export NIMBUS_HOST_MPS_SEN2LIKE_PORT="$host_sen2like_port"
     export NIMBUS_HOST_MPS_MASK_URL="${NIMBUS_HOST_MPS_MASK_URL:-http://host.containers.internal:$host_mps_port}"
+    export NIMBUS_HOST_MPS_SEN2LIKE_URL="${NIMBUS_HOST_MPS_SEN2LIKE_URL:-http://host.containers.internal:$host_sen2like_port}"
     export NIMBUS_MASK_SERVICE_URL="$NIMBUS_HOST_MPS_MASK_URL"
+    export NIMBUS_SEN2LIKE_SERVICE_URL="$NIMBUS_HOST_MPS_SEN2LIKE_URL"
 
-    # Conservative local profile: host MPS does masking, while Sen2Like keeps
-    # bounded parallelism to avoid killing the Podman VM on full Landsat scenes.
+    # Conservative local profile: host-native services handle MPS-sensitive
+    # stages, while Sen2Like keeps bounded parallelism to avoid local OOMs.
     export NIMBUS_SEN2LIKE_WORKERS="${NIMBUS_SEN2LIKE_WORKERS:-2}"
     export NIMBUS_SEN2LIKE_BAND_WORKERS="${NIMBUS_SEN2LIKE_BAND_WORKERS:-2}"
     export NIMBUS_SEN2LIKE_PREPROCESS_WORKERS="${NIMBUS_SEN2LIKE_PREPROCESS_WORKERS:-1}"
@@ -117,6 +125,7 @@ apply_launch_mode() {
     fi
 
     "$ROOT_DIR/scripts/run_host_mps_mask.sh" --daemon
+    "$ROOT_DIR/scripts/run_host_mps_sen2like.sh" --daemon
   else
     export NIMBUS_MASK_SERVICE_URL="${NIMBUS_MASK_SERVICE_URL:-http://nimbus-mask:8020}"
     export NIMBUS_ZARR_SERVICE_URL="${NIMBUS_ZARR_SERVICE_URL:-http://nimbus-zarr:8010}"
@@ -128,8 +137,8 @@ apply_launch_mode
 
 if [ "$LAUNCH_MODE" = "mps" ] && [ "${#SERVICES[@]}" -gt 0 ]; then
   for service in "${SERVICES[@]}"; do
-    if [ "$service" = "nimbus-mask" ]; then
-      echo "nimbus-mask is not part of the mps launch profile. Use the host MPS mask service or switch to --launch-mode oci."
+    if [ "$service" = "nimbus-mask" ] || [ "$service" = "nimbus-sen2like" ]; then
+      echo "$service is not part of the mps launch profile. Use the host MPS services or switch to --launch-mode oci."
       exit 2
     fi
   done
@@ -191,6 +200,9 @@ if [ "$BUILD" -eq 1 ]; then
       if [ "$LAUNCH_MODE" = "mps" ] && [ "$service" = "nimbus-mask" ]; then
         continue
       fi
+      if [ "$LAUNCH_MODE" = "mps" ] && [ "$service" = "nimbus-sen2like" ]; then
+        continue
+      fi
       if [ "$service" = "mongodb" ]; then
         if "$PODMAN_BIN" image exists mongo:7 || "$PODMAN_BIN" image exists docker.io/library/mongo:7; then
           echo "Using existing mongo:7 image."
@@ -208,8 +220,9 @@ UP_ARGS=(up -d --no-build)
 if [ "$FORCE_RECREATE" -eq 1 ]; then
   UP_ARGS+=(--force-recreate)
 fi
-if [ "$LAUNCH_MODE" = "mps" ]; then
+if [ "$LAUNCH_MODE" = "mps" ] && [ "${#SERVICES[@]}" -eq 0 ]; then
   UP_ARGS+=(--scale nimbus-mask=0)
+  UP_ARGS+=(--scale nimbus-sen2like=0)
 fi
 
 echo "Starting NimbusChain stack..."
@@ -259,10 +272,13 @@ check_url "Zarr" "http://127.0.0.1:8010/readiness" || true
 if [ "$LAUNCH_MODE" = "mps" ]; then
   check_url "Host MPS Mask" "http://127.0.0.1:${NIMBUS_HOST_MPS_MASK_PORT:-18021}/health" || true
   check_url "API Mask Proxy" "http://127.0.0.1:8000/v1/mask/health" || true
+  check_url "Host MPS Sen2Like" "http://127.0.0.1:${NIMBUS_HOST_MPS_SEN2LIKE_PORT:-18031}/health" || true
 else
   check_url "Mask" "http://127.0.0.1:8020/health" || true
 fi
-check_url "Sen2Like" "http://127.0.0.1:8030/health" || true
+if [ "$LAUNCH_MODE" != "mps" ]; then
+  check_url "Sen2Like" "http://127.0.0.1:8030/health" || true
+fi
 
 echo
 echo "UI: http://127.0.0.1:8501"

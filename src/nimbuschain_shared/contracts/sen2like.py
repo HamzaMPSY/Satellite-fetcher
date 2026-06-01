@@ -38,6 +38,9 @@ class Sen2LikeNormalizeRequest(BaseModel):
     cleanup_dry_run: bool = False
     timeout_seconds: float | None = Field(default=None, gt=0)
     spark_master: str | None = None
+    nested_band_parallelism: bool | None = None
+    band_workers: int | None = Field(default=None, ge=1, le=32)
+    safe_retry: bool | None = None
     preprocess_target_shape: str | None = None
     direct_zarr: bool | None = None
     zarr_output_dir: str | None = None

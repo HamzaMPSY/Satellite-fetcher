@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 import re
 import tarfile
+import time
 from typing import Any
 
 from nimbuschain_fetch.domain.metadata import PipelineMetadataRecord
@@ -102,7 +104,14 @@ class Sen2LikeNormalizationRouter:
                 response={},
             )
 
-        service_url = str(self._rt.settings.nimbus_sen2like_service_url or "").strip()
+        service_url = str(
+            getattr(
+                self._rt.settings,
+                "effective_sen2like_service_url",
+                self._rt.settings.nimbus_sen2like_service_url,
+            )
+            or ""
+        ).strip()
         if not service_url:
             error = (
                 "NIMBUS_SEN2LIKE_SERVICE_URL is required for Landsat jobs before Zarr conversion."
@@ -184,6 +193,34 @@ class Sen2LikeNormalizationRouter:
                 "sen2like_execution_mode": _sen2like_execution_mode(
                     product_count=len(raw_outputs),
                     worker_count=int(self._rt.settings.nimbus_sen2like_workers),
+                    batch_products=_settings_bool(
+                        self._rt.settings,
+                        "nimbus_sen2like_batch_products",
+                        default=False,
+                    ),
+                    product_parallel_requests=_settings_bool(
+                        self._rt.settings,
+                        "nimbus_sen2like_product_parallel_requests",
+                        default=True,
+                    ),
+                ),
+                "sen2like_service_request_mode": (
+                    "batch_multi_product"
+                    if _settings_bool(
+                        self._rt.settings,
+                        "nimbus_sen2like_batch_products",
+                        default=False,
+                    )
+                    else (
+                        "parallel_single_product"
+                        if _settings_bool(
+                            self._rt.settings,
+                            "nimbus_sen2like_product_parallel_requests",
+                            default=True,
+                        )
+                        and len(raw_outputs) > 1
+                        else "sequential_single_product"
+                    )
                 ),
                 "sen2like_workers": int(self._rt.settings.nimbus_sen2like_workers),
                 "sen2like_nested_band_parallelism": _settings_bool(
@@ -378,6 +415,7 @@ class Sen2LikeNormalizationRouter:
         duration_seconds = 0.0
         reused_existing_count = 0
         missing_products: list[str] = []
+        missing_product_entries: list[tuple[int, str]] = []
         try:
             for index, product in enumerate(products, start=1):
                 product_job_id = f"{job_id}-{index}" if len(products) > 1 else job_id
@@ -410,50 +448,83 @@ class Sen2LikeNormalizationRouter:
                     )
                     continue
                 missing_products.append(product)
+                missing_product_entries.append((index, product))
 
             if missing_products:
-                if client is None:
-                    client = Sen2LikeServiceClient(service_url=service_url)
-                try:
-                    response = client.normalize(
+                if _settings_bool(
+                    self._rt.settings,
+                    "nimbus_sen2like_batch_products",
+                    default=False,
+                ):
+                    if client is None:
+                        client = Sen2LikeServiceClient(service_url=service_url)
+                    response = self._normalize_product_batch(
+                        client=client,
                         products=missing_products,
                         job_id=job_id,
                         pipeline_id=job_id,
                         working_dir=working_dir,
-                        workers=int(self._rt.settings.nimbus_sen2like_workers),
-                        no_resume=True,
-                        timeout_seconds=self._rt.settings.nimbus_sen2like_timeout_seconds,
-                        preprocess_target_shape=_settings_str(
-                            self._rt.settings,
-                            "nimbus_sen2like_preprocess_target_shape",
-                            default="native",
-                        ),
-                        direct_zarr=_settings_bool(
-                            self._rt.settings,
-                            "nimbus_sen2like_direct_zarr",
-                            default=False,
-                        ),
-                        zarr_output_dir=_settings_optional_str(
-                            self._rt.settings,
-                            "nimbus_sen2like_zarr_dir",
-                        ),
                     )
-                except Exception as exc:
-                    product_names = ", ".join(
-                        Path(str(item)).name or str(item)
-                        for item in missing_products
+                    responses.append(response)
+                    outputs.extend(
+                        dict(item)
+                        for item in list(response.get("outputs") or [])
+                        if isinstance(item, dict)
                     )
-                    raise RuntimeError(f"Sen2Like failed for {product_names}: {exc}") from exc
-                responses.append(response)
-                outputs.extend(
-                    dict(item)
-                    for item in list(response.get("outputs") or [])
-                    if isinstance(item, dict)
-                )
-                try:
-                    duration_seconds += float(response.get("duration_seconds") or 0.0)
-                except (TypeError, ValueError):
-                    pass
+                    try:
+                        duration_seconds += float(response.get("duration_seconds") or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    request_started = time.perf_counter()
+                    if _use_parallel_product_requests(
+                        settings=self._rt.settings,
+                        product_count=len(missing_product_entries),
+                    ):
+                        max_workers = min(
+                            len(missing_product_entries),
+                            max(1, int(self._rt.settings.nimbus_sen2like_workers)),
+                        )
+                        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                            product_responses = list(
+                                pool.map(
+                                    lambda item: self._normalize_single_product_request(
+                                        service_url=service_url,
+                                        product=item[1],
+                                        job_id=(
+                                            f"{job_id}-{item[0]}"
+                                            if len(products) > 1
+                                            else job_id
+                                        ),
+                                        pipeline_id=job_id,
+                                        working_dir=working_dir,
+                                    ),
+                                    missing_product_entries,
+                                )
+                            )
+                    else:
+                        product_responses = [
+                            self._normalize_single_product_request(
+                                service_url=service_url,
+                                product=product,
+                                job_id=(
+                                    f"{job_id}-{product_index}"
+                                    if len(products) > 1
+                                    else job_id
+                                ),
+                                pipeline_id=job_id,
+                                working_dir=working_dir,
+                            )
+                            for product_index, product in missing_product_entries
+                        ]
+                    duration_seconds += time.perf_counter() - request_started
+                    for response in product_responses:
+                        responses.append(response)
+                        outputs.extend(
+                            dict(item)
+                            for item in list(response.get("outputs") or [])
+                            if isinstance(item, dict)
+                        )
             direct_zarr_metadata = _direct_zarr_metadata_from_outputs(
                 outputs,
                 settings=self._rt.settings,
@@ -473,6 +544,32 @@ class Sen2LikeNormalizationRouter:
                         product_count=len(products),
                         worker_count=int(self._rt.settings.nimbus_sen2like_workers),
                         missing_product_count=len(missing_products),
+                        batch_products=_settings_bool(
+                            self._rt.settings,
+                            "nimbus_sen2like_batch_products",
+                            default=False,
+                        ),
+                        product_parallel_requests=_settings_bool(
+                            self._rt.settings,
+                            "nimbus_sen2like_product_parallel_requests",
+                            default=True,
+                        ),
+                    ),
+                    "service_request_mode": (
+                        "batch_multi_product"
+                        if _settings_bool(
+                            self._rt.settings,
+                            "nimbus_sen2like_batch_products",
+                            default=False,
+                        )
+                        else (
+                            "parallel_single_product"
+                            if _use_parallel_product_requests(
+                                settings=self._rt.settings,
+                                product_count=len(missing_product_entries),
+                            )
+                            else "sequential_single_product"
+                        )
                     ),
                     "product_count": len(products),
                     "batched_product_count": len(missing_products),
@@ -498,11 +595,34 @@ class Sen2LikeNormalizationRouter:
                         default="native",
                     ),
                     "product_parallelism": (
-                        len(missing_products) > 1
-                        and int(self._rt.settings.nimbus_sen2like_workers) > 1
+                        (
+                            _settings_bool(
+                                self._rt.settings,
+                                "nimbus_sen2like_batch_products",
+                                default=False,
+                            )
+                            and len(missing_products) > 1
+                            and int(self._rt.settings.nimbus_sen2like_workers) > 1
+                        )
+                        or _use_parallel_product_requests(
+                            settings=self._rt.settings,
+                            product_count=len(missing_product_entries),
+                        )
                     ),
                     "tile_parallelism": int(self._rt.settings.nimbus_sen2like_workers) > 1,
-                    "band_parallelism": int(self._rt.settings.nimbus_sen2like_workers) > 1,
+                    "band_parallelism": (
+                        _settings_bool(
+                            self._rt.settings,
+                            "nimbus_sen2like_nested_band_parallelism",
+                            default=True,
+                        )
+                        and _settings_int(
+                            self._rt.settings,
+                            "nimbus_sen2like_band_workers",
+                            default=2,
+                        )
+                        > 1
+                    ),
                     "reused_existing_output_count": reused_existing_count,
                     "service_url": service_url,
                     "direct_zarr_requested": _settings_bool(
@@ -521,21 +641,115 @@ class Sen2LikeNormalizationRouter:
             if client is not None:
                 client.close()
 
+    def _normalize_product_batch(
+        self,
+        *,
+        client: Sen2LikeServiceClient,
+        products: list[str],
+        job_id: str,
+        pipeline_id: str,
+        working_dir: str,
+    ) -> dict[str, Any]:
+        try:
+            return client.normalize(
+                products=products,
+                job_id=job_id,
+                pipeline_id=pipeline_id,
+                working_dir=working_dir,
+                workers=int(self._rt.settings.nimbus_sen2like_workers),
+                no_resume=True,
+                timeout_seconds=self._rt.settings.nimbus_sen2like_timeout_seconds,
+                nested_band_parallelism=_settings_bool(
+                    self._rt.settings,
+                    "nimbus_sen2like_nested_band_parallelism",
+                    default=True,
+                ),
+                band_workers=_settings_int(
+                    self._rt.settings,
+                    "nimbus_sen2like_band_workers",
+                    default=2,
+                ),
+                safe_retry=_settings_bool(
+                    self._rt.settings,
+                    "nimbus_sen2like_safe_retry",
+                    default=True,
+                ),
+                preprocess_target_shape=_settings_str(
+                    self._rt.settings,
+                    "nimbus_sen2like_preprocess_target_shape",
+                    default="native",
+                ),
+                direct_zarr=_settings_bool(
+                    self._rt.settings,
+                    "nimbus_sen2like_direct_zarr",
+                    default=False,
+                ),
+                zarr_output_dir=_settings_optional_str(
+                    self._rt.settings,
+                    "nimbus_sen2like_zarr_dir",
+                ),
+            )
+        except Exception as exc:
+            product_names = ", ".join(
+                Path(str(item)).name or str(item)
+                for item in products
+            )
+            raise RuntimeError(f"Sen2Like failed for {product_names}: {exc}") from exc
+
+    def _normalize_single_product_request(
+        self,
+        *,
+        service_url: str,
+        product: str,
+        job_id: str,
+        pipeline_id: str,
+        working_dir: str,
+    ) -> dict[str, Any]:
+        client = Sen2LikeServiceClient(service_url=service_url)
+        try:
+            return self._normalize_product_batch(
+                client=client,
+                products=[product],
+                job_id=job_id,
+                pipeline_id=pipeline_id,
+                working_dir=working_dir,
+            )
+        finally:
+            client.close()
+
 
 def _sen2like_execution_mode(
     *,
     product_count: int,
     worker_count: int,
     missing_product_count: int | None = None,
+    batch_products: bool = False,
+    product_parallel_requests: bool = True,
 ) -> str:
     runnable_products = product_count if missing_product_count is None else missing_product_count
     if runnable_products <= 0:
         return "resume_existing_safe"
     if runnable_products == 1:
         return "single_product_parallel_steps" if worker_count > 1 else "single_product"
+    if not batch_products:
+        if product_parallel_requests and worker_count > 1:
+            return "parallel_single_product_requests"
+        return "sequential_single_product_requests"
     if worker_count > 1:
         return "parallel_multi_product"
     return "batched_multi_product_single_worker"
+
+
+def _use_parallel_product_requests(*, settings: Any, product_count: int) -> bool:
+    return (
+        product_count > 1
+        and int(getattr(settings, "nimbus_sen2like_workers", 1) or 1) > 1
+        and _settings_bool(
+            settings,
+            "nimbus_sen2like_product_parallel_requests",
+            default=True,
+        )
+    )
 
 
 def _settings_bool(settings: Any, name: str, *, default: bool) -> bool:

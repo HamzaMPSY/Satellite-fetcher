@@ -11,6 +11,7 @@ class PipelineLaunchMode(str, Enum):
 
 
 DEFAULT_HOST_MPS_MASK_PORT = "18021"
+DEFAULT_HOST_MPS_SEN2LIKE_PORT = "18031"
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,12 @@ def default_host_mps_mask_url(*, container: bool = False) -> str:
     return f"http://{host}:{port}"
 
 
+def default_host_mps_sen2like_url(*, container: bool = False) -> str:
+    host = "host.containers.internal" if container else "127.0.0.1"
+    port = str(os.getenv("NIMBUS_HOST_MPS_SEN2LIKE_PORT") or DEFAULT_HOST_MPS_SEN2LIKE_PORT).strip()
+    return f"http://{host}:{port}"
+
+
 def service_defaults(
     launch_mode: str | PipelineLaunchMode | None,
     *,
@@ -60,8 +67,8 @@ def service_defaults(
                 default_host_mps_mask_url(container=container),
             ),
             sen2like_service_url=_env(
-                "NIMBUS_SEN2LIKE_SERVICE_URL",
-                _default_service_url("nimbus-sen2like", "8030", container=container),
+                "NIMBUS_HOST_MPS_SEN2LIKE_URL",
+                default_host_mps_sen2like_url(container=container),
             ),
             stage_dir=_env("NIMBUS_PIPELINE_STAGE_DIR", "./data/downloads/staged"),
             zarr_dir=_env("NIMBUS_PIPELINE_ZARR_DIR", "./data/downloads/zarr"),
@@ -98,9 +105,11 @@ def _env(name: str, fallback: str) -> str:
 
 __all__ = [
     "DEFAULT_HOST_MPS_MASK_PORT",
+    "DEFAULT_HOST_MPS_SEN2LIKE_PORT",
     "PipelineLaunchMode",
     "PipelineServiceDefaults",
     "default_host_mps_mask_url",
+    "default_host_mps_sen2like_url",
     "normalize_pipeline_launch_mode",
     "service_defaults",
 ]

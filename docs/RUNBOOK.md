@@ -27,16 +27,16 @@ Only two pipeline launch profiles are supported:
 
 - `mps`: the local/UI profile. Start the stack with
   `scripts/run_all.sh --launch-mode mps`; the script starts the host-native MPS
-  mask service on macOS and points the API, worker and UI at it. Sen2Like keeps
-  bounded local parallelism so Landsat normalization is less likely to exhaust
-  the Podman VM.
+  mask service and the host-native Sen2Like service on macOS, then points the
+  API, worker and UI at those host services. Sen2Like keeps bounded local
+  parallelism so Landsat normalization is less likely to exhaust the Podman VM.
 - `oci`: the cloud/VM profile. Start with `scripts/run_all.sh --launch-mode oci`
   or run `nimbuschain-vm-pipeline --launch-mode oci ...`; masking and conversion
   use the service endpoints configured in the VM/container runtime.
 
-Do not use the in-container mask service for local UI MPS validation. Podman on
-macOS cannot expose Apple Metal/MPS to Linux containers, so the local MPS path is
-always the host-native mask service.
+Do not use the in-container mask or Sen2Like services for local UI MPS
+validation. Podman on macOS cannot expose Apple Metal/MPS to Linux containers,
+so the local MPS path uses host-native services.
 
 ### Sen2Like memory profile for Landsat
 

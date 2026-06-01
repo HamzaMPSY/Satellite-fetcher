@@ -113,6 +113,17 @@ def test_fetcher_masker_uses_mps_host_url_over_stale_mask_url(tmp_path) -> None:
         masker.close()
 
 
+def test_mps_launch_mode_uses_host_sen2like_url_over_container_url(tmp_path) -> None:
+    settings = _sqlite_settings(
+        tmp_path,
+        NIMBUS_PIPELINE_LAUNCH_MODE="mps",
+        NIMBUS_HOST_MPS_SEN2LIKE_URL="http://host.containers.internal:18031",
+        NIMBUS_SEN2LIKE_SERVICE_URL="http://nimbus-sen2like:8030",
+    )
+
+    assert settings.effective_sen2like_service_url == "http://host.containers.internal:18031"
+
+
 def test_fetcher_inspects_zarr_dataset_via_remote_client(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
 

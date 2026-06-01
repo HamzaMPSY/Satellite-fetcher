@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from nimbuschain_shared.clients.sen2like import Sen2LikeServiceClient
 from nimbuschain_shared.contracts.sen2like import Sen2LikeNormalizeRequest
+from nimbuschain_sen2like_service import runner as sen2like_runner
 from nimbuschain_sen2like_service.main import create_app
 from nimbuschain_sen2like_service.runner import build_command, readiness_payload, run_sen2like
 
@@ -78,6 +80,25 @@ def test_sen2like_request_defaults_to_parallel_workers() -> None:
     assert Sen2LikeNormalizeRequest().workers == 4
 
 
+def test_sen2like_host_runtime_maps_container_download_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_downloads = tmp_path / "downloads"
+    host_downloads.mkdir()
+    monkeypatch.setenv("NIMBUS_HOST_DATA_DIR", str(host_downloads))
+    monkeypatch.setenv("NIMBUS_DATA_DIR", str(host_downloads))
+
+    work_dir = sen2like_runner.resolve_working_dir("/data/downloads/sen2like/job-1")
+    raw_path = sen2like_runner._local_path_for_data_uri(
+        "/data/downloads/raw/LC08_SCENE.tar",
+        allow_missing=True,
+    )
+
+    assert work_dir == host_downloads / "sen2like" / "job-1"
+    assert raw_path == host_downloads / "raw" / "LC08_SCENE.tar"
+
+
 def test_sen2like_client_uses_shared_normalize_contract() -> None:
     class FakeResponse:
         status_code = 200
@@ -129,14 +150,58 @@ def test_sen2like_client_uses_shared_normalize_contract() -> None:
         working_dir="/data/downloads/sen2like/job-1",
         workers=6,
         steps=["packaging"],
+        nested_band_parallelism=True,
+        band_workers=3,
+        safe_retry=False,
     )
 
     request_json = fake_session.posts[0]["json"]
     assert request_json["products"] == ["/data/raw/LC08_SCENE.tar"]
     assert request_json["workers"] == 6
     assert request_json["steps"] == ["packaging"]
+    assert request_json["nested_band_parallelism"] is True
+    assert request_json["band_workers"] == 3
+    assert request_json["safe_retry"] is False
     assert "trace_id" not in request_json
     assert payload["outputs"][0]["normalized_uri"].endswith("S2L_SCENE.SAFE")
+
+
+def test_sen2like_client_reports_missing_runtime_dependency() -> None:
+    class FakeResponse:
+        status_code = 500
+        text = ""
+
+        def json(self):
+            return {
+                "detail": {
+                    "status": "failed",
+                    "return_code": 1,
+                    "stderr_tail": "ModuleNotFoundError: No module named 'dask'",
+                    "metadata": {
+                        "output_issues": [
+                            {
+                                "code": "output_missing",
+                                "message": "No Sen2Like output directory was written.",
+                            }
+                        ]
+                    },
+                }
+            }
+
+    class FakeSession:
+        def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+        def close(self) -> None:
+            pass
+
+    client = Sen2LikeServiceClient(service_url="http://sen2like.test")
+    client._session = FakeSession()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError) as excinfo:
+        client.normalize(products=["/data/raw/LC08_SCENE.tar"])
+
+    assert "missing a Python dependency: dask" in str(excinfo.value)
 
 
 def test_sen2like_command_preserves_pipeline_entrypoint(tmp_path: Path) -> None:
@@ -203,6 +268,19 @@ def test_sen2like_runner_reports_outputs_and_duration(tmp_path: Path, monkeypatc
     assert response.metadata["execution_mode"] == "single_product_parallel_steps"
     assert response.metadata["product_parallelism"] is False
     assert response.metadata["tile_parallelism"] is True
+
+
+def test_sen2like_spark_submit_args_preserve_local_dir_with_spaces() -> None:
+    args = sen2like_runner._default_pyspark_submit_args(
+        driver_memory="1g",
+        executor_memory="1g",
+        python_worker_memory="256m",
+        spark_local_dirs="/tmp/backend nimbus/spark",
+    )
+
+    parts = shlex.split(args)
+
+    assert "spark.local.dir=/tmp/backend nimbus/spark" in parts
 
 
 def test_sen2like_runner_can_write_direct_zarr_output(tmp_path: Path, monkeypatch) -> None:
@@ -273,12 +351,14 @@ def test_sen2like_runner_reports_parallel_multi_product_metadata(
     (vendor_root / "Pipeline.py").write_text("print('upstream')")
     work_dir = tmp_path / "work"
     captured_command = []
+    captured_env = {}
 
     def fake_vendor_root() -> Path:
         return vendor_root
 
     def fake_run(*args, **kwargs):
         captured_command.extend(args[0])
+        captured_env.update(dict(kwargs.get("env") or {}))
         _write_valid_sen2like_output(work_dir, "LC08_SCENE_A")
         _write_valid_sen2like_output(work_dir, "LC09_SCENE_B")
         return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="ok", stderr="")
@@ -292,6 +372,9 @@ def test_sen2like_runner_reports_parallel_multi_product_metadata(
             products=["/data/raw/LC08_SCENE_A", "/data/raw/LC09_SCENE_B"],
             working_dir=str(work_dir),
             workers=4,
+            nested_band_parallelism=True,
+            band_workers=3,
+            safe_retry=True,
         )
     )
 
@@ -306,7 +389,11 @@ def test_sen2like_runner_reports_parallel_multi_product_metadata(
     assert response.metadata["tile_parallelism"] is True
     assert response.metadata["band_parallelism"] is True
     assert response.metadata["nested_band_parallelism"] is True
+    assert response.metadata["band_workers"] == 3
     assert response.metadata["safe_retry_enabled"] is True
+    assert captured_env["NIMBUS_SEN2LIKE_NESTED_BAND_PARALLELISM"] == "true"
+    assert captured_env["NIMBUS_SEN2LIKE_BAND_WORKERS"] == "3"
+    assert captured_env["NIMBUS_SEN2LIKE_SAFE_RETRY"] == "true"
     assert response.metadata["subprocess_attempts"][0]["mode"] == "parallel_products_and_bands"
 
 
