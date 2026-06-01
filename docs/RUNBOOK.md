@@ -21,13 +21,33 @@ Do not commit `.env`.
 
 At minimum, configure provider credentials before testing downloads.
 
+## 2.1 Launch profiles
+
+Only two pipeline launch profiles are supported:
+
+- `mps`: the local/UI profile. Start the stack with
+  `scripts/run_all.sh --launch-mode mps`; the script starts the host-native MPS
+  mask service on macOS and points the API, worker and UI at it. Sen2Like keeps
+  bounded local parallelism so Landsat normalization is less likely to exhaust
+  the Podman VM.
+- `oci`: the cloud/VM profile. Start with `scripts/run_all.sh --launch-mode oci`
+  or run `nimbuschain-vm-pipeline --launch-mode oci ...`; masking and conversion
+  use the service endpoints configured in the VM/container runtime.
+
+Do not use the in-container mask service for local UI MPS validation. Podman on
+macOS cannot expose Apple Metal/MPS to Linux containers, so the local MPS path is
+always the host-native mask service.
+
 ### Sen2Like memory profile for Landsat
 
 Landsat jobs require Sen2Like to produce real Sentinel-like outputs before Zarr
-conversion. The default local profile is fail-closed:
+conversion. The default local MPS launcher is fail-closed and exports a bounded
+Sen2Like profile unless you override these values:
 
 ```bash
-NIMBUS_SEN2LIKE_WORKERS=4
+NIMBUS_SEN2LIKE_WORKERS=2
+NIMBUS_SEN2LIKE_BAND_WORKERS=2
+NIMBUS_SEN2LIKE_PREPROCESS_WORKERS=1
 NIMBUS_SEN2LIKE_TIMEOUT_SECONDS=3600
 NIMBUS_SEN2LIKE_RAW_FALLBACK=false
 NIMBUS_SEN2LIKE_MEM_LIMIT=24g
@@ -258,6 +278,7 @@ Or run the end-to-end VM test path in one command:
 nimbuschain-vm-pipeline \
   oci://<bucket>@<namespace>/raw/<scene-a>.SAFE.zip \
   oci://<bucket>@<namespace>/raw/<scene-b>.SAFE.zip \
+  --launch-mode oci \
   --provider copernicus \
   --collection SENTINEL-2 \
   --product-type S2MSI2A \

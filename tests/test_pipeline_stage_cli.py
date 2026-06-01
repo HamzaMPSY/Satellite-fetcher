@@ -27,6 +27,7 @@ def test_stage_cli_plan_outputs_json(capsys) -> None:
 
     assert code == 0
     assert payload["status"] == "planned"
+    assert payload["launch_mode"] == "mps"
     assert [stage["name"] for stage in payload["stages"]] == ["fetch", "zarr"]
 
 

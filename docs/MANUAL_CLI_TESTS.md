@@ -15,15 +15,17 @@ Start or verify the stack from the repository root:
 
 ```bash
 podman machine start
-podman compose up -d
+scripts/run_all.sh --launch-mode mps --no-build
 podman ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
 curl -fsS http://127.0.0.1:8000/v1/health
 ```
 
 Expected:
 
-- `nimbus-api`, `nimbus-zarr`, `nimbus-mask`, `nimbus-sen2like`, `nimbus-ui`,
-  and `mongodb` are `Up`.
+- `nimbus-api`, `nimbus-zarr`, `nimbus-sen2like`, `nimbus-ui`, and `mongodb`
+  are `Up`.
+- In `mps` launch mode, `nimbus-mask` is intentionally not part of the compose
+  path; masking goes to the host-native MPS service.
 - API health returns `{"status":"ok","ready":true,...}`.
 
 If VS Code Pod Manager cannot connect but `podman ps` works in the terminal,
@@ -53,7 +55,7 @@ Service URLs used by the commands:
 
 ```bash
 export ZARR_URL=http://nimbus-zarr:8010
-export MASK_URL=http://nimbus-mask:8020
+export MASK_URL=http://host.containers.internal:18021
 export SEN2LIKE_URL=http://nimbus-sen2like:8030
 ```
 
@@ -84,6 +86,7 @@ testing, run all green-path cases and at least one edge case.
 
 ```bash
 api python -m nimbuschain_fetch.pipeline_cli "$S2_RAW" \
+  --launch-mode mps \
   --provider copernicus \
   --collection SENTINEL-2 \
   --product-type S2MSI2A \
@@ -275,6 +278,7 @@ Expected:
 
 ```bash
 api python -m nimbuschain_fetch.stage_cli plan \
+  --launch-mode mps \
   --provider copernicus \
   --collection SENTINEL-2 \
   --product-type S2MSI2A \
@@ -468,7 +472,7 @@ extension is stale.
 podman compose ps
 podman compose logs --tail=100 nimbus-api
 podman compose logs --tail=100 nimbus-zarr
-podman compose logs --tail=100 nimbus-mask
+tail -n 100 data/downloads/mask-cache/host-mps-mask.log
 ```
 
 ### Raw path does not exist in the container
@@ -513,7 +517,8 @@ The readiness payload must include `"sixs_executable_exists": true`.
 ### Water mask logs show `Permission denied: 'cache'`
 
 This comes from OSMnx inside OmniWaterMask trying to write its default relative
-`./cache` folder under `/app`. Rebuild/recreate `nimbus-mask` with:
+`./cache` folder. Restart the host MPS mask service or recreate `nimbus-mask`
+in `oci` mode with:
 
 ```bash
 NIMBUS_WATERMASK_OSMNX_CACHE_DIR=/data/downloads/mask-cache/osmnx
@@ -524,8 +529,8 @@ NIMBUS_WATERMASK_MODEL_PROGRESS_SECONDS=5
 ```
 
 The water-mask request can keep running, but every tile may stay slow until the
-mask service is recreated with the writable cache settings. The local stack uses
-512 px water tiles so mask patches match the Zarr chunk size.
+mask service is restarted with the writable cache settings. The local MPS path
+uses the host-native service; the `oci` profile uses the `nimbus-mask` container.
 
 ### Landsat daily mosaic
 

@@ -350,7 +350,7 @@ class NimbusFetcher:
 
     def _converter(self) -> ConverterPort:
         if self._zarr_converter is None:
-            service_url = str(self.settings.nimbus_zarr_service_url or "").strip()
+            service_url = str(self.settings.effective_zarr_service_url or "").strip()
             if not service_url:
                 raise RuntimeError("Zarr service URL is not configured.")
             self._zarr_converter = ZarrServiceClient(service_url=service_url)
@@ -470,14 +470,14 @@ class NimbusFetcher:
 
     def _masker(self) -> MaskPort:
         if self._mask_service is None:
-            service_url = str(self.settings.nimbus_mask_service_url or "").strip()
+            service_url = str(self.settings.effective_mask_service_url or "").strip()
             if not service_url:
                 raise RuntimeError("Mask service URL is not configured.")
             self._mask_service = MaskServiceClient(service_url=service_url)
         return self._mask_service
 
     def _remote_mask_runtime(self) -> dict[str, Any]:
-        service_url = str(self.settings.nimbus_mask_service_url or "").strip()
+        service_url = str(self.settings.effective_mask_service_url or "").strip()
         if not service_url:
             return {}
         try:

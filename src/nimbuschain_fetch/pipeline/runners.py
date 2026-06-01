@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nimbuschain_fetch.launch_modes import (
+    PipelineLaunchMode,
+    normalize_pipeline_launch_mode,
+    service_defaults,
+)
 from nimbuschain_fetch.pipeline.core import PipelineContext, StageResult
 from nimbuschain_fetch.pipeline.sen2like import Sen2LikeStage, is_landsat_context
 from nimbuschain_shared.clients.mask import MaskServiceClient as _MaskServiceClient
@@ -18,6 +23,7 @@ MaskServiceClient: Any = _MaskServiceClient
 
 @dataclass(frozen=True, slots=True)
 class PipelineRuntimeConfig:
+    launch_mode: str | None = None
     zarr_service_url: str | None = None
     mask_service_url: str | None = None
     zarr_output_dir: str = "./data/downloads/zarr/manual"
@@ -35,10 +41,28 @@ class PipelineRuntimeConfig:
     cube_end_date: str | None = None
 
     def resolved_zarr_service_url(self) -> str | None:
-        return _first_non_empty(self.zarr_service_url, os.getenv("NIMBUS_ZARR_SERVICE_URL"))
+        launch_mode = normalize_pipeline_launch_mode(self.launch_mode)
+        defaults = service_defaults(launch_mode)
+        return _first_non_empty(
+            self.zarr_service_url,
+            os.getenv("NIMBUS_ZARR_SERVICE_URL"),
+            defaults.zarr_service_url,
+        )
 
     def resolved_mask_service_url(self) -> str | None:
-        return _first_non_empty(self.mask_service_url, os.getenv("NIMBUS_MASK_SERVICE_URL"))
+        launch_mode = normalize_pipeline_launch_mode(self.launch_mode)
+        defaults = service_defaults(launch_mode)
+        if launch_mode is PipelineLaunchMode.mps:
+            return _first_non_empty(
+                self.mask_service_url,
+                os.getenv("NIMBUS_HOST_MPS_MASK_URL"),
+                defaults.mask_service_url,
+            )
+        return _first_non_empty(
+            self.mask_service_url,
+            os.getenv("NIMBUS_MASK_SERVICE_URL"),
+            defaults.mask_service_url,
+        )
 
 
 @dataclass(frozen=True, slots=True)

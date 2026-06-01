@@ -172,3 +172,66 @@ def test_vm_pipeline_cli_can_build_cube_before_masking(monkeypatch, capsys) -> N
     assert captured["grouped_sources"] == [payload["converted_items"][0]["zarr_uri"]]
     assert captured["grouped_sources"][0].endswith(".zarr")
     assert not captured["grouped_sources"][0].endswith("_masked.zarr")
+
+
+def test_vm_pipeline_cli_launch_mode_mps_supplies_mps_mask_default(
+    monkeypatch,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.delenv("NIMBUS_ZARR_SERVICE_URL", raising=False)
+    monkeypatch.setenv("NIMBUS_MASK_SERVICE_URL", "http://nimbus-mask:8020")
+    monkeypatch.setenv("NIMBUS_HOST_MPS_MASK_PORT", "18021")
+    monkeypatch.setenv("NIMBUS_HOST_MPS_MASK_URL", "http://127.0.0.1:18021")
+    monkeypatch.setattr(pipeline_cli, "_materialize_raw_source", lambda raw_uri, stage_dir: raw_uri)
+
+    class FakeZarrClient:
+        def __init__(self, *, service_url: str):
+            captured["zarr_service_url"] = service_url
+
+        def convert(self, **kwargs):
+            return (
+                kwargs["output_uri"],
+                "optical",
+                {"scene_id": kwargs["scene_id"]},
+                {"acquisition_datetime": "2026-04-10T08:00:21Z"},
+            )
+
+        def close(self) -> None:
+            return None
+
+    class FakeMaskClient:
+        def __init__(self, *, service_url: str | None = None):
+            captured["mask_service_url"] = service_url
+
+        def apply_masks_to_zarr(self, **kwargs):
+            return {"status": "written", "masked_zarr_uri": kwargs["zarr_uri"]}
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(pipeline_cli, "ZarrServiceClient", FakeZarrClient)
+    monkeypatch.setattr(pipeline_cli, "MaskServiceClient", FakeMaskClient)
+
+    args = pipeline_cli.build_parser().parse_args(
+        [
+            "/data/raw/A.SAFE.zip",
+            "--launch-mode",
+            "mps",
+            "--provider",
+            "copernicus",
+            "--collection",
+            "SENTINEL-2",
+            "--product-type",
+            "S2MSI2A",
+            "--mask-types",
+            "water",
+        ]
+    )
+
+    assert pipeline_cli.run(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["launch_mode"] == "mps"
+    assert captured["zarr_service_url"] == "http://127.0.0.1:8010"
+    assert captured["mask_service_url"] == "http://127.0.0.1:18021"

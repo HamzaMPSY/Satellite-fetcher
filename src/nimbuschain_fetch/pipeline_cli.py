@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from nimbuschain_fetch.launch_modes import normalize_pipeline_launch_mode, service_defaults
 from nimbuschain_shared.clients.mask import MaskServiceClient
 from nimbuschain_shared.clients.zarr import ZarrServiceClient
 from nimbuschain_shared.oci import OCIStorageError, OCIStore, is_oci_uri, parse_oci_uri
-from nimbuschain_shared.zarr import ConversionError
 
 
 def _json_default(value: Any) -> Any:
@@ -81,12 +81,21 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("sources", nargs="+", help="Raw input paths or oci:// URIs.")
+    parser.add_argument(
+        "--launch-mode",
+        choices=["mps", "oci"],
+        default=None,
+        help=(
+            "Runtime launch profile. 'mps' uses the host-native Apple MPS mask "
+            "service; 'oci' uses cloud/container service endpoints."
+        ),
+    )
     parser.add_argument("--provider", required=True, choices=["copernicus", "usgs"])
     parser.add_argument("--collection", required=True)
     parser.add_argument("--product-type", default=None)
-    parser.add_argument("--stage-dir", default="./data/downloads/staged")
-    parser.add_argument("--zarr-dir", default="./data/downloads/zarr")
-    parser.add_argument("--zarr-service-url", required=True)
+    parser.add_argument("--stage-dir", default=None)
+    parser.add_argument("--zarr-dir", default=None)
+    parser.add_argument("--zarr-service-url", default=None)
     parser.add_argument("--mask-types", default=None, help="Comma-separated: water,cloud")
     parser.add_argument("--mask-service-url", default=None)
     parser.add_argument(
@@ -115,13 +124,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
-    stage_dir = _resolve_output_root(args.stage_dir, "./data/downloads/staged")
-    zarr_dir = _resolve_output_root(args.zarr_dir, "./data/downloads/zarr")
+    launch_mode = normalize_pipeline_launch_mode(args.launch_mode)
+    defaults = service_defaults(launch_mode)
+    stage_dir = _resolve_output_root(args.stage_dir, defaults.stage_dir)
+    zarr_dir = _resolve_output_root(args.zarr_dir, defaults.zarr_dir)
     zarr_dir.mkdir(parents=True, exist_ok=True)
     cube_mode, legacy_grouped_mode = _normalize_cube_mode(args.cube_mode)
     grouped_cube_build = bool(args.group_by_tile or legacy_grouped_mode)
 
-    zarr_service_url = str(args.zarr_service_url or "").strip()
+    zarr_service_url = str(args.zarr_service_url or defaults.zarr_service_url).strip()
     if not zarr_service_url:
         raise ValueError("zarr_service_url is required.")
 
@@ -129,7 +140,7 @@ def run(args: argparse.Namespace) -> int:
     mask_client: MaskServiceClient | None = None
     requested_mask_types = _mask_types(args.mask_types)
     if requested_mask_types:
-        mask_service_url = str(args.mask_service_url or "").strip()
+        mask_service_url = str(args.mask_service_url or defaults.mask_service_url).strip()
         if not mask_service_url:
             raise ValueError("mask_service_url is required when masking is enabled.")
         mask_client = MaskServiceClient(service_url=mask_service_url)
@@ -226,6 +237,7 @@ def run(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "status": "completed",
+                    "launch_mode": launch_mode.value,
                     "provider": args.provider,
                     "collection": args.collection,
                     "product_type": args.product_type,

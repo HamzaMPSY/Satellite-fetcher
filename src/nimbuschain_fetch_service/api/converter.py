@@ -26,7 +26,7 @@ router = APIRouter(prefix="/v1", tags=["converter"])
 
 
 def _require_mask_service_url(settings: Settings) -> str:
-    service_url = str(settings.nimbus_mask_service_url or "").strip()
+    service_url = str(settings.effective_mask_service_url or "").strip()
     if not service_url:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -36,7 +36,7 @@ def _require_mask_service_url(settings: Settings) -> str:
 
 
 def _require_zarr_service_url(settings: Settings) -> str:
-    service_url = str(settings.nimbus_zarr_service_url or "").strip()
+    service_url = str(settings.effective_zarr_service_url or "").strip()
     if not service_url:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

@@ -12,6 +12,7 @@ def test_visual_orchestrator_builds_stage_cli_command() -> None:
         job_id="job-1",
         mask_types=["water", "cloud"],
         cube_mode="before_mask",
+        launch_mode="mps",
         run_stage="mask",
         raw_uri="/data/downloads/raw/LC08_SCENE",
         sen2like_service_url="http://nimbus-sen2like:8030",
@@ -22,6 +23,7 @@ def test_visual_orchestrator_builds_stage_cli_command() -> None:
 
     assert command[:4] == ["python", "-m", "nimbuschain_fetch.stage_cli", "run-stage"]
     assert command[command.index("--provider") + 1] == "usgs"
+    assert command[command.index("--launch-mode") + 1] == "mps"
     assert command[command.index("--mask-types") + 1] == "water,cloud"
     assert command[command.index("--stage") + 1] == "mask"
     assert command[command.index("--raw-uri") + 1] == "/data/downloads/raw/LC08_SCENE"

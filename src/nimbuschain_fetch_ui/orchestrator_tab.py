@@ -13,6 +13,7 @@ from nimbuschain_fetch.pipeline import (
     build_default_pipeline_stages,
     is_landsat_selection,
 )
+from nimbuschain_fetch.launch_modes import normalize_pipeline_launch_mode, service_defaults
 from nimbuschain_fetch_ui.constants import PRODUCT_TYPES, PROJECT_ROOT, PROVIDER_CLI_MAP, PROVIDERS
 from nimbuschain_fetch_ui.orchestrator_cli import build_stage_cli_command, run_stage_cli
 
@@ -94,6 +95,9 @@ def render_orchestrator_tab(
         )
 
     provider = PROVIDER_CLI_MAP.get(selected_provider_label, selected_provider_label.lower())
+    launch_mode = normalize_pipeline_launch_mode(os.getenv("NIMBUS_PIPELINE_LAUNCH_MODE")).value
+    launch_defaults = service_defaults(launch_mode, container=True)
+    mask_service_default = _mask_service_default(launch_mode, launch_defaults.mask_service_url)
     is_landsat_flow = is_landsat_selection(
         provider=provider,
         collection=selected_collection,
@@ -118,7 +122,7 @@ def render_orchestrator_tab(
             "Zarr service",
             value=st.session_state.get(
                 "orch_zarr_service_url",
-                os.getenv("NIMBUS_ZARR_SERVICE_URL", "http://nimbus-zarr:8010"),
+                os.getenv("NIMBUS_ZARR_SERVICE_URL", launch_defaults.zarr_service_url),
             ),
             key="orch_zarr_service_url",
         )
@@ -126,7 +130,7 @@ def render_orchestrator_tab(
             "Mask service",
             value=st.session_state.get(
                 "orch_mask_service_url",
-                os.getenv("NIMBUS_MASK_SERVICE_URL", "http://nimbus-mask:8020"),
+                mask_service_default,
             ),
             key="orch_mask_service_url",
         )
@@ -137,7 +141,7 @@ def render_orchestrator_tab(
                 "Sen2Like service",
                 value=st.session_state.get(
                     "orch_sen2like_service_url",
-                    os.getenv("NIMBUS_SEN2LIKE_SERVICE_URL", "http://nimbus-sen2like:8030"),
+                    os.getenv("NIMBUS_SEN2LIKE_SERVICE_URL", launch_defaults.sen2like_service_url),
                 ),
                 key="orch_sen2like_service_url",
             )
@@ -221,6 +225,7 @@ def render_orchestrator_tab(
         job_id=job_id,
         mask_types=mask_types,
         cube_mode=cube_mode,
+        launch_mode=launch_mode,
         target_stage=None if target_stage == "full" else target_stage,
         **sen2like_kwargs,
     )
@@ -232,6 +237,7 @@ def render_orchestrator_tab(
         job_id=job_id,
         mask_types=mask_types,
         cube_mode=cube_mode,
+        launch_mode=launch_mode,
         run_stage=_default_run_stage(target_stage, cube_mode, mask_types),
         raw_uri=raw_uri.strip() or None,
         source_zarr_uri=source_zarr_uri.strip() or None,
@@ -498,6 +504,12 @@ def _mask_types_from_mode(mask_mode: str) -> list[str]:
     if value == "water_cloud":
         return ["water", "cloud"]
     return []
+
+
+def _mask_service_default(launch_mode: str, fallback: str) -> str:
+    if normalize_pipeline_launch_mode(launch_mode).value == "mps":
+        return str(os.getenv("NIMBUS_HOST_MPS_MASK_URL") or fallback).strip()
+    return str(os.getenv("NIMBUS_MASK_SERVICE_URL") or fallback).strip()
 
 
 def _sen2like_command_kwargs(

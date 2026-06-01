@@ -6,6 +6,7 @@ import sys
 import uuid
 from typing import Any
 
+from nimbuschain_fetch.launch_modes import normalize_pipeline_launch_mode
 from nimbuschain_fetch.pipeline import PipelineContext, PipelineOrchestrator
 from nimbuschain_fetch.pipeline.defaults import PipelineOptions, build_default_pipeline_stages
 from nimbuschain_fetch.pipeline.runners import (
@@ -41,6 +42,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common_options(command: argparse.ArgumentParser) -> None:
         command.add_argument("--job-id", default="", help="Existing or manual job id.")
+        command.add_argument(
+            "--launch-mode",
+            default=None,
+            choices=["mps", "oci"],
+            help=(
+                "Runtime launch profile. 'mps' uses the host-native Apple MPS "
+                "mask service; 'oci' uses in-cloud/container services."
+            ),
+        )
         command.add_argument("--provider", required=True, choices=["copernicus", "usgs"])
         command.add_argument("--collection", required=True)
         command.add_argument("--product-type", default=None)
@@ -122,6 +132,7 @@ def _options_from_args(args: argparse.Namespace) -> PipelineOptions:
 
 
 def _context_from_args(args: argparse.Namespace, options: PipelineOptions) -> PipelineContext:
+    launch_mode = normalize_pipeline_launch_mode(args.launch_mode).value
     raw_uris = _csv_values(args.raw_uris)
     if args.raw_uri:
         raw_uris.insert(0, str(args.raw_uri).strip())
@@ -141,6 +152,7 @@ def _context_from_args(args: argparse.Namespace, options: PipelineOptions) -> Pi
             "raw_uris": _unique_strings(raw_uris),
             "source_zarr_uri": source_zarr_uris[0] if source_zarr_uris else None,
             "source_zarr_uris": _unique_strings(source_zarr_uris),
+            "launch_mode": launch_mode,
             "mask_types": list(options.mask_types),
             "cube_mode": options.normalized_cube_mode,
             "sen2like_working_dir": (
@@ -155,6 +167,7 @@ def _context_from_args(args: argparse.Namespace, options: PipelineOptions) -> Pi
 
 def _runtime_config_from_args(args: argparse.Namespace) -> PipelineRuntimeConfig:
     return PipelineRuntimeConfig(
+        launch_mode=normalize_pipeline_launch_mode(args.launch_mode).value,
         zarr_service_url=_optional_arg(args.zarr_service_url),
         mask_service_url=_optional_arg(args.mask_service_url),
         zarr_output_dir=_optional_arg(args.zarr_output_dir) or "./data/downloads/zarr/manual",
@@ -209,9 +222,11 @@ def run_plan(args: argparse.Namespace) -> int:
     options = _options_from_args(args)
     context = _context_from_args(args, options)
     orchestrator = _orchestrator(options)
+    launch_mode = normalize_pipeline_launch_mode(args.launch_mode).value
     payload = {
         "status": "planned",
         "job_id": context.job_id,
+        "launch_mode": launch_mode,
         "provider": options.normalized_provider,
         "collection": options.collection,
         "product_type": options.product_type,
@@ -230,9 +245,11 @@ def run_stage(args: argparse.Namespace) -> int:
     orchestrator = _orchestrator(options, args=args, runtime_stages=runtime_stages)
     results = orchestrator.run(context, target_stage=str(args.stage), raise_on_failure=False)
     has_failure = any(result.status.value == "failed" for result in results)
+    launch_mode = normalize_pipeline_launch_mode(args.launch_mode).value
     payload = {
         "status": "failed" if has_failure else "completed",
         "job_id": context.job_id,
+        "launch_mode": launch_mode,
         "stage": str(args.stage),
         "execution_mode": "runtime" if runtime_stages else "dry",
         "results": [result.to_dict() for result in results],

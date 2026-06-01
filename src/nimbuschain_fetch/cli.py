@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -71,6 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="NimbusChain Fetch CLI")
 
     parser.add_argument("--mode", choices=["direct", "service"], default="direct")
+    parser.add_argument(
+        "--launch-mode",
+        choices=["mps", "oci"],
+        default=None,
+        help=(
+            "Runtime launch profile for direct terminal runs. Service mode uses "
+            "the profile configured on the running API/worker stack."
+        ),
+    )
     parser.add_argument("--service-url", default="http://127.0.0.1:8000")
     parser.add_argument("--api-key", default=None)
 
@@ -110,6 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.launch_mode:
+        os.environ["NIMBUS_PIPELINE_LAUNCH_MODE"] = str(args.launch_mode)
     request = _build_request(args)
 
     with NimbusFetcherClient(

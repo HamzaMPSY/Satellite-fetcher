@@ -69,11 +69,14 @@ def test_fetcher_uses_remote_zarr_client_when_service_url_is_configured(monkeypa
     assert kwargs["trace_id"]
 
 
-def test_fetcher_converter_requires_zarr_service_url(tmp_path) -> None:
+def test_fetcher_converter_uses_launch_mode_zarr_default(tmp_path) -> None:
     fetcher = NimbusFetcher(settings=_sqlite_settings(tmp_path, NIMBUS_ZARR_SERVICE_URL=""))
 
-    with pytest.raises(RuntimeError, match="Zarr service URL is not configured."):
-        fetcher._converter()
+    converter = fetcher._converter()
+    try:
+        assert converter.service_url == "http://127.0.0.1:8010"
+    finally:
+        converter.close()
 
 
 def test_fetcher_stop_closes_remote_zarr_client(tmp_path) -> None:
@@ -93,11 +96,21 @@ def test_fetcher_stop_closes_remote_zarr_client(tmp_path) -> None:
     assert fetcher._zarr_converter is None
 
 
-def test_fetcher_masker_requires_mask_service_url(tmp_path) -> None:
-    fetcher = NimbusFetcher(settings=_sqlite_settings(tmp_path, NIMBUS_MASK_SERVICE_URL=""))
+def test_fetcher_masker_uses_mps_host_url_over_stale_mask_url(tmp_path) -> None:
+    fetcher = NimbusFetcher(
+        settings=_sqlite_settings(
+            tmp_path,
+            NIMBUS_PIPELINE_LAUNCH_MODE="mps",
+            NIMBUS_HOST_MPS_MASK_URL="http://host.containers.internal:18021",
+            NIMBUS_MASK_SERVICE_URL="http://nimbus-mask:8020",
+        )
+    )
 
-    with pytest.raises(RuntimeError, match="Mask service URL is not configured."):
-        fetcher._masker()
+    masker = fetcher._masker()
+    try:
+        assert masker.service_url == "http://host.containers.internal:18021"
+    finally:
+        masker.close()
 
 
 def test_fetcher_inspects_zarr_dataset_via_remote_client(monkeypatch, tmp_path) -> None:

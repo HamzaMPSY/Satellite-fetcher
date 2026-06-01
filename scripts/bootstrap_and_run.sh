@@ -34,9 +34,7 @@ source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev,ui,mask-service]"
 
-podman machine start || true
-podman compose build
-podman compose up -d
+"$ROOT_DIR/scripts/run_all.sh" --launch-mode "${NIMBUS_PIPELINE_LAUNCH_MODE:-mps}" --build
 
 echo
 echo "Running containers:"
@@ -46,4 +44,4 @@ echo "Health endpoints:"
 echo "  API:  http://127.0.0.1:8000/v1/health"
 echo "  UI:   http://127.0.0.1:8501"
 echo "  Zarr: http://127.0.0.1:8010/readiness"
-echo "  Mask: http://127.0.0.1:8020/health"
+echo "  Mask: http://127.0.0.1:8000/v1/mask/health"

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nimbuschain_fetch.launch_modes import normalize_pipeline_launch_mode
+
 
 @dataclass(frozen=True, slots=True)
 class StageCliInvocation:
@@ -43,6 +45,7 @@ def build_stage_cli_command(
     cube_target_resolution_m: int | None = None,
     cube_overlap_policy: str | None = None,
     execute: bool = False,
+    launch_mode: str | None = None,
     sen2like_service_url: str | None = None,
     sen2like_working_dir: str | None = None,
     sen2like_workers: int | None = None,
@@ -59,6 +62,8 @@ def build_stage_cli_command(
         "-m",
         "nimbuschain_fetch.stage_cli",
         action,
+        "--launch-mode",
+        normalize_pipeline_launch_mode(launch_mode).value,
         "--provider",
         provider,
         "--collection",

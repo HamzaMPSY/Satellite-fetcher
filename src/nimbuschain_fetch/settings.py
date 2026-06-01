@@ -9,6 +9,13 @@ from typing import Any
 from pydantic import Field, PrivateAttr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from nimbuschain_fetch.launch_modes import (
+    PipelineLaunchMode,
+    default_host_mps_mask_url,
+    normalize_pipeline_launch_mode,
+    service_defaults,
+)
+
 
 class Settings(BaseSettings):
     """Runtime settings loaded from environment variables."""
@@ -32,6 +39,11 @@ class Settings(BaseSettings):
     nimbus_mongodb_db: str = Field(default="nimbuschain_fetch", alias="NIMBUS_MONGODB_DB")
 
     nimbus_data_dir: Path = Field(default=Path("./data/downloads"), alias="NIMBUS_DATA_DIR")
+    nimbus_pipeline_launch_mode: str = Field(default="mps", alias="NIMBUS_PIPELINE_LAUNCH_MODE")
+    nimbus_host_mps_mask_url: str = Field(
+        default_factory=default_host_mps_mask_url,
+        alias="NIMBUS_HOST_MPS_MASK_URL",
+    )
     nimbus_mask_service_url: str | None = Field(default=None, alias="NIMBUS_MASK_SERVICE_URL")
     nimbus_integrated_mask_water_backend: str = Field(
         default="omniwatermask",
@@ -212,10 +224,19 @@ class Settings(BaseSettings):
         self._explicit_setting_names = explicit_names
 
     @field_validator(
+        "nimbus_pipeline_launch_mode",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_pipeline_launch_mode(cls, value: str | None) -> str:
+        return normalize_pipeline_launch_mode(value).value
+
+    @field_validator(
         "nimbus_copernicus_base_url",
         "nimbus_copernicus_token_url",
         "nimbus_copernicus_download_url",
         "nimbus_usgs_service_url",
+        "nimbus_host_mps_mask_url",
         "nimbus_mask_service_url",
         "nimbus_zarr_service_url",
         "nimbus_sen2like_service_url",
@@ -338,6 +359,19 @@ class Settings(BaseSettings):
         if value in {"all", "api", "worker"}:
             return value
         return "all"
+
+    @property
+    def effective_zarr_service_url(self) -> str:
+        defaults = service_defaults(self.nimbus_pipeline_launch_mode)
+        return str(self.nimbus_zarr_service_url or defaults.zarr_service_url).strip()
+
+    @property
+    def effective_mask_service_url(self) -> str:
+        launch_mode = normalize_pipeline_launch_mode(self.nimbus_pipeline_launch_mode)
+        defaults = service_defaults(launch_mode)
+        if launch_mode is PipelineLaunchMode.mps:
+            return str(self.nimbus_host_mps_mask_url or defaults.mask_service_url).strip()
+        return str(self.nimbus_mask_service_url or defaults.mask_service_url).strip()
 
     @staticmethod
     def _normalize_copernicus_account_entry(

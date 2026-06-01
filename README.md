@@ -184,19 +184,29 @@ cd /path/to/Satellite-fetcher
 cp .env.example .env
 ```
 
-Start the API, worker, UI, Sen2Like, Zarr service, and mask service with the canonical compose stack:
+Nimbus has two supported launch profiles:
+
+- `mps`: local UI profile. The UI/API/worker use the host-native Apple MPS mask
+  service for cloud/water masking, while Sen2Like runs with a conservative local
+  memory profile.
+- `oci`: cloud/VM profile. Services use container/cloud endpoints and OCI object
+  storage paths can be staged by the terminal pipeline.
+
+For the local UI path on Apple Silicon, use:
 
 ```bash
-docker compose -f deploy/compose/compose.yml up --build
+scripts/run_all.sh --launch-mode mps --build
 ```
 
-For Podman-compatible environments, use:
+For cloud/VM or OCI-oriented runs, use:
 
 ```bash
-podman compose -f deploy/compose/compose.yml up --build
+scripts/run_all.sh --launch-mode oci --build
 ```
 
-The root `docker-compose*.yml` and `podman-compose*.yml` files are compatibility includes that point at `deploy/compose/`.
+The root `docker-compose*.yml` and `podman-compose*.yml` files are compatibility
+includes that point at `deploy/compose/`; `scripts/run_all.sh` applies the
+intended launch profile before invoking compose.
 
 ## Health endpoints
 
@@ -358,6 +368,7 @@ Run the whole VM-oriented flow in one command:
 nimbuschain-vm-pipeline \
   oci://my-bucket@my-namespace/raw/S2A_MSIL2A_20260410T080021_N0512_R035_T37RDP_20260410T134820.SAFE.zip \
   oci://my-bucket@my-namespace/raw/S2B_MSIL2A_20260413T075609_N0512_R035_T37RDP_20260413T102805.SAFE.zip \
+  --launch-mode oci \
   --provider copernicus \
   --collection SENTINEL-2 \
   --product-type S2MSI2A \

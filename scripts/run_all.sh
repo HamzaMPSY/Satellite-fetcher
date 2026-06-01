@@ -19,6 +19,7 @@ fi
 BUILD=1
 FORCE_RECREATE=0
 FOLLOW_LOGS=0
+LAUNCH_MODE="${NIMBUS_PIPELINE_LAUNCH_MODE:-mps}"
 SERVICES=()
 DEFAULT_BUILD_SERVICES=(
   mongodb
@@ -44,8 +45,22 @@ while [ "$#" -gt 0 ]; do
     --logs)
       FOLLOW_LOGS=1
       ;;
+    --launch-mode|--pipeline-mode|--profile)
+      if [ "$#" -lt 2 ]; then
+        echo "$1 requires a value: mps or oci"
+        exit 2
+      fi
+      LAUNCH_MODE="$2"
+      shift
+      ;;
+    --mps)
+      LAUNCH_MODE="mps"
+      ;;
+    --oci)
+      LAUNCH_MODE="oci"
+      ;;
     --help|-h)
-      echo "Usage: scripts/run_all.sh [--build|--no-build] [--recreate] [--logs] [service...]"
+      echo "Usage: scripts/run_all.sh [--launch-mode mps|oci] [--build|--no-build] [--recreate] [--logs] [service...]"
       exit 0
       ;;
     *)
@@ -55,9 +70,69 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+case "$(printf '%s' "$LAUNCH_MODE" | tr '[:upper:]' '[:lower:]')" in
+  mps|local-mps|local_mps|ui)
+    LAUNCH_MODE="mps"
+    ;;
+  oci|cloud|vm)
+    LAUNCH_MODE="oci"
+    ;;
+  *)
+    echo "Invalid launch mode '$LAUNCH_MODE'. Expected: mps or oci."
+    exit 2
+    ;;
+esac
+
+COMPOSE_PROJECT_NAME_VALUE="${COMPOSE_PROJECT_NAME:-${NIMBUS_COMPOSE_PROJECT_NAME:-backendnimbus}}"
+COMPOSE_ARGS=(--project-name "$COMPOSE_PROJECT_NAME_VALUE" -f "$ROOT_DIR/deploy/compose/compose.yml")
+if [ "$LAUNCH_MODE" = "mps" ]; then
+  COMPOSE_ARGS+=(-f "$ROOT_DIR/deploy/compose/compose.mask-external.yml")
+fi
+
 if [ ! -f .env ]; then
   cp .env.example .env
   echo "Created .env from .env.example"
+fi
+
+apply_launch_mode() {
+  export NIMBUS_PIPELINE_LAUNCH_MODE="$LAUNCH_MODE"
+
+  if [ "$LAUNCH_MODE" = "mps" ]; then
+    local host_mps_port="${NIMBUS_HOST_MPS_MASK_PORT:-18021}"
+    export NIMBUS_HOST_MPS_MASK_PORT="$host_mps_port"
+    export NIMBUS_HOST_MPS_MASK_URL="${NIMBUS_HOST_MPS_MASK_URL:-http://host.containers.internal:$host_mps_port}"
+    export NIMBUS_MASK_SERVICE_URL="$NIMBUS_HOST_MPS_MASK_URL"
+
+    # Conservative local profile: host MPS does masking, while Sen2Like keeps
+    # bounded parallelism to avoid killing the Podman VM on full Landsat scenes.
+    export NIMBUS_SEN2LIKE_WORKERS="${NIMBUS_SEN2LIKE_WORKERS:-2}"
+    export NIMBUS_SEN2LIKE_BAND_WORKERS="${NIMBUS_SEN2LIKE_BAND_WORKERS:-2}"
+    export NIMBUS_SEN2LIKE_PREPROCESS_WORKERS="${NIMBUS_SEN2LIKE_PREPROCESS_WORKERS:-1}"
+    export NIMBUS_SEN2LIKE_RAW_FALLBACK="${NIMBUS_SEN2LIKE_RAW_FALLBACK:-false}"
+    export NIMBUS_SEN2LIKE_SAFE_RETRY="${NIMBUS_SEN2LIKE_SAFE_RETRY:-true}"
+
+    if [ "$(uname -s)" != "Darwin" ]; then
+      echo "Launch mode mps is for the local macOS/UI pipeline. Use --launch-mode oci on Linux/cloud."
+      exit 2
+    fi
+
+    "$ROOT_DIR/scripts/run_host_mps_mask.sh" --daemon
+  else
+    export NIMBUS_MASK_SERVICE_URL="${NIMBUS_MASK_SERVICE_URL:-http://nimbus-mask:8020}"
+    export NIMBUS_ZARR_SERVICE_URL="${NIMBUS_ZARR_SERVICE_URL:-http://nimbus-zarr:8010}"
+    export NIMBUS_SEN2LIKE_SERVICE_URL="${NIMBUS_SEN2LIKE_SERVICE_URL:-http://nimbus-sen2like:8030}"
+  fi
+}
+
+apply_launch_mode
+
+if [ "$LAUNCH_MODE" = "mps" ] && [ "${#SERVICES[@]}" -gt 0 ]; then
+  for service in "${SERVICES[@]}"; do
+    if [ "$service" = "nimbus-mask" ]; then
+      echo "nimbus-mask is not part of the mps launch profile. Use the host MPS mask service or switch to --launch-mode oci."
+      exit 2
+    fi
+  done
 fi
 
 ensure_podman_machine_running() {
@@ -101,34 +176,47 @@ if "$PODMAN_BIN" machine inspect >/dev/null 2>&1; then
   fi
 fi
 
+echo "Launch mode: $LAUNCH_MODE"
+echo "Mask service URL: ${NIMBUS_MASK_SERVICE_URL:-}"
+
 echo "Validating compose configuration..."
-"$PODMAN_BIN" compose config --quiet
+"$PODMAN_BIN" compose "${COMPOSE_ARGS[@]}" config --quiet
 
 if [ "$BUILD" -eq 1 ]; then
   echo "Building NimbusChain services..."
   if [ "${#SERVICES[@]}" -gt 0 ]; then
-    "$PODMAN_BIN" compose build "${SERVICES[@]}"
+    "$PODMAN_BIN" compose "${COMPOSE_ARGS[@]}" build "${SERVICES[@]}"
   else
     for service in "${DEFAULT_BUILD_SERVICES[@]}"; do
+      if [ "$LAUNCH_MODE" = "mps" ] && [ "$service" = "nimbus-mask" ]; then
+        continue
+      fi
       if [ "$service" = "mongodb" ]; then
-        "$PODMAN_BIN" pull mongo:7
+        if "$PODMAN_BIN" image exists mongo:7 || "$PODMAN_BIN" image exists docker.io/library/mongo:7; then
+          echo "Using existing mongo:7 image."
+        else
+          "$PODMAN_BIN" pull mongo:7
+        fi
       else
-        "$PODMAN_BIN" compose build "$service"
+        "$PODMAN_BIN" compose "${COMPOSE_ARGS[@]}" build "$service"
       fi
     done
   fi
 fi
 
-UP_ARGS=(up -d)
+UP_ARGS=(up -d --no-build)
 if [ "$FORCE_RECREATE" -eq 1 ]; then
   UP_ARGS+=(--force-recreate)
+fi
+if [ "$LAUNCH_MODE" = "mps" ]; then
+  UP_ARGS+=(--scale nimbus-mask=0)
 fi
 
 echo "Starting NimbusChain stack..."
 if [ "${#SERVICES[@]}" -gt 0 ]; then
-  "$PODMAN_BIN" compose "${UP_ARGS[@]}" "${SERVICES[@]}"
+  "$PODMAN_BIN" compose "${COMPOSE_ARGS[@]}" "${UP_ARGS[@]}" "${SERVICES[@]}"
 else
-  "$PODMAN_BIN" compose "${UP_ARGS[@]}"
+  "$PODMAN_BIN" compose "${COMPOSE_ARGS[@]}" "${UP_ARGS[@]}"
 fi
 
 echo
@@ -168,7 +256,12 @@ echo "Health endpoints:"
 check_url "API" "http://127.0.0.1:8000/v1/health" || true
 check_url "UI" "http://127.0.0.1:8501" || true
 check_url "Zarr" "http://127.0.0.1:8010/readiness" || true
-check_url "Mask" "http://127.0.0.1:8020/health" || true
+if [ "$LAUNCH_MODE" = "mps" ]; then
+  check_url "Host MPS Mask" "http://127.0.0.1:${NIMBUS_HOST_MPS_MASK_PORT:-18021}/health" || true
+  check_url "API Mask Proxy" "http://127.0.0.1:8000/v1/mask/health" || true
+else
+  check_url "Mask" "http://127.0.0.1:8020/health" || true
+fi
 check_url "Sen2Like" "http://127.0.0.1:8030/health" || true
 
 echo
@@ -176,8 +269,8 @@ echo "UI: http://127.0.0.1:8501"
 
 if [ "$FOLLOW_LOGS" -eq 1 ]; then
   if [ "${#SERVICES[@]}" -gt 0 ]; then
-    "$PODMAN_BIN" compose logs -f "${SERVICES[@]}"
+    "$PODMAN_BIN" compose "${COMPOSE_ARGS[@]}" logs -f "${SERVICES[@]}"
   else
-    "$PODMAN_BIN" compose logs -f
+    "$PODMAN_BIN" compose "${COMPOSE_ARGS[@]}" logs -f
   fi
 fi
