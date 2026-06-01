@@ -3954,6 +3954,41 @@ def _render_download_jobs_panel_body(download_provider_api: str | None) -> None:
         empty_message="No pipeline runs match the selected filter.",
     )
 
+    mask_statuses = [row for row in all_statuses if _job_is_mask_job(row)]
+    mask_base_statuses = _filter_jobs_by_scope(
+        mask_statuses,
+        provider=_provider_scope_value(provider_scope, None),
+        collection_query=collection_filter,
+        product_query=product_filter,
+        job_query=job_query,
+    )
+    mask_visible_statuses = _filter_jobs_by_view(
+        mask_base_statuses,
+        job_view,
+        recent_minutes=RECENT_JOB_CATEGORY_MINUTES,
+        active_states=ACTIVE_JOB_STATES,
+    )
+    if mask_base_statuses:
+        st.markdown("#### Standalone mask jobs")
+        mask_stats = summarize_statuses(mask_base_statuses)
+        mask_col1, mask_col2, mask_col3, mask_col4 = st.columns(4)
+        with mask_col1:
+            st.metric("Mask jobs", int(mask_stats["total_jobs"]))
+        with mask_col2:
+            st.metric("Active", int(mask_stats["active_jobs"]))
+        with mask_col3:
+            st.metric("Succeeded", int(mask_stats["succeeded_jobs"]))
+        with mask_col4:
+            st.metric("Failed", int(mask_stats["failed_jobs"]))
+        st.caption("Standalone mask jobs are API/manual runs on existing Zarr stores.")
+        st.caption(f"Showing {len(mask_visible_statuses)} / {len(mask_base_statuses)} matching standalone mask jobs.")
+        mask_result_cache = _ensure_job_results_loaded(mask_visible_statuses)
+        _render_job_cards(
+            mask_visible_statuses,
+            result_cache=mask_result_cache,
+            empty_message="No standalone mask jobs match the selected filter.",
+        )
+
 
 @st.fragment(run_every=JOB_MONITOR_REFRESH_EVERY)
 def _render_download_jobs_panel_live(download_provider_api: str | None) -> None:
